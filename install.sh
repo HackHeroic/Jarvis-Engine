@@ -40,7 +40,7 @@ else
 fi
 
 # --- 4. Activate and install packages ---
-echo "Installing packages into env '$ENV_NAME'..."
+echo "Installing packages into env '$ENV_NAME' (includes ortools for Phase 2 scheduler)..."
 $CONDA_CMD run -n "$ENV_NAME" pip install --upgrade pip
 $CONDA_CMD run -n "$ENV_NAME" pip install --no-user -e .
 
@@ -49,7 +49,8 @@ echo "Running smoke test..."
 $CONDA_CMD run -n "$ENV_NAME" python -c "
 import fastapi
 import mlx.core as mx
-print('OK: fastapi and mlx imports succeeded.')
+from ortools.sat.python import cp_model
+print('OK: fastapi, mlx, and ortools imports succeeded.')
 " || {
     echo "Warning: Smoke test failed. Check dependencies manually."
 }
