@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
 from app.models.brain.litellm_conf import hybrid_route_query
 
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Jarvis Reasoning Engine", lifespan=lifespan)
+app.include_router(api_router, prefix="/api/v1")
 
 
 @app.get("/")
