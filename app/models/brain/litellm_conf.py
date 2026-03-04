@@ -1,6 +1,8 @@
 """Hybrid routing logic for LiteLLM: Local Qwen (LM Studio) vs Cloud Gemini."""
 
+import json
 import os
+import re
 
 import litellm
 from pydantic import BaseModel
@@ -13,7 +15,9 @@ from app.core.config import (
     LITELLM_VERBOSE,
 )
 
-# Keyword-based routing: queries containing these go to Cloud Gemini
+# Cloud keywords: Real-Time Research (L9) only. Local-First: all other requests
+# (including decomposition, academic topics like SARIMAX) go to local Qwen.
+# Cloud Gemini is reserved exclusively for real-time/research queries.
 CLOUD_KEYWORDS = [
     "latest news",
     "current events",
@@ -21,6 +25,21 @@ CLOUD_KEYWORDS = [
     "real-time",
     "recent developments",
 ]
+
+# Strip markdown code fences from LLM output (local models often wrap JSON)
+_FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$",
+    re.DOTALL,
+)
+
+
+def _sanitize_llm_json(raw: str) -> str:
+    """Strip markdown code fences that local models wrap around JSON."""
+    stripped = raw.strip()
+    match = _FENCE_RE.match(stripped)
+    if match:
+        return match.group(1).strip()
+    return stripped
 
 # Use the new environment variable method for LiteLLM logging
 if LITELLM_VERBOSE:
@@ -54,21 +73,23 @@ async def hybrid_route_query(
     user_prompt: str,
     system_prompt: str,
     response_schema: type[BaseModel] | None = None,
+    force_cloud: bool = False,
+    lenient_validation: bool = False,
 ) -> str | dict:
     """
-    Route the query to Local Qwen or Cloud Gemini based on keyword detection.
-    Returns raw content string, or parsed dict when response_schema is provided.
+    Route the query to Local Qwen or Cloud Gemini. Local-First: all requests
+    go to local Qwen unless (a) CLOUD_KEYWORDS match (Real-Time Research L9),
+    or (b) force_cloud=True (last-resort fallback when local fails validation).
     """
-    # Keyword-based routing (case-insensitive)
     prompt_lower = user_prompt.lower()
-    use_cloud = any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
+    use_cloud = force_cloud or any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
     target_model = GEMINI_MODEL if use_cloud else LOCAL_LLM_MODEL
 
-    # Routing decision log
     if use_cloud:
-        print("[LiteLLM Router] Routing to Cloud Gemini")
+        reason = "force_cloud fallback" if force_cloud else "Real-Time Research (L9)"
+        print(f"[LiteLLM Router] Routing to Cloud Gemini ({reason})")
     else:
-        print("[LiteLLM Router] Routing to Local Qwen")
+        print("[LiteLLM Router] Routing to Local Qwen (Local-First)")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -83,6 +104,7 @@ async def hybrid_route_query(
     }
     if response_schema is not None:
         completion_kwargs["response_format"] = response_schema
+        completion_kwargs["max_tokens"] = 4096
 
     if use_cloud:
         if GEMINI_API_KEY:
@@ -95,6 +117,18 @@ async def hybrid_route_query(
     content = response.choices[0].message.content
 
     if response_schema is not None and content:
-        parsed = response_schema.model_validate_json(content)
-        return parsed.model_dump()
+        try:
+            parsed = response_schema.model_validate_json(content)
+            return parsed.model_dump()
+        except Exception as e:
+            # Retry with sanitized content (local models often wrap JSON in fences)
+            content_sanitized = _sanitize_llm_json(content)
+            try:
+                parsed = response_schema.model_validate_json(content_sanitized)
+                return parsed.model_dump()
+            except Exception:
+                # If lenient, return raw dict for caller to inspect/retry (e.g. undersized decomposition)
+                if lenient_validation:
+                    return json.loads(content_sanitized)
+                raise e
     return content
