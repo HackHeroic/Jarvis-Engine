@@ -165,12 +165,14 @@ class ExecutionGraph(BaseModel):
     goal_metadata: GoalMetadata
     decomposition: List[TaskChunk] = Field(
         ...,
-        min_length=5,
+        min_length=1,
         description=(
             "Ordered list of atomic micro-tasks produced by Socratic "
             "decomposition.  Each chunk is sized to the 25-minute "
             "Pomodoro ceiling and includes verifiable completion criteria. "
-            "MUST contain at least 5 TaskChunk objects."
+            "For decompose-goal output, at least 5 tasks are required "
+            "(enforced by endpoint logic). For schedule input, 1+ tasks "
+            "are accepted."
         ),
     )
     cognitive_load_estimate: Dict[str, float] = Field(
@@ -229,9 +231,13 @@ SYSTEM_PROMPT = (
     "(1 = awareness, 5 = teaching proficiency). Never use 0.\n"
     "5. Provide a cognitive_load_estimate with at least an 'intrinsic_load' "
     "float (0.0-1.0) for the overall goal.\n"
-    "6. Output ONLY strictly valid JSON matching the ExecutionGraph schema. "
+    "6. When the user mentions a deadline (exam date, due date, 'by Friday'), "
+    "include it in deadline_hint as ISO-8601 (YYYY-MM-DD) when possible. "
+    "Example: 'exam on March 20' -> deadline_hint: '2026-03-20'. "
+    "Put the deadline on the final or most relevant chunk.\n"
+    "7. Output ONLY strictly valid JSON matching the ExecutionGraph schema. "
     "No markdown fences, no commentary, no text outside the JSON object.\n"
-    "7. The decomposition array MUST contain at least 5 TaskChunk objects. "
+    "8. The decomposition array MUST contain at least 5 TaskChunk objects. "
     "An empty or undersized decomposition is invalid and indicates failure "
     "to complete the task.\n\n"
     "Example of one TaskChunk in the decomposition array:\n"
