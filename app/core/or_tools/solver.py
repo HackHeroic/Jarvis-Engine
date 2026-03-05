@@ -34,6 +34,7 @@ class JarvisScheduler:
         self.horizon = horizon_minutes
         self.tasks: dict[str, dict] = {}
         self.hard_blocks: list = []
+        self.soft_blocks: list[tuple] = []  # (interval_var, max_duration, max_difficulty)
 
     def add_hard_block(self, start_min: int, end_min: int, name: str) -> None:
         """Add a non-negotiable block (e.g., sleep 23:00–07:00).
@@ -52,12 +53,36 @@ class JarvisScheduler:
         )
         self.hard_blocks.append(iv)
 
+    def add_soft_block(
+        self,
+        start_min: int,
+        end_min: int,
+        name: str,
+        max_task_duration: int = 15,
+        max_difficulty: float = 0.4,
+    ) -> None:
+        """Add a soft block (e.g., back-bench lecture) — only short, low-difficulty tasks may overlap.
+
+        Args:
+            start_min: Block start time in minutes from horizon zero.
+            end_min: Block end time in minutes from horizon zero.
+            name: Identifier for the block.
+            max_task_duration: Max task duration in minutes to allow overlap.
+            max_difficulty: Max difficulty_weight (0–1) to allow overlap.
+        """
+        duration = end_min - start_min
+        iv = self.model.new_interval_var(
+            start_min, duration, end_min, f"soft_{name}"
+        )
+        self.soft_blocks.append((iv, max_task_duration, max_difficulty))
+
     def add_task(
         self,
         task_id: str,
         duration: int,
         priority_score: int,
         dependencies: list[str],
+        difficulty_weight: float = 1.0,
     ) -> None:
         """Add a schedulable task with variable start/end.
 
@@ -66,6 +91,7 @@ class JarvisScheduler:
             duration: Task duration in minutes.
             priority_score: TMT-derived integer for objective weighting.
             dependencies: List of task_ids that must finish before this one.
+            difficulty_weight: Cognitive load 0–1; used for soft-block qualification.
         """
         start_var = self.model.new_int_var(
             0, self.horizon, f"start_{task_id}"
@@ -80,6 +106,8 @@ class JarvisScheduler:
             "end": end_var,
             "priority": priority_score,
             "dependencies": dependencies,
+            "duration": duration,
+            "difficulty_weight": difficulty_weight,
         }
 
     def build_dependencies(self) -> None:
@@ -114,6 +142,14 @@ class JarvisScheduler:
             [t["interval"] for t in self.tasks.values()] + self.hard_blocks
         )
         self.model.add_no_overlap(all_intervals)
+
+        # Soft blocks: non-qualifying tasks cannot overlap them
+        for soft_iv, max_dur, max_diff in self.soft_blocks:
+            for task_id, t in self.tasks.items():
+                duration = t["duration"]
+                diff = t["difficulty_weight"]
+                if duration > max_dur or diff > max_diff:
+                    self.model.add_no_overlap([t["interval"], soft_iv])
 
         self.build_dependencies()
 

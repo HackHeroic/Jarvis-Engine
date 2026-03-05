@@ -13,6 +13,7 @@ from app.core.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     LITELLM_VERBOSE,
+    SLM_ROUTER_URL,
 )
 
 # Cloud keywords: Real-Time Research (L9) only. Local-First: all other requests
@@ -75,21 +76,28 @@ async def hybrid_route_query(
     response_schema: type[BaseModel] | None = None,
     force_cloud: bool = False,
     lenient_validation: bool = False,
+    model_override: str | None = None,
 ) -> str | dict:
     """
     Route the query to Local Qwen or Cloud Gemini. Local-First: all requests
     go to local Qwen unless (a) CLOUD_KEYWORDS match (Real-Time Research L9),
     or (b) force_cloud=True (last-resort fallback when local fails validation).
+    If model_override is set, bypass routing and use that model (e.g. SLM for Semantic Router).
     """
-    prompt_lower = user_prompt.lower()
-    use_cloud = force_cloud or any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
-    target_model = GEMINI_MODEL if use_cloud else LOCAL_LLM_MODEL
-
-    if use_cloud:
-        reason = "force_cloud fallback" if force_cloud else "Real-Time Research (L9)"
-        print(f"[LiteLLM Router] Routing to Cloud Gemini ({reason})")
+    if model_override is not None:
+        target_model = model_override
+        use_cloud = False
+        print(f"[LiteLLM Router] Using model_override: {model_override}")
     else:
-        print("[LiteLLM Router] Routing to Local Qwen (Local-First)")
+        prompt_lower = user_prompt.lower()
+        use_cloud = force_cloud or any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
+        target_model = GEMINI_MODEL if use_cloud else LOCAL_LLM_MODEL
+
+        if use_cloud:
+            reason = "force_cloud fallback" if force_cloud else "Real-Time Research (L9)"
+            print(f"[LiteLLM Router] Routing to Cloud Gemini ({reason})")
+        else:
+            print("[LiteLLM Router] Routing to Local Qwen (Local-First)")
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -110,8 +118,14 @@ async def hybrid_route_query(
         if GEMINI_API_KEY:
             completion_kwargs["api_key"] = GEMINI_API_KEY
     else:
-        completion_kwargs["api_base"] = LOCAL_LLM_URL
-        completion_kwargs["api_key"] = "lm-studio"  # Dummy key; LM Studio doesn't validate it
+        if model_override is not None and SLM_ROUTER_URL:
+            completion_kwargs["api_base"] = SLM_ROUTER_URL
+        elif model_override is not None and "ollama/" not in model_override:
+            completion_kwargs["api_base"] = LOCAL_LLM_URL  # LM Studio or custom
+        elif model_override is None:
+            completion_kwargs["api_base"] = LOCAL_LLM_URL
+        # else: model_override with ollama/ and no SLM_ROUTER_URL — LiteLLM uses Ollama default
+        completion_kwargs["api_key"] = "lm-studio"  # Dummy key; LM Studio/Ollama don't validate it
 
     response = await litellm.acompletion(**completion_kwargs)
     content = response.choices[0].message.content
@@ -132,3 +146,35 @@ async def hybrid_route_query(
                     return json.loads(content_sanitized)
                 raise e
     return content
+
+
+async def run_deep_research(queries: list[str]) -> dict:
+    """Run Deep Research (L9) for each query via Gemini. Returns dict with queries and summaries.
+
+    Used when BrainDumpExtraction identifies search_queries. Runs with force_cloud=True.
+    """
+    if not queries:
+        return {"queries": [], "summaries": []}
+    if not GEMINI_API_KEY:
+        return {"queries": queries, "summaries": ["(Gemini not configured for search)"] * len(queries)}
+
+    summaries: list[str] = []
+    for q in queries:
+        try:
+            prompt = (
+                f"Provide a concise 2-3 sentence summary of the latest information on: {q}. "
+                "Focus on recent developments, current status, or key facts. Be factual and brief."
+            )
+            result = await hybrid_route_query(
+                user_prompt=prompt,
+                system_prompt="You are a research assistant. Summarize the requested topic concisely.",
+                response_schema=None,
+                force_cloud=True,
+            )
+            summary = result if isinstance(result, str) else str(result)
+            summaries.append(summary.strip() if summary else "(No summary)")
+        except Exception as e:
+            print(f"[Deep Research] Failed for query '{q}': {e}")
+            summaries.append(f"(Search failed: {e})")
+
+    return {"queries": queries, "summaries": summaries}
