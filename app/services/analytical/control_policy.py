@@ -673,11 +673,13 @@ async def _run_plan_day_flow(
         _decompose_dur = int((time_mod.monotonic() - _decompose_start) * 1000)
         if progress_callback:
             _task_titles = [t.title for t in graph.decomposition]
+            _task_data = [t.model_dump() for t in graph.decomposition]
             await progress_callback("decomposition_done", {
                 "task_count": len(graph.decomposition),
                 "total_minutes": sum(t.duration_minutes for t in graph.decomposition),
                 "duration_ms": _decompose_dur,
                 "task_titles": _task_titles,
+                "tasks": _task_data,  # Full task data for progressive render
                 "phase_summary": f"Created {len(graph.decomposition)} tasks ({sum(t.duration_minutes for t in graph.decomposition)} min): {', '.join(_task_titles[:3])}{'...' if len(_task_titles) > 3 else ''}",
             })
         if len(graph.decomposition) < 5:
@@ -816,6 +818,7 @@ async def _run_plan_day_flow(
             await progress_callback("schedule_done", {
                 "status": "OPTIMAL",
                 "task_count": _sched_task_count,
+                "schedule": schedule_response.model_dump(mode='json'),  # Full schedule data
                 "horizon_hours": round(used_horizon_minutes / 60, 1),
                 "duration_ms": _schedule_dur,
                 "phase_summary": f"Scheduled {_sched_task_count} tasks across {round(used_horizon_minutes / 60, 1)}h (OPTIMAL)",
@@ -860,11 +863,11 @@ async def _run_plan_day_flow(
 
         if progress_callback:
             await progress_callback("synthesizing", {"model": SLM_ROUTER_MODEL})
-        if use_voice_synthesis:
-            message, thinking_process = await synthesize_jarvis_response(summary)
-        else:
-            message = "Here's your schedule."
-            thinking_process = _build_thinking_fallback(summary)
+        # Skip VoJ when frontend will render structured schedule data directly.
+        # VoJ was adding 5-10s for a message the user doesn't read when they can
+        # see the visual schedule. Use deterministic fallback instead.
+        message = "Here's your schedule."
+        thinking_process = _build_thinking_fallback(summary)
         return ChatResponse(
             intent=IntentType.PLAN_DAY.value,
             message=message,
@@ -1175,7 +1178,8 @@ async def execute_agentic_flow(
         if progress_callback:
             await progress_callback("habits_staged", {
                 "count": len(staged_habits),
-                "habits": [h["raw_text"][:60] for h in staged_habits],
+                "habits": staged_habits,  # Full data, not just count
+                "phase_summary": f"Found {len(staged_habits)} habit(s) for your review",
             })
 
     if extraction.inline_habits and draft and draft_store:
