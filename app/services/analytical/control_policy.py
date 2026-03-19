@@ -352,14 +352,24 @@ def _is_extraction_empty(ext: BrainDumpExtraction) -> bool:
     )
 
 
-async def _run_brain_dump_extraction(user_prompt: str) -> Optional[BrainDumpExtraction]:
+async def _run_brain_dump_extraction(
+    user_prompt: str,
+    conversation_history: list[dict] | None = None,
+) -> Optional[BrainDumpExtraction]:
     """Extract all components from brain-dump prompt. Returns None on failure."""
     try:
+        _slm_history = None
+        if conversation_history:
+            _slm_history = [
+                {"role": m["role"], "content": m["content"][:200] + ("..." if len(m["content"]) > 200 else "")}
+                for m in conversation_history[-4:]
+            ]
         result = await hybrid_route_query(
             user_prompt=user_prompt,
             system_prompt=BRAIN_DUMP_EXTRACTION_PROMPT,
             response_schema=BrainDumpExtraction,
             model_override=SLM_ROUTER_MODEL,
+            conversation_history=_slm_history,
         )
         if isinstance(result, dict):
             return BrainDumpExtraction.model_validate(result)
@@ -373,6 +383,7 @@ async def _direct_qa_response(
     user_prompt: str,
     model_override: str | None = None,
     progress_callback: ProgressCallback = None,
+    conversation_history: list[dict] | None = None,
 ) -> ChatResponse:
     """Answer a question directly using the specified model (default: 27B).
 
@@ -397,6 +408,7 @@ async def _direct_qa_response(
             ),
             response_schema=None,
             model_override=model,
+            conversation_history=conversation_history,
         )
         msg = result if isinstance(result, str) else str(result)
         msg = msg.strip() if msg else "I couldn't generate a response."
@@ -428,6 +440,7 @@ async def _fallback_single_intent(
     max_task_duration_minutes: Optional[int] = None,
     min_task_duration_minutes: Optional[int] = None,
     progress_callback: ProgressCallback = None,
+    conversation_history: list[dict] | None = None,
 ) -> ChatResponse:
     """Fallback: use single-intent classifier when extraction fails or is empty."""
     try:
@@ -444,7 +457,8 @@ async def _fallback_single_intent(
     except (ValidationError, json.JSONDecodeError) as e:
         print(f"[Fallback] Intent classification parse error: {e}")
         return await _direct_qa_response(
-            user_prompt, progress_callback=progress_callback
+            user_prompt, progress_callback=progress_callback,
+            conversation_history=conversation_history,
         )
     except Exception as e:
         print(f"[Fallback] Intent classification failed (model unavailable?): {e}")
@@ -468,7 +482,10 @@ async def _fallback_single_intent(
 
     # GENERAL_QA: answer the question directly using 27B
     if intent == IntentType.GENERAL_QA:
-        return await _direct_qa_response(user_prompt, progress_callback=progress_callback)
+        return await _direct_qa_response(
+            user_prompt, progress_callback=progress_callback,
+            conversation_history=conversation_history,
+        )
 
     if intent in (
         IntentType.CALENDAR_SYNC,
@@ -1007,6 +1024,7 @@ async def execute_agentic_flow(
     file_name: Optional[str] = None,
     draft_schedule: Optional[dict] = None,
     draft_store: Optional[Any] = None,
+    conversation_history: list[dict] | None = None,
 ) -> ChatResponse:
     """Master orchestrator: brain dump extraction, multi-execution, Voice of Jarvis."""
     # Pre-check: if draft_schedule is provided, route to schedule modification flow
@@ -1058,6 +1076,7 @@ async def execute_agentic_flow(
             effective_prompt,
             model_override=LOCAL_LLM_MODEL,
             progress_callback=progress_callback,
+            conversation_history=conversation_history,
         )
 
     # Step 1: Brain dump extraction
@@ -1070,7 +1089,7 @@ async def execute_agentic_flow(
             "model_mode": model_mode,
             "started_at_ms": int(time_mod.time() * 1000),
         })
-    extraction = await _run_brain_dump_extraction(effective_prompt)
+    extraction = await _run_brain_dump_extraction(effective_prompt, conversation_history=conversation_history)
     _extraction_duration = int((time_mod.monotonic() - _phase_start) * 1000)
     if extraction is None or _is_extraction_empty(extraction):
         return await _fallback_single_intent(
@@ -1083,6 +1102,7 @@ async def execute_agentic_flow(
             max_task_duration_minutes=max_task_duration_minutes,
             min_task_duration_minutes=min_task_duration_minutes,
             progress_callback=progress_callback,
+            conversation_history=conversation_history,
         )
 
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -1111,6 +1131,7 @@ async def execute_agentic_flow(
                     max_task_duration_minutes=max_task_duration_minutes,
                     min_task_duration_minutes=min_task_duration_minutes,
                     progress_callback=progress_callback,
+                    conversation_history=conversation_history,
                 )
 
     execution_summary: dict[str, Any] = {}
