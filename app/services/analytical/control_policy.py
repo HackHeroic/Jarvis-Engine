@@ -352,6 +352,50 @@ def _is_extraction_empty(ext: BrainDumpExtraction) -> bool:
     )
 
 
+def _needs_clarification(
+    extraction: Optional[BrainDumpExtraction],
+    user_prompt: str,
+    conversation_history: list[dict] | None,
+) -> Optional[ChatResponse]:
+    """Return a clarification ChatResponse if the request is too ambiguous.
+
+    Only triggers when:
+    - Extraction is empty or None
+    - No conversation history to resolve context
+    - Prompt is very short (< 15 chars) or uses pronouns without antecedent
+    """
+    if conversation_history:
+        return None  # Multi-turn context available
+
+    if extraction and not _is_extraction_empty(extraction):
+        return None  # Extraction succeeded
+
+    prompt_lower = user_prompt.strip().lower()
+
+    ambiguous_patterns = [
+        "do it", "schedule it", "plan it", "ok", "yes", "sure",
+        "go ahead", "the thing", "do the thing", "that",
+    ]
+    is_ambiguous = (
+        len(prompt_lower) < 15
+        and any(p in prompt_lower for p in ambiguous_patterns)
+    )
+
+    if not is_ambiguous:
+        return None
+
+    return ChatResponse(
+        intent="CLARIFICATION",
+        message="I'd like to help! Could you give me a bit more detail?",
+        clarification_options=[
+            "Plan my day",
+            "Help me study for an exam",
+            "I want to build a habit",
+            "Break down a project into tasks",
+        ],
+    )
+
+
 async def _run_brain_dump_extraction(
     user_prompt: str,
     conversation_history: list[dict] | None = None,
@@ -1091,6 +1135,14 @@ async def execute_agentic_flow(
         })
     extraction = await _run_brain_dump_extraction(effective_prompt, conversation_history=conversation_history)
     _extraction_duration = int((time_mod.monotonic() - _phase_start) * 1000)
+
+    # Check if clarification is needed before proceeding
+    clarification = _needs_clarification(extraction, effective_prompt, conversation_history)
+    if clarification:
+        if progress_callback:
+            await progress_callback("intent_classified", {"intent": "CLARIFICATION"})
+        return clarification
+
     if extraction is None or _is_extraction_empty(extraction):
         return await _fallback_single_intent(
             effective_prompt,
