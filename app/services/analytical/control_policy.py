@@ -542,6 +542,8 @@ async def _run_plan_day_flow(
     progress_callback: ProgressCallback = None,
     skip_scheduling: bool = False,
     inline_habits_already_saved: bool = False,
+    draft: Optional[Any] = None,
+    draft_store: Optional[Any] = None,
 ) -> ChatResponse:
     """Run PLAN_DAY pipeline: save habits, fetch habits, translate, decompose, schedule."""
     from app.core.config import LOCAL_LLM_MODEL as _LLM_27B
@@ -692,6 +694,7 @@ async def _run_plan_day_flow(
                     "into enough actionable steps. A clearer goal (e.g. 'Plan my day to study "
                     "for math midterm') helps me schedule better."
                 ),
+                draft_id=draft.draft_id if draft else None,
             )
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
         return ChatResponse(
@@ -707,6 +710,7 @@ async def _run_plan_day_flow(
                 "into enough actionable steps. A clearer goal (e.g. 'Plan my day to study "
                 "for math midterm') helps me schedule better."
             ),
+            draft_id=draft.draft_id if draft else None,
         )
 
     # If skip_scheduling is True, return the decomposition for user review
@@ -722,6 +726,7 @@ async def _run_plan_day_flow(
             },
             awaiting_task_confirmation=True,
             thinking_process=f"Decomposed your goal into {len(graph.decomposition)} micro-tasks totaling {sum(t.duration_minutes for t in graph.decomposition)} minutes. Waiting for your review before scheduling.",
+            draft_id=draft.draft_id if draft else None,
         )
 
     goal_id = graph.goal_metadata.goal_id if graph.goal_metadata else None
@@ -823,6 +828,27 @@ async def _run_plan_day_flow(
         # Defer persistence — schedule is returned as draft for user to accept
         # _persist_fused_tasks is called only via POST /chat/accept-schedule
 
+        if draft and draft_store:
+            from app.services.draft_store import DraftComponent
+            draft_store.add_component(
+                draft.draft_id, user_id, "tasks",
+                DraftComponent(
+                    component_type="tasks",
+                    data=[c.model_dump() for c in master_chunk_list],
+                    status="pending",
+                ),
+            )
+        if schedule_response is not None and draft and draft_store:
+            from app.services.draft_store import DraftComponent
+            draft_store.add_component(
+                draft.draft_id, user_id, "schedule",
+                DraftComponent(
+                    component_type="schedule",
+                    data=schedule_response.model_dump(mode='json'),
+                    status="pending",
+                ),
+            )
+
         search_result: Optional[dict] = None
         if search_task is not None:
             try:
@@ -849,6 +875,7 @@ async def _run_plan_day_flow(
             suggested_action="replan" if summary.get("habits_saved") else None,
             thinking_process=thinking_process,
             schedule_status="draft",
+            draft_id=draft.draft_id if draft else None,
         )
 
     log_step(
@@ -871,6 +898,7 @@ async def _run_plan_day_flow(
             "a feasible solution. Your constraints may be too tight—try reducing scope "
             "or relaxing a habit."
         ),
+        draft_id=draft.draft_id if draft else None,
     )
 
 
@@ -975,6 +1003,7 @@ async def execute_agentic_flow(
     skip_scheduling: bool = False,
     file_name: Optional[str] = None,
     draft_schedule: Optional[dict] = None,
+    draft_store: Optional[Any] = None,
 ) -> ChatResponse:
     """Master orchestrator: brain dump extraction, multi-execution, Voice of Jarvis."""
     # Pre-check: if draft_schedule is provided, route to schedule modification flow
@@ -1119,6 +1148,14 @@ async def execute_agentic_flow(
             "phase_summary": " — ".join(_parts),
         })
 
+    # Create draft to hold pipeline output for review
+    draft = None
+    if draft_store is not None:
+        draft = draft_store.create(user_id, metadata={
+            "prompt": user_prompt[:200],
+            "intent": _intent,
+        })
+
     # Step 2: Spawn search task immediately (runs in parallel)
     search_task: Optional[asyncio.Task] = None
     if extraction.search_queries:
@@ -1140,6 +1177,17 @@ async def execute_agentic_flow(
                 "count": len(staged_habits),
                 "habits": [h["raw_text"][:60] for h in staged_habits],
             })
+
+    if extraction.inline_habits and draft and draft_store:
+        from app.services.draft_store import DraftComponent
+        draft_store.add_component(
+            draft.draft_id, user_id, "habits",
+            DraftComponent(
+                component_type="habits",
+                data=execution_summary.get("habits_staged", []),
+                status="pending",
+            ),
+        )
 
     # Step 4: State updates (transient, logic injection happens in plan flow)
     if extraction.state_updates:
@@ -1224,6 +1272,17 @@ async def execute_agentic_flow(
                     print(f"[Action Item] Failed for '{item}': {e}")
         execution_summary["action_proposals"] = action_proposals
 
+    if action_proposals and draft and draft_store:
+        from app.services.draft_store import DraftComponent
+        draft_store.add_component(
+            draft.draft_id, user_id, "action_items",
+            DraftComponent(
+                component_type="action_items",
+                data=action_proposals,
+                status="pending",
+            ),
+        )
+
     # Step 6: Calendar
     if extraction.has_calendar and extraction.calendar_text:
         log_step("6_CALENDAR", "Extracting calendar slots")
@@ -1286,6 +1345,8 @@ async def execute_agentic_flow(
             progress_callback=progress_callback,
             skip_scheduling=skip_scheduling,
             inline_habits_already_saved=bool(extraction.inline_habits),
+            draft=draft,
+            draft_store=draft_store,
         )
 
     # Step 8: Await search task for ingestion-only path
@@ -1328,6 +1389,7 @@ async def execute_agentic_flow(
         search_result=search_result,
         suggested_action=suggested,
         thinking_process=thinking_process,
+        draft_id=draft.draft_id if draft else None,
     )
 
 
