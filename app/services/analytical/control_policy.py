@@ -53,7 +53,7 @@ from app.utils.deadline_parser import compute_horizon_from_deadlines
 # Key: SHA-256 of enriched planning goal. Value: (timestamp, dict).
 # ---------------------------------------------------------------------------
 _decompose_cache: dict[str, tuple[float, dict]] = {}
-_DECOMPOSE_CACHE_TTL_S = 3600  # 1 hour
+_DECOMPOSE_CACHE_TTL_S = 14400  # 4 hours (was 3600)
 
 # ---------------------------------------------------------------------------
 # Prompts
