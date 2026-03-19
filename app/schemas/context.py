@@ -255,3 +255,11 @@ class ChatResponse(BaseModel):
         default=None,
         description="Draft identifier for review/accept/reject flow. Present when pipeline output is staged.",
     )
+    conversation_id: Optional[str] = Field(
+        default=None,
+        description="Session ID for this conversation. Frontend should store and send back.",
+    )
+    message_id: Optional[str] = Field(
+        default=None,
+        description="Unique ID for this specific response message.",
+    )
