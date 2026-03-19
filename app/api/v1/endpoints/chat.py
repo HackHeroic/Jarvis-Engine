@@ -297,6 +297,18 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
+        # Skip VoJ for PLAN_DAY when schedule data exists — frontend renders it directly
+        if partial.schedule and partial.intent == "PLAN_DAY":
+            partial_dict = partial.model_dump()
+            partial_dict["message"] = partial.message or "Here's your schedule."
+            partial_dict["thinking_process"] = partial.thinking_process or _build_thinking_fallback(captured_summary)
+            partial_dict["generation_metrics"] = {
+                "total_tokens": 0, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
+                "model": "none (structured response)",
+            }
+            yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
+            return
+
         # Step 2b: For pipeline intents (PLAN_DAY, ingestion, habits), stream VoJ
         # Guard: if pipeline already has a meaningful message (e.g. error, INFEASIBLE,
         # or decomposition failure) and captured_summary is empty, skip VoJ streaming
