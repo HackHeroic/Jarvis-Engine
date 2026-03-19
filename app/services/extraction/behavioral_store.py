@@ -3,6 +3,7 @@
 from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.services.analytical.habit_translator import invalidate_habit_cache
 from supabase import create_client
 
 
@@ -46,6 +47,7 @@ async def store_behavioral_constraint(
 
     try:
         result = client.table("behavioral_constraints").insert(row).execute()
+        invalidate_habit_cache()
         if result.data and len(result.data) > 0:
             return {"status": "stored", "id": result.data[0].get("id")}
         return {"status": "stored"}
@@ -106,6 +108,20 @@ async def delete_behavioral_constraint(
         if user_id:
             delete_query = delete_query.eq("user_id", user_id)
         delete_query.execute()
+        invalidate_habit_cache()
         return {"status": "deleted", "id": constraint_id}
     except Exception as e:
         return {"status": "error", "reason": str(e)}
+
+
+def stage_habit(raw_text: str, user_id: str) -> dict:
+    """Create a habit proposal without persisting to DB.
+
+    Returns a dict suitable for DraftComponent.data.
+    """
+    return {
+        "raw_text": raw_text.strip(),
+        "user_id": user_id,
+        "constraint_type": "behavioral",
+        "status": "staged",
+    }
