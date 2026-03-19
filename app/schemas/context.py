@@ -263,3 +263,7 @@ class ChatResponse(BaseModel):
         default=None,
         description="Unique ID for this specific response message.",
     )
+    clarification_options: Optional[List[str]] = Field(
+        default=None,
+        description="Quick-reply options when Jarvis needs clarification. Frontend renders as buttons.",
+    )
