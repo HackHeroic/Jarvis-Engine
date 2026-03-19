@@ -9,11 +9,16 @@ from pydantic import BaseModel, Field
 class IntentType(str, Enum):
     """Universal intent classification for unstructured data."""
 
+    GREETING = "GREETING"  # Short greetings, chitchat, non-actionable messages
+    GENERAL_QA = "GENERAL_QA"  # Questions, explanations, knowledge queries (not planning)
     CALENDAR_SYNC = "CALENDAR_SYNC"  # Timetables, meetings, flights, deep-work blocks
     KNOWLEDGE_INGESTION = "KNOWLEDGE_INGESTION"  # Syllabi, business plans, PDFs
     BEHAVIORAL_CONSTRAINT = "BEHAVIORAL_CONSTRAINT"  # Work preferences, back-bench modes
     ACTION_ITEM = "ACTION_ITEM"  # Direct goals or tasks to be scheduled
     PLAN_DAY = "PLAN_DAY"  # User wants to plan day, schedule tasks, break down a goal
+
+
+LearningStyle = Literal["watcher", "reader", "interactive"]
 
 
 class IntentClassification(BaseModel):
@@ -59,6 +64,10 @@ class BrainDumpExtraction(BaseModel):
     has_knowledge: bool = Field(
         default=False,
         description="Stub for future PDF/syllabus inline refs",
+    )
+    deadline_update: Optional[str] = Field(
+        default=None,
+        description="User mentions a new deadline (e.g. 'exam is March 20'). Extract as ISO-8601 if possible.",
     )
 
 
@@ -180,6 +189,10 @@ class ActionItemProposal(BaseModel):
         description="e.g. remind_after_days, add_to_evening_schedule",
     )
     deadline_mentioned: bool = False
+    deadline_date: Optional[str] = Field(
+        default=None,
+        description="ISO-8601 date when extractable (e.g. 2026-03-20)",
+    )
     created_at: str = Field(description="ISO-8601 timestamp")
 
 
@@ -229,4 +242,16 @@ class ChatResponse(BaseModel):
     thinking_process: Optional[str] = Field(
         default=None,
         description="The extracted internal think monologue from the LLM.",
+    )
+    awaiting_task_confirmation: bool = Field(
+        default=False,
+        description="True when tasks are ready for user review before scheduling.",
+    )
+    schedule_status: Optional[str] = Field(
+        default=None,
+        description="'draft' = awaiting user accept; 'accepted' = finalized and persisted.",
+    )
+    draft_id: Optional[str] = Field(
+        default=None,
+        description="Draft identifier for review/accept/reject flow. Present when pipeline output is staged.",
     )
