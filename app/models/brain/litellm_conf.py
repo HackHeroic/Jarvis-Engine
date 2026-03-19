@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from collections.abc import AsyncGenerator
 
 import litellm
 from pydantic import BaseModel
@@ -77,7 +78,9 @@ async def hybrid_route_query(
     force_cloud: bool = False,
     lenient_validation: bool = False,
     model_override: str | None = None,
-) -> str | dict:
+    stream: bool = False,
+    conversation_history: list[dict] | None = None,
+) -> str | dict | AsyncGenerator[str, None]:
     """
     Route the query to Local Qwen or Cloud Gemini. Local-First: all requests
     go to local Qwen unless (a) CLOUD_KEYWORDS match (Real-Time Research L9),
@@ -99,10 +102,10 @@ async def hybrid_route_query(
         else:
             print("[LiteLLM Router] Routing to Local Qwen (Local-First)")
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
+    if conversation_history:
+        messages.extend(conversation_history)
+    messages.append({"role": "user", "content": user_prompt})
 
     # Build completion kwargs
     completion_kwargs: dict = {
@@ -127,8 +130,99 @@ async def hybrid_route_query(
         # else: model_override with ollama/ and no SLM_ROUTER_URL — LiteLLM uses Ollama default
         completion_kwargs["api_key"] = "lm-studio"  # Dummy key; LM Studio/Ollama don't validate it
 
+    # Streaming path: only for unstructured calls (no response_schema)
+    # Yields (event_type, token) tuples where event_type is "reasoning" or "content"
+    if stream and response_schema is None:
+        completion_kwargs["stream"] = True
+        stream_response = await litellm.acompletion(**completion_kwargs)
+
+        async def _token_gen() -> AsyncGenerator[tuple[str, str], None]:
+            in_think = False   # are we currently inside a <think> block?
+            tag_buf = ""       # incomplete tag fragment buffered across chunk boundary
+
+            async for chunk in stream_response:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta:
+                    continue
+
+                # Primary: LiteLLM standardized reasoning_content (LM Studio native separation)
+                reasoning = getattr(delta, "reasoning_content", None) or ""
+                raw_content = delta.content or ""
+
+                if reasoning:
+                    in_think = False
+                    tag_buf = ""
+                    yield ("reasoning", reasoning)
+                    continue
+
+                if not raw_content:
+                    continue
+
+                # Fallback: detect <think>…</think> embedded in content stream.
+                # Qwen models emit the thinking block as content when the OpenAI-compatible
+                # endpoint doesn't separate reasoning_content.
+                text = tag_buf + raw_content
+                tag_buf = ""
+
+                while text:
+                    if in_think:
+                        end = text.lower().find("</think>")
+                        if end == -1:
+                            # Buffer a potential partial closing tag at the chunk boundary
+                            possible = ""
+                            for n in range(min(8, len(text)), 0, -1):
+                                if "</think>"[:n].lower() == text[-n:].lower():
+                                    possible = text[-n:]
+                                    break
+                            if possible:
+                                tag_buf = possible
+                                text = text[:-len(possible)]
+                            if text:
+                                yield ("reasoning", text)
+                            text = ""
+                        else:
+                            if end > 0:
+                                yield ("reasoning", text[:end])
+                            in_think = False
+                            text = text[end + 8:]   # skip </think>
+                    else:
+                        start = text.lower().find("<think>")
+                        if start == -1:
+                            # Buffer a potential partial opening tag at the chunk boundary
+                            possible = ""
+                            for n in range(min(7, len(text)), 0, -1):
+                                if "<think>"[:n].lower() == text[-n:].lower():
+                                    possible = text[-n:]
+                                    break
+                            if possible:
+                                tag_buf = possible
+                                text = text[:-len(possible)]
+                            if text:
+                                yield ("content", text)
+                            text = ""
+                        else:
+                            if start > 0:
+                                yield ("content", text[:start])
+                            in_think = True
+                            text = text[start + 7:]   # skip <think>
+
+        return _token_gen()
+
     response = await litellm.acompletion(**completion_kwargs)
     content = response.choices[0].message.content
+
+    # Guard: empty LLM response when structured output expected
+    if response_schema is not None and not content:
+        if not force_cloud and model_override is None and GEMINI_API_KEY:
+            print(f"[LiteLLM Router] Empty response from local model for {response_schema.__name__}, retrying with cloud")
+            return await hybrid_route_query(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+                force_cloud=True,
+                lenient_validation=lenient_validation,
+            )
+        raise ValueError(f"LLM returned empty response for {response_schema.__name__}")
 
     if response_schema is not None and content:
         try:
@@ -178,3 +272,33 @@ async def run_deep_research(queries: list[str]) -> dict:
             summaries.append(f"(Search failed: {e})")
 
     return {"queries": queries, "summaries": summaries}
+
+
+async def gemini_web_search(
+    user_prompt: str,
+    system_prompt: str = "You are a helpful research assistant. Return factual information with real URLs when relevant.",
+) -> str:
+    """Run Gemini with Google Search grounding for real-time web results (L9).
+
+    Used by Proactive Task Workspace for YouTube/article/LeetCode link surfacing.
+    Requires GEMINI_API_KEY. Falls back to empty string if unavailable.
+    """
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        completion_kwargs = {
+            "model": GEMINI_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "api_key": GEMINI_API_KEY,
+            "temperature": 0.1,
+            "web_search_options": {"search_context_size": "medium"},
+        }
+        response = await litellm.acompletion(**completion_kwargs)
+        content = response.choices[0].message.content
+        return content.strip() if content else ""
+    except Exception as e:
+        print(f"[Gemini Web Search] Failed: {e}")
+        return ""

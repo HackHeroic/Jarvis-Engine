@@ -88,6 +88,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Current draft schedule + execution_graph for modification. Keys: schedule, execution_graph, horizon_start.",
     )
+    conversation_id: Optional[str] = Field(
+        default=None,
+        description="Session ID for conversation continuity. If None, auto-creates a new session.",
+    )
 
 
 @router.post(
@@ -105,7 +109,25 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     log_step("REQUEST", "Chat received", {"user_id": request.user_id, "prompt_preview": request.user_prompt[:60]})
     db_client = getattr(http_request.app.state, "db_client", None)
     draft_store = getattr(http_request.app.state, "draft_store", None)
-    return await execute_agentic_flow(
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+
+    # Session management
+    from app.services.chat_history import (
+        get_or_create_session,
+        save_user_message,
+        save_assistant_message,
+        build_context_messages,
+    )
+
+    session_id = await get_or_create_session(
+        request.user_id, request.conversation_id, supabase
+    )
+    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+    conversation_history = await build_context_messages(
+        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
+    )
+
+    response = await execute_agentic_flow(
         user_prompt=request.user_prompt,
         user_id=request.user_id,
         db_client=db_client,
@@ -120,7 +142,19 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         file_name=request.file_name,
         draft_schedule=request.draft_schedule,
         draft_store=draft_store,
+        conversation_history=conversation_history,
     )
+
+    # Save assistant response
+    msg_id = await save_assistant_message(
+        session_id, request.user_id, response.message, response.intent,
+        {"schedule": response.schedule, "draft_id": response.draft_id, "intent": response.intent},
+        supabase,
+    )
+
+    response.conversation_id = session_id
+    response.message_id = msg_id
+    return response
 
 
 @router.post(
@@ -139,10 +173,28 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     draft_store = getattr(http_request.app.state, "draft_store", None)
     model_mode = request.model_mode or "auto"
 
+    # --- Session management (before any early returns) ---
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+
+    from app.services.chat_history import (
+        get_or_create_session,
+        save_user_message,
+        save_assistant_message,
+        build_context_messages,
+    )
+
+    session_id = await get_or_create_session(
+        request.user_id, request.conversation_id, supabase
+    )
+    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+    conversation_history = await build_context_messages(
+        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
+    )
+
     # --- 27B DIRECT MODE: bypass pipeline, stream 27B directly ---
     if model_mode == "27b":
         return StreamingResponse(
-            _stream_direct_27b(request, db_client),
+            _stream_direct_27b(request, db_client, session_id=session_id, supabase=supabase),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
@@ -189,6 +241,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                     file_name=request.file_name,
                     draft_schedule=request.draft_schedule,
                     draft_store=draft_store,
+                    conversation_history=conversation_history,
                 )
             except Exception as exc:
                 pipeline_error = exc
@@ -217,6 +270,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
 
         if partial.awaiting_task_confirmation:
             partial_dict = partial.model_dump()
+            # Save assistant response and attach session info
+            _assistant_msg = partial.message or "Done."
+            _msg_id = await save_assistant_message(
+                session_id, request.user_id, _assistant_msg, partial.intent or "",
+                {},
+                supabase,
+            )
+            partial_dict["conversation_id"] = session_id
+            partial_dict["message_id"] = _msg_id
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -281,6 +343,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 "ttft_ms": round(_qa_ttft, 1) if _qa_ttft is not None else None,
                 "model": LOCAL_LLM_MODEL,
             }
+            # Save assistant response and attach session info
+            _assistant_msg = message_clean or partial.message or "Done."
+            _msg_id = await save_assistant_message(
+                session_id, request.user_id, _assistant_msg, "GENERAL_QA",
+                {},
+                supabase,
+            )
+            partial_dict["conversation_id"] = session_id
+            partial_dict["message_id"] = _msg_id
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -294,6 +365,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 "total_tokens": 1, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
                 "model": SLM_ROUTER_MODEL,
             }
+            # Save assistant response and attach session info
+            _assistant_msg = partial.message or "Hello!"
+            _msg_id = await save_assistant_message(
+                session_id, request.user_id, _assistant_msg, "GREETING",
+                {},
+                supabase,
+            )
+            partial_dict["conversation_id"] = session_id
+            partial_dict["message_id"] = _msg_id
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -306,6 +386,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 "total_tokens": 0, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
                 "model": "none (structured response)",
             }
+            # Save assistant response and attach session info
+            _assistant_msg = partial.message or "Here's your schedule."
+            _msg_id = await save_assistant_message(
+                session_id, request.user_id, _assistant_msg, "PLAN_DAY",
+                {},
+                supabase,
+            )
+            partial_dict["conversation_id"] = session_id
+            partial_dict["message_id"] = _msg_id
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -369,6 +458,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             "ttft_ms": round(_voj_ttft, 1) if _voj_ttft is not None else None,
             "model": _primary_model[0] if _primary_model else SLM_ROUTER_MODEL,
         }
+        # Save assistant response and attach session info
+        _assistant_msg = message_clean or partial.message or "Done."
+        _msg_id = await save_assistant_message(
+            session_id, request.user_id, _assistant_msg, partial.intent or "",
+            {},
+            supabase,
+        )
+        partial_dict["conversation_id"] = session_id
+        partial_dict["message_id"] = _msg_id
         yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
 
     return StreamingResponse(
@@ -378,7 +476,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     )
 
 
-async def _stream_direct_27b(request: "ChatRequest", db_client) -> AsyncGenerator:
+async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str | None = None, supabase=None) -> AsyncGenerator:
     """Stream 27B model response directly — no pipeline routing.
 
     Captures reasoning_content separately, tracks tok/sec, TTFT, token count.
@@ -434,9 +532,19 @@ async def _stream_direct_27b(request: "ChatRequest", db_client) -> AsyncGenerato
         message_clean, thinking_extracted = _extract_thinking_process(message_clean or message_full)
         thinking_clean = thinking_extracted or ""
 
+    # Save assistant response and attach session info
+    _assistant_msg = message_clean or "Done."
+    _msg_id = None
+    if session_id and supabase:
+        from app.services.chat_history import save_assistant_message
+        _msg_id = await save_assistant_message(
+            session_id, request.user_id, _assistant_msg, "GENERAL_QA",
+            {}, supabase,
+        )
+
     complete_data = {
         "intent": "GENERAL_QA",
-        "message": message_clean or "Done.",
+        "message": _assistant_msg,
         "thinking_process": thinking_clean or None,
         "generation_metrics": {
             "total_tokens": _token_count,
@@ -445,6 +553,8 @@ async def _stream_direct_27b(request: "ChatRequest", db_client) -> AsyncGenerato
             "ttft_ms": round(_ttft, 1) if _ttft is not None else None,
             "model": LOCAL_LLM_MODEL,
         },
+        "conversation_id": session_id,
+        "message_id": _msg_id,
     }
     yield f"event: complete\ndata: {json.dumps(complete_data)}\n\n"
 
