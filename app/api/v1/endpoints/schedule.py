@@ -10,13 +10,15 @@ recalibration rather than user guilt.
 from __future__ import annotations
 
 from datetime import datetime, time, timezone
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Protocol
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
 from app.core.config import DAY_START_HOUR, DEFAULT_HORIZON_MINUTES
+from app.utils.deadline_parser import parse_deadline_to_date
+from app.utils.pacing import compute_adaptive_daily_cap
 from app.core.or_tools.solver import JarvisScheduler
 from app.schemas.context import Availability, TimeSlot
 
@@ -27,6 +29,28 @@ from app.schemas.context import Availability, TimeSlot
 EXPECTANCY = 1.0  # Default: user expects to complete
 IMPULSIVENESS = 1.5  # Constant; higher = more discounting of delayed rewards
 DEFAULT_DELAY_HOURS = 24  # Used when deadline_hint is missing
+
+
+class _ChunkWithDeadline(Protocol):
+    deadline_hint: Optional[str]
+
+
+def _delay_hours_for_chunk(
+    chunk: _ChunkWithDeadline,
+    horizon_start: datetime,
+) -> float:
+    """Compute delay_hours from chunk.deadline_hint for TMT.
+
+    Past deadlines -> 1 (highest urgency). Invalid ISO -> DEFAULT_DELAY_HOURS.
+    """
+    parsed = parse_deadline_to_date(chunk.deadline_hint, horizon_start)
+    if parsed is None:
+        return DEFAULT_DELAY_HOURS
+    if parsed.date() < horizon_start.date():
+        return 1.0
+    delta_days = (parsed.date() - horizon_start.date()).days
+    hours = delta_days * 24
+    return max(1.0, hours)
 
 
 def _compute_tmt_priority(
@@ -62,6 +86,7 @@ class ScheduledTask(BaseModel):
     start_min: int = Field(..., description="Start time in minutes from horizon zero.")
     end_min: int = Field(..., description="End time in minutes from horizon zero.")
     tmt_score: float = Field(..., description="Temporal Motivation Theory score.")
+    title: Optional[str] = Field(default=None, description="Human-readable task title from decomposition.")
 
 
 def _compute_horizon_start(plan_start: Optional[datetime] = None) -> datetime:
@@ -88,6 +113,30 @@ class ScheduleRequest(BaseModel):
     plan_start: Optional[datetime] = Field(
         default=None,
         description="Reference datetime for horizon; default = now. Used to compute horizon_start.",
+    )
+    max_daily_deep_work_minutes: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=600,
+        description="Cap on scheduled work per day; None uses adaptive formula.",
+    )
+    min_daily_deep_work_minutes: Optional[int] = Field(
+        default=None,
+        ge=15,
+        le=240,
+        description="Avoid days with less than X min; constrains spread.",
+    )
+    max_task_duration_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=25,
+        description="Clamp per-chunk duration; None uses LLM values.",
+    )
+    min_task_duration_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=25,
+        description="Clamp per-chunk duration floor; None uses LLM values.",
     )
 
 
@@ -120,15 +169,43 @@ SLEEP_START = 960  # midnight (intra-day: 0=8 AM, 960=midnight)
 SLEEP_END = 1440  # 8 AM
 
 
+def _clamp_duration(
+    duration: int,
+    min_task: Optional[int],
+    max_task: Optional[int],
+) -> int:
+    """Clamp duration to [min_task, max_task] when overrides provided."""
+    if min_task is not None:
+        duration = max(duration, min_task)
+    if max_task is not None:
+        duration = min(duration, max_task)
+    return duration
+
+
 def run_schedule(
     graph: ExecutionGraph,
     daily_context: List[TimeSlot],
     horizon_minutes: int = DEFAULT_HORIZON_MINUTES,
     horizon_start: Optional[datetime] = None,
+    max_daily_deep_work_minutes: Optional[int] = None,
+    min_daily_deep_work_minutes: Optional[int] = None,
+    max_task_duration_minutes: Optional[int] = None,
+    min_task_duration_minutes: Optional[int] = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
     Raises HTTPException on INFEASIBLE."""
     resolved_horizon_start = horizon_start or _compute_horizon_start()
+
+    # Per-task duration clamp when overrides provided
+    clamped_durations: Dict[str, int] = {}
+    for chunk in graph.decomposition:
+        d = _clamp_duration(
+            chunk.duration_minutes,
+            min_task_duration_minutes,
+            max_task_duration_minutes,
+        )
+        clamped_durations[chunk.task_id] = d
+    total_task_minutes = sum(clamped_durations.values())
 
     # Dynamic Biological Fallback: inject default sleep block for cold-start users
     has_sleep_habit = any(
@@ -152,7 +229,21 @@ def run_schedule(
                 )
             )
 
-    scheduler = JarvisScheduler(horizon_minutes=horizon_minutes)
+    intrinsic_load = graph.cognitive_load_estimate.get("intrinsic_load", 0.5)
+    slack_ratio = horizon_minutes / max(1, total_task_minutes)
+    cap = compute_adaptive_daily_cap(
+        horizon_minutes=horizon_minutes,
+        total_task_minutes=total_task_minutes,
+        intrinsic_load=intrinsic_load,
+        user_override=max_daily_deep_work_minutes,
+        min_daily_override=min_daily_deep_work_minutes,
+        daily_context=daily_context if horizon_minutes > MINUTES_PER_DAY else None,
+    )
+    scheduler = JarvisScheduler(
+        horizon_minutes=horizon_minutes,
+        max_daily_deep_work_minutes=cap if horizon_minutes > MINUTES_PER_DAY else None,
+        slack_ratio=slack_ratio,
+    )
 
     # Enforce dynamic calendar blocks from daily_context
     for slot in daily_context:
@@ -168,17 +259,19 @@ def run_schedule(
             )
         # FULL_FOCUS: no block added
 
-    # TMT scores and task mapping
+    # TMT scores and task mapping (per-chunk delay from deadline_hint)
     tmt_scores: dict[str, float] = {}
     for chunk in graph.decomposition:
+        duration = clamped_durations[chunk.task_id]
+        delay_h = _delay_hours_for_chunk(chunk, resolved_horizon_start)
         tmt_raw, priority_score = _compute_tmt_priority(
             chunk.difficulty_weight,
-            DEFAULT_DELAY_HOURS,
+            delay_h,
         )
         tmt_scores[chunk.task_id] = tmt_raw
         scheduler.add_task(
             chunk.task_id,
-            chunk.duration_minutes,
+            duration,
             priority_score,
             chunk.dependencies,
             difficulty_weight=chunk.difficulty_weight,
@@ -187,6 +280,13 @@ def run_schedule(
     result, status_or_empty = scheduler.solve()
 
     if result == "INFEASIBLE":
+        from app.core.jarvis_logger import log_step
+
+        log_step(
+            "SCHEDULER_INFEASIBLE",
+            "OR-Tools returned INFEASIBLE",
+            {"horizon_min": horizon_minutes, "num_blocks": len(daily_context)},
+        )
         raise HTTPException(
             status_code=422,
             detail=(
@@ -195,12 +295,14 @@ def run_schedule(
         )
 
     # Build response with schedule and TMT scores
+    title_map = {c.task_id: c.title for c in graph.decomposition}
     schedule: dict[str, ScheduledTask] = {}
     for task_id, slot in result.items():
         schedule[task_id] = ScheduledTask(
             start_min=slot["start"],
             end_min=slot["end"],
             tmt_score=round(tmt_scores[task_id], 2),
+            title=title_map.get(task_id),
         )
 
     status: Literal["FEASIBLE", "OPTIMAL"] = (
@@ -234,4 +336,8 @@ def generate_schedule(request: ScheduleRequest) -> GenerateScheduleResponse:
         request.daily_context,
         horizon_minutes=request.horizon_minutes,
         horizon_start=horizon_start,
+        max_daily_deep_work_minutes=request.max_daily_deep_work_minutes,
+        min_daily_deep_work_minutes=request.min_daily_deep_work_minutes,
+        max_task_duration_minutes=request.max_task_duration_minutes,
+        min_task_duration_minutes=request.min_task_duration_minutes,
     )

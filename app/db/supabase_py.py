@@ -10,6 +10,11 @@ class DatabaseClient:
     """Supabase database client with async connection verification."""
 
     def __init__(self) -> None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise ValueError(
+                "Supabase not configured: set SUPABASE_URL and SUPABASE_SERVICE_KEY in .env "
+                f"(SUPABASE_URL present: {bool(SUPABASE_URL)}, key present: {bool(SUPABASE_SERVICE_KEY)})"
+            )
         self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
     async def check_connection(self) -> bool:
