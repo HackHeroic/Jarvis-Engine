@@ -12,7 +12,12 @@ CamelCase (NewIntVar, etc.) — they raise AttributeError.
 
 from __future__ import annotations
 
+import math
+from typing import Optional
+
 from ortools.sat.python import cp_model
+
+MINUTES_PER_DAY = 1440
 
 
 class JarvisScheduler:
@@ -24,17 +29,27 @@ class JarvisScheduler:
     tasks earlier while minimizing makespan.
     """
 
-    def __init__(self, horizon_minutes: int = 2880) -> None:
+    def __init__(
+        self,
+        horizon_minutes: int = 2880,
+        max_daily_deep_work_minutes: Optional[int] = None,
+        slack_ratio: float = 1.0,
+    ) -> None:
         """Initialize the constraint model and storage.
 
         Args:
             horizon_minutes: Planning window in minutes (default 48 hours).
+            max_daily_deep_work_minutes: Cap on scheduled work per day; None to skip.
+            slack_ratio: horizon_minutes / total_task_minutes; higher = favor spread.
         """
         self.model = cp_model.CpModel()
         self.horizon = horizon_minutes
+        self.max_daily_deep_work_minutes = max_daily_deep_work_minutes
+        self.slack_ratio = slack_ratio
         self.tasks: dict[str, dict] = {}
         self.hard_blocks: list = []
         self.soft_blocks: list[tuple] = []  # (interval_var, max_duration, max_difficulty)
+        self._load_d_vars: list = []  # for spread objective
 
     def add_hard_block(self, start_min: int, end_min: int, name: str) -> None:
         """Add a non-negotiable block (e.g., sleep 23:00–07:00).
@@ -123,6 +138,40 @@ class JarvisScheduler:
                         data["start"] >= self.tasks[dep_id]["end"]
                     )
 
+    def _build_daily_load_constraints(self) -> None:
+        """Enforce max_daily_deep_work_minutes per day. Skip if horizon <= 1 day."""
+        cap = self.max_daily_deep_work_minutes
+        if cap is None or self.horizon <= MINUTES_PER_DAY:
+            return
+        num_days = math.ceil(self.horizon / MINUTES_PER_DAY)
+        self._load_d_vars = []
+        # contribs_by_task[t] = list of contrib vars for task t across days
+        contribs_by_task: dict[str, list] = {tid: [] for tid in self.tasks}
+        for d in range(num_days):
+            day_start = d * MINUTES_PER_DAY
+            day_end = (d + 1) * MINUTES_PER_DAY
+            if day_end > self.horizon:
+                break
+            contribs = []
+            for task_id, t in self.tasks.items():
+                start_var = t["start"]
+                duration = t["duration"]
+                b = self.model.new_bool_var(f"on_day_{task_id}_d{d}")
+                self.model.add(start_var >= day_start).only_enforce_if(b)
+                self.model.add(start_var < day_end).only_enforce_if(b)
+                contrib = self.model.new_int_var(0, duration, f"contrib_{task_id}_d{d}")
+                self.model.add(contrib == duration).only_enforce_if(b)
+                self.model.add(contrib == 0).only_enforce_if(b.Not())
+                contribs.append(contrib)
+                contribs_by_task[task_id].append(contrib)
+            load_d = self.model.new_int_var(0, cap, f"load_d{d}")
+            self.model.add(load_d == sum(contribs))
+            self.model.add(load_d <= cap)
+            self._load_d_vars.append(load_d)
+        # Each task's contrib sums to its duration (ensures exact one day gets it)
+        for task_id, t in self.tasks.items():
+            self.model.add(sum(contribs_by_task[task_id]) == t["duration"])
+
     def solve(
         self,
     ) -> tuple[dict[str, dict[str, int]], str] | tuple[str, str]:
@@ -152,6 +201,7 @@ class JarvisScheduler:
                     self.model.add_no_overlap([t["interval"], soft_iv])
 
         self.build_dependencies()
+        self._build_daily_load_constraints()
 
         # TMT-weighted objective: minimize makespan AND early start for high-priority
         weight_makespan = 15  # Balance: makespan ~500–2880, sum(pri*start) ~5k–50k
@@ -163,9 +213,18 @@ class JarvisScheduler:
         priority_weighted_starts = [
             t["priority"] * t["start"] for t in self.tasks.values()
         ]
-        self.model.minimize(
-            weight_makespan * obj_var + sum(priority_weighted_starts)
-        )
+        obj_expr = weight_makespan * obj_var + sum(priority_weighted_starts)
+
+        # Spread preference: minimize peak daily load when cap is enabled
+        # Adaptive weight: high slack -> favor spread; low slack -> makespan dominates
+        if self._load_d_vars:
+            weight_spread = 5 + 45 * min(1.0, max(0.0, (self.slack_ratio - 2) / 8))
+            max_load = self.model.new_int_var(0, self.horizon, "max_load")
+            for load_d in self._load_d_vars:
+                self.model.add(max_load >= load_d)
+            obj_expr += weight_spread * max_load
+
+        self.model.minimize(obj_expr)
 
         solver = cp_model.CpSolver()
         status = solver.solve(self.model)

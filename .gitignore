@@ -52,3 +52,12 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Claude Code (local config)
+.claude/
+
+# Symlinks to iCloud
+Jarvis-Docs
+
+# Legacy plan location
+.cursor/
