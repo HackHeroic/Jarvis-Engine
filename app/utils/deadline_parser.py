@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 from app.core.config import MAX_HORIZON_MINUTES
 
 if TYPE_CHECKING:
-    from app.api.v1.endpoints.reasoning import ExecutionGraph
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
 
 
 def parse_deadline_to_date(hint: str | None, ref: datetime) -> datetime | None:
@@ -36,35 +36,55 @@ def parse_deadline_to_date(hint: str | None, ref: datetime) -> datetime | None:
 
 
 def compute_horizon_from_deadlines(
-    graph: "ExecutionGraph",
-    plan_start: datetime,
+    graph: Union["ExecutionGraph", None] = None,
+    plan_start: datetime | None = None,
+    *,
+    chunks: list["TaskChunk"] | None = None,
+    external_deadline: str | None = None,
+    plan_deadlines: list[str] | None = None,
 ) -> int | None:
-    """Compute horizon_minutes from furthest parseable deadline across all TaskChunks.
+    """Compute horizon_minutes from furthest parseable deadline across all sources.
 
-    Takes the maximum (furthest) parsed deadline date. Ignores past deadlines.
-    Returns None if no deadline_hint is parseable.
+    Collects: (a) chunk.deadline_hint from graph.decomposition or chunks, (b)
+    external_deadline (e.g. manual override), (c) plan_deadlines (from
+    user_plan_updates). Takes max of all parseable future dates.
 
     Args:
-        graph: ExecutionGraph from Socratic decomposition.
-        plan_start: Reference datetime (e.g. planning "now").
+        graph: Optional ExecutionGraph (used when chunks not provided).
+        plan_start: Reference datetime (e.g. planning "now"). Required if chunks provided.
+        chunks: Optional list of TaskChunks (takes precedence over graph.decomposition).
+        external_deadline: Manual override (ISO-8601).
+        plan_deadlines: List of deadline strings from user_plan_updates.
 
     Returns:
         Horizon in minutes (capped at MAX_HORIZON_MINUTES), or None if no parseable deadlines.
     """
-    plan_date = plan_start.date()
+    plan_date = (plan_start or datetime.now()).date()
     max_deadline_date = None
 
-    for chunk in graph.decomposition:
-        if not chunk.deadline_hint:
-            continue
-        parsed = parse_deadline_to_date(chunk.deadline_hint, plan_start)
+    def _consider(hint: str | None) -> None:
+        nonlocal max_deadline_date
+        if not hint:
+            return
+        parsed = parse_deadline_to_date(hint, plan_start or datetime.now())
         if parsed is None:
-            continue
-        # Ignore past deadlines
+            return
         if parsed.date() <= plan_date:
-            continue
+            return
         if max_deadline_date is None or parsed.date() > max_deadline_date:
             max_deadline_date = parsed.date()
+
+    if chunks is not None:
+        for chunk in chunks:
+            _consider(chunk.deadline_hint)
+    elif graph is not None:
+        for chunk in graph.decomposition:
+            _consider(chunk.deadline_hint)
+
+    _consider(external_deadline)
+
+    for d in plan_deadlines or []:
+        _consider(d)
 
     if max_deadline_date is None:
         return None

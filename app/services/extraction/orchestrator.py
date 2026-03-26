@@ -83,6 +83,7 @@ async def process_ingestion(
     user_id: Optional[str] = None,
     db_client=None,
     intent_override: Optional[IntentType] = None,
+    file_name: Optional[str] = None,
 ) -> IngestionPipelineResult:
     """Run the full autonomous extraction pipeline.
 
@@ -144,12 +145,14 @@ async def process_ingestion(
             base_result.pending_calendar_id = str(uuid.uuid4())
 
     elif classification.intent == IntentType.KNOWLEDGE_INGESTION:
+        source_id = f"ingestion_{uuid.uuid4().hex[:12]}"
         if provenance_items:
             kr = await ingest_knowledge(
                 extracted_items=provenance_items,
                 source="ingestion",
                 intent=classification.intent.value,
                 deadline_detected=None,
+                source_id=source_id,
             )
         else:
             kr = await ingest_knowledge(
@@ -157,6 +160,7 @@ async def process_ingestion(
                 source="ingestion",
                 intent=classification.intent.value,
                 deadline_detected=None,
+                source_id=source_id,
             )
         base_result.knowledge_result = {
             "stored_chunk_count": kr.stored_chunk_count,
@@ -176,9 +180,9 @@ async def process_ingestion(
                 deadline_mentioned=bool(kr.deadlines),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
-        # Task–Material Linking via embedding similarity
+        # Task–Material Linking via embedding similarity (same source_id as ChromaDB)
+        matched: list[str] = []
         if user_id and kr.document_topics:
-            source_id = f"ingestion_{uuid.uuid4().hex[:12]}"
             matched = await link_document_to_tasks(
                 user_id=user_id,
                 document_topics=kr.document_topics,
@@ -188,6 +192,64 @@ async def process_ingestion(
             )
             if matched:
                 base_result.knowledge_result["linked_task_ids"] = matched
+
+        # Record in ingested_documents for document management UI
+        if user_id and supabase:
+            try:
+                supabase.table("ingested_documents").upsert(
+                    {
+                        "user_id": user_id,
+                        "source_id": source_id,
+                        "file_name": file_name,
+                        "media_type": media_type,
+                        "document_topics": kr.document_topics or [],
+                        "chunk_count": kr.stored_chunk_count or 0,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    on_conflict="user_id,source_id",
+                ).execute()
+            except Exception as e:
+                print(f"[Orchestrator] Insert ingested_documents failed: {e}")
+
+        # Store deadlines in user_plan_updates (goal-level persistence)
+        if user_id and kr.deadlines and supabase:
+            from app.utils.deadline_parser import parse_deadline_to_date
+
+            goal_id_val = None
+            if matched:
+                try:
+                    result = (
+                        supabase.table("user_tasks")
+                        .select("goal_id")
+                        .eq("user_id", user_id)
+                        .in_("task_id", matched)
+                        .limit(1)
+                        .execute()
+                    )
+                    if result.data and len(result.data) > 0:
+                        goal_id_val = result.data[0].get("goal_id")
+                except Exception:
+                    pass
+            plan_date = datetime.now(timezone.utc).date()
+            for raw_deadline in kr.deadlines:
+                parsed = parse_deadline_to_date(raw_deadline, datetime.now(timezone.utc))
+                if parsed and parsed.date() > plan_date:
+                    try:
+                        supabase.table("user_plan_updates").insert(
+                            {
+                                "user_id": user_id,
+                                "goal_id": goal_id_val,
+                                "source": "ingestion",
+                                "deadline_date": parsed.date().isoformat(),
+                                "deadline_raw": raw_deadline,
+                                "context_snippet": (
+                                    kr.action_items[0][:200] if kr.action_items
+                                    else (", ".join(kr.document_topics[:3]) if kr.document_topics else None)
+                                ),
+                            }
+                        ).execute()
+                    except Exception as e:
+                        print(f"[Orchestrator] Insert user_plan_updates failed: {e}")
 
     elif classification.intent == IntentType.BEHAVIORAL_CONSTRAINT:
         br = await store_behavioral_constraint(

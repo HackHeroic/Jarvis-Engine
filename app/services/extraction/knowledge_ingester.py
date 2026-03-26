@@ -131,6 +131,7 @@ async def ingest_knowledge(
     source: str = "unknown",
     intent: str = "KNOWLEDGE_INGESTION",
     deadline_detected: Optional[str] = None,
+    source_id: Optional[str] = None,
 ) -> KnowledgeIngestionResult:
     """Chunk text and store in Vector DB. Falls back to metadata-only when Chroma unavailable.
 
@@ -140,6 +141,8 @@ async def ingest_knowledge(
         source: Source identifier (e.g. "slack", "pdf").
         intent: Intent type.
         deadline_detected: Optional deadline string if detected by LLM.
+        source_id: Optional unique ID per ingestion; when provided, used as chunk ID prefix
+            and stored in metadata for task_materials linkage.
 
     Returns:
         KnowledgeIngestionResult with stored_chunk_count, suggested_actions.
@@ -156,22 +159,24 @@ async def ingest_knowledge(
     suggested = []
 
     try:
-        import chromadb
-        from chromadb.config import Settings
+        from app.utils.chroma_client import get_chroma_client
 
-        client = chromadb.Client(Settings(anonymized_telemetry=False))
+        client = get_chroma_client()
         collection = client.get_or_create_collection("jarvis_knowledge", metadata={"hnsw:space": "cosine"})
 
+        id_prefix = source_id if source_id else source
         for i, chunk in enumerate(chunks):
             meta: dict[str, Any] = {
                 "source": source,
                 "intent": intent,
                 "deadline": deadline_detected or "",
             }
+            if source_id:
+                meta["source_id"] = source_id
             meta.update(chunk_metas[i] if i < len(chunk_metas) else {})
             meta = _sanitize_chroma_metadata(meta)
             collection.add(
-                ids=[f"{source}_{i}"],
+                ids=[f"{id_prefix}_{i}"],
                 documents=[chunk],
                 metadatas=[meta],
             )
