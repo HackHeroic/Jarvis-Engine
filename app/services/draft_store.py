@@ -125,10 +125,10 @@ class DraftStore:
         return Draft(draft_id=str(uuid.uuid4()), user_id=user_id, created_at=time.time(), metadata=kwargs.get("metadata", {}))
 
     def delete(self, draft_id: str, user_id: str = None, **kwargs) -> bool:
-        """Legacy alias for delete_draft."""
+        """Legacy alias for delete_draft. Returns False if user_id missing (fail-safe)."""
         if user_id:
             return self.delete_draft(draft_id, user_id)
-        return True
+        return False  # Fail-safe: refuse to delete without user_id
 
     def get(self, draft_id: str, user_id: str = None, **kwargs):
         """Legacy alias. Callers: drafts.py:36,63,130 pass (draft_id, user_id)."""

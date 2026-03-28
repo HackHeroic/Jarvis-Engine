@@ -50,6 +50,9 @@ async def lifespan(app: FastAPI):
     from app.services.documents.registry import register_default_document_types
     register_default_document_types()
 
+    from app.services.memory.pearl import register_default_patterns
+    register_default_patterns()
+
     # Warmup LM Studio models using explicit load endpoint (avoids model-swap on chat/completions)
     from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL, LM_STUDIO_NATIVE_URL
     try:
