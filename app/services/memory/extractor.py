@@ -98,7 +98,7 @@ async def extract_memories_from_turn(
                 user_id, mem.get("content", ""), threshold=0.85
             )
             if similar:
-                memory_store.reinforce_memory(similar["id"])
+                memory_store.reinforce_memory(similar["id"], user_id=user_id)
             else:
                 memory_store.store_memory(user_id, mem)
 
