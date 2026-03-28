@@ -60,6 +60,8 @@ def _parse_time_range(text: str) -> tuple[int, int] | None:
         period = (match_after.group(2) or "").upper()
         if period == "PM" and h != 12:
             h += 12
+        if not period and 1 <= h <= 7:
+            h += 12  # Assume PM for small hours in "after" context
         return h * 60, 24 * 60
 
     # Pattern: "before N AM/PM" → midnight to N

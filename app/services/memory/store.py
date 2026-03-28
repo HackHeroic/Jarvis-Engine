@@ -2,6 +2,11 @@
 
 All queries filter by user_id for IDOR protection.
 Embeddings are pre-computed at storage time using all-MiniLM-L6-v2.
+
+NOTE: All methods are synchronous (using sync Supabase client).
+When calling from async code, wrap in asyncio.to_thread().
+The memory extractor already does this via safe_extract_memories (fire-and-forget).
+Memory retrieval on the /chat hot path will need asyncio.to_thread() wrappers.
 """
 
 import uuid
@@ -85,21 +90,27 @@ class MemoryStore:
         result = query.execute()
         return result.data or []
 
-    def get_memory(self, memory_id: str) -> dict | None:
+    def get_memory(self, memory_id: str, user_id: str = None) -> dict | None:
         if not self._supabase:
             return None
-        result = self._supabase.table("user_memories").select("*").eq("id", memory_id).execute()
+        query = self._supabase.table("user_memories").select("*").eq("id", memory_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
         return result.data[0] if result.data else None
 
-    def update_memory(self, memory_id: str, updates: dict) -> bool:
+    def update_memory(self, memory_id: str, updates: dict, user_id: str = None) -> bool:
         if not self._supabase:
             return False
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-        result = self._supabase.table("user_memories").update(updates).eq("id", memory_id).execute()
+        query = self._supabase.table("user_memories").update(updates).eq("id", memory_id)
+        if user_id:
+            query = query.eq("user_id", user_id)
+        result = query.execute()
         return bool(result.data)
 
     def supersede_memory(self, old_memory_id: str, user_id: str, new_content: str) -> dict | None:
-        old_mem = self.get_memory(old_memory_id)
+        old_mem = self.get_memory(old_memory_id, user_id=user_id)
         if not old_mem:
             return None
         new_mem = self.store_memory(user_id, {
@@ -110,11 +121,11 @@ class MemoryStore:
         })
         if not new_mem:
             return None
-        self.update_memory(old_memory_id, {"superseded_by": new_mem["id"]})
+        self.update_memory(old_memory_id, {"superseded_by": new_mem["id"]}, user_id=user_id)
         return new_mem
 
-    def reinforce_memory(self, memory_id: str) -> bool:
-        mem = self.get_memory(memory_id)
+    def reinforce_memory(self, memory_id: str, user_id: str = None) -> bool:
+        mem = self.get_memory(memory_id, user_id=user_id)
         if not mem:
             return False
         new_stability = min(MAX_STABILITY, (mem.get("stability", 1.0) + 1.0))
@@ -125,7 +136,7 @@ class MemoryStore:
             "confidence": new_confidence,
             "strength": 1.0,
             "last_reinforced": now,
-        })
+        }, user_id=user_id)
 
     def find_similar_memory(self, user_id: str, content: str, threshold: float = 0.85, memory_type: str | None = None) -> dict | None:
         query_embedding = embed_text(content)
@@ -146,5 +157,5 @@ class MemoryStore:
                 best_match = mem
         return best_match
 
-    def archive_memory(self, memory_id: str) -> bool:
-        return self.update_memory(memory_id, {"strength": 0.0})
+    def archive_memory(self, memory_id: str, user_id: str = None) -> bool:
+        return self.update_memory(memory_id, {"strength": 0.0}, user_id=user_id)
