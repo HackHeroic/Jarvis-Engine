@@ -44,7 +44,7 @@ def _get_supabase():
 class DraftStore:
     """Persists draft schedules in Supabase draft_schedules table."""
 
-    def __init__(self, supabase_client=None):
+    def __init__(self, supabase_client=None, ttl_seconds=None):
         self._supabase = supabase_client or _get_supabase()
 
     def create_draft(self, user_id: str, tasks: list, horizon_start: str, goal_id: str | None = None) -> dict | None:
@@ -83,6 +83,13 @@ class DraftStore:
         return bool(result.data)
 
     def edit_task_in_draft(self, draft_id: str, user_id: str, task_id: str, edits: dict) -> dict | None:
+        """Edit a single task within a draft by task_id.
+
+        Note: This method has a read-modify-write pattern that is not atomic.
+        Concurrent edits to different tasks in the same draft may cause lost updates.
+        For Phase 1, single-user usage makes this acceptable. Phase 2 should use
+        a PostgreSQL jsonb_set RPC for atomic updates.
+        """
         draft = self.get_draft(draft_id, user_id)
         if not draft:
             return None
@@ -112,9 +119,16 @@ class DraftStore:
     # These aliases keep existing callers in drafts.py and control_policy.py working
     # until they are rewritten to use the new API in Phase 1B.
 
-    def create(self, user_id: str, **kwargs) -> "DraftStore":
-        """Legacy alias. Returns self for chaining (old API returned Draft dataclass)."""
-        return self
+    def create(self, user_id: str, **kwargs) -> "Draft":
+        """Legacy alias. Returns a Draft stub with a generated draft_id."""
+        import time
+        return Draft(draft_id=str(uuid.uuid4()), user_id=user_id, created_at=time.time(), metadata=kwargs.get("metadata", {}))
+
+    def delete(self, draft_id: str, user_id: str = None, **kwargs) -> bool:
+        """Legacy alias for delete_draft."""
+        if user_id:
+            return self.delete_draft(draft_id, user_id)
+        return True
 
     def get(self, draft_id: str, **kwargs):
         """Legacy alias for get_draft. Ignores extra kwargs."""
