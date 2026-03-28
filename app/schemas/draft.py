@@ -1,7 +1,7 @@
 # app/schemas/draft.py
 """Schemas for draft review/accept/reject API."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field
 
@@ -73,14 +73,14 @@ class DraftSchedule(BaseModel):
     horizon_start: datetime
     status: Literal["pending", "accepted", "rejected", "modified", "expired"] = "pending"
     rejection_reason: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class DraftTaskEdit(BaseModel):
     """User edit to a single task in a draft."""
 
     title: str | None = None
-    duration_minutes: int | None = Field(default=None, le=60)
+    duration_minutes: int | None = Field(default=None, le=25, description="Max 25 min per task chunk")
     difficulty_weight: float | None = Field(default=None, ge=0, le=1)
     start_min: int | None = None
 

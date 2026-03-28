@@ -76,6 +76,7 @@ class TestDraftStore:
     def test_reject_draft(self, mock_supabase):
         from app.services.draft_store import DraftStore
 
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{"id": "d1", "status": "rejected"}]
         store = DraftStore(supabase_client=mock_supabase)
         result = store.reject_draft("d1", "u1", reason="Too much work")
         assert result is True

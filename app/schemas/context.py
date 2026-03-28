@@ -135,9 +135,9 @@ class TimeSlot(BaseModel):
         default=None,
         description="Max difficulty weight if minimal_work",
     )
-    source: str = Field(
+    source: Literal["user", "habit", "pearl_inferred", "calendar"] = Field(
         default="user",
-        description="Origin of this constraint: user, habit, pearl_inferred, calendar",
+        description="Origin of this constraint",
     )
 
 

@@ -1,6 +1,7 @@
 # app/api/v1/endpoints/drafts.py
 """Draft review/accept/reject endpoints."""
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -184,7 +185,7 @@ async def edit_draft_task(
     if not edits_dict:
         raise HTTPException(status_code=400, detail="No edits provided")
 
-    result = draft_store.edit_task_in_draft(draft_id, user_id, task_id, edits_dict)
+    result = await asyncio.to_thread(draft_store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict)
     if result is None:
         raise HTTPException(status_code=404, detail="Draft or task not found")
 
