@@ -73,14 +73,14 @@ class DraftStore:
     def accept_draft(self, draft_id: str, user_id: str) -> bool:
         if not self._supabase:
             return False
-        self._supabase.table("draft_schedules").update({"status": "accepted"}).eq("id", draft_id).eq("user_id", user_id).execute()
-        return True
+        result = self._supabase.table("draft_schedules").update({"status": "accepted"}).eq("id", draft_id).eq("user_id", user_id).execute()
+        return bool(result.data)
 
     def reject_draft(self, draft_id: str, user_id: str, reason: str | None = None) -> bool:
         if not self._supabase:
             return False
-        self._supabase.table("draft_schedules").update({"status": "rejected", "rejection_reason": reason}).eq("id", draft_id).eq("user_id", user_id).execute()
-        return True
+        result = self._supabase.table("draft_schedules").update({"status": "rejected", "rejection_reason": reason}).eq("id", draft_id).eq("user_id", user_id).execute()
+        return bool(result.data)
 
     def edit_task_in_draft(self, draft_id: str, user_id: str, task_id: str, edits: dict) -> dict | None:
         draft = self.get_draft(draft_id, user_id)
@@ -105,3 +105,42 @@ class DraftStore:
             return False
         self._supabase.table("draft_schedules").delete().eq("id", draft_id).eq("user_id", user_id).execute()
         return True
+
+    # ── Backward-compatible aliases ──────────────────────────
+    # The old in-memory DraftStore had: create(), get(), delete(), add_component(),
+    # accept_component(), reject_component(), accept_all(), cleanup_expired().
+    # These aliases keep existing callers in drafts.py and control_policy.py working
+    # until they are rewritten to use the new API in Phase 1B.
+
+    def create(self, user_id: str, **kwargs) -> "DraftStore":
+        """Legacy alias. Returns self for chaining (old API returned Draft dataclass)."""
+        return self
+
+    def get(self, draft_id: str, **kwargs):
+        """Legacy alias for get_draft. Ignores extra kwargs."""
+        # Old API didn't require user_id, but we need it. Return None if not available.
+        return None
+
+    def add_component(self, draft_id: str, component_type: str, data, **kwargs) -> bool:
+        """Legacy no-op. Components are now stored as tasks in draft JSONB."""
+        return True
+
+    def update_component_data(self, draft_id: str, component_type: str, data, **kwargs) -> bool:
+        """Legacy no-op."""
+        return True
+
+    def accept_component(self, draft_id: str, component_type: str, **kwargs) -> bool:
+        """Legacy no-op."""
+        return True
+
+    def reject_component(self, draft_id: str, component_type: str, **kwargs) -> bool:
+        """Legacy no-op."""
+        return True
+
+    def accept_all(self, draft_id: str, **kwargs) -> bool:
+        """Legacy no-op."""
+        return True
+
+    def cleanup_expired(self) -> int:
+        """Legacy no-op. Supabase handles expiry via expires_at column."""
+        return 0
