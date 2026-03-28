@@ -28,7 +28,7 @@ After a full architecture reset (Phase 1A–1D), the Jarvis Engine has a clean, 
 | Component | What It Does |
 |-----------|-------------|
 | **BaseRegistry Framework** | Extensible registry pattern for intents, document types, and PEARL patterns. New types added by registering, not by editing routing logic. |
-| **Intent Registry** | 9 registered intents with handler lookup (plan_day, greeting, behavioral, calendar_sync, knowledge_ingestion, action_item, task_update, task_query, general_chat) |
+| **Intent Registry** | 9 registered intents with handler lookup (PLAN_DAY, EDIT_TASK, REARRANGE, ADD_CONSTRAINT, ACCEPT_DRAFT, REJECT_DRAFT, INGEST_DOCUMENT, CHECK_PROGRESS, CHAT) |
 | **Document Type Registry** | 5 document types: practice_problems, lecture_notes, syllabus, assignment, reference |
 | **Document Intelligence Pipeline** | Classify → dispatch to type-specific handler → store memory and link to tasks |
 | **3-Tier Memory System** | Working memory (session context), recall memory (LLM-generated summaries), archival memory (persistent user_memories with SM-2 decay) |
