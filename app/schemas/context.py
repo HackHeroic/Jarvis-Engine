@@ -135,6 +135,10 @@ class TimeSlot(BaseModel):
         default=None,
         description="Max difficulty weight if minimal_work",
     )
+    source: str = Field(
+        default="user",
+        description="Origin of this constraint: user, habit, pearl_inferred, calendar",
+    )
 
 
 class TimeSlotsResponse(BaseModel):
