@@ -1,83 +1,56 @@
-import time
 import pytest
-from app.services.draft_store import DraftStore, Draft, DraftComponent
+from unittest.mock import MagicMock
+from app.services.draft_store import DraftStore
+from app.schemas.draft import DraftTask
 
 
-def test_create_and_get_draft():
-    store = DraftStore(ttl_seconds=60)
-    draft = store.create("user_123")
-    assert draft.draft_id
-    assert draft.user_id == "user_123"
-    assert draft.components == {}
-
-    retrieved = store.get(draft.draft_id, "user_123")
-    assert retrieved is not None
-    assert retrieved.draft_id == draft.draft_id
-
-
-def test_get_draft_wrong_user():
-    store = DraftStore(ttl_seconds=60)
-    draft = store.create("user_123")
-    assert store.get(draft.draft_id, "user_456") is None
+@pytest.fixture
+def mock_supabase():
+    client = MagicMock()
+    table = MagicMock()
+    client.table.return_value = table
+    execute_result = MagicMock()
+    execute_result.data = [{"id": "test-draft-id"}]
+    table.insert.return_value.execute.return_value = execute_result
+    table.select.return_value.eq.return_value.eq.return_value.execute.return_value = execute_result
+    table.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = execute_result
+    table.update.return_value.eq.return_value.eq.return_value.execute.return_value = execute_result
+    table.delete.return_value.eq.return_value.eq.return_value.execute.return_value = execute_result
+    return client
 
 
-def test_add_component():
-    store = DraftStore(ttl_seconds=60)
-    draft = store.create("user_123")
-    store.add_component(
-        draft.draft_id,
-        "user_123",
-        "habits",
-        DraftComponent(
-            component_type="habits",
-            data=[{"raw_text": "no work before 11 AM"}],
-            status="pending",
-        ),
-    )
-    updated = store.get(draft.draft_id, "user_123")
-    assert "habits" in updated.components
-    assert updated.components["habits"].status == "pending"
+@pytest.fixture
+def store(mock_supabase):
+    return DraftStore(supabase_client=mock_supabase)
 
 
-def test_accept_component():
-    store = DraftStore(ttl_seconds=60)
-    draft = store.create("user_123")
-    store.add_component(
-        draft.draft_id,
-        "user_123",
-        "habits",
-        DraftComponent(component_type="habits", data=[], status="pending"),
-    )
-    store.accept_component(draft.draft_id, "user_123", "habits")
-    updated = store.get(draft.draft_id, "user_123")
-    assert updated.components["habits"].status == "accepted"
+def test_create_draft(store, mock_supabase):
+    tasks = [
+        DraftTask(
+            task_id="t1", title="Study CNNs", start_min=480,
+            duration_minutes=25, difficulty_weight=0.5,
+            completion_criteria="Explain convolution operation",
+        )
+    ]
+    draft = store.create_draft(user_id="user-1", tasks=tasks, horizon_start="2026-03-29T08:00:00Z")
+    assert draft is not None
+    mock_supabase.table.assert_called_with("draft_schedules")
 
 
-def test_reject_component():
-    store = DraftStore(ttl_seconds=60)
-    draft = store.create("user_123")
-    store.add_component(
-        draft.draft_id,
-        "user_123",
-        "habits",
-        DraftComponent(component_type="habits", data=[], status="pending"),
-    )
-    store.reject_component(draft.draft_id, "user_123", "habits")
-    updated = store.get(draft.draft_id, "user_123")
-    assert updated.components["habits"].status == "rejected"
+def test_get_draft(store, mock_supabase):
+    mock_supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
+        {"id": "d1", "user_id": "user-1", "tasks": [], "horizon_start": "2026-03-29T08:00:00Z", "status": "pending"}
+    ]
+    result = store.get_draft("d1", "user-1")
+    assert result is not None
+    assert result["status"] == "pending"
 
 
-def test_draft_expires():
-    store = DraftStore(ttl_seconds=0)  # Immediate expiry
-    draft = store.create("user_123")
-    time.sleep(0.01)
-    assert store.get(draft.draft_id, "user_123") is None
+def test_accept_draft(store):
+    result = store.accept_draft("d1", "user-1")
+    assert result is True
 
 
-def test_cleanup_expired():
-    store = DraftStore(ttl_seconds=0)
-    store.create("user_123")
-    store.create("user_123")
-    time.sleep(0.01)
-    removed = store.cleanup_expired()
-    assert removed >= 2
+def test_reject_draft(store):
+    result = store.reject_draft("d1", "user-1", reason="Too cramped")
+    assert result is True
