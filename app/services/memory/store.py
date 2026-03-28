@@ -91,22 +91,32 @@ class MemoryStore:
         return result.data or []
 
     def get_memory(self, memory_id: str, user_id: str = None) -> dict | None:
-        if not self._supabase:
+        """Get a single memory. Always filters by user_id when provided.
+        Returns None if user_id is not provided (fail-safe IDOR protection)."""
+        if not self._supabase or not user_id:
             return None
-        query = self._supabase.table("user_memories").select("*").eq("id", memory_id)
-        if user_id:
-            query = query.eq("user_id", user_id)
-        result = query.execute()
+        result = (
+            self._supabase.table("user_memories")
+            .select("*")
+            .eq("id", memory_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
         return result.data[0] if result.data else None
 
     def update_memory(self, memory_id: str, updates: dict, user_id: str = None) -> bool:
-        if not self._supabase:
+        """Update fields on a memory. Always filters by user_id when provided.
+        Returns False if user_id is not provided (fail-safe IDOR protection)."""
+        if not self._supabase or not user_id:
             return False
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
-        query = self._supabase.table("user_memories").update(updates).eq("id", memory_id)
-        if user_id:
-            query = query.eq("user_id", user_id)
-        result = query.execute()
+        result = (
+            self._supabase.table("user_memories")
+            .update(updates)
+            .eq("id", memory_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
         return bool(result.data)
 
     def supersede_memory(self, old_memory_id: str, user_id: str, new_content: str) -> dict | None:
@@ -125,6 +135,9 @@ class MemoryStore:
         return new_mem
 
     def reinforce_memory(self, memory_id: str, user_id: str = None) -> bool:
+        """Reinforce a memory. Requires user_id for IDOR protection."""
+        if not user_id:
+            return False
         mem = self.get_memory(memory_id, user_id=user_id)
         if not mem:
             return False

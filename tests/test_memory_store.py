@@ -71,7 +71,7 @@ def test_update_memory(memory_store, mock_supabase):
     mock_supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = [
         {"id": "m1", "strength": 1.0, "stability": 2.0}
     ]
-    result = memory_store.update_memory("m1", {"strength": 1.0, "stability": 2.0})
+    result = memory_store.update_memory("m1", {"strength": 1.0, "stability": 2.0}, user_id="u1")
     assert result is True
 
 

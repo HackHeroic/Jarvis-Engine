@@ -84,13 +84,15 @@ class TestStabilityCapIntegration:
     def test_stability_cap_at_20(self):
         """Reinforcing a memory 25 times should cap stability at 20."""
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [
+        # get_memory chains: .select().eq(id).eq(user_id).execute()
+        mock_supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
             {"id": "m1", "stability": 19.5, "confidence": 0.9}
         ]
-        mock_supabase.table.return_value.update.return_value.eq.return_value.execute.return_value.data = [{"id": "m1"}]
+        # update_memory chains: .update().eq(id).eq(user_id).execute()
+        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{"id": "m1"}]
 
         store = MemoryStore(supabase_client=mock_supabase)
-        store.reinforce_memory("m1")
+        store.reinforce_memory("m1", user_id="u1")
 
         # Check the update was called with capped stability
         update_call = mock_supabase.table.return_value.update.call_args
