@@ -26,8 +26,9 @@ LOCAL_LLM_MODEL: str = os.getenv(
     "LOCAL_LLM_MODEL", "openai/mlx-community/qwen3.5-27b"
 )  # Heavy lifting: decomposition, reasoning
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-_raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-1.5-pro")
+_raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
+GEMINI_PRIMARY: bool = os.getenv("GEMINI_PRIMARY", "true").lower() == "true"
 
 # SLM for Semantic Router (Level 2 - fast intent detection, ~100ms)
 # Uses qwen3.5-4b for rapid classification; same LM Studio server as LOCAL_LLM

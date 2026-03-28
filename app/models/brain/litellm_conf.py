@@ -13,6 +13,7 @@ from app.core.config import (
     LOCAL_LLM_MODEL,
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    GEMINI_PRIMARY,
     LITELLM_VERBOSE,
     SLM_ROUTER_URL,
 )
@@ -80,6 +81,7 @@ async def hybrid_route_query(
     model_override: str | None = None,
     stream: bool = False,
     conversation_history: list[dict] | None = None,
+    prefer_local: bool = False,
 ) -> str | dict | AsyncGenerator[str, None]:
     """
     Route the query to Local Qwen or Cloud Gemini. Local-First: all requests
@@ -92,6 +94,17 @@ async def hybrid_route_query(
         use_cloud = False
         print(f"[LiteLLM Router] Using model_override: {model_override}")
     else:
+        # Gemini-primary routing: use cloud for schema-critical tasks
+        if (
+            model_override is None
+            and GEMINI_PRIMARY
+            and not prefer_local
+            and not force_cloud
+            and GEMINI_API_KEY
+            and response_schema is not None
+        ):
+            force_cloud = True
+
         prompt_lower = user_prompt.lower()
         use_cloud = force_cloud or any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
         target_model = GEMINI_MODEL if use_cloud else LOCAL_LLM_MODEL
