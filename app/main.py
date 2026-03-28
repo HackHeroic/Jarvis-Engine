@@ -42,7 +42,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize draft store (Supabase-backed, no TTL — persistence across restarts)
     from app.services.draft_store import DraftStore
-    app.state.draft_store = DraftStore()
+    app.state.draft_store = DraftStore(supabase_client=db_client.supabase if hasattr(db_client, 'supabase') else None)
+
+    from app.services.intent_registry import register_default_intents
+    register_default_intents()
 
     # Warmup LM Studio models using explicit load endpoint (avoids model-swap on chat/completions)
     from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL, LM_STUDIO_NATIVE_URL
