@@ -11,7 +11,7 @@ Inspired by Django's app registry and FastAPI's dependency injection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -22,7 +22,7 @@ class RegistryEntry(Generic[T]):
 
     name: str
     description: str
-    handler: Callable[..., Awaitable[Any]]
+    handler: Callable[..., Any]  # Accepts both sync and async handlers
     examples: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
