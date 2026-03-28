@@ -55,7 +55,8 @@ def compute_memory_strength(memory: dict, current_time: datetime) -> float:
         last_reinforced = last_reinforced.replace(tzinfo=timezone.utc)
 
     hours_since = (current_time - last_reinforced).total_seconds() / 3600
-    stability = memory.get("stability", 1.0)
+    hours_since = max(0.0, hours_since)
+    stability = max(0.01, memory.get("stability", 1.0))
     effective_halflife = stability * BASE_HALFLIFE_HOURS
     strength = memory.get("strength", 1.0)
 

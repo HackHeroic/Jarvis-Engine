@@ -5,6 +5,7 @@ Embedding model: all-MiniLM-L6-v2 (384 dimensions) via ChromaDB.
 Runs locally — no API calls, no cost, ~5ms per embedding.
 """
 
+import functools
 import math
 from typing import Optional
 
@@ -19,6 +20,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+@functools.lru_cache(maxsize=1)
 def get_embedding_function():
     """Get the ChromaDB default embedding function (all-MiniLM-L6-v2).
     Returns None if chromadb is not installed.
