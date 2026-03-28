@@ -1295,6 +1295,480 @@ async def test_memory_affects_schedule():
 
 ---
 
+## Intelligent Document-Task Integration
+
+### The Problem (Current State)
+
+The current `task_material_linker.py` does a single cosine similarity match between document topics and task titles. This is shallow — it answers "is this document vaguely related to this task?" but NOT:
+
+- What TYPE of document is this? (practice problems vs lecture notes vs syllabus vs assignment)
+- Does this document contain INDIVIDUAL problems that should be extracted?
+- Should this document CHANGE existing task completion criteria?
+- Should this document CREATE new tasks?
+- Should this document be surfaced DURING task execution as practice material?
+
+### The Scenario
+
+```
+Day 1: User says "I have a deep learning contest on Friday"
+       → Jarvis decomposes into tasks:
+         1. "Study CNNs - convolution layers" (25 min)
+         2. "Study backpropagation math" (25 min)
+         3. "Practice: implement a basic neural network" (25 min)
+         4. "Study optimization algorithms (SGD, Adam)" (25 min)
+         5. "Mock contest: solve timed problems" (25 min)
+
+Day 1: User adds habits: "I study best after lunch", "30 min breaks between sessions"
+       → Tasks recalibrated — scheduled 1-5 PM with breaks
+
+Day 2: User uploads "DL_Practice_Problems.pdf" containing 15 practice problems
+       → CURRENT BEHAVIOR: Links PDF to tasks by topic similarity. That's it.
+       → DESIRED BEHAVIOR: See below.
+```
+
+### The Design: Document Intelligence Pipeline
+
+```mermaid
+flowchart TD
+    Upload[User Uploads Document] --> Docling[Docling: Extract Structured Text]
+    Docling --> Classify{Document Classifier - LLM}
+
+    Classify -->|practice_problems| ProblemExtract[Extract Individual Problems]
+    Classify -->|lecture_notes| NotesProcess[Extract Key Concepts + Summaries]
+    Classify -->|syllabus| SyllabusProcess[Extract Topics + Deadlines + Structure]
+    Classify -->|assignment| AssignmentProcess[Extract Requirements + Deadline]
+    Classify -->|reference| ReferenceProcess[Chunk + Store for RAG]
+
+    subgraph ProblemFlow [Practice Problem Flow]
+        ProblemExtract --> MatchProblems[Match Each Problem to Existing Tasks]
+        MatchProblems --> EnrichCriteria[Enrich Task Completion Criteria]
+        EnrichCriteria --> CreatePractice[Create Practice Assets from Problems]
+    end
+
+    subgraph NotesFlow [Lecture Notes Flow]
+        NotesProcess --> MatchConcepts[Match Concepts to Task Topics]
+        MatchConcepts --> LinkAsStudyMaterial[Link as Study Material]
+        LinkAsStudyMaterial --> SurfaceInWorkspace[Surface in Workspace When Task Active]
+    end
+
+    subgraph SyllabusFlow [Syllabus Flow]
+        SyllabusProcess --> CreateNewTasks{Tasks Exist for This Topic?}
+        CreateNewTasks -->|No| ProposeDraft[Propose New Task Decomposition]
+        CreateNewTasks -->|Yes| UpdateExisting[Update Deadlines + Add Subtopics]
+    end
+
+    subgraph AssignmentFlow [Assignment Flow]
+        AssignmentProcess --> CreateOrLink{Related Task Exists?}
+        CreateOrLink -->|Yes| AddAsCriteria[Add Requirements as Completion Criteria]
+        CreateOrLink -->|No| ProposeNewTask[Propose New Task with Deadline]
+    end
+
+    ProblemFlow --> Replan[trigger_replan if tasks changed]
+    SyllabusFlow --> Replan
+    AssignmentFlow --> Replan
+    NotesFlow --> NotifyUser[Notify: Material linked to N tasks]
+```
+
+### Document Classification Schema
+
+```python
+class DocumentClassification(BaseModel):
+    """LLM classifies uploaded document into a type for intelligent routing."""
+
+    document_type: Literal[
+        "practice_problems",  # Problem sets, DPPs, sample papers, exercises
+        "lecture_notes",      # Class notes, slides, summaries
+        "syllabus",           # Course structure, topic lists, exam schedules
+        "assignment",         # Homework, projects with deadlines
+        "reference",          # Textbook chapters, articles, general reference
+    ]
+
+    confidence: float = Field(ge=0, le=1)
+
+    # Extracted metadata (varies by type)
+    topics_covered: list[str] = Field(
+        description="Granular topic tags: 'CNN architectures', 'backpropagation', 'Adam optimizer'"
+    )
+
+    problem_count: int | None = Field(
+        default=None,
+        description="Number of individual problems/questions found (for practice_problems type)"
+    )
+
+    deadline_detected: str | None = Field(
+        default=None,
+        description="ISO date if a deadline is mentioned"
+    )
+
+    difficulty_estimate: float | None = Field(
+        default=None, ge=0, le=1,
+        description="Estimated difficulty 0-1 based on content complexity"
+    )
+```
+
+### Practice Problem Extraction
+
+When a document is classified as `practice_problems`, extract individual problems:
+
+```python
+class ExtractedProblem(BaseModel):
+    """A single problem extracted from a problem set document."""
+
+    problem_number: int
+    problem_text: str                    # The actual question
+    topic_tags: list[str]                # What KC does this test?
+    difficulty_estimate: float           # 0-1
+    expected_time_minutes: int           # How long should this take?
+    has_solution: bool                   # Is the solution included in the doc?
+    solution_text: str | None = None     # If yes, the solution
+
+class ProblemSetExtraction(BaseModel):
+    """Full extraction from a practice problem document."""
+
+    problems: list[ExtractedProblem]
+    overall_topics: list[str]
+    source_document_id: str
+```
+
+### Task Enrichment Logic
+
+```python
+async def enrich_tasks_with_document(
+    user_id: str,
+    classification: DocumentClassification,
+    extracted_content: dict,  # Type-specific extraction result
+    source_id: str,
+):
+    """
+    The core integration logic. Based on document type,
+    modify existing tasks or propose new ones.
+    """
+
+    if classification.document_type == "practice_problems":
+        await _handle_practice_problems(user_id, extracted_content, source_id)
+
+    elif classification.document_type == "syllabus":
+        await _handle_syllabus(user_id, extracted_content, source_id)
+
+    elif classification.document_type == "assignment":
+        await _handle_assignment(user_id, extracted_content, source_id)
+
+    elif classification.document_type in ("lecture_notes", "reference"):
+        await _handle_reference_material(user_id, extracted_content, source_id)
+
+
+async def _handle_practice_problems(user_id, extraction, source_id):
+    """
+    Practice problems flow:
+    1. Match each problem to existing tasks by topic similarity
+    2. For matched tasks: add problems as completion criteria
+    3. For unmatched problems: propose as standalone practice tasks
+    4. Create practice assets that surface during workspace
+    """
+    problems = extraction["problems"]
+    existing_tasks = await get_all_pending_tasks(user_id)
+
+    for problem in problems:
+        # Find best matching task
+        best_task, similarity = await find_best_matching_task(
+            problem.topic_tags, existing_tasks
+        )
+
+        if best_task and similarity > 0.6:
+            # ENRICH: Add problem as completion criteria for this task
+            await append_completion_criteria(
+                task_id=best_task.task_id,
+                criteria=f"Solve: {problem.problem_text[:100]}",
+                source="uploaded_document",
+                source_id=source_id,
+            )
+
+            # Store as practice asset for workspace
+            await store_practice_asset(
+                user_id=user_id,
+                task_id=best_task.task_id,
+                asset_type="practice_problem",
+                content=problem.problem_text,
+                solution=problem.solution_text,
+                source_id=source_id,
+            )
+        else:
+            # No matching task — propose as new practice task via draft
+            await propose_practice_task(
+                user_id=user_id,
+                problem=problem,
+                source_id=source_id,
+                # This goes into the draft review flow — user can accept/reject
+            )
+
+
+async def _handle_syllabus(user_id, extraction, source_id):
+    """
+    Syllabus flow:
+    1. Extract topics and deadlines from syllabus
+    2. For each topic: check if a task already exists
+    3. If yes: update deadline, add subtopics
+    4. If no: propose new task decomposition via draft
+    5. Store syllabus as reference material for all matched tasks
+    """
+    topics = extraction["topics_covered"]
+    deadlines = extraction.get("deadlines", [])
+    existing_tasks = await get_all_pending_tasks(user_id)
+
+    for topic in topics:
+        matching_task = await find_best_matching_task(topic, existing_tasks)
+
+        if matching_task:
+            # Update existing task with syllabus info
+            if deadlines:
+                await update_task_deadline(matching_task.task_id, deadlines[0])
+            await link_document_to_task(user_id, matching_task.task_id, source_id)
+        else:
+            # Propose new tasks for uncovered topics
+            await propose_syllabus_task(user_id, topic, deadlines, source_id)
+
+
+async def _handle_assignment(user_id, extraction, source_id):
+    """
+    Assignment flow:
+    1. Check if related task exists
+    2. If yes: add assignment requirements as completion criteria
+    3. If no: create new task with assignment deadline
+    4. Either way: link document for workspace reference
+    """
+    requirements = extraction.get("requirements", [])
+    deadline = extraction.get("deadline_detected")
+    topic = extraction.get("topics_covered", ["Assignment"])[0]
+
+    matching_task = await find_best_matching_task(topic, await get_all_pending_tasks(user_id))
+
+    if matching_task:
+        # Enrich existing task
+        for req in requirements:
+            await append_completion_criteria(
+                task_id=matching_task.task_id,
+                criteria=req,
+                source="assignment",
+                source_id=source_id,
+            )
+        if deadline:
+            await update_task_deadline(matching_task.task_id, deadline)
+    else:
+        # Propose new task via draft
+        await propose_assignment_task(user_id, topic, requirements, deadline, source_id)
+
+
+async def _handle_reference_material(user_id, extraction, source_id):
+    """
+    Reference material flow (lecture notes, textbook chapters):
+    1. Chunk and store in ChromaDB (existing behavior)
+    2. Match to existing tasks by topic
+    3. Link for workspace surfacing
+    4. Do NOT modify task criteria — this is support material, not requirements
+    """
+    # This is what the current system already does, but with better matching
+    topics = extraction.get("topics_covered", [])
+    matched_tasks = await link_document_to_tasks(user_id, topics, source_id)
+
+    if matched_tasks:
+        # Notify user: "Linked your notes to N tasks"
+        pass
+```
+
+### Updated Database Schema for Document Integration
+
+```sql
+-- Practice problems extracted from documents
+extracted_problems (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL,
+    source_id       TEXT NOT NULL,        -- Links to ChromaDB document
+    problem_number  INTEGER NOT NULL,
+    problem_text    TEXT NOT NULL,
+    topic_tags      TEXT[] NOT NULL,
+    difficulty      FLOAT DEFAULT 0.5,
+    expected_time   INTEGER DEFAULT 10,   -- minutes
+    has_solution    BOOLEAN DEFAULT false,
+    solution_text   TEXT,
+    linked_task_id  TEXT,                 -- Which task this problem is assigned to
+    status          TEXT DEFAULT 'pending', -- 'pending' | 'completed' | 'skipped'
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_problems_task ON extracted_problems(user_id, linked_task_id);
+
+-- Task completion criteria (enriched by documents)
+task_completion_criteria (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL,
+    task_id         TEXT NOT NULL,
+    criteria_text   TEXT NOT NULL,
+    source          TEXT DEFAULT 'decomposition', -- 'decomposition' | 'uploaded_document' | 'assignment' | 'user_edit'
+    source_id       TEXT,                -- Links to document if from upload
+    is_required     BOOLEAN DEFAULT true,
+    is_completed    BOOLEAN DEFAULT false,
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_criteria_task ON task_completion_criteria(user_id, task_id);
+```
+
+### Document Integration Diagram (Full Flow)
+
+```mermaid
+flowchart TD
+    subgraph Day1 [Day 1: User Creates Goal]
+        Goal[User: I have a DL contest Friday]
+        Goal --> Decompose[Socratic Chunker]
+        Decompose --> Tasks[5 Tasks with Completion Criteria]
+        Tasks --> Draft[Draft Review → Accept]
+        Draft --> Persisted[(user_tasks in Supabase)]
+    end
+
+    subgraph Day1b [Day 1: User Adds Habits]
+        Habits[User: I study best after lunch + 30 min breaks]
+        Habits --> BehavioralStore[(behavioral_constraints)]
+        BehavioralStore --> Replan1[trigger_replan]
+        Replan1 --> RescheduledTasks[Tasks rescheduled: 1-5 PM with breaks]
+    end
+
+    subgraph Day2 [Day 2: User Uploads Practice PDF]
+        Upload[User uploads DL_Practice_Problems.pdf]
+        Upload --> Docling[Docling: Extract Text]
+        Docling --> Classify[Document Classifier]
+        Classify -->|practice_problems| ExtractProblems[Extract 15 Individual Problems]
+
+        ExtractProblems --> MatchLoop{For Each Problem}
+        MatchLoop -->|Problem about CNNs| MatchTask1[Match → Study CNNs task]
+        MatchLoop -->|Problem about backprop| MatchTask2[Match → Study backprop task]
+        MatchLoop -->|Problem about transformers| NoMatch[No matching task]
+
+        MatchTask1 --> EnrichCriteria1[Add as completion criteria for CNN task]
+        MatchTask2 --> EnrichCriteria2[Add as completion criteria for backprop task]
+        NoMatch --> ProposeDraft[Propose new practice task via Draft]
+
+        EnrichCriteria1 --> StorePractice1[Store as practice asset for workspace]
+        EnrichCriteria2 --> StorePractice2[Store as practice asset for workspace]
+    end
+
+    subgraph Workspace [User Starts Working on Study CNNs Task]
+        StartTask[User clicks Start Task]
+        StartTask --> WorkspaceBuilder[Workspace Builder]
+        WorkspaceBuilder --> FetchCriteria[Fetch completion criteria]
+        WorkspaceBuilder --> FetchProblems[Fetch linked practice problems]
+        WorkspaceBuilder --> FetchRAG[Fetch RAG chunks from notes]
+        WorkspaceBuilder --> FetchWeb[Web search for tutorials]
+
+        FetchCriteria --> Display[Display Workspace]
+        FetchProblems --> Display
+        FetchRAG --> Display
+        FetchWeb --> Display
+
+        Display --> UserSolves[User solves practice problems]
+        UserSolves --> MarkComplete[Mark problems complete]
+        MarkComplete --> CriteriaProgress[Update completion criteria progress]
+        CriteriaProgress --> TaskProgress[Task completion: 3/5 criteria done]
+    end
+
+    subgraph PEARL_Observe [PEARL Observes]
+        MarkComplete --> PearlObs[PEARL: User solved CNN problems in 8 min avg]
+        PearlObs --> AdjustDifficulty[Adjust difficulty_weight for CNN topics]
+        PearlObs --> MemoryStore[Memory: User is strong at CNNs, weak at backprop]
+    end
+```
+
+### Workspace Enhancement
+
+When the user starts working on a task, the workspace now surfaces:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  WORKSPACE: Study CNNs - convolution layers          │
+│                                                      │
+│  📋 Completion Criteria:                             │
+│  ✅ Understand convolution operation                 │
+│  ☐  Solve: Problem 3 from DL_Practice_Problems.pdf  │
+│  ☐  Solve: Problem 7 from DL_Practice_Problems.pdf  │
+│  ☐  Implement a basic conv layer (from decomposition)│
+│                                                      │
+│  📝 Practice Problems (from your uploaded PDF):      │
+│  Problem 3: "Given a 5×5 input and 3×3 kernel..."   │
+│     [Show Solution] [Mark Complete] [Skip]           │
+│  Problem 7: "Calculate the output dimensions..."     │
+│     [Show Solution] [Mark Complete] [Skip]           │
+│                                                      │
+│  📚 Study Materials:                                 │
+│  • Lecture notes excerpt (from your uploaded notes)   │
+│  • YouTube: 3Blue1Brown - CNNs explained             │
+│  • Article: Stanford CS231n - Conv layers            │
+│                                                      │
+│  Progress: ██████░░░░ 40% (2/5 criteria complete)    │
+└─────────────────────────────────────────────────────┘
+```
+
+### How Multi-Source Integration Works
+
+The key insight: documents from ANY source (direct upload, Slack, email, API) go through the same Document Intelligence Pipeline:
+
+```python
+# All these entry points feed the same pipeline:
+
+# 1. Direct upload via /chat
+POST /api/v1/chat  (with file_base64)
+  → Control Policy → INGEST_DOCUMENT → Document Intelligence Pipeline
+
+# 2. Direct upload via /ingestion
+POST /api/v1/ingestion/process
+  → Document Intelligence Pipeline
+
+# 3. Future: Slack integration (MCP)
+Slack message with PDF attachment
+  → Extract file → Document Intelligence Pipeline
+
+# 4. Future: Email integration
+Email with attachment
+  → Extract file → Document Intelligence Pipeline
+
+# All paths converge:
+async def document_intelligence_pipeline(
+    user_id: str,
+    extracted_text: str,
+    source: str,         # "direct_upload" | "slack" | "email" | "api"
+    source_id: str,
+):
+    """
+    Single pipeline for all document sources.
+    1. Classify document type
+    2. Extract type-specific content
+    3. Match to existing tasks
+    4. Enrich tasks or propose new ones
+    5. Store for workspace surfacing
+    6. Trigger replan if tasks changed
+    """
+    classification = await classify_document(extracted_text)
+    extraction = await extract_by_type(classification, extracted_text)
+    await enrich_tasks_with_document(user_id, classification, extraction, source_id)
+
+    if classification.document_type in ("practice_problems", "syllabus", "assignment"):
+        await trigger_replan(user_id)  # Tasks may have changed
+```
+
+### Psychological Alignment
+
+This design respects the psychological frameworks from the research:
+
+| Framework | How Document Integration Applies |
+|-----------|--------------------------------|
+| **CLT (Cognitive Load)** | Practice problems are matched to specific tasks, not dumped as a generic list. Reduces extraneous load of "which problems go with which topic?" |
+| **WOOP** | Assignment requirements become obstacles in the implementation intention: "If I encounter a CNN problem I can't solve, then I'll review the linked lecture notes" |
+| **Mastery Orientation** | Progress is tracked per-criteria, not per-task. "3/5 criteria done" shows mastery development, not just checkboxes |
+| **Anti-Guilt** | If user can't solve a practice problem, it's a signal to adjust difficulty_weight, not a failure. PEARL observes and adapts |
+| **SM-2** | Problems the user struggles with get re-surfaced at spaced intervals (future: when DKT is implemented) |
+
+---
+
 ## Documentation Updates
 
 ### Files to Update
@@ -1464,18 +1938,37 @@ reliably with real users.
 
 ## Implementation Order (High Level)
 
-1. Database migrations (memory tables)
-2. Memory extraction pipeline
-3. Memory retrieval + injection into LLM prompt
-4. Memory scoring with SM-2 decay
-5. Contradiction detection
-6. Intent registry system
-7. Swap LLM routing (Gemini primary)
-8. Draft negotiation endpoints
-9. PEARL pattern detection
-10. Memory → constraint bridge
-11. Integration tests
-12. Documentation updates
-13. FUTURE_ARCHITECTURE.md creation
+### Phase 1A: Foundation (Make the core loop reliable)
+1. Swap LLM routing (Gemini 2.5 Flash primary, Qwen-4B fallback)
+2. Intent registry system (replace hardcoded routing)
+3. Database migrations (memory tables + document integration tables)
+4. Draft negotiation endpoints (accept/edit/reject/chat-modify)
+5. Integration tests for core pipeline (brain dump → schedule → draft)
+
+### Phase 1B: Memory & Context (Make Jarvis remember)
+6. Conversation store (messages + sessions tables)
+7. Memory extraction pipeline (extract after each turn)
+8. Memory retrieval + injection into LLM prompt
+9. Memory scoring with SM-2 decay
+10. Contradiction detection
+11. Memory → constraint bridge (memories affect OR-Tools)
+
+### Phase 1C: Document Intelligence (Make materials work)
+12. Document classifier (practice_problems / lecture_notes / syllabus / assignment / reference)
+13. Practice problem extraction from PDFs
+14. Task enrichment logic (match problems → tasks, update completion criteria)
+15. Workspace enhancement (surface problems + criteria progress)
+16. Multi-source integration pipeline (single pipeline for all document sources)
+
+### Phase 1D: Behavioral Intelligence (Make Jarvis learn)
+17. PEARL pattern detection (observe skips, edits, rejections)
+18. Pattern → constraint bridge (inferred patterns become soft blocks)
+19. Proactive surfacing ("I noticed you always skip morning tasks...")
+
+### Phase 1E: Stabilize & Document
+20. Full integration test suite
+21. Documentation rewrite (POLICY_ENGINE_ARCHITECTURE.md)
+22. FUTURE_ARCHITECTURE.md creation (preserve DKT/RL/SARIMAX specs)
+23. PROJECT_STATUS.md and CLAUDE.md updates
 
 Detailed implementation plan will be created by the writing-plans skill after this spec is approved.
