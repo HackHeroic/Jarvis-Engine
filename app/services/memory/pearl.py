@@ -13,7 +13,7 @@ Observe their actions and infer rules.
 """
 
 import logging
-from collections import Counter
+import re
 
 from app.core.registry import BaseRegistry, RegistryEntry
 
@@ -253,11 +253,12 @@ def generate_proactive_insights(
 
         # Generate user-friendly message
         if "avoids tasks during hour" in content:
-            import re
             match = re.search(r"hour (\d+)", content)
             if match:
                 hour = int(match.group(1))
-                if hour < 12:
+                if hour == 0:
+                    time_desc = "12 AM"
+                elif hour < 12:
                     time_desc = f"{hour} AM"
                 elif hour == 12:
                     time_desc = "12 PM"
@@ -268,11 +269,12 @@ def generate_proactive_insights(
                     f"I've adjusted your schedule to avoid scheduling deep work at that time."
                 )
         elif "most productive during hour" in content:
-            import re
             match = re.search(r"hour (\d+)", content)
             if match:
                 hour = int(match.group(1))
-                if hour < 12:
+                if hour == 0:
+                    time_desc = "12 AM"
+                elif hour < 12:
                     time_desc = f"{hour} AM"
                 elif hour == 12:
                     time_desc = "12 PM"
