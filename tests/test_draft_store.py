@@ -35,3 +35,60 @@ def test_reject_draft(mock_supabase):
     store = DraftStore(supabase_client=mock_supabase)
     result = store.reject_draft("d1", "user-1", reason="Too cramped")
     assert result is True
+
+
+# ── Legacy alias call-pattern tests ──────────────────────
+# These test the exact positional args used by drafts.py and control_policy.py
+# to prevent TypeError crashes at runtime.
+
+def test_legacy_get_with_user_id(mock_supabase):
+    """drafts.py:36 calls store.get(draft_id, user_id)"""
+    store = DraftStore(supabase_client=mock_supabase)
+    result = store.get("draft-id", "user-id")
+    assert result is None  # no-op returns None
+
+
+def test_legacy_add_component_with_four_args(mock_supabase):
+    """control_policy.py:897 calls draft_store.add_component(draft_id, user_id, key, DraftComponent)"""
+    from app.services.draft_store import DraftComponent
+    store = DraftStore(supabase_client=mock_supabase)
+    comp = DraftComponent(component_type="tasks", data=[], status="pending")
+    result = store.add_component("draft-id", "user-id", "tasks", comp)
+    assert result is True
+
+
+def test_legacy_accept_component_with_three_args(mock_supabase):
+    """drafts.py:115 calls store.accept_component(draft_id, user_id, key)"""
+    store = DraftStore(supabase_client=mock_supabase)
+    result = store.accept_component("draft-id", "user-id", "tasks")
+    assert result is True
+
+
+def test_legacy_reject_component_with_three_args(mock_supabase):
+    """drafts.py:136 calls store.reject_component(draft_id, user_id, key)"""
+    store = DraftStore(supabase_client=mock_supabase)
+    result = store.reject_component("draft-id", "user-id", "tasks")
+    assert result is True
+
+
+def test_legacy_update_component_data_with_four_args(mock_supabase):
+    """drafts.py:151 calls store.update_component_data(draft_id, user_id, component, data)"""
+    store = DraftStore(supabase_client=mock_supabase)
+    result = store.update_component_data("draft-id", "user-id", "tasks", {"key": "val"})
+    assert result is True
+
+
+def test_legacy_create_returns_draft_with_id(mock_supabase):
+    """control_policy.py:1230 calls draft = draft_store.create(user_id, metadata={...}) then draft.draft_id"""
+    store = DraftStore(supabase_client=mock_supabase)
+    draft = store.create("user-id", metadata={"goal": "test"})
+    assert hasattr(draft, "draft_id")
+    assert draft.draft_id is not None
+    assert draft.user_id == "user-id"
+
+
+def test_legacy_delete_with_user_id(mock_supabase):
+    """drafts.py:166 calls store.delete(draft_id, user_id)"""
+    store = DraftStore(supabase_client=mock_supabase)
+    result = store.delete("draft-id", "user-id")
+    assert result is True
