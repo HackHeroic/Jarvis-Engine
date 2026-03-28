@@ -231,48 +231,26 @@ User sends message
 
 ### Intent Registry System
 
+The Intent Registry uses the shared `BaseRegistry` framework (defined in the Registry Framework section below). All registries in Jarvis share the same base class.
+
 ```python
 # app/services/intent_registry.py
+# Uses BaseRegistry from app/core/registry.py
 
-from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any
+from app.core.registry import BaseRegistry, RegistryEntry
 
-@dataclass
-class IntentDefinition:
-    name: str
-    description: str                    # Used by LLM to classify
-    handler: Callable[..., Awaitable[Any]]
-    examples: list[str] = field(default_factory=list)
-    requires_draft: bool = False        # Does this intent need an active draft?
-    triggers_replan: bool = False       # Should this trigger background replan?
+# Create the intent registry instance
+intent_registry = BaseRegistry[dict](
+    name="intent",
+    fallback_key="CHAT",  # Unknown intents default to general conversation
+)
 
-class IntentRegistry:
-    _intents: dict[str, IntentDefinition] = {}
-
-    @classmethod
-    def register(cls, intent: IntentDefinition):
-        cls._intents[intent.name] = intent
-
-    @classmethod
-    def get(cls, name: str) -> IntentDefinition | None:
-        return cls._intents.get(name)
-
-    @classmethod
-    def all_for_classification(cls) -> str:
-        """Generate classification prompt from all registered intents."""
-        lines = []
-        for name, defn in cls._intents.items():
-            examples = ", ".join(defn.examples[:3])
-            lines.append(f"- {name}: {defn.description} (e.g., {examples})")
-        return "\n".join(lines)
-
-    @classmethod
-    def classify(cls, intent_name: str) -> IntentDefinition:
-        """Look up handler for classified intent. Falls back to CHAT."""
-        return cls._intents.get(intent_name, cls._intents["CHAT"])
+# Intent-specific metadata fields (passed via RegistryEntry.metadata)
+# - requires_draft: bool — Does this intent need an active draft?
+# - triggers_replan: bool — Should this trigger background replan?
 
 # Registration happens at app startup (main.py lifespan)
-# New intents added by creating a handler function + registering it
+# See register_default_intents() below for built-in intents
 ```
 
 **Adding a new intent tomorrow:**
@@ -286,11 +264,12 @@ async def handle_weekly_review(user_id: str, message: str, context: dict):
     ...
 
 # 2. Register it (in main.py or a setup file)
-IntentRegistry.register(IntentDefinition(
+intent_registry.register(RegistryEntry(
     name="WEEKLY_REVIEW",
     description="User wants to review their week's progress and accomplishments",
     handler=handle_weekly_review,
     examples=["how was my week", "weekly review", "what did I accomplish"],
+    metadata={"requires_draft": False, "triggers_replan": False},
 ))
 
 # Done. The classifier will now recognize it. No other code changes needed.
@@ -1825,29 +1804,9 @@ class ProblemSetExtraction(BaseModel):
 
 ### Task Enrichment Logic
 
-```python
-async def enrich_tasks_with_document(
-    user_id: str,
-    classification: DocumentClassification,
-    extracted_content: dict,  # Type-specific extraction result
-    source_id: str,
-):
-    """
-    The core integration logic. Based on document type,
-    modify existing tasks or propose new ones.
-    """
+> **Note:** The dispatch below is handled by the **Document Type Registry** (see Registry Framework section). Each document type's handler IS the enrichment logic — there is no separate `enrich_tasks_with_document` function with hardcoded if/elif. The `document_intelligence_pipeline` calls `entry.handler(user_id, extraction, source_id)` directly from the registry lookup.
 
-    if classification.document_type == "practice_problems":
-        await _handle_practice_problems(user_id, extracted_content, source_id)
-
-    elif classification.document_type == "syllabus":
-        await _handle_syllabus(user_id, extracted_content, source_id)
-
-    elif classification.document_type == "assignment":
-        await _handle_assignment(user_id, extracted_content, source_id)
-
-    elif classification.document_type in ("lecture_notes", "reference"):
-        await _handle_reference_material(user_id, extracted_content, source_id)
+The handler implementations below are what gets registered in the Document Type Registry (see `register_default_document_types()` in the Registry Framework section):
 
 
 async def _handle_practice_problems(user_id, extraction, source_id):
@@ -2124,28 +2083,9 @@ Slack message with PDF attachment
 Email with attachment
   → Extract file → Document Intelligence Pipeline
 
-# All paths converge:
-async def document_intelligence_pipeline(
-    user_id: str,
-    extracted_text: str,
-    source: str,         # "direct_upload" | "slack" | "email" | "api"
-    source_id: str,
-):
-    """
-    Single pipeline for all document sources.
-    1. Classify document type
-    2. Extract type-specific content
-    3. Match to existing tasks
-    4. Enrich tasks or propose new ones
-    5. Store for workspace surfacing
-    6. Trigger replan if tasks changed
-    """
-    classification = await classify_document(extracted_text)
-    extraction = await extract_by_type(classification, extracted_text)
-    await enrich_tasks_with_document(user_id, classification, extraction, source_id)
-
-    if classification.document_type in ("practice_problems", "syllabus", "assignment"):
-        await trigger_replan(user_id)  # Tasks may have changed
+# All paths converge into the SAME registry-based pipeline.
+# See document_intelligence_pipeline() in the Registry Framework section.
+# No hardcoded type checks — the registry handler + metadata handles everything.
 ```
 
 ### Psychological Alignment
@@ -2326,6 +2266,351 @@ reliably with real users.
 | Stubs (DKT/RL/SARIMAX) | Cut, preserved in FUTURE_ARCHITECTURE.md | Reduce false complexity, bring back with data |
 | Testing | Integration tests for full pipeline | Must work end-to-end before adding features |
 | Docs | Full rewrite of POLICY_ENGINE_ARCHITECTURE.md | Honest, accurate, no false claims |
+
+---
+
+## Spec Review Fixes — Resolved Issues
+
+The following sections address gaps identified during spec review.
+
+### Session Management (Recall Memory Lifecycle)
+
+The `conversation_sessions` and `conversation_messages` tables need explicit lifecycle management:
+
+```python
+# app/services/memory/sessions.py
+
+SESSION_TIMEOUT_MINUTES = 30  # Inactivity threshold for session end
+
+async def get_or_create_session(user_id: str) -> str:
+    """
+    Get the active session for this user, or create a new one.
+    A session ends after 30 minutes of inactivity.
+    """
+    # Find most recent session
+    recent = await db.table("conversation_sessions") \
+        .select("id, started_at") \
+        .eq("user_id", user_id) \
+        .is_("ended_at", "null") \
+        .order("started_at", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if recent.data:
+        last_message = await db.table("conversation_messages") \
+            .select("created_at") \
+            .eq("session_id", recent.data[0]["id"]) \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+
+        if last_message.data:
+            last_time = parse_datetime(last_message.data[0]["created_at"])
+            if (now() - last_time).total_seconds() < SESSION_TIMEOUT_MINUTES * 60:
+                return recent.data[0]["id"]  # Session still active
+
+        # Session timed out — close it and summarize
+        await close_session(recent.data[0]["id"])
+
+    # Create new session
+    result = await db.table("conversation_sessions").insert({
+        "user_id": user_id,
+    }).execute()
+    return result.data[0]["id"]
+
+
+async def close_session(session_id: str):
+    """
+    Close a session: generate summary, set ended_at.
+    Summary is generated by Qwen-4B (fast, background task).
+    """
+    messages = await db.table("conversation_messages") \
+        .select("role, content") \
+        .eq("session_id", session_id) \
+        .order("created_at") \
+        .execute()
+
+    if not messages.data or len(messages.data) < 2:
+        await db.table("conversation_sessions") \
+            .update({"ended_at": now().isoformat()}) \
+            .eq("id", session_id) \
+            .execute()
+        return
+
+    # Generate summary with fast local model
+    conversation_text = "\n".join([
+        f"{m['role']}: {m['content'][:200]}" for m in messages.data
+    ])
+    summary = await hybrid_route_query(
+        user_prompt=f"Summarize this conversation in 2-3 sentences:\n{conversation_text}",
+        system_prompt="Write a concise summary. Focus on goals discussed and decisions made.",
+        prefer_local=True,  # Qwen-4B is fine for summaries
+    )
+
+    # Extract goals mentioned
+    goals = await hybrid_route_query(
+        user_prompt=f"List any goals or tasks mentioned:\n{conversation_text}",
+        system_prompt="Return a JSON array of goal strings. Empty array if none.",
+        prefer_local=True,
+    )
+
+    await db.table("conversation_sessions").update({
+        "ended_at": now().isoformat(),
+        "summary": summary[:500],
+        "goals_discussed": goals,
+        "message_count": len(messages.data),
+    }).eq("id", session_id).execute()
+```
+
+### Draft Persistence Model
+
+Drafts are stored in **Supabase** (not in-memory) to survive server restarts and support multi-request interactions:
+
+```sql
+-- Draft schedules awaiting user review
+draft_schedules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         TEXT NOT NULL,
+    goal_id         TEXT,
+    tasks           JSONB NOT NULL,       -- Array of DraftTask objects
+    horizon_start   TIMESTAMPTZ NOT NULL,
+    status          TEXT DEFAULT 'pending' CHECK (status IN (
+                        'pending', 'accepted', 'rejected', 'modified', 'expired'
+                    )),
+    rejection_reason TEXT,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    expires_at      TIMESTAMPTZ DEFAULT (now() + interval '24 hours')
+);
+
+CREATE INDEX idx_drafts_user ON draft_schedules(user_id, status);
+```
+
+**Lifecycle:**
+- Created by `_run_plan_day_flow` → status = `pending`
+- `POST /drafts/{id}/accept` → status = `accepted`, tasks persisted to `user_tasks`
+- `POST /drafts/{id}/reject` → status = `rejected`, rejection_reason stored as memory
+- `PATCH /drafts/{id}/tasks/{task_id}` → status = `modified`, tasks re-solved, new draft created
+- After 24 hours without action → status = `expired` (background cleanup)
+- Server restart: drafts survive in Supabase, user can resume review
+
+### trigger_replan Definition
+
+```python
+# app/services/analytical/replan.py
+
+async def trigger_replan(user_id: str, reason: str = "task_change"):
+    """
+    Background schedule recalculation. Called when tasks change.
+
+    This is a BACKGROUND task — it does NOT block the HTTP response.
+    The user sees the updated schedule on their next request.
+
+    What it does:
+    1. Fetch all pending tasks (existing decomposition, not re-decomposed)
+    2. Fetch behavioral constraints + memory-based constraints
+    3. Re-run OR-Tools solver with current task set
+    4. Create a new draft OR update the active schedule
+
+    What it does NOT do:
+    - Re-decompose goals (that only happens on PLAN_DAY intent)
+    - Block the current response
+    - Notify the user (they see changes on next interaction)
+    """
+    import asyncio
+
+    async def _replan():
+        try:
+            pending = await get_all_pending_tasks(user_id)
+            if not pending:
+                return
+
+            habits = await get_behavioral_context(user_id)
+            memory_constraints = await memories_to_constraints(user_id)
+
+            slots = await translate_habits_to_slots(habits)
+            slots.extend(memory_constraints)
+
+            time_slots = await expand_semantic_slots_to_time_slots(slots)
+            horizon = compute_horizon_from_deadlines(pending)
+            daily_cap = compute_adaptive_daily_cap(horizon, pending)
+
+            schedule = await run_schedule(pending, time_slots, horizon, daily_cap)
+
+            await persist_schedule(user_id, schedule)
+        except Exception as e:
+            logger.warning(f"Background replan failed for {user_id}: {e}")
+            # Silent failure — replan is best-effort
+            # User can always trigger manual replan via chat
+
+    asyncio.create_task(_replan())
+```
+
+### behavioral_constraints → user_memories Migration Strategy
+
+Both tables coexist during the transition. The migration is gradual:
+
+```
+Phase 1A-1B: COEXISTENCE
+  - behavioral_constraints: existing habits (read + write)
+  - user_memories: new memories from conversations (read + write)
+  - Plan-day flow queries BOTH tables
+  - New constraints from chat go to user_memories (type='constraint')
+  - Existing habit CRUD endpoints continue to use behavioral_constraints
+
+Phase 1D: BRIDGE
+  - memories_to_constraints() queries BOTH tables
+  - PEARL writes patterns to user_memories only
+  - behavioral_constraints becomes read-mostly
+
+Phase 2 (future): MIGRATION
+  - One-time script copies behavioral_constraints → user_memories
+  - behavioral_constraints table kept as archive
+  - All new writes go to user_memories
+  - Habit endpoints updated to use user_memories
+```
+
+### Memory Embedding Strategy
+
+```python
+# Embeddings are computed at STORAGE time and cached in a Supabase column.
+# They are NOT recomputed on every request.
+
+# Schema addition to user_memories:
+#   embedding    FLOAT[] — pre-computed embedding vector (384 dimensions for MiniLM)
+
+async def store_memory(user_id: str, memory: dict):
+    """Store memory with pre-computed embedding."""
+    embedding = await embed(memory["content"])  # Uses same embedder as ChromaDB
+
+    await db.table("user_memories").insert({
+        **memory,
+        "user_id": user_id,
+        "embedding": embedding,
+    }).execute()
+
+
+async def score_and_retrieve(user_id: str, query: str, top_k: int = 15):
+    """
+    Retrieve memories using pre-computed embeddings.
+    Only the QUERY needs embedding at request time (1 call, not N).
+    """
+    query_embedding = await embed(query)  # Single embedding call
+
+    # Fetch active memories with their pre-computed embeddings
+    memories = await db.table("user_memories") \
+        .select("*, embedding") \
+        .eq("user_id", user_id) \
+        .is_("superseded_by", "null") \
+        .gt("strength", 0.1) \
+        .execute()
+
+    # Score using pre-computed embeddings (no LLM calls needed)
+    scored = []
+    for mem in memories.data:
+        relevance = cosine_similarity(query_embedding, mem["embedding"])
+        recency = compute_memory_strength(mem, now())
+        importance = IMPORTANCE_WEIGHTS.get(mem["memory_type"], 0.5)
+        score = relevance * recency * importance * mem["confidence"]
+        scored.append((mem, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+# Embedding model: same as ChromaDB — all-MiniLM-L6-v2 (384 dims)
+# Runs locally via chromadb.utils.embedding_functions.DefaultEmbeddingFunction
+# No API calls, no cost, fast (~5ms per embedding)
+```
+
+### Memory Extraction Error Handling
+
+Memory extraction is **fire-and-forget** — it must NEVER block the response:
+
+```python
+async def safe_extract_memories(user_id, user_message, assistant_response, existing_memories):
+    """
+    Wrapper that catches ALL errors. Memory extraction is best-effort.
+    A failed extraction means we miss one memory — not that the user's
+    request fails.
+    """
+    try:
+        await extract_memories_from_turn(
+            user_id, user_message, assistant_response, existing_memories
+        )
+    except Exception as e:
+        logger.debug(f"Memory extraction failed (non-blocking): {e}")
+        # Silent failure. The response was already sent to the user.
+        # We'll extract from the next turn.
+
+# Called AFTER the response is sent:
+# response = build_response(...)
+# asyncio.create_task(safe_extract_memories(...))
+# return response
+```
+
+### Gemini Rate Limit Fallback
+
+```python
+# In hybrid_route_query:
+
+async def hybrid_route_query(...):
+    if should_use_cloud(prompt):
+        try:
+            result = await call_gemini(prompt)
+            return result
+        except RateLimitError:
+            logger.warning("Gemini rate limit hit — falling back to local")
+            # Degrade gracefully to local model
+            return await call_local_qwen(prompt)
+        except Exception as e:
+            logger.warning(f"Gemini error: {e} — falling back to local")
+            return await call_local_qwen(prompt)
+```
+
+### LLM Model Clarification
+
+Throughout this spec, the available models are:
+
+| Model | Size | Available Now | Used For |
+|-------|------|--------------|----------|
+| Qwen-4B | ~3GB | Yes (LM Studio) | Intent classification, Voice of Jarvis, memory extraction |
+| Qwen-27B | ~16GB | Yes (LM Studio) | Currently used for decomposition/translation (being replaced by Gemini) |
+| Gemini 2.5 Flash | Cloud | Yes (API key configured) | Brain dump extraction, task decomposition, habit translation |
+
+**Qwen-8B is NOT currently available.** References to Qwen-8B in this spec indicate a FUTURE option — when migrating from Gemini back to local (Phase 2), a fine-tuned Qwen-8B would be the target replacement for the 27B model (smaller, faster, fine-tuned for Jarvis schemas). This is a Phase 2 consideration, not a Phase 1 requirement.
+
+### SM-2 Decay Formula Clarification
+
+The decay formula is:
+
+```
+Memory_Strength(t) = Initial_Strength × e^(-t / (stability × base_halflife))
+                                              ↑ parentheses are critical
+```
+
+- `t` = hours since last reinforcement
+- `stability` = reinforcement count (starts at 1.0, incremented on each reinforcement, **capped at 20** to prevent infinite half-life)
+- `base_halflife` = 168 hours (7 days)
+- At stability=1: half-life = 1 week
+- At stability=5: half-life = 5 weeks
+- At stability=20 (cap): half-life = 140 days (~20 weeks)
+
+The stability cap prevents memories from becoming permanently undecayable.
+
+### TimeSlot Schema Update
+
+The `TimeSlot` schema needs a `source` field for the memory-to-constraint bridge:
+
+```python
+# Addition to app/schemas/context.py TimeSlot model:
+
+class TimeSlot(BaseModel):
+    start_min: int
+    end_min: int
+    availability: Literal["blocked", "minimal_work", "full_focus"]
+    recurrence: str | None = None
+    weekday: int | None = None
+    source: str = "user"  # NEW: "user" | "habit" | "pearl_inferred" | "calendar"
+```
 
 ---
 
