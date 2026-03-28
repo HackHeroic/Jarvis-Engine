@@ -13,7 +13,7 @@ Quick reference to all important documents. Start here.
 | [PITCH_ARCHITECTURE.md](PITCH_ARCHITECTURE.md) | 10 Mermaid diagrams for pitch + moat comparison | VC pitch, demos, explaining the system |
 | [POLICY_ENGINE_ARCHITECTURE.md](POLICY_ENGINE_ARCHITECTURE.md) | Full current architecture with Mermaid diagrams | Understanding the system in depth |
 | [PROJECT_STATUS.md](PROJECT_STATUS.md) | Honest status: what works, what's broken | Before pitching or planning |
-| `FUTURE_ARCHITECTURE.md` | Preserved Phase 2 specs (DKT, RL, SARIMAX, L8, L1) | When ready to build advanced features *(to be created)* |
+| [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md) | Preserved Phase 2 specs (DKT, RL, SARIMAX, L8, L1) | When ready to build advanced features |
 | [NST-Startup-Foundry-2026-Application.md](NST-Startup-Foundry-2026-Application.md) | Startup foundry application | Reference |
 
 ## Design Specs
@@ -84,7 +84,11 @@ Quick reference to all important documents. Start here.
 | Plan | What It Covers | Status |
 |------|---------------|--------|
 | [Architecture Reset Spec](superpowers/specs/2026-03-28-jarvis-architecture-reset-design.md) | Master spec — see Design Specs above | Active |
-| Implementation Plan | To be created from the spec | Pending |
+| [Phase 1A: Foundation](superpowers/plans/2026-03-29-architecture-reset-phase-1a-foundation.md) | BaseRegistry, IntentRegistry, DraftStore migration | Done |
+| [Phase 1B: Memory & Context](superpowers/plans/2026-03-29-architecture-reset-phase-1b-memory-context.md) | 3-tier memory, SM-2 decay, Memory → Constraint Bridge | Done |
+| [Phase 1C: Document Intelligence](superpowers/plans/2026-03-29-architecture-reset-phase-1c-document-intelligence.md) | Document type registry, classification pipeline | Done |
+| [Phase 1D: Behavioral Intelligence](superpowers/plans/2026-03-29-architecture-reset-phase-1d-behavioral-intelligence.md) | PEARL pattern detection, behavioral insights | Done |
+| [Phase 1E: Stabilize & Document](superpowers/plans/2026-03-29-architecture-reset-phase-1e-stabilize-document.md) | FUTURE_ARCHITECTURE.md, PROJECT_STATUS.md rewrite, INDEX.md | Done |
 
 ## Research Documents
 
