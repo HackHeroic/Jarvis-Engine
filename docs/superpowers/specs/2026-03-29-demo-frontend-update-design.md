@@ -369,17 +369,190 @@ Update `lib/architectureDiagrams.ts` to reflect the Phase 1 architecture:
 
 ---
 
+---
+
+## Spec Review Fixes
+
+The following sections address issues found during spec review against the Phase 1 architecture reset spec and PITCH_ARCHITECTURE.md.
+
+### Fix 1: Prompt Cards Stay Visible (Sequential Demo Flow)
+
+The 4 scenario cards are designed as a sequential demo script (Card 2 creates context that Cards 3 and 4 depend on). Therefore:
+
+- Cards remain visible **throughout the session**, not just when `messages.length === 0`
+- After the first message, cards collapse into a compact "Try next:" strip below the chat input
+- Each card shows a checkmark after it's been used
+- Cards 3 and 4 show a "Requires: Plan Complex Task first" hint if Card 2 hasn't been used yet (in demo mode, they still work because mock data is self-contained)
+
+### Fix 2: Memory-to-Constraint Bridge — Visual Indicator
+
+When a constraint memory changes the schedule (the moat), the recalibrated schedule must visually show WHY tasks moved:
+
+- Each shifted task in ScheduleSection shows a small badge: "⚡ Moved: no work before 2 PM"
+- A summary callout at the top of the recalibrated schedule: "Schedule recalibrated — 3 tasks shifted to respect your constraint"
+- In demo mode, the `DEMO_SCHEDULE_RECALIBRATED` mock data includes `constraint_applied: "No work before 2 PM"` on each shifted task
+
+This makes the Memory → Constraint Bridge tangible and visible during the pitch.
+
+### Fix 3: ChatResponse TypeScript Type Expansion
+
+Add these fields to the `ChatResponse` interface in `lib/jarvis-types.ts` (or wherever the type lives):
+
+```typescript
+interface ChatResponse {
+  // ... existing fields ...
+
+  // New Phase 1 fields
+  draft_id?: string;                    // Supabase draft ID for accept/reject
+  memories?: MemoryRecord[];            // Memories extracted this turn
+  pearl_insights?: PearlInsight[];      // PEARL behavioral insights
+  document_classification?: {           // Document classification result
+    document_type: string;
+    confidence: number;
+    topics_covered: string[];
+    problem_count?: number;
+    deadline_detected?: string;
+  };
+}
+
+interface MemoryRecord {
+  id: string;
+  memory_type: "fact" | "preference" | "behavioral_pattern" | "temporal_event" | "goal" | "feedback" | "constraint";
+  content: string;
+  confidence: number;
+}
+
+interface PearlInsight {
+  insight: string;
+  confidence: number;
+}
+```
+
+### Fix 4: Mock Data for Recalibrated Schedule
+
+Add `DEMO_SCHEDULE_RECALIBRATED` to `demoData.ts` — a second schedule where all tasks start at 14:00 (2 PM) or later, with 1-hour gaps between sessions. Each task has a `constraint_applied` field.
+
+Also add `DEMO_RESPONSE_DIJKSTRA` for the "Learn a Concept" card — a CHAT intent response with markdown explanation, no schedule.
+
+The 4 demo responses in total:
+1. `DEMO_RESPONSE_DIJKSTRA` — CHAT intent, markdown with algorithm explanation
+2. `DEMO_RESPONSE_PLAN_WEEK` — PLAN_DAY intent, 8-10 tasks + schedule + draft_id
+3. `DEMO_RESPONSE_CONTRADICT_HABIT` — ADD_CONSTRAINT intent, recalibrated schedule + constraint_applied badges
+4. `DEMO_RESPONSE_UPLOAD_PDF` — INGEST_DOCUMENT intent, classification result + linked tasks
+
+### Fix 5: Dark Mode Hardcoded Styles
+
+Existing components (`ScheduleSection.tsx`, `JarvisResponse.tsx`, `JarvisChatPanel.tsx`) have hardcoded dark-mode Tailwind classes like `bg-slate-900/60`, `text-slate-400`, `border-slate-700/50`. With light mode as default, these will look wrong.
+
+**Rule:** All color references must use either:
+- CSS variables (`bg-[var(--card-bg)]`, `text-[var(--foreground)]`, etc.)
+- Tailwind `dark:` prefixed classes (`bg-white dark:bg-slate-900`)
+- Never bare dark-mode colors without a light-mode counterpart
+
+This applies to all modified files. New components must follow this rule from the start.
+
+### Fix 6: Draft API Endpoint Migration
+
+The current frontend uses `POST /api/v1/chat/accept-schedule`. Migrate to the new endpoints:
+
+| Old Endpoint | New Endpoint | Notes |
+|-------------|-------------|-------|
+| `POST /api/v1/chat/accept-schedule` | `POST /api/v1/drafts/{draft_id}/accept` | Requires draft_id from ChatResponse |
+| (none) | `POST /api/v1/drafts/{draft_id}/reject` | New — with rejection_reason body |
+| (none) | `PATCH /api/v1/drafts/{draft_id}/tasks/{task_id}` | New — edit single task |
+
+Keep the old endpoint working as a fallback for responses that don't include draft_id (backward compat).
+
+### Fix 7: Architecture Diagrams — Specific Diagrams
+
+Replace the contents of `lib/architectureDiagrams.ts` with these 3 diagrams from `docs/PITCH_ARCHITECTURE.md`:
+
+1. **Diagram 1: Core Loop** (stateDiagram — brain dump → schedule → draft → learn)
+2. **Diagram 3: Memory-to-Constraint Bridge** (stateDiagram — the moat)
+3. **Diagram 10: Platform Roadmap** (flowchart — Phase 1/2/3)
+
+Remove the old 9-layer stack and target architecture diagrams (they reference DKT/RL/SARIMAX which are now in FUTURE_ARCHITECTURE.md).
+
+### Fix 8: simulateDemoStream Routing
+
+Update `api.ts` `getMockChatResponse` to route 4 scenarios by keyword matching:
+
+```typescript
+function getMockChatResponse(prompt: string): ChatResponse {
+  const lower = prompt.toLowerCase();
+
+  if (lower.includes("dijkstra") || lower.includes("teach me") || lower.includes("explain"))
+    return DEMO_RESPONSE_DIJKSTRA;
+
+  if (lower.includes("contest") || lower.includes("exam") || lower.includes("plan my"))
+    return DEMO_RESPONSE_PLAN_WEEK;
+
+  if (lower.includes("don't work before") || lower.includes("breaks between") || lower.includes("habit"))
+    return DEMO_RESPONSE_CONTRADICT_HABIT;
+
+  if (lower.includes("practice problems") || lower.includes("here are"))
+    return DEMO_RESPONSE_UPLOAD_PDF;
+
+  // Fallback
+  return DEMO_RESPONSE_DIJKSTRA;
+}
+```
+
+### Fix 9: useJarvisChat Hook Updates
+
+The `useJarvisChat.ts` hook needs these new state values:
+
+```typescript
+// New state for Phase 1 features
+const [memories, setMemories] = useState<MemoryRecord[]>([]);
+const [pearlInsights, setPearlInsights] = useState<PearlInsight[]>([]);
+const [documentClassification, setDocumentClassification] = useState<DocumentClassification | null>(null);
+
+// On complete callback update:
+if (response.memories) setMemories(prev => [...prev, ...response.memories]);
+if (response.pearl_insights) setPearlInsights(prev => [...prev, ...response.pearl_insights]);
+if (response.document_classification) setDocumentClassification(response.document_classification);
+```
+
+These are passed to MemoryPanel, PearlInsightBanner, and DocumentClassificationToast respectively.
+
+### Fix 10: PEARL Insight Narrative Alignment
+
+The mock PEARL insight should connect to Card 3's constraint. Updated:
+
+```typescript
+const MOCK_PEARL_INSIGHT = {
+  insight: "Your new habit matches what I've observed — you complete 92% of tasks scheduled after 2 PM, but only 35% before 10 AM. I've made 'no work before 2 PM' a permanent scheduling rule.",
+  confidence: 0.92,
+};
+```
+
+This directly connects the user's stated habit (Card 3) with PEARL's observed behavior, making the Memory → Constraint Bridge story tangible.
+
+### Additional Notes
+
+- **Card 1 ("Learn a Concept")** is kept — it shows Jarvis handles general Q&A AND extracts memories (the memory panel populates even from a teaching request). This demonstrates breadth.
+- **GSAP and Spline 3D are explicitly "cut if time is tight"** — they are steps 9 and 10 in the implementation order and are not required for the pitch.
+- **Responsive/mobile layout is deferred** — demo runs on a laptop for the VC pitch.
+- **Mock memories include a `temporal_event`**: "DL contest: Friday March 31" added to the mock data.
+
+---
+
 ## Implementation Order
 
-1. **Light mode default + design token polish** (globals.css, themeContext, layout)
-2. **Prompt selector cards** (PromptSelector.tsx, wire into JarvisChatPanel)
-3. **Demo mode mock data** (demoData.ts updates for all 4 scenarios)
-4. **Intent badge updates** (JarvisResponse.tsx)
-5. **Memory panel** (MemoryPanel.tsx, wire into chat layout)
-6. **PEARL insight banner** (PearlInsightBanner.tsx, wire into response flow)
-7. **Document classification toast** (DocumentClassificationToast.tsx)
-8. **Draft UX cleanup** (ScheduleSection.tsx, RejectionReasonModal.tsx, api.ts)
-9. **GSAP hero animation** (app/page.tsx)
-10. **Spline 3D** (optional, if community scene found)
-11. **Architecture diagrams update** (architectureDiagrams.ts)
-12. **Motion animations** across all new + existing components
+1. **Light mode default + design token polish** (globals.css, themeContext, layout, dark-mode class audit)
+2. **ChatResponse type expansion** (jarvis-types.ts — add draft_id, memories, pearl_insights, document_classification)
+3. **Prompt selector cards** (PromptSelector.tsx — stays visible, compact strip after first use)
+4. **Demo mode mock data** (demoData.ts — 4 scenario responses + recalibrated schedule + mock memories)
+5. **simulateDemoStream routing** (api.ts — 4-scenario keyword matching)
+6. **useJarvisChat hook updates** (memories, pearl insights, classification state)
+7. **Intent badge updates** (JarvisResponse.tsx — new intent names + colors)
+8. **Memory panel** (MemoryPanel.tsx, wire into chat layout)
+9. **PEARL insight banner** (PearlInsightBanner.tsx, wire into response flow)
+10. **Memory-to-Constraint Bridge indicator** (ScheduleSection.tsx — constraint_applied badges)
+11. **Document classification toast** (DocumentClassificationToast.tsx)
+12. **Draft UX cleanup** (ScheduleSection.tsx, RejectionReasonModal.tsx, api.ts endpoint migration)
+13. **Architecture diagrams update** (architectureDiagrams.ts — 3 diagrams from PITCH_ARCHITECTURE.md)
+14. **Motion animations** across all new + existing components
+15. **GSAP hero animation** (app/page.tsx) — *cut if time is tight*
+16. **Spline 3D** (optional) — *cut if time is tight*
