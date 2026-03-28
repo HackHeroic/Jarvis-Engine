@@ -25,7 +25,7 @@ The Phase 1 architecture reset added memory, PEARL behavioral intelligence, docu
 
 ### Design
 
-4 scenario cards displayed when the chat is empty (no messages). Each card has:
+4 scenario cards displayed at session start, collapsing into a compact "Try next:" strip after the first interaction. Cards remain visible throughout the session — they do NOT disappear after the first message. Used cards show a checkmark. Cards 3 and 4 show a dependency hint if Card 2 hasn't been used yet. Each card has:
 - Icon (emoji)
 - Title (color-coded by scenario type)
 - Pre-written prompt text (visible to user)
@@ -53,7 +53,7 @@ The Phase 1 architecture reset added memory, PEARL behavioral intelligence, docu
 ```
 File: components/PromptSelector.tsx
 Props: onSelectPrompt(prompt: string), onSelectFile(), mode: "demo" | "live"
-Location: Rendered inside JarvisChatPanel when messages.length === 0
+Location: Rendered inside JarvisChatPanel — full grid when no messages, compact strip after first interaction
 Animation: Cards fade in with stagger (Motion), hover lift + subtle scale
 ```
 
