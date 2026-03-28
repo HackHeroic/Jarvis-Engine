@@ -130,25 +130,24 @@ class DraftStore:
             return self.delete_draft(draft_id, user_id)
         return True
 
-    def get(self, draft_id: str, **kwargs):
-        """Legacy alias for get_draft. Ignores extra kwargs."""
-        # Old API didn't require user_id, but we need it. Return None if not available.
+    def get(self, draft_id: str, user_id: str = None, **kwargs):
+        """Legacy alias. Callers: drafts.py:36,63,130 pass (draft_id, user_id)."""
         return None
 
-    def add_component(self, draft_id: str, component_type: str, data, **kwargs) -> bool:
-        """Legacy no-op. Components are now stored as tasks in draft JSONB."""
+    def add_component(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
+        """Legacy no-op. Callers: control_policy.py:897,907,1260,1354 pass (draft_id, user_id, key, DraftComponent)."""
         return True
 
-    def update_component_data(self, draft_id: str, component_type: str, data, **kwargs) -> bool:
-        """Legacy no-op."""
+    def update_component_data(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
+        """Legacy no-op. Callers: drafts.py:151 pass (draft_id, user_id, component, data)."""
         return True
 
-    def accept_component(self, draft_id: str, component_type: str, **kwargs) -> bool:
-        """Legacy no-op."""
+    def accept_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
+        """Legacy no-op. Callers: drafts.py:115 pass (draft_id, user_id, key)."""
         return True
 
-    def reject_component(self, draft_id: str, component_type: str, **kwargs) -> bool:
-        """Legacy no-op."""
+    def reject_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
+        """Legacy no-op. Callers: drafts.py:136 pass (draft_id, user_id, key)."""
         return True
 
     def accept_all(self, draft_id: str, **kwargs) -> bool:
