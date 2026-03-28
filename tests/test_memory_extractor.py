@@ -93,7 +93,7 @@ async def test_extract_handles_duplicate():
             memory_store=mock_store,
         )
 
-    mock_store.reinforce_memory.assert_called_once_with("existing-1")
+    mock_store.reinforce_memory.assert_called_once_with("existing-1", user_id="u1")
     mock_store.store_memory.assert_not_called()
 
 
