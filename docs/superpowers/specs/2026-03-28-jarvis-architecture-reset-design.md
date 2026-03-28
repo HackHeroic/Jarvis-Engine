@@ -1326,73 +1326,458 @@ Day 2: User uploads "DL_Practice_Problems.pdf" containing 15 practice problems
        → DESIRED BEHAVIOR: See below.
 ```
 
-### The Design: Document Intelligence Pipeline
+### Architectural Principle: The Registry Framework
+
+Before diving into document-specific design, let's establish the core architectural principle that applies across the ENTIRE system.
+
+**The problem with hardcoding:** Hardcoded types (5 document types, 7 intents, 6 memory types) create a system that requires code changes every time you want to extend it. Tomorrow you might need to handle meeting transcripts, code repositories, medical data, or client briefs.
+
+**The solution: Registry Pattern as a first-class framework.**
+
+This is the same pattern used by:
+- Django (middleware registry, app registry)
+- FastAPI (dependency injection, router mounting)
+- VS Code (extension system)
+- Claude Code (skill system)
 
 ```mermaid
 flowchart TD
-    Upload[User Uploads Document] --> Docling[Docling: Extract Structured Text]
-    Docling --> Classify{Document Classifier - LLM}
+    subgraph RegistryFramework [Jarvis Registry Framework]
+        direction TB
+        BaseRegistry[BaseRegistry - Abstract]
 
-    Classify -->|practice_problems| ProblemExtract[Extract Individual Problems]
-    Classify -->|lecture_notes| NotesProcess[Extract Key Concepts + Summaries]
-    Classify -->|syllabus| SyllabusProcess[Extract Topics + Deadlines + Structure]
-    Classify -->|assignment| AssignmentProcess[Extract Requirements + Deadline]
-    Classify -->|reference| ReferenceProcess[Chunk + Store for RAG]
+        BaseRegistry --> IntentRegistry[Intent Registry]
+        BaseRegistry --> DocTypeRegistry[Document Type Registry]
+        BaseRegistry --> MemoryTypeRegistry[Memory Type Registry]
+        BaseRegistry --> PatternRegistry[PEARL Pattern Registry]
 
-    subgraph ProblemFlow [Practice Problem Flow]
-        ProblemExtract --> MatchProblems[Match Each Problem to Existing Tasks]
-        MatchProblems --> EnrichCriteria[Enrich Task Completion Criteria]
-        EnrichCriteria --> CreatePractice[Create Practice Assets from Problems]
+        IntentRegistry --> I1[PLAN_DAY]
+        IntentRegistry --> I2[EDIT_TASK]
+        IntentRegistry --> I3[+ register new intent]
+
+        DocTypeRegistry --> D1[practice_problems]
+        DocTypeRegistry --> D2[lecture_notes]
+        DocTypeRegistry --> D3[+ register new doc type]
+
+        MemoryTypeRegistry --> M1[fact]
+        MemoryTypeRegistry --> M2[preference]
+        MemoryTypeRegistry --> M3[+ register new memory type]
+
+        PatternRegistry --> P1[skip_time_window]
+        PatternRegistry --> P2[duration_preference]
+        PatternRegistry --> P3[+ register new pattern detector]
     end
 
-    subgraph NotesFlow [Lecture Notes Flow]
-        NotesProcess --> MatchConcepts[Match Concepts to Task Topics]
-        MatchConcepts --> LinkAsStudyMaterial[Link as Study Material]
-        LinkAsStudyMaterial --> SurfaceInWorkspace[Surface in Workspace When Task Active]
+    subgraph Adding [Adding Something New Tomorrow]
+        NewDocType[New Doc Type: meeting_transcript]
+        Step1[1. Define handler function]
+        Step2[2. Register with metadata]
+        Step3[3. Done - classifier auto-discovers it]
+        NewDocType --> Step1 --> Step2 --> Step3
     end
-
-    subgraph SyllabusFlow [Syllabus Flow]
-        SyllabusProcess --> CreateNewTasks{Tasks Exist for This Topic?}
-        CreateNewTasks -->|No| ProposeDraft[Propose New Task Decomposition]
-        CreateNewTasks -->|Yes| UpdateExisting[Update Deadlines + Add Subtopics]
-    end
-
-    subgraph AssignmentFlow [Assignment Flow]
-        AssignmentProcess --> CreateOrLink{Related Task Exists?}
-        CreateOrLink -->|Yes| AddAsCriteria[Add Requirements as Completion Criteria]
-        CreateOrLink -->|No| ProposeNewTask[Propose New Task with Deadline]
-    end
-
-    ProblemFlow --> Replan[trigger_replan if tasks changed]
-    SyllabusFlow --> Replan
-    AssignmentFlow --> Replan
-    NotesFlow --> NotifyUser[Notify: Material linked to N tasks]
 ```
 
-### Document Classification Schema
+### The Base Registry (Shared Framework)
+
+```python
+# app/core/registry.py
+
+from dataclasses import dataclass, field
+from typing import Callable, Awaitable, Any, TypeVar, Generic
+
+T = TypeVar("T")
+
+@dataclass
+class RegistryEntry(Generic[T]):
+    """Base entry for any registry."""
+    name: str
+    description: str              # Used by LLM for classification
+    handler: Callable[..., Awaitable[Any]]
+    examples: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class BaseRegistry(Generic[T]):
+    """
+    Generic registry framework. All registries (intent, document, memory,
+    pattern) inherit from this. Provides:
+    - Registration with validation
+    - LLM classification prompt generation
+    - Handler lookup
+    - Introspection (list all registered types)
+
+    This is the core architectural pattern of Jarvis.
+    Adding a new capability to ANY subsystem = defining a handler + registering it.
+    """
+
+    def __init__(self, name: str, fallback_key: str | None = None):
+        self._name = name
+        self._entries: dict[str, RegistryEntry[T]] = {}
+        self._fallback_key = fallback_key  # e.g., "CHAT" for intents, "reference" for docs
+
+    def register(self, entry: RegistryEntry[T]) -> None:
+        """Register a new entry. Idempotent — re-registering overwrites."""
+        if not entry.name or not entry.handler:
+            raise ValueError(f"Registry entry must have name and handler")
+        self._entries[entry.name] = entry
+
+    def get(self, name: str) -> RegistryEntry[T] | None:
+        """Look up an entry by name."""
+        return self._entries.get(name)
+
+    def get_or_fallback(self, name: str) -> RegistryEntry[T]:
+        """Look up entry, fall back to default if not found."""
+        entry = self._entries.get(name)
+        if entry:
+            return entry
+        if self._fallback_key and self._fallback_key in self._entries:
+            return self._entries[self._fallback_key]
+        raise KeyError(f"No entry '{name}' in {self._name} registry and no fallback")
+
+    def classification_prompt(self) -> str:
+        """
+        Generate a classification prompt from all registered entries.
+        The LLM sees this to decide which handler to route to.
+
+        This is the KEY to extensibility: when you register a new type,
+        the LLM automatically learns to classify it. No retraining needed.
+        """
+        lines = [f"Classify into one of these {self._name} types:\n"]
+        for name, entry in self._entries.items():
+            examples = ", ".join(entry.examples[:3]) if entry.examples else "N/A"
+            lines.append(f"- {name}: {entry.description} (e.g., {examples})")
+        if self._fallback_key:
+            lines.append(f"\nIf none match clearly, use: {self._fallback_key}")
+        return "\n".join(lines)
+
+    def all_entries(self) -> dict[str, RegistryEntry[T]]:
+        """List all registered entries (for introspection/debugging)."""
+        return dict(self._entries)
+
+    def registered_names(self) -> list[str]:
+        """List all registered type names."""
+        return list(self._entries.keys())
+```
+
+### Document Type Registry (Framework-Based)
+
+```python
+# app/services/documents/registry.py
+
+from app.core.registry import BaseRegistry, RegistryEntry
+
+# Create the document type registry
+document_registry = BaseRegistry[dict](
+    name="document",
+    fallback_key="reference",  # Unknown docs default to reference material
+)
+
+
+# ─── Handler definitions ────────────────────────────────────
+
+async def handle_practice_problems(user_id: str, extraction: dict, source_id: str):
+    """Extract individual problems, match to tasks, enrich completion criteria."""
+    ...
+
+async def handle_lecture_notes(user_id: str, extraction: dict, source_id: str):
+    """Extract key concepts, link to tasks as study material."""
+    ...
+
+async def handle_syllabus(user_id: str, extraction: dict, source_id: str):
+    """Extract topics + deadlines, create/update tasks."""
+    ...
+
+async def handle_assignment(user_id: str, extraction: dict, source_id: str):
+    """Extract requirements + deadline, add as completion criteria or new task."""
+    ...
+
+async def handle_reference(user_id: str, extraction: dict, source_id: str):
+    """Chunk + store in ChromaDB for RAG. Default handler."""
+    ...
+
+
+# ─── Registration (happens at app startup) ──────────────────
+
+def register_default_document_types():
+    """Register the built-in document types. Called during app lifespan."""
+
+    document_registry.register(RegistryEntry(
+        name="practice_problems",
+        description="Problem sets, DPPs, sample papers, exercises, practice questions",
+        handler=handle_practice_problems,
+        examples=[
+            "DPP with 15 math problems",
+            "Sample exam paper",
+            "LeetCode problem compilation",
+        ],
+        metadata={
+            "modifies_tasks": True,
+            "triggers_replan": True,
+            "extraction_schema": "ProblemSetExtraction",
+        },
+    ))
+
+    document_registry.register(RegistryEntry(
+        name="lecture_notes",
+        description="Class notes, lecture slides, topic summaries, study guides",
+        handler=handle_lecture_notes,
+        examples=[
+            "Chapter 5 notes on neural networks",
+            "Lecture slides from ML class",
+            "Study guide for midterm",
+        ],
+        metadata={
+            "modifies_tasks": False,  # Support material, doesn't change tasks
+            "triggers_replan": False,
+            "extraction_schema": "NotesExtraction",
+        },
+    ))
+
+    document_registry.register(RegistryEntry(
+        name="syllabus",
+        description="Course structure, topic lists, exam schedules, curriculum outlines",
+        handler=handle_syllabus,
+        examples=[
+            "CS301 course syllabus",
+            "Semester schedule with exam dates",
+            "Module breakdown for Deep Learning course",
+        ],
+        metadata={
+            "modifies_tasks": True,
+            "triggers_replan": True,
+            "extraction_schema": "SyllabusExtraction",
+        },
+    ))
+
+    document_registry.register(RegistryEntry(
+        name="assignment",
+        description="Homework, projects, lab reports, deliverables with deadlines",
+        handler=handle_assignment,
+        examples=[
+            "Assignment 3: implement CNN",
+            "Project proposal due Friday",
+            "Lab report requirements",
+        ],
+        metadata={
+            "modifies_tasks": True,
+            "triggers_replan": True,
+            "extraction_schema": "AssignmentExtraction",
+        },
+    ))
+
+    document_registry.register(RegistryEntry(
+        name="reference",
+        description="Textbook chapters, articles, documentation, general reference material",
+        handler=handle_reference,
+        examples=[
+            "Chapter from Deep Learning textbook",
+            "Research paper on transformers",
+            "API documentation",
+        ],
+        metadata={
+            "modifies_tasks": False,
+            "triggers_replan": False,
+            "extraction_schema": None,  # Uses default chunking
+        },
+    ))
+
+
+# ─── ADDING A NEW TYPE TOMORROW ─────────────────────────────
+#
+# Example: Meeting transcripts from Slack/Zoom integration
+#
+# async def handle_meeting_transcript(user_id, extraction, source_id):
+#     """Extract action items from meeting, create tasks, link decisions."""
+#     action_items = extraction["action_items"]
+#     decisions = extraction["decisions"]
+#     for item in action_items:
+#         await propose_task_from_action_item(user_id, item, source_id)
+#     for decision in decisions:
+#         await store_memory(user_id, {
+#             "type": "fact",
+#             "content": decision,
+#             "source": "meeting_transcript",
+#         })
+#
+# document_registry.register(RegistryEntry(
+#     name="meeting_transcript",
+#     description="Meeting notes, Zoom transcripts, standup summaries",
+#     handler=handle_meeting_transcript,
+#     examples=["Weekly standup notes", "Client call transcript", "Sprint retro"],
+#     metadata={
+#         "modifies_tasks": True,
+#         "triggers_replan": True,
+#         "extraction_schema": "MeetingExtraction",
+#     },
+# ))
+#
+# That's it. The classifier will now recognize meeting transcripts.
+# No changes to the pipeline, classifier, or routing code needed.
+```
+
+### The Document Intelligence Pipeline (Framework-Based)
+
+```mermaid
+flowchart TD
+    Upload[Document Arrives - any source] --> Docling[Docling: Extract Structured Text]
+    Docling --> ClassifyPrompt[Generate Classification Prompt from Registry]
+    ClassifyPrompt --> LLMClassify[LLM Classifies Using Registry Descriptions]
+
+    LLMClassify --> Lookup[Registry Lookup: get_or_fallback]
+    Lookup --> Handler[Execute Registered Handler]
+
+    Handler --> CheckMeta{handler.metadata.modifies_tasks?}
+    CheckMeta -->|Yes| Replan[trigger_replan]
+    CheckMeta -->|No| Notify[Notify: Material linked]
+
+    subgraph Registry [Document Type Registry]
+        R1[practice_problems → handle_practice_problems]
+        R2[lecture_notes → handle_lecture_notes]
+        R3[syllabus → handle_syllabus]
+        R4[assignment → handle_assignment]
+        R5[reference → handle_reference]
+        R6[... → register more anytime]
+    end
+
+    Lookup -.-> Registry
+```
+
+```python
+# app/services/documents/pipeline.py
+
+async def document_intelligence_pipeline(
+    user_id: str,
+    extracted_text: str,
+    source: str,
+    source_id: str,
+):
+    """
+    Universal document processing pipeline.
+    Uses the registry framework — no hardcoded type checks.
+
+    Adding a new document type requires ZERO changes to this function.
+    """
+    # 1. Classify using registry-generated prompt
+    classification_prompt = document_registry.classification_prompt()
+
+    doc_type = await classify_with_llm(
+        text=extracted_text[:8000],
+        classification_prompt=classification_prompt,
+        response_schema=DocumentClassification,
+    )
+
+    # 2. Look up handler from registry
+    entry = document_registry.get_or_fallback(doc_type.document_type)
+
+    # 3. Run type-specific extraction if schema defined
+    extraction = {}
+    if entry.metadata.get("extraction_schema"):
+        extraction = await extract_by_schema(
+            extracted_text,
+            schema_name=entry.metadata["extraction_schema"],
+        )
+    extraction["classification"] = doc_type
+
+    # 4. Execute handler
+    await entry.handler(user_id, extraction, source_id)
+
+    # 5. Trigger replan if handler metadata says so
+    if entry.metadata.get("triggers_replan"):
+        await trigger_replan(user_id)
+
+    # 6. Store ingestion event as memory
+    await store_memory(user_id, {
+        "type": "fact",
+        "content": f"Uploaded {doc_type.document_type}: topics {', '.join(doc_type.topics_covered[:5])}",
+        "source": "ingestion",
+        "source_id": source_id,
+    })
+
+    return doc_type
+```
+
+### The Same Pattern Everywhere
+
+This registry framework is now the architectural backbone. Every extensible subsystem uses it:
+
+| Registry | Fallback | Current Entries | Adding New = |
+|----------|----------|----------------|--------------|
+| **Intent Registry** | `CHAT` | PLAN_DAY, EDIT_TASK, REARRANGE, ADD_CONSTRAINT, ACCEPT_DRAFT, REJECT_DRAFT, INGEST_DOCUMENT, CHECK_PROGRESS, CHAT | Define handler + register |
+| **Document Type Registry** | `reference` | practice_problems, lecture_notes, syllabus, assignment, reference | Define handler + register |
+| **Memory Type Registry** | `fact` | fact, preference, behavioral_pattern, temporal_event, goal, feedback, constraint | Define type config + register |
+| **PEARL Pattern Registry** | N/A | skip_time_window, duration_preference, deadline_buffer | Define detector query + register |
+
+```python
+# Example: PEARL Pattern Registry
+
+pearl_registry = BaseRegistry[dict](name="pearl_pattern")
+
+pearl_registry.register(RegistryEntry(
+    name="skip_time_window",
+    description="User consistently skips tasks in a specific time window",
+    handler=detect_skip_time_pattern,
+    metadata={
+        "min_observations": 3,
+        "min_rate": 0.7,
+        "constraint_type": "soft_preference",
+        "sql_query": "SELECT EXTRACT(HOUR FROM ...) ...",
+    },
+))
+
+# Tomorrow: detect that user always reschedules after lunch
+pearl_registry.register(RegistryEntry(
+    name="post_lunch_reschedule",
+    description="User reschedules tasks after 1-2 PM window",
+    handler=detect_post_lunch_pattern,
+    metadata={
+        "min_observations": 4,
+        "min_rate": 0.6,
+        "constraint_type": "soft_preference",
+    },
+))
+```
+
+### Future Document Types You Might Add
+
+These require ZERO pipeline changes — just a handler + registration:
+
+| Document Type | Handler Does | When You'd Add It |
+|--------------|-------------|-------------------|
+| `meeting_transcript` | Extract action items → create tasks, store decisions as memories | When Slack/Zoom integration lands |
+| `email_thread` | Extract deadlines, commitments, action items → create/update tasks | When email MCP integration lands |
+| `code_repository` | Extract TODOs, README tasks, issue references → link to tasks | When GitHub integration lands |
+| `calendar_export` | Parse .ics → create hard blocks, detect conflicts | When calendar sync is built |
+| `research_paper` | Extract key findings, methodology → link to research tasks | For graduate students |
+| `project_proposal` | Extract milestones, deliverables, timeline → create task hierarchy | For entrepreneurs |
+| `health_data` | Extract sleep patterns, energy data → feed into SARIMAX/pacing | When health tracking integration lands |
+| `financial_report` | Extract deadlines (tax, invoices), commitments → create tasks | For freelancers/entrepreneurs |
+
+The classifier automatically discovers new types because it reads from the registry. No retraining, no code changes to the pipeline.
+
+### Document Classification Schema (Updated — Registry-Driven)
 
 ```python
 class DocumentClassification(BaseModel):
-    """LLM classifies uploaded document into a type for intelligent routing."""
+    """
+    LLM classifies uploaded document into a registered type.
+    The 'document_type' field is validated against the registry at runtime,
+    not against a hardcoded Literal.
+    """
 
-    document_type: Literal[
-        "practice_problems",  # Problem sets, DPPs, sample papers, exercises
-        "lecture_notes",      # Class notes, slides, summaries
-        "syllabus",           # Course structure, topic lists, exam schedules
-        "assignment",         # Homework, projects with deadlines
-        "reference",          # Textbook chapters, articles, general reference
-    ]
+    document_type: str = Field(
+        description="One of the registered document types from the registry"
+    )
 
     confidence: float = Field(ge=0, le=1)
 
-    # Extracted metadata (varies by type)
     topics_covered: list[str] = Field(
+        default_factory=list,
         description="Granular topic tags: 'CNN architectures', 'backpropagation', 'Adam optimizer'"
     )
 
     problem_count: int | None = Field(
         default=None,
-        description="Number of individual problems/questions found (for practice_problems type)"
+        description="Number of individual problems/questions found (if applicable)"
     )
 
     deadline_detected: str | None = Field(
@@ -1404,6 +1789,14 @@ class DocumentClassification(BaseModel):
         default=None, ge=0, le=1,
         description="Estimated difficulty 0-1 based on content complexity"
     )
+
+    @model_validator(mode="after")
+    def validate_document_type(self):
+        """Validate that document_type is registered in the registry."""
+        if not document_registry.get(self.document_type):
+            # Fall back to default rather than crash
+            self.document_type = document_registry._fallback_key or "reference"
+        return self
 ```
 
 ### Practice Problem Extraction
