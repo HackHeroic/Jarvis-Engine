@@ -71,6 +71,8 @@ def _parse_time_range(text: str) -> tuple[int, int] | None:
         period = (match_before.group(2) or "").upper()
         if period == "PM" and h != 12:
             h += 12
+        elif not period and 1 <= h <= 7:
+            h += 12  # Assume PM for small hours in "before" context
         return 0, h * 60
 
     return None
