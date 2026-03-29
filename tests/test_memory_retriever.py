@@ -126,3 +126,48 @@ class TestFormatMemoryBlock:
         assert result.count("Facts") == 1  # Only one header
         assert "Fact 1" in result
         assert "Fact 2" in result
+
+
+class TestBuildMemoryContext:
+    def test_build_memory_context__returns_formatted_block(self):
+        """build_memory_context fetches active memories, scores, returns formatted string."""
+        from app.services.memory.retriever import build_memory_context
+
+        class MockStore:
+            def get_active_memories(self, user_id):
+                return [
+                    {
+                        "id": "m1", "user_id": "u1", "memory_type": "constraint",
+                        "content": "No tasks between 2 PM and 3 PM",
+                        "confidence": 0.9, "strength": 1.0, "stability": 2.0,
+                        "last_reinforced": datetime.now(timezone.utc).isoformat(),
+                    },
+                    {
+                        "id": "m2", "user_id": "u1", "memory_type": "goal",
+                        "content": "Finish DSA by April",
+                        "confidence": 0.8, "strength": 1.0, "stability": 1.0,
+                        "last_reinforced": datetime.now(timezone.utc).isoformat(),
+                    },
+                    {
+                        "id": "m3", "user_id": "u1", "memory_type": "fact",
+                        "content": "CS student at VIT",
+                        "confidence": 0.7, "strength": 0.5, "stability": 1.0,
+                        "last_reinforced": datetime.now(timezone.utc).isoformat(),
+                    },
+                ]
+
+        result = build_memory_context("u1", MockStore())
+        assert "No tasks between 2 PM and 3 PM" in result
+        assert "Finish DSA by April" in result
+        assert "CS student at VIT" in result
+
+    def test_build_memory_context__empty_memories(self):
+        """Returns empty string when no memories."""
+        from app.services.memory.retriever import build_memory_context
+
+        class EmptyStore:
+            def get_active_memories(self, user_id):
+                return []
+
+        result = build_memory_context("u1", EmptyStore())
+        assert result == ""

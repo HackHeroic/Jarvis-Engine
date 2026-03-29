@@ -119,3 +119,41 @@ def deduplicate_memories(memories: list[dict]) -> list[dict]:
             seen.add(mem_id)
             result.append(mem)
     return result
+
+
+def build_memory_context(user_id: str, memory_store) -> str:
+    """Retrieve and format memories for LLM context injection.
+
+    Called at the START of every /chat request.
+    Returns a formatted string to inject into the LLM system prompt.
+    Uses importance + confidence + recency scoring (no embeddings — fast path).
+    """
+    all_memories = memory_store.get_active_memories(user_id)
+    if not all_memories:
+        return ""
+
+    current_time = datetime.now(timezone.utc)
+
+    # Always-include: constraints, goals, patterns with high confidence
+    must_include = [
+        mem for mem in all_memories
+        if mem.get("memory_type") in ALWAYS_INCLUDE_TYPES
+        and mem.get("confidence", 0) >= ALWAYS_INCLUDE_MIN_CONFIDENCE
+        and mem.get("superseded_by") is None
+    ]
+
+    # Score remaining by recency × importance × confidence
+    remaining = [m for m in all_memories if m not in must_include]
+    scored = []
+    for mem in remaining:
+        recency = compute_memory_strength(mem, current_time)
+        importance = IMPORTANCE_WEIGHTS.get(mem.get("memory_type", "fact"), 0.5)
+        confidence = mem.get("confidence", 0.5)
+        score = recency * importance * confidence
+        scored.append((mem, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_k = [mem for mem, _ in scored[:15]]
+
+    final = deduplicate_memories(must_include + top_k)
+    return format_memory_block(final)

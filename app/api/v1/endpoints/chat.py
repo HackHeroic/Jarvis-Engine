@@ -109,6 +109,7 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     log_step("REQUEST", "Chat received", {"user_id": request.user_id, "prompt_preview": request.user_prompt[:60]})
     db_client = getattr(http_request.app.state, "db_client", None)
     draft_store = getattr(http_request.app.state, "draft_store", None)
+    memory_store = getattr(http_request.app.state, "memory_store", None)
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
     # Session management
@@ -127,6 +128,12 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
     )
 
+    # Inject archival memory into conversation context
+    memory_context = ""
+    if memory_store:
+        from app.services.memory.retriever import build_memory_context
+        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
+
     response = await execute_agentic_flow(
         user_prompt=request.user_prompt,
         user_id=request.user_id,
@@ -143,6 +150,8 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         draft_schedule=request.draft_schedule,
         draft_store=draft_store,
         conversation_history=conversation_history,
+        memory_context=memory_context,
+        memory_store=memory_store,
     )
 
     # Save assistant response
@@ -151,6 +160,13 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         {"schedule": response.schedule, "draft_id": response.draft_id, "intent": response.intent},
         supabase,
     )
+
+    # Fire-and-forget: extract memories from this turn
+    if memory_store:
+        from app.services.memory.extractor import safe_extract_memories
+        asyncio.create_task(safe_extract_memories(
+            request.user_id, request.user_prompt, response.message, memory_store,
+        ))
 
     response.conversation_id = session_id
     response.message_id = msg_id
@@ -171,6 +187,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     log_step("STREAM_REQUEST", "Stream chat received", {"user_id": request.user_id})
     db_client = getattr(http_request.app.state, "db_client", None)
     draft_store = getattr(http_request.app.state, "draft_store", None)
+    memory_store = getattr(http_request.app.state, "memory_store", None)
     model_mode = request.model_mode or "auto"
 
     # --- Session management (before any early returns) ---
@@ -191,6 +208,12 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
     )
 
+    # Inject archival memory into conversation context
+    memory_context = ""
+    if memory_store:
+        from app.services.memory.retriever import build_memory_context
+        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
+
     # --- 27B DIRECT MODE: bypass pipeline, stream 27B directly ---
     if model_mode == "27b":
         return StreamingResponse(
@@ -201,6 +224,15 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
 
     # --- NORMAL PIPELINE MODE (auto / 4b) ---
     async def event_stream():
+        from app.services.memory.extractor import safe_extract_memories
+
+        # Fetch existing memories for frontend MemoryPanel
+        _existing_memories = []
+        if memory_store:
+            _existing_memories = await asyncio.to_thread(
+                memory_store.get_active_memories, request.user_id
+            )
+
         # Progress queue: pipeline emits phase events, we yield them as SSE
         progress_queue: asyncio.Queue = asyncio.Queue()
         # Track the primary model used during pipeline (for final metrics)
@@ -242,6 +274,8 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                     draft_schedule=request.draft_schedule,
                     draft_store=draft_store,
                     conversation_history=conversation_history,
+                    memory_context=memory_context,
+                    memory_store=memory_store,
                 )
             except Exception as exc:
                 pipeline_error = exc
@@ -266,7 +300,9 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             return
 
         from app.core.config import SLM_ROUTER_MODEL, LOCAL_LLM_MODEL
-        yield f"event: step\ndata: {json.dumps({'intent': partial.intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': SLM_ROUTER_MODEL})}\n\n"
+        # GENERAL_QA uses 27B for the actual response; other intents use 4B for synthesis
+        _synthesis_model = LOCAL_LLM_MODEL if partial.intent == "GENERAL_QA" else SLM_ROUTER_MODEL
+        yield f"event: step\ndata: {json.dumps({'intent': partial.intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _synthesis_model})}\n\n"
 
         if partial.awaiting_task_confirmation:
             partial_dict = partial.model_dump()
@@ -279,6 +315,17 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             )
             partial_dict["conversation_id"] = session_id
             partial_dict["message_id"] = _msg_id
+            # Fire-and-forget memory extraction
+            if memory_store:
+                _resp_text = partial.message or ""
+                asyncio.create_task(safe_extract_memories(
+                    request.user_id, request.user_prompt, _resp_text, memory_store,
+                ))
+            if _existing_memories:
+                partial_dict["memories"] = [
+                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                    for m in _existing_memories[:20]
+                ]
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -352,6 +399,17 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             )
             partial_dict["conversation_id"] = session_id
             partial_dict["message_id"] = _msg_id
+            # Fire-and-forget memory extraction
+            if memory_store:
+                _resp_text = message_clean or partial.message or ""
+                asyncio.create_task(safe_extract_memories(
+                    request.user_id, request.user_prompt, _resp_text, memory_store,
+                ))
+            if _existing_memories:
+                partial_dict["memories"] = [
+                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                    for m in _existing_memories[:20]
+                ]
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -374,6 +432,17 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             )
             partial_dict["conversation_id"] = session_id
             partial_dict["message_id"] = _msg_id
+            # Fire-and-forget memory extraction
+            if memory_store:
+                _resp_text = partial.message or "Hello!"
+                asyncio.create_task(safe_extract_memories(
+                    request.user_id, request.user_prompt, _resp_text, memory_store,
+                ))
+            if _existing_memories:
+                partial_dict["memories"] = [
+                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                    for m in _existing_memories[:20]
+                ]
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -395,6 +464,17 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             )
             partial_dict["conversation_id"] = session_id
             partial_dict["message_id"] = _msg_id
+            # Fire-and-forget memory extraction
+            if memory_store:
+                _resp_text = partial.message or "Here's your schedule."
+                asyncio.create_task(safe_extract_memories(
+                    request.user_id, request.user_prompt, _resp_text, memory_store,
+                ))
+            if _existing_memories:
+                partial_dict["memories"] = [
+                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                    for m in _existing_memories[:20]
+                ]
             yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
             return
 
@@ -467,6 +547,17 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         )
         partial_dict["conversation_id"] = session_id
         partial_dict["message_id"] = _msg_id
+        # Fire-and-forget memory extraction
+        if memory_store:
+            _resp_text = message_clean or partial.message or ""
+            asyncio.create_task(safe_extract_memories(
+                request.user_id, request.user_prompt, _resp_text, memory_store,
+            ))
+        if _existing_memories:
+            partial_dict["memories"] = [
+                {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                for m in _existing_memories[:20]
+            ]
         yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
 
     return StreamingResponse(
@@ -783,6 +874,17 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
         return {"status": "error", "message": f"Invalid tasks: {exc}", "task_count": 0}
 
     _persist_fused_tasks(request.user_id, task_chunks, supabase)
+
+    # Fire-and-forget: detect behavioral patterns from task history
+    memory_store = getattr(http_request.app.state, "memory_store", None)
+    if memory_store:
+        from app.services.memory.pearl import detect_patterns
+        _sb = getattr(db_client, "supabase", db_client) if db_client else None
+        if _sb:
+            asyncio.create_task(asyncio.to_thread(
+                detect_patterns, request.user_id, _sb, memory_store
+            ))
+
     return {"status": "accepted", "task_count": len(task_chunks)}
 
 

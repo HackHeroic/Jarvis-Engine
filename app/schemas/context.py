@@ -271,3 +271,7 @@ class ChatResponse(BaseModel):
         default=None,
         description="Quick-reply options when Jarvis needs clarification. Frontend renders as buttons.",
     )
+    memories: Optional[List[dict]] = Field(
+        default=None,
+        description="Memories extracted from this conversation turn. Frontend renders in MemoryPanel.",
+    )

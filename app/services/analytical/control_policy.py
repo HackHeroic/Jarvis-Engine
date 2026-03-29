@@ -513,8 +513,11 @@ async def _fallback_single_intent(
 
     intent = classification.intent
 
+    # Resolve which model will handle this intent
+    from app.core.config import LOCAL_LLM_MODEL
+    _fallback_model = LOCAL_LLM_MODEL if intent == IntentType.GENERAL_QA else SLM_ROUTER_MODEL
     if progress_callback:
-        await progress_callback("intent_classified", {"intent": intent.value, "fallback": True})
+        await progress_callback("intent_classified", {"intent": intent.value, "fallback": True, "model": _fallback_model})
 
     if intent == IntentType.GREETING:
         message, thinking_process = await synthesize_jarvis_response({"greeting": True})
@@ -605,6 +608,7 @@ async def _run_plan_day_flow(
     inline_habits_already_saved: bool = False,
     draft: Optional[Any] = None,
     draft_store: Optional[Any] = None,
+    memory_store=None,
 ) -> ChatResponse:
     """Run PLAN_DAY pipeline: save habits, fetch habits, translate, decompose, schedule."""
     from app.core.config import LOCAL_LLM_MODEL as _LLM_27B
@@ -653,12 +657,21 @@ async def _run_plan_day_flow(
     horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
     past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
 
+    # Inject memory-derived constraints (PEARL patterns + explicit constraints)
+    memory_constraints: list = []
+    if memory_store:
+        from app.services.memory.constraint_bridge import memories_to_constraints
+        memory_constraints = await asyncio.to_thread(
+            memories_to_constraints, user_id, memory_store
+        )
+
     def _build_daily_context(horizon_minutes: int) -> list:
         ctx = expand_semantic_slots_to_time_slots(
             semantic_slots,
             horizon_minutes=horizon_minutes,
             plan_start=plan_start,
         )
+        ctx.extend(memory_constraints)
         if past_minutes > 0:
             past_slot = TimeSlot(
                 name="past",
@@ -1069,6 +1082,8 @@ async def execute_agentic_flow(
     draft_schedule: Optional[dict] = None,
     draft_store: Optional[Any] = None,
     conversation_history: list[dict] | None = None,
+    memory_context: str = "",
+    memory_store=None,
 ) -> ChatResponse:
     """Master orchestrator: brain dump extraction, multi-execution, Voice of Jarvis."""
     # Pre-check: if draft_schedule is provided, route to schedule modification flow
@@ -1096,6 +1111,10 @@ async def execute_agentic_flow(
                 effective_prompt = (user_prompt + "\n\n" + file_text.strip()) if user_prompt.strip() else file_text.strip()
         except Exception as e:
             print(f"[Control Policy] File extraction failed: {e}")
+
+    # Inject archival memory so the LLM has user context
+    if memory_context:
+        effective_prompt = memory_context + "\n\n---\n\nUser message: " + effective_prompt
 
     # Resolve model names for progress visibility
     from app.core.config import LOCAL_LLM_MODEL
@@ -1424,6 +1443,7 @@ async def execute_agentic_flow(
             inline_habits_already_saved=bool(extraction.inline_habits),
             draft=draft,
             draft_store=draft_store,
+            memory_store=memory_store,
         )
 
     # Step 8: Await search task for ingestion-only path

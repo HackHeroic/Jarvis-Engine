@@ -44,6 +44,11 @@ async def lifespan(app: FastAPI):
     from app.services.draft_store import DraftStore
     app.state.draft_store = DraftStore(supabase_client=getattr(app.state.db_client, 'supabase', None))
 
+    from app.services.memory.store import MemoryStore
+    app.state.memory_store = MemoryStore(
+        supabase_client=getattr(app.state.db_client, 'supabase', None)
+    )
+
     from app.services.intent_registry import register_default_intents
     register_default_intents()
 
