@@ -135,6 +135,10 @@ class TimeSlot(BaseModel):
         default=None,
         description="Max difficulty weight if minimal_work",
     )
+    source: Literal["user", "habit", "pearl_inferred", "calendar"] = Field(
+        default="user",
+        description="Origin of this constraint",
+    )
 
 
 class TimeSlotsResponse(BaseModel):
@@ -266,4 +270,8 @@ class ChatResponse(BaseModel):
     clarification_options: Optional[List[str]] = Field(
         default=None,
         description="Quick-reply options when Jarvis needs clarification. Frontend renders as buttons.",
+    )
+    memories: Optional[List[dict]] = Field(
+        default=None,
+        description="Memories extracted from this conversation turn. Frontend renders in MemoryPanel.",
     )
