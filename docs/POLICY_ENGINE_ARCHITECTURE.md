@@ -24,7 +24,7 @@ flowchart TD
 
     subgraph LocalOrch [Local Orchestration Layer]
         API --> Router{LiteLLM Hybrid Router}
-        Router -->|Simple Task or Planning| LocalLLM[Local Powerhouse: Qwen-14B]
+        Router -->|Simple Task or Planning| LocalLLM[Local: Qwen-27B via LM Studio]
         Router -->|Deep Research Query| L8PII[L8 Alignment: Guardrails AI]
     end
 
@@ -47,7 +47,7 @@ flowchart TD
         CSP -->|Calendar Math| Calendar[Calendar]
     end
 
-    L8PII -->|Anonymized| CloudLLM[Gemini 1.5 Pro]
+    L8PII -->|Anonymized| CloudLLM[Gemini 2.5 Flash]
 
     CloudLLM -->|Cloud Response| API
     LocalLLM -->|Local Response| API
@@ -743,11 +743,11 @@ The system is designed around a layered model. Implemented layers are in use; pl
 
 ## Routing Behavior (Local-First)
 
-The LiteLLM Hybrid Router adheres to a **Local-First** principle:
+The LiteLLM Hybrid Router adheres to a **Local-First** principle. **Gemini 2.5 Flash** is the primary model for structured tasks (decomposition, habit translation); **Qwen-27B** (via LM Studio) is the local fallback.
 
-1. **Local by default**: All requests—including goal decomposition, academic topics (e.g., SARIMAX), and structured-output tasks—go to the local Qwen model first (Qwen 27B for heavy lifting). The SLM (Qwen 4B) handles fast intent classification.
-2. **Cloud Gemini (L9 Real-Time Research)**: Reserved for queries containing "latest news", "current events", "search the web", "real-time", or "recent developments". Uses Gemini with web_search_options.
-3. **Last-resort fallback**: When the local model fails (e.g., returns fewer than 5 micro-tasks, or Pydantic validation fails), the engine retries once via Cloud Gemini. If GEMINI_API_KEY is unset or the retry still fails, a 502 is returned.
+1. **Local by default**: All requests—including goal decomposition, academic topics (e.g., SARIMAX), and structured-output tasks—go to the local Qwen model first (Qwen-27B for heavy lifting). The SLM (Qwen 4B) handles fast intent classification.
+2. **Cloud Gemini (L9 Real-Time Research)**: Reserved for queries containing "latest news", "current events", "search the web", "real-time", or "recent developments". Uses Gemini 2.5 Flash with web_search_options.
+3. **Last-resort fallback**: When the local model fails (e.g., returns fewer than 5 micro-tasks, or Pydantic validation fails), the engine retries once via Cloud Gemini 2.5 Flash. If GEMINI_API_KEY is unset or the retry still fails, a 502 is returned.
 
 ---
 
@@ -970,7 +970,7 @@ flowchart TB
         API --> Router{LiteLLM Hybrid Router}:::implemented
         Router -->|Local-First / Standard| LocalLLM[Local Powerhouse: Qwen 4B/27B]:::implemented
         Router -->|Deep Research / Grounding| L8[L8: PII Filter / Guardrails]:::planned
-        L8 -.->|Anonymized| CloudLLM[Cloud: Gemini 1.5 Pro]
+        L8 -.->|Anonymized| CloudLLM[Cloud: Gemini 2.5 Flash]
     end
 
     subgraph L_Control [The Brain: Extraction & Control]
@@ -1061,6 +1061,87 @@ flowchart TB
 
 </details>
 
+
+---
+
+## Memory System (Phase 1)
+
+Jarvis uses a 3-tier memory model:
+
+- **Working memory**: Top-K scored memories injected into the LLM system prompt on every request. Scored by `Importance x Recency x Confidence`.
+- **Recall memory**: All active user memories in Supabase (`user_memories`), retrievable by similarity or category.
+- **Archival memory**: Superseded or decayed memories marked inactive; kept for audit but excluded from retrieval.
+
+After every response, the system extracts new facts, preferences, and patterns. Duplicates above 0.85 similarity are merged (reinforced); new memories start at confidence 0.5 and stabilize over time.
+
+```mermaid
+flowchart TD
+    subgraph MemRead ["Memory Read -- Every Request"]
+        ChatStart["/chat request"] --> FetchActive["Fetch active memories"]
+        FetchActive --> Score["Score: Importance x Recency x Confidence"]
+        Score --> TopK["Top-K + always-include constraints/goals"]
+        TopK --> Inject["Inject into LLM system prompt"]
+    end
+
+    subgraph MemWrite ["Memory Write -- After Response"]
+        Response["ChatResponse"] --> Extract["Extract facts, prefs, patterns"]
+        Extract --> Dedup{"Similarity > 0.85?"}
+        Dedup -->|"New"| Store["Store with confidence=0.5"]
+        Dedup -->|"Existing"| Reinforce["Reinforce: stability++"]
+    end
+
+    subgraph Bridge ["Memory to Constraint Bridge"]
+        Memories[("user_memories")] --> Constraints["Convert to TimeSlot"]
+        Constraints --> Solver["OR-Tools CP-SAT"]
+    end
+
+    Inject --> Pipeline["execute_agentic_flow"]
+    Pipeline --> Response
+    Store --> Memories
+    Reinforce --> Memories
+```
+
+---
+
+## PEARL Behavioral Intelligence
+
+PEARL detects recurring behavioral patterns from user actions (complete, skip, edit) and converts them into soft scheduling constraints. A pattern is only created when there are 3+ observations AND the rate exceeds 70%, preventing premature generalization.
+
+```mermaid
+flowchart TD
+    Actions["User Actions: complete, skip, edit"] --> Aggregate["Aggregate by category"]
+    Aggregate --> Time["Time window patterns"]
+    Aggregate --> Duration["Duration patterns"]
+    Time --> Gate{"3+ observations AND rate > 70%?"}
+    Duration --> Gate
+    Gate -->|"Yes, new"| Create["Create behavioral_pattern memory"]
+    Gate -->|"Yes, existing"| Reinforce2["Reinforce existing pattern"]
+    Gate -->|"No"| Discard["Insufficient evidence"]
+    Create --> SoftBlock["Soft block in OR-Tools"]
+    Reinforce2 --> SoftBlock
+```
+
+---
+
+## Draft Negotiation UX
+
+Rather than silently scheduling tasks, Jarvis uses a draft-review loop. The user can preview decomposed tasks before scheduling, and review the draft schedule before it is persisted. Rejected schedules store the rejection reason as a memory for future planning.
+
+```mermaid
+flowchart TD
+    Plan["Plan Day request"] --> Decompose["Socratic Chunker: 27B"]
+    Decompose --> Preview{"confirm_before_schedule?"}
+    Preview -->|"Yes"| TaskEdit["User edits tasks"]
+    Preview -->|"No"| Schedule["OR-Tools CP-SAT"]
+    TaskEdit --> Schedule
+    Schedule --> Draft["DRAFT schedule created"]
+    Draft --> Review{"User Reviews"}
+    Review -->|"Accept"| Persist["Persist to user_tasks"]
+    Review -->|"Edit tasks"| TaskEdit
+    Review -->|"Reject"| Memory["Store reason as memory"]
+```
+
+---
 
 ### How to Proceed with Implementation
 

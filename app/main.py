@@ -40,10 +40,23 @@ async def lifespan(app: FastAPI):
         print("   → Check SUPABASE_URL in .env (e.g. https://xxx.supabase.co) and network access.")
         app.state.db_client = _StubDBClient()
 
-    # Initialize draft store for pipeline output review
+    # Initialize draft store (Supabase-backed, no TTL — persistence across restarts)
     from app.services.draft_store import DraftStore
-    from app.core.config import DRAFT_TTL_SECONDS
-    app.state.draft_store = DraftStore(ttl_seconds=DRAFT_TTL_SECONDS)
+    app.state.draft_store = DraftStore(supabase_client=getattr(app.state.db_client, 'supabase', None))
+
+    from app.services.memory.store import MemoryStore
+    app.state.memory_store = MemoryStore(
+        supabase_client=getattr(app.state.db_client, 'supabase', None)
+    )
+
+    from app.services.intent_registry import register_default_intents
+    register_default_intents()
+
+    from app.services.documents.registry import register_default_document_types
+    register_default_document_types()
+
+    from app.services.memory.pearl import register_default_patterns
+    register_default_patterns()
 
     # Warmup LM Studio models using explicit load endpoint (avoids model-swap on chat/completions)
     from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL, LM_STUDIO_NATIVE_URL

@@ -1,9 +1,10 @@
 # app/api/v1/endpoints/drafts.py
 """Draft review/accept/reject endpoints."""
 
+import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas.draft import (
     DraftAcceptRequest,
@@ -11,6 +12,7 @@ from app.schemas.draft import (
     DraftRejectRequest,
     DraftResponse,
     DraftComponentResponse,
+    DraftTaskEdit,
 )
 
 router = APIRouter()
@@ -164,3 +166,27 @@ async def delete_draft(draft_id: str, user_id: str, http_request: Request):
     if not store.delete(draft_id, user_id):
         raise HTTPException(status_code=404, detail="Draft not found")
     return {"status": "deleted", "draft_id": draft_id}
+
+
+@router.patch("/{draft_id}/tasks/{task_id}")
+async def edit_draft_task(
+    draft_id: str,
+    task_id: str,
+    edits: DraftTaskEdit,
+    user_id: str = Query(..., description="User ID for authorization"),
+    request: Request = None,
+):
+    """Edit a single task in a draft."""
+    draft_store = _get_draft_store(request)
+    if not draft_store:
+        raise HTTPException(status_code=503, detail="Draft store unavailable")
+
+    edits_dict = edits.model_dump(exclude_none=True)
+    if not edits_dict:
+        raise HTTPException(status_code=400, detail="No edits provided")
+
+    result = await asyncio.to_thread(draft_store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Draft or task not found")
+
+    return {"status": "modified", "draft_id": draft_id, "task_id": task_id, "updated_draft": result}

@@ -150,6 +150,14 @@ async def complete_task(
         body.user_id, db_client, reason=f"task_completed:{task_id}",
     )
 
+    # Fire-and-forget: detect behavioral patterns from task history
+    memory_store = getattr(request.app.state, "memory_store", None)
+    if memory_store and supabase:
+        from app.services.memory.pearl import detect_patterns
+        asyncio.create_task(asyncio.to_thread(
+            detect_patterns, body.user_id, supabase, memory_store
+        ))
+
     return TaskResponse(
         task_id=task_id,
         status="completed",
@@ -181,6 +189,14 @@ async def skip_task(
     replan_triggered = await _try_trigger_replan(
         body.user_id, db_client, reason=f"task_skipped:{task_id}",
     )
+
+    # Fire-and-forget: detect behavioral patterns from task history
+    memory_store = getattr(request.app.state, "memory_store", None)
+    if memory_store and supabase:
+        from app.services.memory.pearl import detect_patterns
+        asyncio.create_task(asyncio.to_thread(
+            detect_patterns, body.user_id, supabase, memory_store
+        ))
 
     return TaskResponse(
         task_id=task_id,
