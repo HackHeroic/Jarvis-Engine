@@ -42,7 +42,7 @@ stateDiagram-v2
 
     state "Learning Loop" as Learn {
         Accepted --> TasksActive: Tasks persisted to calendar
-        TasksActive --> BehaviorObserved: System observes: complete / skip / edit
+        TasksActive --> BehaviorObserved: System observes — complete, skip, edit
         BehaviorObserved --> PatternsDetected: PEARL detects behavioral patterns
         PatternsDetected --> ConstraintsUpdated: Patterns become scheduling constraints
     }
@@ -86,8 +86,8 @@ stateDiagram-v2
     Archived --> [*]: Pruned from active queries but kept for history
 
     note right of Active
-        Score = Relevance x Recency x Importance x Confidence
-        Recency = strength x e^(-t / (stability x 7days))
+        Score = Relevance × Recency × Importance × Confidence
+        Recency = strength × exp(-t / (stability × 7days))
         Higher stability = slower decay
         Stability capped at 20 (max half-life ~140 days)
     end note
@@ -157,7 +157,7 @@ flowchart TD
         WM2[Top-K scored memories from archival]
         WM3[Active constraints — always included]
         WM4[Active goals — always included]
-        WM5[Recent behavioral patterns — confidence > 0.6]
+        WM5["Recent behavioral patterns — confidence > 0.6"]
     end
 
     subgraph Recall [Recall Memory — Past Sessions]
@@ -177,8 +177,8 @@ flowchart TD
     end
 
     subgraph Scoring [SM-2 Decay Scoring]
-        Score["Score = Relevance x Recency x Importance x Confidence"]
-        Decay["Strength = Initial x e^(-t / (stability x halflife))"]
+        Score["Score = Relevance × Recency × Importance × Confidence"]
+        Decay["Strength = Initial × exp(-t / (stability × halflife))"]
     end
 
     Archival -->|Score + Rank| Scoring
@@ -223,8 +223,8 @@ stateDiagram-v2
     RejectDraft --> StoreReason: Why? (builds memory)
     StoreReason --> Decompose: Try different approach
 
-    Persisted --> Replan: Background: replan remaining tasks
-    Persisted --> PearlObserve: PEARL: observe what was accepted/edited
+    Persisted --> Replan: Background — replan remaining tasks
+    Persisted --> PearlObserve: PEARL — observe what was accepted/edited
     Persisted --> [*]: Schedule active
 
     note right of Review
@@ -328,7 +328,7 @@ stateDiagram-v2
     }
 
     state "Day 3: System Learns" as Day3 {
-        ProgressTracked --> PearlDetects: PEARL: CNN problems solved in 8 min avg
+        ProgressTracked --> PearlDetects: PEARL — CNN problems solved in 8 min avg
         PearlDetects --> DifficultyAdjusted: CNN difficulty_weight lowered
         DifficultyAdjusted --> MoreBackprop: More time allocated to backprop (weak area)
     }

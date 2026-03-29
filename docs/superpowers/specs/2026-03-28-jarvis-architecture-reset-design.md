@@ -322,8 +322,8 @@ flowchart TD
     end
 
     subgraph Scoring [Memory Scoring - SM-2 Decay]
-        Score[Score = Relevance × Recency × Importance × Confidence]
-        Decay[Strength = Initial × e^-t/stability × halflife]
+        Score["Score = Relevance × Recency × Importance × Confidence"]
+        Decay["Strength = Initial × exp(-t / (stability × halflife))"]
         Reinforce[Reinforcement: stability++ confidence++]
         Contradict[Contradiction: old.superseded_by = new.id]
     end
@@ -482,7 +482,7 @@ stateDiagram-v2
 
     note right of Active
         Score = Relevance × Recency × Importance × Confidence
-        Recency = strength × e^(-t / stability × 7days)
+        Recency = strength × exp(-t / (stability × 7days))
         Higher stability = slower decay
     end note
 
