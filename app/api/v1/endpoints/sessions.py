@@ -23,6 +23,22 @@ async def get_sessions(user_id: str, limit: int = 50, http_request: Request = No
     return {"sessions": sessions}
 
 
+@router.get("/{session_id}/messages", summary="Get session messages")
+async def get_session_messages(
+    session_id: str, user_id: str, limit: int = 100, http_request: Request = None
+):
+    """Retrieve messages for a session."""
+    db_client = getattr(http_request.app.state, "db_client", None)
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    messages = await get_recent_messages(
+        session_id, user_id, limit=limit, supabase=supabase
+    )
+    return {"messages": messages}
+
+
 @router.get("/{session_id}", summary="Get session with messages")
 async def get_session(session_id: str, user_id: str, http_request: Request):
     """Retrieve a session and its messages."""
