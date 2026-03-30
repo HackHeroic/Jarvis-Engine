@@ -125,18 +125,18 @@ class GoalMetadata(BaseModel):
     physiological arousal for goal pursuit."""
 
     goal_id: str = Field(
-        ...,
+        default="",
         description="Unique identifier for the high-level goal.",
     )
     objective: str = Field(
-        ...,
+        default="",
         description=(
             "The 'Wish' — a clear, one-sentence statement of the user's "
             "desired achievement."
         ),
     )
     outcome_visualization: str = Field(
-        ...,
+        default="",
         description=(
             "The 'Outcome' — a vivid description of the emotional and "
             "tangible state the user will experience upon success.  This "
@@ -145,7 +145,7 @@ class GoalMetadata(BaseModel):
         ),
     )
     mastery_level_target: int = Field(
-        ...,
+        default=3,
         ge=1,
         le=5,
         description=(

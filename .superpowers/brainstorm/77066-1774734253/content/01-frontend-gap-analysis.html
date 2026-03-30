@@ -1,0 +1,103 @@
+<h2>Frontend Demo: What Phase 1 Added vs What the UI Shows</h2>
+<p class="subtitle">Gap analysis — backend features that need frontend representation</p>
+
+<div class="section">
+  <h3>Backend Features with NO Frontend Support</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #ef4444; margin: 0 0 8px;">Memory System</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>No display of what Jarvis remembers about you</li>
+        <li>No indication memories are being extracted</li>
+        <li>No "I noticed..." proactive insights (PEARL)</li>
+        <li>No memory-based constraint indicators on schedule</li>
+      </ul>
+    </div>
+    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #ef4444; margin: 0 0 8px;">Document Intelligence</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>No document classification result shown after upload</li>
+        <li>No "practice_problems detected, linked to 3 tasks" feedback</li>
+        <li>No extracted problems view in workspace</li>
+        <li>No completion criteria progress tracking</li>
+      </ul>
+    </div>
+    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #ef4444; margin: 0 0 8px;">Draft Negotiation</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>Draft accept/reject buttons exist but don't use new Supabase store</li>
+        <li>No "chat to modify" flow for drafts</li>
+        <li>No rearrange/reorder UI</li>
+        <li>No rejection reason capture</li>
+      </ul>
+    </div>
+    <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #ef4444; margin: 0 0 8px;">Registry & Routing</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>Intent badges show old intents (GREETING, GENERAL_QA)</li>
+        <li>Should show new intents (EDIT_TASK, REARRANGE, CHECK_PROGRESS)</li>
+        <li>No indication of Gemini vs local model being used</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Frontend Features That Already Work</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+    <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #10b981; margin: 0 0 8px;">Chat & Streaming</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>SSE streaming with phase indicators</li>
+        <li>Thinking process display</li>
+        <li>File upload (PDF, images)</li>
+        <li>Session sidebar</li>
+      </ul>
+    </div>
+    <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 12px; padding: 16px;">
+      <h4 style="color: #10b981; margin: 0 0 8px;">Schedule & Tasks</h4>
+      <ul style="margin: 0; padding-left: 20px; font-size: 14px;">
+        <li>FullCalendar view</li>
+        <li>Task editing (title, duration, difficulty)</li>
+        <li>Task complete/skip/delete</li>
+        <li>Quality rating on completion</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>What's your TOP priority for the demo update?</h3>
+  <p class="subtitle">Click the area that matters most for Wednesday's pitch</p>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Visual Polish Only</h3>
+      <p>Light mode default, clean colors, updated diagrams, fix UI inconsistencies. No new features — just make what exists look professional.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Memory + PEARL Visibility</h3>
+      <p>Show what Jarvis remembers, display PEARL insights ("I noticed you skip morning tasks"), show memory-based constraints on schedule. The moat, made visible.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Draft Negotiation UX</h3>
+      <p>Wire the accept/edit/reject/chat-modify flow to the new Supabase-backed DraftStore. Show the negotiation loop — the key differentiator.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="d" onclick="toggleSelect(this)">
+    <div class="letter">D</div>
+    <div class="content">
+      <h3>All of the Above</h3>
+      <p>Polish + Memory visibility + Draft negotiation + Document intelligence feedback. Full demo update for VC pitch.</p>
+    </div>
+  </div>
+</div>
