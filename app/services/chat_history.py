@@ -319,9 +319,10 @@ async def list_sessions(
         def _fetch() -> list[dict]:
             resp = (
                 supabase.table("chat_sessions")
-                .select("id, title, created_at, updated_at, is_archived")
+                .select("id, title, created_at, updated_at, is_archived, is_pinned")
                 .eq("user_id", user_id)
                 .eq("is_archived", False)
+                .order("is_pinned", desc=True)
                 .order("updated_at", desc=True)
                 .limit(limit)
                 .execute()
