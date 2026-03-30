@@ -519,72 +519,36 @@ async def _fallback_single_intent(
     if progress_callback:
         await progress_callback("intent_classified", {"intent": intent.value, "fallback": True, "model": _fallback_model})
 
-    if intent == IntentType.GREETING:
-        message, thinking_process = await synthesize_jarvis_response({"greeting": True})
-        return ChatResponse(
-            intent=IntentType.GREETING.value,
-            message=message,
-            thinking_process=thinking_process,
-        )
+    # --- Registry-based dispatch ---
+    from app.schemas.context import IntentContext
+    from app.services.intent_registry import intent_registry
 
-    # GENERAL_QA: answer the question directly using 27B
-    if intent == IntentType.GENERAL_QA:
-        return await _direct_qa_response(
-            user_prompt, progress_callback=progress_callback,
-            conversation_history=conversation_history,
-        )
+    intent_key = str(intent.value) if hasattr(intent, "value") else str(intent)
+    entry = intent_registry.get(intent_key)
+    if entry is None:
+        entry = intent_registry.get_or_fallback("CHAT")
 
-    if intent in (
-        IntentType.CALENDAR_SYNC,
-        IntentType.KNOWLEDGE_INGESTION,
-        IntentType.BEHAVIORAL_CONSTRAINT,
-        IntentType.ACTION_ITEM,
-    ):
-        result = await process_ingestion(
-            payload=user_prompt,
-            user_id=user_id,
-            db_client=db_client,
-            intent_override=intent,
-        )
-        execution_summary: dict[str, Any] = {}
-        if result.calendar_result:
-            execution_summary["calendar_extracted"] = True
-            execution_summary["needs_end_date"] = getattr(
-                result.calendar_result, "needs_end_date", False
-            )
-        if result.action_proposal:
-            execution_summary["action_proposal"] = result.action_proposal.model_dump()
-        if intent == IntentType.KNOWLEDGE_INGESTION and result.knowledge_result:
-            execution_summary["knowledge_stored"] = True
-        if execution_summary:
-            message, thinking_process = await synthesize_jarvis_response(execution_summary)
-        else:
-            message = INGESTION_MESSAGES.get(intent, "Saved.")
-            thinking_process = "I processed your input and saved it to your profile."
-        suggested = "replan" if intent == IntentType.BEHAVIORAL_CONSTRAINT else None
-        return ChatResponse(
-            intent=intent.value,
-            message=message,
-            ingestion_result=result.model_dump(),
-            suggested_action=suggested,
-            thinking_process=thinking_process,
-        )
-
-    # PLAN_DAY fallback: run legacy plan-day flow
-    return await _run_plan_day_flow(
-        user_prompt=user_prompt,
+    intent_ctx = IntentContext(
         user_id=user_id,
+        user_prompt=user_prompt,
         db_client=db_client,
-        planning_goal=user_prompt,
-        state_updates=None,
-        use_voice_synthesis=False,
-        day_start_hour_override=day_start_hour_override,
-        max_daily_deep_work_minutes=max_daily_deep_work_minutes,
-        min_daily_deep_work_minutes=min_daily_deep_work_minutes,
-        max_task_duration_minutes=max_task_duration_minutes,
-        min_task_duration_minutes=min_task_duration_minutes,
         progress_callback=progress_callback,
+        conversation_history=conversation_history or [],
+        extra={
+            "day_start_hour_override": day_start_hour_override,
+            "max_daily_deep_work_minutes": max_daily_deep_work_minutes,
+            "min_daily_deep_work_minutes": min_daily_deep_work_minutes,
+            "max_task_duration_minutes": max_task_duration_minutes,
+            "min_task_duration_minutes": min_task_duration_minutes,
+        },
     )
+
+    result = await entry.handler(intent_ctx)
+
+    # Convert dict result back to ChatResponse
+    if isinstance(result, dict):
+        return ChatResponse(**{k: v for k, v in result.items() if k in ChatResponse.model_fields})
+    return result
 
 
 async def _run_plan_day_flow(
