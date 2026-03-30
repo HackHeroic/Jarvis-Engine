@@ -1,9 +1,27 @@
 """Universal Semantic Router and timetable schemas for dynamic scheduling."""
 
+from dataclasses import dataclass, field as dc_field
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+@dataclass
+class IntentContext:
+    """Unified context object passed to every intent handler in the registry."""
+
+    user_id: str
+    user_prompt: str
+    brain_dump: Optional[Any] = None  # BrainDumpExtraction
+    memory_context: str = ""
+    db_client: Any = None
+    progress_callback: Any = None
+    model_mode: str = "auto"
+    draft_store: Any = None
+    memory_store: Any = None
+    conversation_history: list = dc_field(default_factory=list)
+    extra: dict = dc_field(default_factory=dict)
 
 
 class IntentType(str, Enum):
