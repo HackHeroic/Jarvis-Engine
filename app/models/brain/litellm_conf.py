@@ -279,7 +279,14 @@ async def gemini_primary_route(
                 conversation_history=conversation_history,
             )
         except Exception as e:
-            logger.warning("Gemini primary failed, falling back to local: %s", e)
+            logger.warning(
+                "Gemini primary failed (falling back to %s): %s: %s",
+                fallback_model or SLM_ROUTER_MODEL,
+                type(e).__name__,
+                str(e)[:500],
+            )
+    else:
+        logger.info("No GEMINI_API_KEY set, skipping cloud routing")
     return await hybrid_route_query(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
