@@ -112,11 +112,14 @@ async def safe_extract_memories(
     user_message: str,
     assistant_response: str,
     memory_store,
+    db_client=None,
 ) -> None:
     """Fire-and-forget wrapper. Catches ALL errors.
 
     A failed extraction means we miss one memory — not that the user's
     request fails. Called via asyncio.create_task() after the response is sent.
+
+    After extraction, chains PEARL pattern detection if a db_client is available.
     """
     try:
         await extract_memories_from_turn(
@@ -125,5 +128,9 @@ async def safe_extract_memories(
             assistant_response=assistant_response,
             memory_store=memory_store,
         )
+        # Chain PEARL detection after extraction
+        if db_client:
+            from app.services.memory.pearl import detect_patterns
+            detect_patterns(user_id, db_client, memory_store)
     except Exception as e:
-        logger.debug("Memory extraction failed (non-blocking): %s", e)
+        logger.debug("Memory extraction/PEARL failed (non-blocking): %s", e)
