@@ -25,7 +25,7 @@ from app.core.config import (
     MAX_HORIZON_MINUTES,
     SLM_ROUTER_MODEL,
 )
-from app.models.brain.litellm_conf import hybrid_route_query, run_deep_research
+from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query, run_deep_research
 from app.schemas.context import (
     Availability,
     BrainDumpExtraction,
@@ -408,11 +408,11 @@ async def _run_brain_dump_extraction(
                 {"role": m["role"], "content": m["content"][:200] + ("..." if len(m["content"]) > 200 else "")}
                 for m in conversation_history[-4:]
             ]
-        result = await hybrid_route_query(
+        result = await gemini_primary_route(
             user_prompt=user_prompt,
             system_prompt=BRAIN_DUMP_EXTRACTION_PROMPT,
             response_schema=BrainDumpExtraction,
-            model_override=SLM_ROUTER_MODEL,
+            fallback_model=SLM_ROUTER_MODEL,
             conversation_history=_slm_history,
         )
         if isinstance(result, dict):
@@ -694,13 +694,22 @@ async def _run_plan_day_flow(
         enriched_planning_goal = constraint + enriched_planning_goal
 
     async def _call_decompose(force_cloud: bool = False) -> dict:
-        result = await hybrid_route_query(
-            user_prompt=enriched_planning_goal,
-            system_prompt=SYSTEM_PROMPT,
-            response_schema=ExecutionGraph,
-            force_cloud=force_cloud,
-            lenient_validation=True,
-        )
+        if force_cloud:
+            # Explicit cloud retry (undersized decomposition fallback)
+            result = await hybrid_route_query(
+                user_prompt=enriched_planning_goal,
+                system_prompt=SYSTEM_PROMPT,
+                response_schema=ExecutionGraph,
+                force_cloud=True,
+                lenient_validation=True,
+            )
+        else:
+            result = await gemini_primary_route(
+                user_prompt=enriched_planning_goal,
+                system_prompt=SYSTEM_PROMPT,
+                response_schema=ExecutionGraph,
+                fallback_model=_LLM_27B,
+            )
         if isinstance(result, dict):
             return result
         sanitized = _sanitize_llm_json(result)
