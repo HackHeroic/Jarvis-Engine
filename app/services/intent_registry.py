@@ -213,6 +213,19 @@ async def _handle_reject_draft(ctx: Any) -> dict:
     draft_store = ctx.draft_store
     if draft_store and hasattr(draft_store, "reject"):
         await draft_store.reject(ctx.user_id)
+
+    # Store rejection reason as feedback memory for PEARL
+    if ctx.memory_store:
+        try:
+            await ctx.memory_store.store_memory(
+                user_id=ctx.user_id,
+                memory_type="feedback",
+                content=f"User rejected schedule draft: {ctx.user_prompt}",
+                confidence=0.5,
+            )
+        except Exception:
+            pass  # Non-blocking
+
     return {
         "intent": "REJECT_DRAFT",
         "message": "Draft rejected. Tell me what you'd like to change and I'll re-plan.",
