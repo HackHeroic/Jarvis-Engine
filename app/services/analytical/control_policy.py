@@ -25,7 +25,7 @@ from app.core.config import (
     MAX_HORIZON_MINUTES,
     SLM_ROUTER_MODEL,
 )
-from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query, run_deep_research
+from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query, local_primary_route, run_deep_research
 from app.schemas.context import (
     Availability,
     BrainDumpExtraction,
@@ -490,7 +490,7 @@ async def _fallback_single_intent(
 ) -> ChatResponse:
     """Fallback: use single-intent classifier when extraction fails or is empty."""
     try:
-        classify_result = await hybrid_route_query(
+        classify_result = await local_primary_route(
             user_prompt=user_prompt,
             system_prompt=UNIFIED_CLASSIFICATION_PROMPT,
             response_schema=IntentClassification,
@@ -1125,7 +1125,7 @@ async def execute_agentic_flow(
     log_step("1_BRAIN_DUMP", "Extracting planning_goal, habits, action_items, search_queries")
     if progress_callback:
         await progress_callback("brain_dump_extraction", {
-            "model": active_models["classifier"],
+            "model": "gemini-2.5-flash",  # Primary model for brain dump
             "model_mode": model_mode,
             "started_at_ms": int(time_mod.time() * 1000),
         })
