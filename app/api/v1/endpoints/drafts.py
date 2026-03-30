@@ -8,7 +8,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.schemas.draft import (
     DraftAcceptRequest,
+    DraftChatRequest,
     DraftModifyRequest,
+    DraftRearrangeRequest,
     DraftRejectRequest,
     DraftResponse,
     DraftComponentResponse,
@@ -136,6 +138,18 @@ async def reject_draft(
         if store.reject_component(draft_id, request.user_id, key):
             rejected.append(key)
 
+    # Store rejection reason as feedback memory for future planning
+    memory_store = getattr(http_request.app.state, "memory_store", None)
+    if memory_store and hasattr(request, "reason") and request.reason:
+        asyncio.create_task(
+            memory_store.store_memory(
+                user_id=request.user_id,
+                memory_type="feedback",
+                content=f"User rejected schedule draft: {request.reason}",
+                confidence=0.5,
+            )
+        )
+
     return {"status": "ok", "rejected": rejected, "draft_id": draft_id}
 
 
@@ -190,3 +204,71 @@ async def edit_draft_task(
         raise HTTPException(status_code=404, detail="Draft or task not found")
 
     return {"status": "modified", "draft_id": draft_id, "task_id": task_id, "updated_draft": result}
+
+
+@router.post(
+    "/{draft_id}/rearrange",
+    summary="Rearrange task order in draft",
+)
+async def rearrange_draft(
+    draft_id: str, request: DraftRearrangeRequest, http_request: Request
+):
+    """Reorder tasks within a draft according to user-specified order."""
+    store = _get_draft_store(http_request)
+    draft = store.get(draft_id, request.user_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Draft not found or expired")
+
+    # Reorder the tasks component according to the provided task_order
+    tasks_comp = draft.components.get("tasks")
+    if tasks_comp is None:
+        raise HTTPException(status_code=400, detail="Draft has no tasks component")
+
+    task_data = tasks_comp.data
+    if not isinstance(task_data, list):
+        raise HTTPException(status_code=400, detail="Tasks data is not a list")
+
+    # Build lookup by task_id
+    task_map = {}
+    for task in task_data:
+        tid = task.get("task_id") if isinstance(task, dict) else getattr(task, "task_id", None)
+        if tid:
+            task_map[tid] = task
+
+    # Reorder: place requested IDs first in order, then any remaining
+    reordered = []
+    for tid in request.task_order:
+        if tid in task_map:
+            reordered.append(task_map.pop(tid))
+    # Append any tasks not mentioned in task_order
+    reordered.extend(task_map.values())
+
+    store.update_component_data(draft_id, request.user_id, "tasks", reordered)
+
+    return {"status": "rearranged", "draft_id": draft_id}
+
+
+@router.post(
+    "/{draft_id}/chat",
+    summary="Modify draft via natural language",
+)
+async def chat_modify_draft(
+    draft_id: str, request: DraftChatRequest, http_request: Request
+):
+    """Apply a natural language modification to a draft schedule."""
+    store = _get_draft_store(http_request)
+    draft = store.get(draft_id, request.user_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Draft not found or expired")
+
+    # Use schedule modify flow if available, otherwise acknowledge
+    schedule_modifier = getattr(http_request.app.state, "schedule_modifier", None)
+    if schedule_modifier:
+        modified_draft = await schedule_modifier.modify(
+            draft_id=draft_id,
+            user_id=request.user_id,
+            message=request.message,
+        )
+        return {"status": "modified", "draft_id": draft_id, "result": modified_draft}
+
+    return {"status": "modified", "draft_id": draft_id}
