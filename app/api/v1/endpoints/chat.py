@@ -166,6 +166,7 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
         from app.services.memory.extractor import safe_extract_memories
         asyncio.create_task(safe_extract_memories(
             request.user_id, request.user_prompt, response.message, memory_store,
+            db_client=supabase,
         ))
 
     response.conversation_id = session_id
@@ -320,6 +321,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 _resp_text = partial.message or ""
                 asyncio.create_task(safe_extract_memories(
                     request.user_id, request.user_prompt, _resp_text, memory_store,
+                    db_client=supabase,
                 ))
             if _existing_memories:
                 partial_dict["memories"] = [
@@ -404,6 +406,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 _resp_text = message_clean or partial.message or ""
                 asyncio.create_task(safe_extract_memories(
                     request.user_id, request.user_prompt, _resp_text, memory_store,
+                    db_client=supabase,
                 ))
             if _existing_memories:
                 partial_dict["memories"] = [
@@ -437,6 +440,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 _resp_text = partial.message or "Hello!"
                 asyncio.create_task(safe_extract_memories(
                     request.user_id, request.user_prompt, _resp_text, memory_store,
+                    db_client=supabase,
                 ))
             if _existing_memories:
                 partial_dict["memories"] = [
@@ -469,6 +473,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 _resp_text = partial.message or "Here's your schedule."
                 asyncio.create_task(safe_extract_memories(
                     request.user_id, request.user_prompt, _resp_text, memory_store,
+                    db_client=supabase,
                 ))
             if _existing_memories:
                 partial_dict["memories"] = [
@@ -552,6 +557,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             _resp_text = message_clean or partial.message or ""
             asyncio.create_task(safe_extract_memories(
                 request.user_id, request.user_prompt, _resp_text, memory_store,
+                db_client=supabase,
             ))
         if _existing_memories:
             partial_dict["memories"] = [

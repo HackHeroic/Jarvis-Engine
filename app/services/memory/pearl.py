@@ -85,7 +85,7 @@ def detect_skip_time_window(
     return detected
 
 
-def detect_completion_time_preference(
+def detect_duration_preference(
     user_id: str, tasks: list[dict], memory_store, **kwargs
 ) -> list[dict]:
     """Detect which hours the user completes tasks most successfully.
@@ -128,11 +128,86 @@ def detect_completion_time_preference(
                 })
 
             detected.append({
-                "pattern": "completion_time_preference",
+                "pattern": "duration_preference",
                 "hour": hour,
                 "rate": rate,
                 "inference": inference,
             })
+
+    return detected
+
+
+def detect_deadline_buffer(
+    user_id: str, tasks: list[dict], memory_store, **kwargs
+) -> list[dict]:
+    """Detect if user consistently extends deadlines.
+
+    Looks at tasks that have deadline edit metadata (original vs current
+    deadline_hint). If the user extends deadlines on >= MIN_PATTERN_RATE
+    of tasks with MIN_OBSERVATIONS+ edits, create a behavioral pattern
+    recording the average extension days.
+    """
+    detected = []
+
+    # Collect tasks that have deadline extension info
+    extensions: list[float] = []
+    tasks_with_deadlines = 0
+
+    for task in tasks:
+        original_deadline = task.get("original_deadline_hint")
+        current_deadline = task.get("deadline_hint")
+
+        if not original_deadline or not current_deadline:
+            continue
+
+        tasks_with_deadlines += 1
+
+        # Parse ISO date strings to compute extension days
+        try:
+            from datetime import datetime
+            orig = datetime.fromisoformat(original_deadline.replace("Z", "+00:00"))
+            curr = datetime.fromisoformat(current_deadline.replace("Z", "+00:00"))
+            delta_days = (curr - orig).total_seconds() / 86400
+            if delta_days > 0:
+                extensions.append(delta_days)
+        except (ValueError, TypeError):
+            continue
+
+    if tasks_with_deadlines < MIN_OBSERVATIONS:
+        return detected
+
+    extension_rate = len(extensions) / tasks_with_deadlines
+
+    if len(extensions) >= MIN_OBSERVATIONS and extension_rate >= MIN_PATTERN_RATE:
+        avg_days = sum(extensions) / len(extensions)
+        inference = (
+            f"User tends to extend deadlines by ~{avg_days:.1f} days "
+            f"({int(extension_rate * 100)}% of deadlined tasks)"
+        )
+
+        existing = memory_store.find_similar_memory(
+            user_id, inference, memory_type="behavioral_pattern"
+        )
+
+        if existing:
+            memory_store.reinforce_memory(existing["id"], user_id=user_id)
+        else:
+            memory_store.store_memory(user_id, {
+                "type": "behavioral_pattern",
+                "content": inference,
+                "confidence": min(0.9, extension_rate),
+                "source": "behavior",
+                "applied_as": "soft_preference",
+                "observation_count": tasks_with_deadlines,
+            })
+
+        detected.append({
+            "pattern": "deadline_buffer",
+            "avg_extension_days": avg_days,
+            "rate": extension_rate,
+            "total": tasks_with_deadlines,
+            "inference": inference,
+        })
 
     return detected
 
@@ -155,10 +230,22 @@ def register_default_patterns() -> None:
     ))
 
     pearl_registry.register(RegistryEntry(
-        name="completion_time_preference",
+        name="duration_preference",
         description="User completes tasks most successfully at specific hours",
-        handler=detect_completion_time_preference,
+        handler=detect_duration_preference,
         examples=["productive in afternoon", "best focus 2-4 PM"],
+        metadata={
+            "min_observations": MIN_OBSERVATIONS,
+            "min_rate": MIN_PATTERN_RATE,
+            "constraint_type": "soft_preference",
+        },
+    ))
+
+    pearl_registry.register(RegistryEntry(
+        name="deadline_buffer",
+        description="User consistently extends deadlines by a certain number of days",
+        handler=detect_deadline_buffer,
+        examples=["always pushes deadlines back 2 days", "extends due dates"],
         metadata={
             "min_observations": MIN_OBSERVATIONS,
             "min_rate": MIN_PATTERN_RATE,
@@ -192,7 +279,7 @@ def detect_patterns(
     try:
         result = (
             supabase_client.table("user_tasks")
-            .select("task_id, status, scheduled_hour, duration_minutes, difficulty_weight")
+            .select("task_id, status, scheduled_hour, duration_minutes, difficulty_weight, deadline_hint, original_deadline_hint")
             .eq("user_id", user_id)
             .execute()
         )
