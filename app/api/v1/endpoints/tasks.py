@@ -87,7 +87,7 @@ async def _update_task_status(
 
     result = (
         supabase.table("user_tasks")
-        .select("task_id, status, user_id")
+        .select("*")
         .eq("task_id", task_id)
         .eq("user_id", user_id)
         .limit(1)
@@ -224,7 +224,7 @@ async def update_task(
     # Verify task exists and belongs to user
     result = (
         supabase.table("user_tasks")
-        .select("task_id, user_id")
+        .select("*")
         .eq("task_id", task_id)
         .eq("user_id", body.user_id)
         .limit(1)
@@ -280,7 +280,7 @@ async def delete_task(
     # Verify exists
     result = (
         supabase.table("user_tasks")
-        .select("task_id")
+        .select("*")
         .eq("task_id", task_id)
         .eq("user_id", user_id)
         .limit(1)
@@ -353,7 +353,7 @@ async def list_tasks(
 
     query = (
         supabase.table("user_tasks")
-        .select("task_id, title, status, duration_minutes, difficulty_weight, dependencies, deadline_hint, goal_id, created_at")
+        .select("*")
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .limit(200)
@@ -383,7 +383,7 @@ def _update_task_status_sync(
 
     result = (
         supabase.table("user_tasks")
-        .select("task_id, status, user_id")
+        .select("*")
         .eq("task_id", task_id)
         .eq("user_id", user_id)
         .limit(1)
