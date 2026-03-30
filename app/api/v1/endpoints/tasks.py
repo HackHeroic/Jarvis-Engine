@@ -99,7 +99,6 @@ async def _update_task_status(
 
     update_payload = {
         "status": new_status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if extra_fields:
         update_payload.update(extra_fields)
@@ -234,9 +233,7 @@ async def update_task(
     if not (result.data or []):
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found for this user")
 
-    update_payload: dict[str, Any] = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    update_payload: dict[str, Any] = {}
     if body.title is not None:
         update_payload["title"] = body.title
     if body.duration_minutes is not None:
@@ -248,7 +245,7 @@ async def update_task(
     if body.status is not None:
         update_payload["status"] = body.status
 
-    if len(update_payload) <= 1:  # only updated_at
+    if len(update_payload) == 0:
         return TaskResponse(
             task_id=task_id, status="unchanged", message="No fields to update."
         )
@@ -356,7 +353,7 @@ async def list_tasks(
 
     query = (
         supabase.table("user_tasks")
-        .select("task_id, title, status, duration_minutes, difficulty_weight, dependencies, deadline_hint, goal_id, created_at, updated_at, actual_duration_minutes")
+        .select("task_id, title, status, duration_minutes, difficulty_weight, dependencies, deadline_hint, goal_id, created_at")
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .limit(200)
@@ -398,7 +395,6 @@ def _update_task_status_sync(
 
     update_payload = {
         "status": new_status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if extra_fields:
         update_payload.update(extra_fields)
