@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.services.memory.retriever import compute_memory_strength
 from app.utils.embedding import cosine_similarity, embed_text
 
 
@@ -69,10 +70,12 @@ class MemoryStore:
             .select("*")
             .eq("user_id", user_id)
             .is_("superseded_by", "null")
-            .gt("strength", 0.1)
             .execute()
         )
-        return result.data or []
+        rows = result.data or []
+        # Post-fetch: filter out memories whose time-decayed strength < 0.1
+        now = datetime.now(timezone.utc)
+        return [m for m in rows if compute_memory_strength(m, now) >= 0.1]
 
     def get_memories_by_type(self, user_id: str, memory_type: str, min_confidence: float = 0.0) -> list[dict]:
         if not self._supabase:
