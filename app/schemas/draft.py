@@ -38,6 +38,7 @@ class DraftRejectRequest(BaseModel):
 
     user_id: str = Field(..., description="User identifier")
     components: List[str] = Field(..., description="Component keys to reject")
+    reason: Optional[str] = Field(default=None, description="Why the user rejected the draft")
 
 
 class DraftModifyRequest(BaseModel):
@@ -83,6 +84,20 @@ class DraftTaskEdit(BaseModel):
     duration_minutes: int | None = Field(default=None, le=25, description="Max 25 min per task chunk")
     difficulty_weight: float | None = Field(default=None, ge=0, le=1)
     start_min: int | None = None
+
+
+class DraftRearrangeRequest(BaseModel):
+    """Rearrange task order in a draft."""
+
+    user_id: str = Field(..., description="User identifier")
+    task_order: List[str] = Field(..., description="Ordered list of task IDs defining new order")
+
+
+class DraftChatRequest(BaseModel):
+    """Modify a draft via natural language."""
+
+    user_id: str = Field(..., description="User identifier")
+    message: str = Field(..., description="Natural language modification request")
 
 
 class DraftAction(BaseModel):
