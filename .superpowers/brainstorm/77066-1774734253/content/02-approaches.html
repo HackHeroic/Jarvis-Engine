@@ -1,0 +1,105 @@
+<h2>Three Approaches for the Demo Update</h2>
+<p class="subtitle">Each delivers the 3-act demo story. They differ in scope and risk.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)" style="border-left: 4px solid #10b981;">
+    <div class="letter" style="background: #10b981;">A</div>
+    <div class="content">
+      <h3>Recommended: Polish + Strategic Additions</h3>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">~8-10 hours | Low risk | High impact</p>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; font-size: 13px;">
+        <div>
+          <strong style="color: #10b981;">Visual Polish</strong>
+          <ul style="margin: 4px 0; padding-left: 16px;">
+            <li>Light mode as default</li>
+            <li>Clean up color inconsistencies</li>
+            <li>Update intent badge names (PLAN_DAY not GREETING)</li>
+            <li>Professional typography + spacing</li>
+          </ul>
+        </div>
+        <div>
+          <strong style="color: #10b981;">Memory Visibility (NEW)</strong>
+          <ul style="margin: 4px 0; padding-left: 16px;">
+            <li>Small "Jarvis knows" panel in sidebar</li>
+            <li>PEARL insight banners in chat</li>
+            <li>Memory indicator badge on responses</li>
+          </ul>
+        </div>
+        <div>
+          <strong style="color: #10b981;">Draft UX Cleanup</strong>
+          <ul style="margin: 4px 0; padding-left: 16px;">
+            <li>Wire accept/reject to new Supabase DraftStore</li>
+            <li>Add rejection reason prompt</li>
+            <li>Visual draft badge styling</li>
+          </ul>
+        </div>
+        <div>
+          <strong style="color: #10b981;">Document Feedback</strong>
+          <ul style="margin: 4px 0; padding-left: 16px;">
+            <li>Show classification result after upload</li>
+            <li>"Practice problems detected" toast/banner</li>
+            <li>Topics linked indicator</li>
+          </ul>
+        </div>
+      </div>
+      <div style="margin-top: 12px; padding: 8px 12px; background: rgba(16, 185, 129, 0.1); border-radius: 8px; font-size: 13px;">
+        <strong>Why recommended:</strong> Delivers all 3 demo acts. Low risk because it builds on existing components. Light mode default + memory panel = instant "wow" factor.
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Minimal: Visual Polish Only</h3>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">~4-5 hours | Lowest risk | Medium impact</p>
+      <ul style="font-size: 13px; padding-left: 16px;">
+        <li>Light mode default</li>
+        <li>Updated intent badges and colors</li>
+        <li>Clean typography and spacing</li>
+        <li>Fix any broken UI elements</li>
+        <li>Architecture diagrams page updated</li>
+      </ul>
+      <div style="margin-top: 12px; padding: 8px 12px; background: rgba(245, 158, 11, 0.1); border-radius: 8px; font-size: 13px;">
+        <strong>Trade-off:</strong> Safe, but the demo won't show memory/PEARL — the moat stays invisible. Acts 2 and 3 of the demo are just "it works" without the differentiating UX.
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Full Rebuild: New Design System</h3>
+      <p style="font-size: 13px; color: #64748b; margin-bottom: 12px;">~16-20 hours | High risk | Highest potential</p>
+      <ul style="font-size: 13px; padding-left: 16px;">
+        <li>Completely new visual design (shadcn/ui or custom)</li>
+        <li>Memory panel as a first-class sidebar</li>
+        <li>Full draft negotiation with inline editing</li>
+        <li>Document intelligence results page</li>
+        <li>PEARL insights timeline</li>
+        <li>New home page with product narrative</li>
+      </ul>
+      <div style="margin-top: 12px; padding: 8px 12px; background: rgba(239, 68, 68, 0.1); border-radius: 8px; font-size: 13px;">
+        <strong>Trade-off:</strong> Too much for 2 days. Risk of breaking existing functionality. Save for post-pitch v2.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 24px;">
+  <h3>The 3-Act Demo Script (with Approach A)</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;">
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #10b981; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">Act 1: Core Loop (60s)</div>
+      <p style="font-size: 13px; margin: 0;">Brain dump "I have a DL contest Friday" → tasks decomposed → schedule appears → edit a task duration → accept. <strong>Shows:</strong> deterministic scheduling, anti-guilt pacing.</p>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #f59e0b; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">Act 2: Depth (60s)</div>
+      <p style="font-size: 13px; margin: 0;">Add habit "I study best after lunch" → schedule shifts → upload practice PDF → "10 problems linked to your tasks" banner. <strong>Shows:</strong> document intelligence, constraint adaptation.</p>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #8b5cf6; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">Act 3: The Moat (60s)</div>
+      <p style="font-size: 13px; margin: 0;">"Jarvis knows" sidebar shows learned facts. PEARL insight banner: "I noticed you skip morning tasks." Schedule already avoids mornings. <strong>Shows:</strong> memory → constraint bridge.</p>
+    </div>
+  </div>
+</div>

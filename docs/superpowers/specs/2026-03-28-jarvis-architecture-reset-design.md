@@ -144,10 +144,33 @@ User sends message
            │
            ▼
 ┌──────────────────────┐
-│   INTENT REGISTRY    │  LLM classifies into registered intents
-│   CLASSIFICATION     │  Registry is extensible — add new intents by registration
-│                      │  Fallback: CHAT (general conversation)
+│   INTENT REGISTRY    │  Embed input → cosine similarity vs all intent descriptions
+│   CLASSIFICATION     │  Qwen-4B classifies into best-matching registered intent
+│                      │  Static + learned intents. Fallback: CHAT
 └──────────┬───────────┘
+           │
+           ├── [max_similarity < 0.65] ──────────────────────────────────────────────┐
+           │                                                                          ▼
+           │                                                   ┌──────────────────────────────┐
+           │                                                   │   INTENT DISCOVERY ENGINE    │
+           │                                                   │                              │
+           │                                                   │  Real-time: embedding gap    │
+           │                                                   │   → increment freq counter   │
+           │                                                   │   → route to CHAT for now    │
+           │                                                   │                              │
+           │                                                   │  Batch (async):              │
+           │                                                   │   semantic clustering of     │
+           │                                                   │   CHAT fallbacks             │
+           │                                                   │                              │
+           │                                                   │  counter ≥ 3 OR cluster hit: │
+           │                                                   │   Gemini generates           │
+           │                                                   │   IntentBlueprint schema     │
+           │                                                   │                              │
+           │                                                   │  Supervised mode:            │
+           │                                                   │   → propose to user          │
+           │                                                   │  Autonomous mode:            │
+           │                                                   │   → auto-register + notify   │
+           │                                                   └──────────────────────────────┘
            │
            ├── PLAN_DAY ──────────────────────────────────────────────┐
            │                                                          │
@@ -164,6 +187,8 @@ User sends message
            ├── INGEST_DOCUMENT ──► Docling → ChromaDB → link tasks   │
            │                                                          │
            ├── CHECK_PROGRESS ──► Query tasks + completion stats      │
+           │                                                          │
+           ├── DYNAMIC_INTENT ──► Load IntentBlueprint → Execute steps│
            │                                                          │
            └── CHAT ──► General conversation (memory extraction only) │
                                                                       │
@@ -224,6 +249,8 @@ User sends message
 | Voice of Jarvis synthesis | Qwen-4B local | Gemini 2.5 Flash | Creative text, local handles well |
 | Memory extraction | Qwen-4B local | Gemini 2.5 Flash | Background task, doesn't need to be perfect |
 | Real-time web search | Gemini 2.5 Flash | N/A | Only cloud can do this |
+| Intent blueprint generation | Gemini 2.5 Flash | Qwen-4B | Needs deep understanding to generate valid step sequences |
+| Intent pattern clustering (batch) | Qwen-4B local | Gemini 2.5 Flash | Async background task, local quality sufficient |
 
 **Cost at scale:** Gemini 2.5 Flash free tier = 500 requests/day. For a solo developer building, this is plenty. At scale: ~$0.001 per request = $90/month for 1000 daily active users.
 

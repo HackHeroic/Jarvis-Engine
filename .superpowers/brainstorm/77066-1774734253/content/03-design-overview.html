@@ -1,0 +1,131 @@
+<h2>Demo Frontend Update — Full Design</h2>
+<p class="subtitle">Everything that changes, organized by area</p>
+
+<div class="section">
+  <h3>1. Prompt Selector Cards (Both Demo & Live Mode)</h3>
+  <p class="subtitle">Pre-loaded scenarios shown when chat is empty — click to auto-fill</p>
+
+  <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; margin-top: 12px;">
+    <div style="text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 16px;">Try a scenario:</div>
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+
+      <div style="background: linear-gradient(135deg, rgba(16,185,129,0.08), rgba(16,185,129,0.02)); border: 1px solid rgba(16,185,129,0.2); border-radius: 12px; padding: 14px; cursor: pointer; transition: all 0.2s;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+          <span style="font-size: 18px;">🎓</span>
+          <strong style="font-size: 13px; color: #10b981;">Learn a Concept</strong>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin: 0;">"Teach me Dijkstra's algorithm with examples"</p>
+      </div>
+
+      <div style="background: linear-gradient(135deg, rgba(59,130,246,0.08), rgba(59,130,246,0.02)); border: 1px solid rgba(59,130,246,0.2); border-radius: 12px; padding: 14px; cursor: pointer; transition: all 0.2s;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+          <span style="font-size: 18px;">📋</span>
+          <strong style="font-size: 13px; color: #3b82f6;">Plan a Complex Task</strong>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin: 0;">"I have a deep learning contest Friday and a math exam Monday"</p>
+      </div>
+
+      <div style="background: linear-gradient(135deg, rgba(245,158,11,0.08), rgba(245,158,11,0.02)); border: 1px solid rgba(245,158,11,0.2); border-radius: 12px; padding: 14px; cursor: pointer; transition: all 0.2s;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+          <span style="font-size: 18px;">⚡</span>
+          <strong style="font-size: 13px; color: #f59e0b;">Add Contradicting Habit</strong>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin: 0;">"I don't work before 2 PM and need 1-hour breaks between sessions"</p>
+      </div>
+
+      <div style="background: linear-gradient(135deg, rgba(139,92,246,0.08), rgba(139,92,246,0.02)); border: 1px solid rgba(139,92,246,0.2); border-radius: 12px; padding: 14px; cursor: pointer; transition: all 0.2s;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 6px;">
+          <span style="font-size: 18px;">📄</span>
+          <strong style="font-size: 13px; color: #8b5cf6;">Upload & Link Material</strong>
+        </div>
+        <p style="font-size: 12px; color: var(--muted); margin: 0;">Attach a PDF with practice problems → auto-linked to tasks</p>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. Visual Enhancements</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <h4 style="margin: 0 0 8px; font-size: 14px;">Motion / Framer Motion</h4>
+      <ul style="font-size: 13px; padding-left: 16px; margin: 0;">
+        <li>Chat messages slide in with spring animation</li>
+        <li>Schedule tasks animate into calendar slots</li>
+        <li>Phase indicators pulse with smooth transitions</li>
+        <li>Prompt cards have hover lift + scale</li>
+        <li>Memory panel slides in from right</li>
+      </ul>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <h4 style="margin: 0 0 8px; font-size: 14px;">GSAP (Heavy Animations)</h4>
+      <ul style="font-size: 13px; padding-left: 16px; margin: 0;">
+        <li>Home page hero — text reveal with stagger</li>
+        <li>Architecture diagram nodes animate in sequence</li>
+        <li>Schedule timeline draws itself</li>
+        <li>Page transitions with smooth scroll</li>
+      </ul>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <h4 style="margin: 0 0 8px; font-size: 14px;">Spline 3D (Hero Only)</h4>
+      <ul style="font-size: 13px; padding-left: 16px; margin: 0;">
+        <li>3D brain/neural network on home page hero</li>
+        <li>Interactive — responds to mouse movement</li>
+        <li>Reinforces the "AI productivity engine" brand</li>
+        <li>Lightweight embed via @splinetool/react-spline</li>
+      </ul>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <h4 style="margin: 0 0 8px; font-size: 14px;">Light Mode Default + Polish</h4>
+      <ul style="font-size: 13px; padding-left: 16px; margin: 0;">
+        <li>Light mode as default (not system preference)</li>
+        <li>Emerald accent stays — clean, professional</li>
+        <li>Card shadows refined (subtle, not harsh)</li>
+        <li>Typography: Inter or system font, proper sizes</li>
+        <li>Consistent border-radius (12px everywhere)</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. New UI Components</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px;">
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #10b981; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">Memory Panel</div>
+      <p style="font-size: 13px; margin: 0;">Collapsible sidebar showing what Jarvis knows: facts, preferences, patterns, constraints. Grouped by type with confidence indicators.</p>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #f59e0b; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">PEARL Insight Banner</div>
+      <p style="font-size: 13px; margin: 0;">Animated banner in chat: "I noticed you skip morning tasks — I've adjusted your schedule." Appears after pattern detection.</p>
+    </div>
+    <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+      <div style="font-size: 12px; color: #8b5cf6; font-weight: 600; text-transform: uppercase; margin-bottom: 8px;">Document Classification Toast</div>
+      <p style="font-size: 13px; margin: 0;">After PDF upload: "Practice problems detected — 10 problems linked to 3 tasks." Slides in from bottom-right.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>4. Mode Toggle (Demo / Live)</h3>
+  <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 16px;">
+    <p style="font-size: 13px; margin: 0 0 8px;"><strong>Demo Mode:</strong> Uses mock data from demoData.ts with simulated streaming. Prompt selectors auto-trigger pre-built responses. Works offline — no LM Studio needed.</p>
+    <p style="font-size: 13px; margin: 0 0 8px;"><strong>Live Mode:</strong> Hits the real backend. Prompt selectors fill the input but user clicks Send. Real streaming, real schedule, real memory extraction.</p>
+    <p style="font-size: 13px; margin: 0;"><strong>Both modes</strong> show the same prompt selector cards. Both modes show memory panel + PEARL insights. The difference is data source (mock vs real).</p>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 16px; padding: 16px; background: rgba(16,185,129,0.05); border: 1px solid rgba(16,185,129,0.2); border-radius: 12px;">
+  <h3 style="margin-top: 0; color: #10b981;">Demo Flow for VC Pitch</h3>
+  <div style="font-size: 13px;">
+    <p><strong>1. Open app</strong> → Light mode, clean hero with Spline 3D brain, "Reclaim your focus" headline</p>
+    <p><strong>2. Click "Try Chat"</strong> → See 4 scenario cards</p>
+    <p><strong>3. Click "Learn a Concept"</strong> → Jarvis explains Dijkstra's with structured response (shows general QA works)</p>
+    <p><strong>4. Click "Plan Complex Task"</strong> → Tasks decomposed → animated schedule → draft review UX</p>
+    <p><strong>5. Click "Add Contradicting Habit"</strong> → Schedule recalibrates → animation shows tasks shifting</p>
+    <p><strong>6. Click "Upload Material"</strong> → Document classification toast → "problems linked" feedback</p>
+    <p><strong>7. Show Memory Panel</strong> → "Jarvis knows" sidebar slides in → facts, patterns listed</p>
+    <p style="margin-bottom: 0;"><strong>8. PEARL Insight</strong> → Banner: "I noticed you skip morning tasks" → Schedule already avoids mornings</p>
+  </div>
+</div>

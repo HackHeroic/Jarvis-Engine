@@ -72,6 +72,7 @@ class UpdateSessionRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     title: Optional[str] = Field(default=None, description="New title")
     is_archived: Optional[bool] = Field(default=None, description="Archive/unarchive")
+    is_pinned: Optional[bool] = Field(default=None, description="Pin/unpin")
 
 
 @router.put("/{session_id}", summary="Update session")
@@ -89,17 +90,41 @@ async def update_session(
         updates["title"] = request.title
     if request.is_archived is not None:
         updates["is_archived"] = request.is_archived
+    if request.is_pinned is not None:
+        updates["is_pinned"] = request.is_pinned
 
     if not updates:
         return {"status": "no_changes"}
 
     def _update():
         supabase.table("chat_sessions").update(updates).eq(
-            "session_id", session_id
+            "id", session_id
         ).eq("user_id", request.user_id).execute()
 
     await asyncio.to_thread(_update)
     return {"status": "updated", "session_id": session_id}
+
+
+@router.delete("/", summary="Archive all sessions")
+async def delete_all_sessions(user_id: str, http_request: Request):
+    """Soft-delete (archive) all sessions for a user."""
+    db_client = getattr(http_request.app.state, "db_client", None)
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    def _archive_all():
+        result = (
+            supabase.table("chat_sessions")
+            .update({"is_archived": True})
+            .eq("user_id", user_id)
+            .eq("is_archived", False)
+            .execute()
+        )
+        return len(result.data) if result.data else 0
+
+    count = await asyncio.to_thread(_archive_all)
+    return {"status": "archived", "archived_count": count}
 
 
 @router.delete("/{session_id}", summary="Archive session")
@@ -113,7 +138,7 @@ async def delete_session(session_id: str, user_id: str, http_request: Request):
     def _archive():
         supabase.table("chat_sessions").update(
             {"is_archived": True}
-        ).eq("session_id", session_id).eq("user_id", user_id).execute()
+        ).eq("id", session_id).eq("user_id", user_id).execute()
 
     await asyncio.to_thread(_archive)
     return {"status": "archived", "session_id": session_id}
