@@ -20,8 +20,9 @@ class TestPearlRegistry:
     def test_default_patterns_registered(self):
         names = pearl_registry.registered_names()
         assert "skip_time_window" in names
-        assert "completion_time_preference" in names
-        assert len(names) >= 2
+        assert "duration_preference" in names
+        assert "deadline_buffer" in names
+        assert len(names) >= 3
 
     def test_all_patterns_have_handlers(self):
         for name in pearl_registry.registered_names():
