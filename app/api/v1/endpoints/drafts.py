@@ -245,7 +245,8 @@ async def rearrange_draft(
 
     store.update_component_data(draft_id, request.user_id, "tasks", reordered)
 
-    return {"status": "rearranged", "draft_id": draft_id}
+    # TODO: Trigger OR-Tools re-solve after rearrange to recompute valid start times
+    return {"status": "rearranged", "draft_id": draft_id, "task_count": len(reordered), "needs_resolve": True}
 
 
 @router.post(

@@ -88,53 +88,37 @@ def detect_skip_time_window(
 def detect_duration_preference(
     user_id: str, tasks: list[dict], memory_store, **kwargs
 ) -> list[dict]:
-    """Detect which hours the user completes tasks most successfully.
+    """Detect if user consistently edits task durations shorter."""
+    edited = [t for t in tasks if t.get("original_duration_minutes") and t.get("duration_minutes")]
+    if len(edited) < MIN_OBSERVATIONS:
+        return []
 
-    The inverse of skip detection — finds productive time windows.
-    """
-    detected = []
+    shorter_count = sum(
+        1 for t in edited
+        if t["duration_minutes"] < t["original_duration_minutes"]
+    )
+    rate = shorter_count / len(edited)
 
-    hour_buckets: dict[int, list[dict]] = {}
-    for task in tasks:
-        hour = task.get("scheduled_hour")
-        if hour is not None:
-            hour_buckets.setdefault(hour, []).append(task)
+    if rate < MIN_PATTERN_RATE:
+        return []
 
-    for hour, bucket in hour_buckets.items():
-        total = len(bucket)
-        if total < MIN_OBSERVATIONS:
-            continue
+    avg_original = sum(t["original_duration_minutes"] for t in edited) / len(edited)
+    avg_edited = sum(t["duration_minutes"] for t in edited) / len(edited)
+    pattern_content = f"User prefers shorter tasks (avg edited from {avg_original:.0f} to {avg_edited:.0f} minutes)"
 
-        completed = sum(1 for t in bucket if t.get("status") == "completed")
-        rate = completed / total
+    existing = memory_store.find_similar_memory(user_id, "behavioral_pattern", "duration_preference")
+    if existing:
+        memory_store.reinforce_memory(existing["id"], user_id)
+        return [{"pattern": "duration_preference", "action": "reinforced"}]
 
-        if rate >= MIN_PATTERN_RATE:
-            inference = f"User is most productive during hour {hour} (completed {int(rate * 100)}%)"
-
-            existing = memory_store.find_similar_memory(
-                user_id, inference, memory_type="behavioral_pattern"
-            )
-
-            if existing:
-                memory_store.reinforce_memory(existing["id"], user_id=user_id)
-            else:
-                memory_store.store_memory(user_id, {
-                    "type": "behavioral_pattern",
-                    "content": inference,
-                    "confidence": min(0.9, rate),
-                    "source": "behavior",
-                    "applied_as": "soft_preference",
-                    "observation_count": total,
-                })
-
-            detected.append({
-                "pattern": "duration_preference",
-                "hour": hour,
-                "rate": rate,
-                "inference": inference,
-            })
-
-    return detected
+    memory_store.store_memory(
+        user_id=user_id,
+        memory_type="behavioral_pattern",
+        content=pattern_content,
+        confidence=min(0.9, rate),
+        metadata={"pattern_name": "duration_preference", "applied_as": "adjust_defaults", "avg_duration": avg_edited},
+    )
+    return [{"pattern": "duration_preference", "action": "created", "avg_duration": avg_edited}]
 
 
 def detect_deadline_buffer(
@@ -231,9 +215,9 @@ def register_default_patterns() -> None:
 
     pearl_registry.register(RegistryEntry(
         name="duration_preference",
-        description="User completes tasks most successfully at specific hours",
+        description="User consistently edits task durations shorter",
         handler=detect_duration_preference,
-        examples=["productive in afternoon", "best focus 2-4 PM"],
+        examples=["always shortens 30-min tasks to 15", "prefers shorter durations"],
         metadata={
             "min_observations": MIN_OBSERVATIONS,
             "min_rate": MIN_PATTERN_RATE,
@@ -279,7 +263,7 @@ def detect_patterns(
     try:
         result = (
             supabase_client.table("user_tasks")
-            .select("task_id, status, scheduled_hour, duration_minutes, difficulty_weight, deadline_hint, original_deadline_hint")
+            .select("task_id, status, scheduled_hour, duration_minutes, original_duration_minutes, difficulty_weight, deadline_hint, original_deadline_hint")
             .eq("user_id", user_id)
             .execute()
         )
@@ -355,22 +339,11 @@ def generate_proactive_insights(
                     f"I've noticed you tend to skip tasks around {time_desc}. "
                     f"I've adjusted your schedule to avoid scheduling deep work at that time."
                 )
-        elif "most productive during hour" in content:
-            match = re.search(r"hour (\d+)", content)
-            if match:
-                hour = int(match.group(1))
-                if hour == 0:
-                    time_desc = "12 AM"
-                elif hour < 12:
-                    time_desc = f"{hour} AM"
-                elif hour == 12:
-                    time_desc = "12 PM"
-                else:
-                    time_desc = f"{hour - 12} PM"
-                insights.append(
-                    f"You seem to be most productive around {time_desc}. "
-                    f"I'll prioritize your hardest tasks during that window."
-                )
+        elif "prefers shorter tasks" in content:
+            insights.append(
+                f"I've noticed you often shorten task durations. "
+                f"I'll default to shorter time blocks for new tasks."
+            )
         else:
             insights.append(f"Pattern observed: {content}")
 
