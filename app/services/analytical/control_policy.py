@@ -485,6 +485,8 @@ async def _fallback_single_intent(
     min_task_duration_minutes: Optional[int] = None,
     progress_callback: ProgressCallback = None,
     conversation_history: list[dict] | None = None,
+    draft_store: Optional[Any] = None,
+    memory_store: Optional[Any] = None,
 ) -> ChatResponse:
     """Fallback: use single-intent classifier when extraction fails or is empty."""
     try:
@@ -534,6 +536,8 @@ async def _fallback_single_intent(
         db_client=db_client,
         progress_callback=progress_callback,
         conversation_history=conversation_history or [],
+        draft_store=draft_store,
+        memory_store=memory_store,
         extra={
             "day_start_hour_override": day_start_hour_override,
             "max_daily_deep_work_minutes": max_daily_deep_work_minutes,
@@ -1147,6 +1151,8 @@ async def execute_agentic_flow(
             min_task_duration_minutes=min_task_duration_minutes,
             progress_callback=progress_callback,
             conversation_history=conversation_history,
+            draft_store=draft_store,
+            memory_store=memory_store,
         )
 
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -1176,6 +1182,8 @@ async def execute_agentic_flow(
                     min_task_duration_minutes=min_task_duration_minutes,
                     progress_callback=progress_callback,
                     conversation_history=conversation_history,
+                    draft_store=draft_store,
+                    memory_store=memory_store,
                 )
 
     execution_summary: dict[str, Any] = {}

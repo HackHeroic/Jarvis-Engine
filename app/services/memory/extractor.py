@@ -6,6 +6,7 @@ Uses Qwen-4B (prefer_local=True) since this is a background task
 that doesn't need to be perfect — a missed extraction is fine.
 """
 
+import asyncio
 import logging
 
 from app.models.brain.litellm_conf import hybrid_route_query
@@ -131,6 +132,6 @@ async def safe_extract_memories(
         # Chain PEARL detection after extraction
         if db_client:
             from app.services.memory.pearl import detect_patterns
-            detect_patterns(user_id, db_client, memory_store)
+            await asyncio.to_thread(detect_patterns, user_id, db_client, memory_store)
     except Exception as e:
         logger.debug("Memory extraction/PEARL failed (non-blocking): %s", e)
