@@ -1,6 +1,7 @@
 """Hybrid routing logic for LiteLLM: Local Qwen (LM Studio) vs Cloud Gemini."""
 
 import json
+import logging
 import os
 import re
 from collections.abc import AsyncGenerator
@@ -15,8 +16,11 @@ from app.core.config import (
     GEMINI_MODEL,
     GEMINI_PRIMARY,
     LITELLM_VERBOSE,
+    SLM_ROUTER_MODEL,
     SLM_ROUTER_URL,
 )
+
+logger = logging.getLogger(__name__)
 
 # Cloud keywords: Real-Time Research (L9) only. Local-First: all other requests
 # (including decomposition, academic topics like SARIMAX) go to local Qwen.
@@ -253,6 +257,70 @@ async def hybrid_route_query(
                     return json.loads(content_sanitized)
                 raise e
     return content
+
+
+async def gemini_primary_route(
+    user_prompt: str,
+    system_prompt: str,
+    response_schema: type[BaseModel] | None = None,
+    fallback_model: str | None = None,
+    stream: bool = False,
+    conversation_history: list[dict] | None = None,
+) -> str | dict:
+    """Route to Gemini 2.5 Flash primary. Fall back to local on failure."""
+    if GEMINI_API_KEY:
+        try:
+            return await hybrid_route_query(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+                force_cloud=True,
+                stream=stream,
+                conversation_history=conversation_history,
+            )
+        except Exception as e:
+            logger.warning("Gemini primary failed, falling back to local: %s", e)
+    return await hybrid_route_query(
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        response_schema=response_schema,
+        model_override=fallback_model or SLM_ROUTER_MODEL,
+        stream=stream,
+        conversation_history=conversation_history,
+    )
+
+
+async def local_primary_route(
+    user_prompt: str,
+    system_prompt: str,
+    response_schema: type[BaseModel] | None = None,
+    model_override: str | None = None,
+    stream: bool = False,
+    conversation_history: list[dict] | None = None,
+) -> str | dict:
+    """Route to local Qwen-4B SLM primary. Fall back to Gemini on failure."""
+    target = model_override or SLM_ROUTER_MODEL
+    try:
+        return await hybrid_route_query(
+            user_prompt=user_prompt,
+            system_prompt=system_prompt,
+            response_schema=response_schema,
+            model_override=target,
+            stream=stream,
+            conversation_history=conversation_history,
+        )
+    except Exception as e:
+        logger.warning("Local primary (%s) failed, falling back to Gemini: %s", target, e)
+        if GEMINI_API_KEY:
+            return await hybrid_route_query(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                response_schema=response_schema,
+                force_cloud=True,
+                stream=stream,
+                conversation_history=conversation_history,
+            )
+        raise
 
 
 async def run_deep_research(queries: list[str]) -> dict:
