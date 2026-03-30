@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from app.utils.embedding import cosine_similarity
 
 # Type-based importance weights (higher = more important to surface)
-IMPORTANCE_WEIGHTS = {
+IMPORTANCE_WEIGHTS: dict[str, float] = {
     "constraint": 1.0,
     "behavioral_pattern": 0.9,
     "preference": 0.8,
