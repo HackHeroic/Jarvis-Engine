@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1.endpoints import chat, documents, habits, reasoning, schedule, ingestion, tasks, workspace, lmstudio_chat
 from app.api.v1.endpoints.drafts import router as drafts_router
+from app.api.v1.endpoints.memories import router as memories_router
 from app.api.v1.endpoints.sessions import router as sessions_router
 
 api_router = APIRouter()
@@ -53,4 +54,5 @@ api_router.include_router(
     tags=["Documents"],
 )
 api_router.include_router(drafts_router, prefix="/drafts", tags=["drafts"])
+api_router.include_router(memories_router, prefix="/memories", tags=["Memories"])
 api_router.include_router(sessions_router, prefix="/sessions", tags=["Sessions"])

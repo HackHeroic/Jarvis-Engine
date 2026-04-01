@@ -32,6 +32,7 @@ from app.schemas.context import (
     ChatResponse,
     IntentClassification,
     IntentType,
+    SchedulePayload,
     TimeSlot,
 )
 from app.services.analytical.habit_translator import translate_habits_to_slots
@@ -62,7 +63,9 @@ _DECOMPOSE_CACHE_TTL_S = 14400  # 4 hours (was 3600)
 BRAIN_DUMP_EXTRACTION_PROMPT = (
     "You extract components from a user's brain-dump message. "
     "Parse the message and populate each field. Use null/empty for missing categories.\n\n"
-    "planning_goal: Schedule tasks, break down goal, plan day. Clean goal string only (e.g. 'Plan my day to write 3 posts'). "
+    "planning_goal: The user's scheduling intent WITH all specific subjects, topics, exams, contests, and deadlines preserved verbatim. "
+    "Include domain details — never reduce to a generic summary. "
+    "E.g. 'Plan my week for deep learning contest Friday and calculus exam Monday', NOT just 'Plan my week'. "
     "Use null for greetings, chitchat, questions, or very short non-goals (e.g. 'hi', 'hello', 'what is X', 'teach me X'). "
     "Only extract when the user clearly wants to plan or schedule.\n"
     "inline_habits: Extract the EXACT, VERBATIM phrase for each long-term constraint. "
@@ -84,6 +87,8 @@ BRAIN_DUMP_EXTRACTION_PROMPT = (
     "E.g. 'exam on March 20' -> '2026-03-20'. Use null if none.\n\n"
     "When the message contains extracted document text (long text from a PDF/file), "
     "set has_knowledge=true. If it looks like a timetable, set has_calendar=true instead.\n\n"
+    "subject_context: List of specific subjects/topics/exams mentioned with any associated time references. "
+    "E.g. [\"deep learning contest - Friday\", \"calculus exam - Monday\"]. Use null if no specific subjects mentioned.\n"
     "Return strictly valid JSON."
 )
 
@@ -155,38 +160,52 @@ def _build_planning_context(
     user_id: str,
     planning_goal: str,
     supabase_client: Any,
+    extraction: Any = None,
 ) -> str:
-    """Enrich planning_goal with deadline context from user_plan_updates."""
-    if not supabase_client or not user_id:
-        return planning_goal
-    try:
-        result = (
-            supabase_client.table("user_plan_updates")
-            .select("deadline_date, deadline_raw, context_snippet")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(10)
-            .execute()
-        )
-        rows = result.data or []
-        goal_words = set(planning_goal.lower().split())
-        for r in rows:
-            snippet = (r.get("context_snippet") or "").lower()
-            if not snippet or not goal_words:
-                continue
-            snippet_words = set(snippet.split())
-            if goal_words & snippet_words:
-                deadline_date = r.get("deadline_date")
-                if deadline_date:
-                    return f"[Context: Known deadline for this goal: {deadline_date}.] {planning_goal}"
-                break
-        for r in rows:
-            deadline_date = r.get("deadline_date")
-            if deadline_date:
-                return f"[Context: Known deadline: {deadline_date}.] {planning_goal}"
-    except Exception as e:
-        print(f"[Control Policy] _build_planning_context failed: {e}")
-    return planning_goal
+    """Enrich planning_goal with deadline context from user_plan_updates and extraction."""
+    enriched = planning_goal
+    if supabase_client and user_id:
+        try:
+            result = (
+                supabase_client.table("user_plan_updates")
+                .select("deadline_date, deadline_raw, context_snippet")
+                .eq("user_id", user_id)
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+            )
+            rows = result.data or []
+            goal_words = set(planning_goal.lower().split())
+            matched = False
+            for r in rows:
+                snippet = (r.get("context_snippet") or "").lower()
+                if not snippet or not goal_words:
+                    continue
+                snippet_words = set(snippet.split())
+                if goal_words & snippet_words:
+                    deadline_date = r.get("deadline_date")
+                    if deadline_date:
+                        enriched = f"[Context: Known deadline for this goal: {deadline_date}.] {planning_goal}"
+                        matched = True
+                    break
+            if not matched:
+                for r in rows:
+                    deadline_date = r.get("deadline_date")
+                    if deadline_date:
+                        enriched = f"[Context: Known deadline: {deadline_date}.] {planning_goal}"
+                        break
+        except Exception as e:
+            print(f"[Control Policy] _build_planning_context failed: {e}")
+
+    # Append deadline from current extraction
+    if extraction and hasattr(extraction, "deadline_update") and extraction.deadline_update:
+        enriched += f" [Deadline: {extraction.deadline_update}]"
+
+    # Append subject context from current extraction
+    if extraction and hasattr(extraction, "subject_context") and extraction.subject_context:
+        enriched += f" [Subjects: {', '.join(extraction.subject_context)}]"
+
+    return enriched
 
 
 def _get_plan_deadlines_from_db(
@@ -276,14 +295,22 @@ def _validate_master_chunk_dependencies(chunks: list[TaskChunk]) -> None:
 
 def _persist_fused_tasks(
     user_id: str,
-    chunks: list[TaskChunk],
+    chunks: list,
     supabase_client: Any,
+    schedule: dict | None = None,
+    horizon_start: str | None = None,
 ) -> None:
     """Replace all pending user_tasks with the fused master chunk list.
 
     Deletes existing pending rows, then inserts fresh rows for each chunk.
     Chunks must have prefixed task_ids (goal_id_orig_id). Full TaskChunk fields
     are persisted for retrieval by get_all_pending_tasks.
+
+    Args:
+        schedule: Optional dict mapping task_id -> {"start_min": int, "end_min": int}
+                  (OR-Tools output). Used to compute wall-clock scheduled_start/end.
+        horizon_start: Optional ISO-8601 datetime string representing minute-0 of
+                       the scheduling horizon.
 
     Safety: will NOT delete if chunks list is empty (prevents accidental wipe
     when task retrieval fails upstream).
@@ -296,24 +323,93 @@ def _persist_fused_tasks(
     try:
         plan_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Parse horizon_start for wall-clock computation
+        horizon_dt: datetime | None = None
+        if horizon_start:
+            try:
+                horizon_dt = datetime.fromisoformat(horizon_start)
+            except (ValueError, TypeError):
+                print(f"[Control Policy] Could not parse horizon_start: {horizon_start}")
+
         rows: list[dict[str, Any]] = []
 
         for chunk in chunks:
-            goal_id = _infer_goal_id_from_task_id(chunk.task_id)
+            # Support both Pydantic TaskChunk objects and plain dicts
+            task_id = getattr(chunk, "task_id", None) or (chunk.get("task_id") if isinstance(chunk, dict) else None)
+            title = getattr(chunk, "title", None) or (chunk.get("title") if isinstance(chunk, dict) else None)
+            duration = getattr(chunk, "duration_minutes", None) or (chunk.get("duration_minutes") if isinstance(chunk, dict) else None)
+            difficulty = getattr(chunk, "difficulty_weight", None)
+            if difficulty is None and isinstance(chunk, dict):
+                difficulty = chunk.get("difficulty_weight")
+            deps = getattr(chunk, "dependencies", None)
+            if deps is None and isinstance(chunk, dict):
+                deps = chunk.get("dependencies", [])
+            deadline = getattr(chunk, "deadline_hint", None)
+            if deadline is None and isinstance(chunk, dict):
+                deadline = chunk.get("deadline_hint")
+
+            goal_id = _infer_goal_id_from_task_id(task_id) if task_id else None
+
             row = {
                 "user_id": user_id,
                 "plan_id": plan_id,
-                "task_id": chunk.task_id,
-                "title": chunk.title,
+                "task_id": task_id,
+                "title": title,
                 "status": "pending",
-                "duration_minutes": chunk.duration_minutes,
-                "difficulty_weight": chunk.difficulty_weight,
-                "dependencies": chunk.dependencies,
-                "deadline_hint": chunk.deadline_hint,
+                "duration_minutes": duration,
+                "difficulty_weight": difficulty,
+                "dependencies": deps,
+                "deadline_hint": deadline,
                 "created_at": now_iso,
             }
             if goal_id:
                 row["goal_id"] = goal_id
+
+            # --- Completion criteria ---
+            cc = getattr(chunk, "completion_criteria", None)
+            if cc is None and isinstance(chunk, dict):
+                cc = chunk.get("completion_criteria")
+            if cc:
+                row["completion_criteria"] = cc
+
+            # --- Implementation intention (WOOP) ---
+            ii = getattr(chunk, "implementation_intention", None)
+            if ii is None and isinstance(chunk, dict):
+                ii = chunk.get("implementation_intention")
+            if ii is not None:
+                # Convert Pydantic model to dict if needed
+                if hasattr(ii, "model_dump"):
+                    ii = ii.model_dump()
+                elif hasattr(ii, "dict"):
+                    ii = ii.dict()
+                row["implementation_intention"] = ii
+
+            # --- Topic keywords ---
+            tk = getattr(chunk, "topic_keywords", None)
+            if tk is None and isinstance(chunk, dict):
+                tk = chunk.get("topic_keywords")
+            if tk:
+                row["topic_keywords"] = tk
+
+            # --- Scheduled start/end from OR-Tools schedule ---
+            if schedule and task_id and task_id in schedule and horizon_dt:
+                slot = schedule[task_id]
+                # Support both "start"/"end" and "start_min"/"end_min" keys
+                if isinstance(slot, dict):
+                    start_min = slot.get("start_min") or slot.get("start")
+                    end_min = slot.get("end_min") or slot.get("end")
+                elif hasattr(slot, "start_min"):
+                    start_min = slot.start_min
+                    end_min = slot.end_min
+                else:
+                    start_min = None
+                    end_min = None
+
+                if start_min is not None and end_min is not None:
+                    row["scheduled_start"] = (horizon_dt + timedelta(minutes=int(start_min))).isoformat()
+                    row["scheduled_end"] = (horizon_dt + timedelta(minutes=int(end_min))).isoformat()
+
             rows.append(row)
 
         # Delete AFTER building rows — if row construction fails, existing tasks survive
@@ -577,8 +673,25 @@ async def _run_plan_day_flow(
     draft: Optional[Any] = None,
     draft_store: Optional[Any] = None,
     memory_store=None,
+    extraction: Any = None,
+    memory_context: str = "",
 ) -> ChatResponse:
     """Run PLAN_DAY pipeline: save habits, fetch habits, translate, decompose, schedule."""
+
+    def _get_plan_memories():
+        if not memory_store:
+            return None
+        try:
+            active = memory_store.get_active_memories(user_id)
+            return [
+                {"memory_type": m.get("memory_type"), "content": m.get("content"),
+                 "confidence": m.get("confidence", 0.5), "source": m.get("source", "inferred"),
+                 "id": m.get("id")}
+                for m in (active or [])[:20]
+            ]
+        except Exception:
+            return None
+
     from app.core.config import LOCAL_LLM_MODEL as _LLM_27B
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
@@ -619,11 +732,21 @@ async def _run_plan_day_flow(
     plan_start = datetime.now(timezone.utc)
     resolved_day_start = day_start_hour_override or DAY_START_HOUR
     plan_date = plan_start.date()
-    # Logical Day Fix: If it's 1 AM, we are still in "yesterday's" schedule window
+    # Logical Day Fix: If it's before DAY_START_HOUR UTC, we are still in "yesterday's" schedule window
     if plan_start.hour < resolved_day_start:
         plan_date -= timedelta(days=1)
     horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+
+    # Safety: if horizon_start is more than 16 hours in the past, snap forward to today/tomorrow
+    # This handles timezone mismatches where UTC date != user's local date
     past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
+    if past_minutes > 960:  # More than 16 hours ago — horizon is stale
+        plan_date = plan_start.date()
+        horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+        if horizon_start < plan_start:
+            # DAY_START already passed today — start from tomorrow
+            horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=timezone.utc)
+        past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
 
     # Inject memory-derived constraints (PEARL patterns + explicit constraints)
     memory_constraints: list = []
@@ -632,6 +755,16 @@ async def _run_plan_day_flow(
         memory_constraints = await asyncio.to_thread(
             memories_to_constraints, user_id, memory_store
         )
+        if memory_constraints:
+            log_step(
+                "P1_CONSTRAINT_BRIDGE",
+                f"{len(memory_constraints)} constraints for user {user_id}",
+                {"constraints": [f"{c.name}: {c.start_min}-{c.end_min} ({c.availability})" for c in memory_constraints]},
+            )
+        else:
+            log_step("P1_CONSTRAINT_BRIDGE", "No memory constraints produced", {"user_id": user_id})
+    else:
+        log_step("P1_CONSTRAINT_BRIDGE", "Memory store unavailable — skipping constraint bridge", {"user_id": user_id})
 
     def _build_daily_context(horizon_minutes: int) -> list:
         ctx = expand_semantic_slots_to_time_slots(
@@ -651,7 +784,7 @@ async def _run_plan_day_flow(
             ctx.insert(0, past_slot)
         return ctx
 
-    enriched_planning_goal = _build_planning_context(user_id, planning_goal, supabase)
+    enriched_planning_goal = _build_planning_context(user_id, planning_goal, supabase, extraction=extraction)
     if max_task_duration_minutes or min_task_duration_minutes:
         parts = []
         if min_task_duration_minutes:
@@ -661,11 +794,19 @@ async def _run_plan_day_flow(
         constraint = "[Constraint: Each task must be " + " and ".join(parts) + ".] "
         enriched_planning_goal = constraint + enriched_planning_goal
 
+    # Inject memory context into decomposition prompt
+    decompose_input = enriched_planning_goal
+    if memory_context:
+        decompose_input = (
+            f"[User Context from Memory]\n{memory_context}\n\n"
+            f"[Planning Goal]\n{enriched_planning_goal}"
+        )
+
     async def _call_decompose(force_cloud: bool = False) -> dict:
         if force_cloud:
             # Explicit cloud retry (undersized decomposition fallback)
             result = await hybrid_route_query(
-                user_prompt=enriched_planning_goal,
+                user_prompt=decompose_input,
                 system_prompt=SYSTEM_PROMPT,
                 response_schema=ExecutionGraph,
                 force_cloud=True,
@@ -673,7 +814,7 @@ async def _run_plan_day_flow(
             )
         else:
             result = await gemini_primary_route(
-                user_prompt=enriched_planning_goal,
+                user_prompt=decompose_input,
                 system_prompt=SYSTEM_PROMPT,
                 response_schema=ExecutionGraph,
                 fallback_model=_LLM_27B,
@@ -686,7 +827,7 @@ async def _run_plan_day_flow(
     _decompose_start = time_mod.monotonic()
 
     # --- Decomposition cache check ---
-    _decompose_cache_key = hashlib.sha256(enriched_planning_goal.encode()).hexdigest()
+    _decompose_cache_key = hashlib.sha256(decompose_input.encode()).hexdigest()
     _cached_decomp = _decompose_cache.get(_decompose_cache_key)
     if _cached_decomp and (time_mod.time() - _cached_decomp[0]) < _DECOMPOSE_CACHE_TTL_S:
         data = _cached_decomp[1]
@@ -748,6 +889,7 @@ async def _run_plan_day_flow(
                     "for math midterm') helps me schedule better."
                 ),
                 draft_id=draft.draft_id if draft else None,
+                memories=_get_plan_memories(),
             )
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
         return ChatResponse(
@@ -764,6 +906,7 @@ async def _run_plan_day_flow(
                 "for math midterm') helps me schedule better."
             ),
             draft_id=draft.draft_id if draft else None,
+            memories=_get_plan_memories(),
         )
 
     # If skip_scheduling is True, return the decomposition for user review
@@ -780,6 +923,7 @@ async def _run_plan_day_flow(
             awaiting_task_confirmation=True,
             thinking_process=f"Decomposed your goal into {len(graph.decomposition)} micro-tasks totaling {sum(t.duration_minutes for t in graph.decomposition)} minutes. Waiting for your review before scheduling.",
             draft_id=draft.draft_id if draft else None,
+            memories=_get_plan_memories(),
         )
 
     goal_id = graph.goal_metadata.goal_id if graph.goal_metadata else None
@@ -919,10 +1063,25 @@ async def _run_plan_day_flow(
         # see the visual schedule. Use deterministic fallback instead.
         message = "Here's your schedule."
         thinking_process = _build_thinking_fallback(summary)
+        sched_dict = schedule_response.model_dump(mode='json')
+        applied_constraints_data = [
+            {"name": c.name, "start_min": c.start_min, "end_min": c.end_min,
+             "availability": c.availability, "source": getattr(c, "source", "memory")}
+            for c in memory_constraints
+        ] if memory_constraints else None
+        schedule_payload = SchedulePayload(
+            schedule=sched_dict.get("schedule", {}),
+            horizon_start=sched_dict.get("horizon_start", ""),
+            horizon_minutes=used_horizon_minutes,
+            daily_cap_minutes=sched_dict.get("daily_cap_minutes"),
+            draft_id=draft.draft_id if draft else None,
+            status="draft",
+            applied_constraints=applied_constraints_data,
+        )
         return ChatResponse(
             intent=IntentType.PLAN_DAY.value,
             message=message,
-            schedule=schedule_response.model_dump(mode='json'),
+            schedule=schedule_payload,
             execution_graph=synthetic_graph.model_dump(mode='json'),
             action_proposals=action_proposals,
             search_result=search_result,
@@ -930,6 +1089,7 @@ async def _run_plan_day_flow(
             thinking_process=thinking_process,
             schedule_status="draft",
             draft_id=draft.draft_id if draft else None,
+            memories=_get_plan_memories(),
         )
 
     log_step(
@@ -953,6 +1113,7 @@ async def _run_plan_day_flow(
             "or relaxing a habit."
         ),
         draft_id=draft.draft_id if draft else None,
+        memories=_get_plan_memories(),
     )
 
 
@@ -962,6 +1123,7 @@ async def _run_schedule_modify_flow(
     draft_schedule: dict,
     db_client: Any,
     progress_callback: ProgressCallback = None,
+    memory_store: Any = None,
 ) -> ChatResponse:
     """Handle schedule modification without re-running the full pipeline.
 
@@ -987,13 +1149,34 @@ async def _run_schedule_modify_flow(
 
     # Parse the modification request
     modification = await parse_modification_request(user_prompt, decomposition)
+    def _get_modify_memories():
+        if not memory_store:
+            return None
+        try:
+            active = memory_store.get_active_memories(user_id)
+            return [
+                {"memory_type": m.get("memory_type"), "content": m.get("content"),
+                 "confidence": m.get("confidence", 0.5), "source": m.get("source", "inferred"),
+                 "id": m.get("id")}
+                for m in (active or [])[:20]
+            ]
+        except Exception:
+            return None
+
     if modification is None:
         return ChatResponse(
             intent=IntentType.PLAN_DAY.value,
             message="I couldn't understand that modification. Could you rephrase? For example: 'make task 2 longer' or 'add a reading task'.",
-            schedule=schedule_data,
+            schedule=SchedulePayload(
+                schedule=schedule_data,
+                horizon_start=horizon_start_str or "",
+                horizon_minutes=draft_schedule.get("horizon_minutes", 0),
+                daily_cap_minutes=draft_schedule.get("daily_cap_minutes"),
+                status="draft",
+            ),
             execution_graph=execution_graph,
             schedule_status="draft",
+            memories=_get_modify_memories(),
         )
 
     # Parse horizon_start
@@ -1033,10 +1216,17 @@ async def _run_schedule_modify_flow(
     return ChatResponse(
         intent=IntentType.PLAN_DAY.value,
         message=msg,
-        schedule=modified_schedule,
+        schedule=SchedulePayload(
+            schedule=modified_schedule if isinstance(modified_schedule, dict) else {},
+            horizon_start=horizon_start.isoformat() if horizon_start else "",
+            horizon_minutes=draft_schedule.get("horizon_minutes", 0),
+            daily_cap_minutes=draft_schedule.get("daily_cap_minutes"),
+            status="draft",
+        ),
         execution_graph=modified_graph,
         schedule_status="draft",
         thinking_process=f"Applied {action_desc} modification to draft schedule.",
+        memories=_get_modify_memories(),
     )
 
 
@@ -1063,6 +1253,21 @@ async def execute_agentic_flow(
     memory_store=None,
 ) -> ChatResponse:
     """Master orchestrator: brain dump extraction, multi-execution, Voice of Jarvis."""
+
+    def _get_response_memories():
+        if not memory_store:
+            return None
+        try:
+            active = memory_store.get_active_memories(user_id)
+            return [
+                {"memory_type": m.get("memory_type"), "content": m.get("content"),
+                 "confidence": m.get("confidence", 0.5), "source": m.get("source", "inferred"),
+                 "id": m.get("id")}
+                for m in (active or [])[:20]
+            ]
+        except Exception:
+            return None
+
     # Pre-check: if draft_schedule is provided, route to schedule modification flow
     if draft_schedule is not None:
         log_step("SCHEDULE_MODIFY", "Draft schedule provided, routing to modification flow")
@@ -1072,6 +1277,7 @@ async def execute_agentic_flow(
             draft_schedule=draft_schedule,
             db_client=db_client,
             progress_callback=progress_callback,
+            memory_store=memory_store,
         )
 
     # Resolve prompt: combine user_prompt with extracted file text if provided
@@ -1112,12 +1318,14 @@ async def execute_agentic_flow(
                 "model_mode": "27b",
                 "phase_summary": "Direct 27B mode — answering with full reasoning power",
             })
-        return await _direct_qa_response(
+        _qa_resp = await _direct_qa_response(
             effective_prompt,
             model_override=LOCAL_LLM_MODEL,
             progress_callback=progress_callback,
             conversation_history=conversation_history,
         )
+        _qa_resp.memories = _get_response_memories()
+        return _qa_resp
 
     # Step 1: Brain dump extraction
     _pipeline_start = time_mod.monotonic()
@@ -1137,10 +1345,11 @@ async def execute_agentic_flow(
     if clarification:
         if progress_callback:
             await progress_callback("intent_classified", {"intent": "CLARIFICATION"})
+        clarification.memories = _get_response_memories()
         return clarification
 
     if extraction is None or _is_extraction_empty(extraction):
-        return await _fallback_single_intent(
+        _fallback_resp = await _fallback_single_intent(
             effective_prompt,
             user_id,
             db_client,
@@ -1154,6 +1363,8 @@ async def execute_agentic_flow(
             draft_store=draft_store,
             memory_store=memory_store,
         )
+        _fallback_resp.memories = _get_response_memories()
+        return _fallback_resp
 
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
@@ -1173,7 +1384,7 @@ async def execute_agentic_flow(
             extraction.has_knowledge = False
             log_step("GUARD", "Overrode has_knowledge=False — prompt is a question, not a document")
             if _is_extraction_empty(extraction):
-                return await _fallback_single_intent(
+                _guard_resp = await _fallback_single_intent(
                     effective_prompt, user_id, db_client,
                     day_start_hour_override=day_start_hour_override,
                     max_daily_deep_work_minutes=max_daily_deep_work_minutes,
@@ -1185,6 +1396,8 @@ async def execute_agentic_flow(
                     draft_store=draft_store,
                     memory_store=memory_store,
                 )
+                _guard_resp.memories = _get_response_memories()
+                return _guard_resp
 
     execution_summary: dict[str, Any] = {}
     action_proposals: list[dict] = []
@@ -1425,6 +1638,8 @@ async def execute_agentic_flow(
             draft=draft,
             draft_store=draft_store,
             memory_store=memory_store,
+            extraction=extraction,
+            memory_context=memory_context,
         )
 
     # Step 8: Await search task for ingestion-only path
@@ -1468,6 +1683,7 @@ async def execute_agentic_flow(
         suggested_action=suggested,
         thinking_process=thinking_process,
         draft_id=draft.draft_id if draft else None,
+        memories=_get_response_memories(),
     )
 
 
@@ -1585,8 +1801,14 @@ async def trigger_replan(
             continue
 
     if schedule_response is not None:
-        # Persist the updated schedule (pending tasks unchanged, just re-ordered)
-        _persist_fused_tasks(user_id, pending, supabase)
+        # Persist the updated schedule with timing data
+        _persist_fused_tasks(
+            user_id,
+            pending,
+            supabase,
+            schedule=schedule_response.schedule if hasattr(schedule_response, "schedule") else None,
+            horizon_start=horizon_start.isoformat() if horizon_start else None,
+        )
         log_step("REPLAN_DONE", f"Background replan complete", {"reason": reason})
     else:
         log_step("REPLAN_INFEASIBLE", f"Background replan infeasible", {"reason": reason})

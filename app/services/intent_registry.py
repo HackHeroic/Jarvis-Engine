@@ -150,31 +150,29 @@ async def _ingestion_handler(ctx: Any, intent_name: str) -> dict:
 
 
 async def _handle_edit_task(ctx: Any) -> dict:
-    """Edit an existing task — minimal VoJ response for now."""
-    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
+    """Edit an existing task — parse request, find task, apply change."""
+    from app.services.analytical.task_editor import handle_edit_task
 
-    message, thinking_process = await synthesize_jarvis_response(
-        {"edit_task": True, "user_request": ctx.user_prompt}
+    return await handle_edit_task(
+        user_id=ctx.user_id,
+        user_prompt=ctx.user_prompt,
+        draft_store=ctx.draft_store,
+        db_client=ctx.db_client,
+        memory_store=ctx.memory_store,
     )
-    return {
-        "intent": "EDIT_TASK",
-        "message": message,
-        "thinking_process": thinking_process,
-    }
 
 
 async def _handle_rearrange(ctx: Any) -> dict:
-    """Rearrange task order — minimal VoJ response for now."""
-    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
+    """Rearrange task order — parse request, fetch tasks, swap positions."""
+    from app.services.analytical.task_rearranger import handle_rearrange
 
-    message, thinking_process = await synthesize_jarvis_response(
-        {"rearrange": True, "user_request": ctx.user_prompt}
+    return await handle_rearrange(
+        user_id=ctx.user_id,
+        user_prompt=ctx.user_prompt,
+        draft_store=ctx.draft_store,
+        db_client=ctx.db_client,
+        memory_store=ctx.memory_store,
     )
-    return {
-        "intent": "REARRANGE",
-        "message": message,
-        "thinking_process": thinking_process,
-    }
 
 
 async def _handle_check_progress(ctx: Any) -> dict:
