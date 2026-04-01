@@ -87,6 +87,12 @@ class BrainDumpExtraction(BaseModel):
         default=None,
         description="User mentions a new deadline (e.g. 'exam is March 20'). Extract as ISO-8601 if possible.",
     )
+    subject_context: Optional[List[str]] = Field(
+        default=None,
+        description="Specific subjects, topics, exams, contests mentioned. "
+        "Preserve verbatim with any associated deadlines. "
+        "E.g. ['deep learning contest - Friday', 'calculus exam - Monday']",
+    )
 
 
 class Availability(str, Enum):
@@ -230,6 +236,21 @@ class IngestionPipelineResult(BaseModel):
     action_proposal: Optional[ActionItemProposal] = None
 
 
+class SchedulePayload(BaseModel):
+    """Typed schedule payload returned in ChatResponse."""
+
+    schedule: dict = Field(description="Map of task_id -> {start_min, end_min, tmt_score, title}")
+    horizon_start: str = Field(description="ISO-8601 datetime for minute-0 of the schedule")
+    horizon_minutes: int = Field(default=0, description="Total horizon length in minutes")
+    daily_cap_minutes: Optional[int] = Field(default=None, description="Adaptive daily cap used")
+    draft_id: Optional[str] = Field(default=None, description="Draft ID if schedule is a draft")
+    status: Optional[str] = Field(default=None, description="'draft' or 'final'")
+    applied_constraints: Optional[List[dict]] = Field(
+        default=None,
+        description="Memory-derived constraints that shaped this schedule",
+    )
+
+
 class ChatResponse(BaseModel):
     """Unified response from the Control Policy for the /chat endpoint."""
 
@@ -237,9 +258,9 @@ class ChatResponse(BaseModel):
         description="Classified intent (e.g. PLAN_DAY, BEHAVIORAL_CONSTRAINT)",
     )
     message: str = Field(description="Friendly agentic response for the user")
-    schedule: Optional[dict] = Field(
+    schedule: Optional[SchedulePayload] = Field(
         default=None,
-        description="OR-Tools output: status, schedule, goal_metadata",
+        description="Typed schedule payload from OR-Tools solver",
     )
     execution_graph: Optional[dict] = Field(
         default=None,
@@ -292,4 +313,8 @@ class ChatResponse(BaseModel):
     memories: Optional[List[dict]] = Field(
         default=None,
         description="Memories extracted from this conversation turn. Frontend renders in MemoryPanel.",
+    )
+    pearl_insights: Optional[List[dict]] = Field(
+        default=None,
+        description="Recently detected behavioral patterns from PEARL.",
     )

@@ -99,8 +99,26 @@ async def accept_draft(
             from app.api.v1.endpoints.reasoning import TaskChunk
             from app.services.analytical.control_policy import _persist_fused_tasks
             task_chunks = [TaskChunk(**t) for t in comp.data]
+
+            # Extract schedule timing from the "schedule" draft component
+            schedule_map = None
+            horizon_start_iso = None
+            sched_comp = draft.components.get("schedule")
+            if sched_comp and sched_comp.data:
+                sched_data = sched_comp.data
+                if isinstance(sched_data, dict):
+                    schedule_map = sched_data.get("schedule")
+                    horizon_start_iso = sched_data.get("horizon_start")
+
             # _persist_fused_tasks is sync — offload to thread to avoid blocking event loop
-            await asyncio.to_thread(_persist_fused_tasks, request.user_id, task_chunks, supabase)
+            await asyncio.to_thread(
+                _persist_fused_tasks,
+                request.user_id,
+                task_chunks,
+                supabase,
+                schedule=schedule_map,
+                horizon_start=horizon_start_iso,
+            )
 
         elif key == "action_items" and supabase:
             for item in comp.data:
