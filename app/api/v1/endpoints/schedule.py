@@ -72,7 +72,8 @@ def _compute_tmt_priority(
     value = difficulty_weight
     motivation = (EXPECTANCY * value) / (IMPULSIVENESS * delay_hours)
     priority_score = max(1, int(motivation * 100))
-    return (motivation, priority_score)
+    tmt_display = min(100, round(motivation * 1000))
+    return (tmt_display, priority_score)
 
 
 # ---------------------------------------------------------------------------
@@ -264,11 +265,11 @@ def run_schedule(
     for chunk in graph.decomposition:
         duration = clamped_durations[chunk.task_id]
         delay_h = _delay_hours_for_chunk(chunk, resolved_horizon_start)
-        tmt_raw, priority_score = _compute_tmt_priority(
+        tmt_display, priority_score = _compute_tmt_priority(
             chunk.difficulty_weight,
             delay_h,
         )
-        tmt_scores[chunk.task_id] = tmt_raw
+        tmt_scores[chunk.task_id] = tmt_display
         scheduler.add_task(
             chunk.task_id,
             duration,
@@ -301,7 +302,7 @@ def run_schedule(
         schedule[task_id] = ScheduledTask(
             start_min=slot["start"],
             end_min=slot["end"],
-            tmt_score=round(tmt_scores[task_id], 2),
+            tmt_score=tmt_scores[task_id],
             title=title_map.get(task_id),
         )
 

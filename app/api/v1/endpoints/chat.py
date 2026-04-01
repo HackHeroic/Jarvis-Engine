@@ -157,7 +157,7 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
     # Save assistant response
     msg_id = await save_assistant_message(
         session_id, request.user_id, response.message, response.intent,
-        {"schedule": response.schedule, "draft_id": response.draft_id, "intent": response.intent},
+        {"schedule": response.schedule.model_dump(mode='json') if response.schedule else None, "draft_id": response.draft_id, "intent": response.intent},
         supabase,
     )
 
@@ -740,6 +740,13 @@ async def confirm_schedule_stream(
             if plan_start.hour < resolved_day_start:
                 plan_date -= timedelta(days=1)
             horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+            # Safety: snap forward if horizon_start is stale (timezone mismatch)
+            past_min = max(0, int((plan_start - horizon_start).total_seconds() / 60))
+            if past_min > 960:
+                plan_date = plan_start.date()
+                horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+                if horizon_start < plan_start:
+                    horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=timezone.utc)
 
             expanded_slots = expand_semantic_slots_to_time_slots(
                 semantic_slots,
@@ -859,6 +866,8 @@ class AcceptScheduleRequest(BaseModel):
     user_id: str = Field(..., description="User identifier")
     tasks: list[dict] = Field(..., description="TaskChunk dicts from accepted draft")
     goal_metadata: Optional[dict] = Field(default=None, description="Goal metadata")
+    schedule: Optional[dict] = Field(default=None, description="Schedule map from OR-Tools {task_id: {start_min, end_min}}")
+    horizon_start: Optional[str] = Field(default=None, description="ISO-8601 horizon start for computing wall-clock times")
 
 
 @router.post(
@@ -879,7 +888,11 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
     except Exception as exc:
         return {"status": "error", "message": f"Invalid tasks: {exc}", "task_count": 0}
 
-    _persist_fused_tasks(request.user_id, task_chunks, supabase)
+    _persist_fused_tasks(
+        request.user_id, task_chunks, supabase,
+        schedule=request.schedule.get("schedule") if request.schedule else None,
+        horizon_start=request.horizon_start,
+    )
 
     # Fire-and-forget: detect behavioral patterns from task history
     memory_store = getattr(http_request.app.state, "memory_store", None)
@@ -951,6 +964,13 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
     if plan_start.hour < DAY_START_HOUR:
         plan_date -= timedelta(days=1)
     horizon_start = datetime.combine(plan_date, time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
+    # Safety: snap forward if horizon_start is stale (timezone mismatch)
+    _past = max(0, int((plan_start - horizon_start).total_seconds() / 60))
+    if _past > 960:
+        plan_date = plan_start.date()
+        horizon_start = datetime.combine(plan_date, time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
+        if horizon_start < plan_start:
+            horizon_start = datetime.combine(plan_date + timedelta(days=1), time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
     if request.horizon_start:
         try:
             horizon_start = datetime.fromisoformat(request.horizon_start)

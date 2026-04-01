@@ -175,3 +175,17 @@ class MemoryStore:
 
     def archive_memory(self, memory_id: str, user_id: str = None) -> bool:
         return self.update_memory(memory_id, {"strength": 0.0}, user_id=user_id)
+
+    def weaken_memory(self, memory_id: str, user_id: str = None) -> bool:
+        """Reduce confidence by 0.3, cap stability at 0.5. Used when user dismisses a pattern."""
+        if not user_id:
+            return False
+        mem = self.get_memory(memory_id, user_id=user_id)
+        if not mem:
+            return False
+        new_conf = max(0.0, mem.get("confidence", 0.5) - 0.3)
+        new_stab = min(0.5, mem.get("stability", 1.0))
+        return self.update_memory(memory_id, {
+            "confidence": new_conf,
+            "stability": new_stab,
+        }, user_id=user_id)
