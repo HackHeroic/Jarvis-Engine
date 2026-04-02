@@ -3,10 +3,14 @@
 import tempfile
 from pathlib import Path
 
-from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.document_converter import PdfFormatOption
+try:
+    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import PdfFormatOption
+    DOCLING_AVAILABLE = True
+except ImportError:
+    DOCLING_AVAILABLE = False
 
 
 def extract_document(
@@ -27,6 +31,8 @@ def extract_document(
     Returns:
         Extracted text in markdown format, preserving table structure.
     """
+    if not DOCLING_AVAILABLE:
+        raise ImportError("docling is not installed. Install with: pip install -e '.[ingestion]'")
     media_type_lower = media_type.lower()
     if media_type_lower in ("image", "png", "jpeg", "jpg"):
         media_type_lower = "image"
