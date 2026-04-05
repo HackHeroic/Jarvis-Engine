@@ -118,6 +118,18 @@ class Tool(Protocol):
         E.g., 'ScheduleTasksTool(horizon > 10000)'. None = no matching."""
         ...
 
+    # ── Lifecycle ──
+    def is_enabled(self) -> bool:
+        """Is this tool currently active? Default: True.
+        Allows disabling tools without unregistering (e.g., feature flags,
+        stub tools like RecordCompletionTool before DKT is implemented)."""
+        ...
+
+    def search_hint(self) -> str | None:
+        """Keyword phrase for deferred tool discovery by LLM.
+        Enables future tool-search for free-form CHAT intent path."""
+        ...
+
     # ── Execution ──
     async def call(
         self,
@@ -144,9 +156,12 @@ class ToolContext:
     memory_store: Any | None                   # Can be None (graceful degradation)
     draft_store: Any                           # DraftStore
     abort_signal: asyncio.Event                # Cooperative cancellation
+    sibling_abort: asyncio.Event | None        # Sibling abort (set by executor, tools check both)
     permissions: "PermissionContext"
-    messages: list["Message"]                  # Conversation history
+    messages: list["Message"]                  # Conversation history (LLM-ready format)
+    conversation_history: list[dict] | None    # Raw chat history for brain dump extraction
     query_tracking: "QueryTracking | None"     # Chain ID + depth + source
+    progress_callback: Callable[[str, dict], Awaitable[None]] | None  # SSE progress emission
 
     # State access (getter/setter, not direct mutation)
     get_app_state: Callable[[], "AppState"]
@@ -254,6 +269,8 @@ def build_tool(**kwargs) -> Tool:
         "is_read_only": lambda self, input: False,
         "is_destructive": lambda self, input: False,
         "interrupt_behavior": lambda self: "block",          # Let tool finish
+        "is_enabled": lambda self: True,                     # Active by default
+        "search_hint": lambda self: None,
         "validate_input": lambda self, input, ctx: None,
         "check_permissions": lambda self, input, ctx: PermissionResult(),
         "prepare_permission_matcher": lambda self, input: None,
@@ -307,7 +324,7 @@ Hooks are middleware that fire at lifecycle points — decoupling cross-cutting 
 - **Function hooks** (internal, registered in code) — optimized fast-path
 - **Command hooks** (user-configurable, in settings.json) — shell commands or HTTP
 
-### Hook Events (20)
+### Hook Events (26)
 
 ```python
 class HookEvent(str, Enum):
@@ -320,6 +337,7 @@ class HookEvent(str, Enum):
     SESSION_START = "session_start"
     SESSION_END = "session_end"
     USER_MESSAGE = "user_message"
+    SETUP = "setup"                            # One-time init (registry warm-up, model loading)
 
     # Agent lifecycle (Phase 3+)
     AGENT_SPAWN = "agent_spawn"
@@ -346,6 +364,17 @@ class HookEvent(str, Enum):
 
     # Ingestion lifecycle
     DOCUMENT_INGESTED = "document_ingested"
+
+    # Pipeline lifecycle
+    PIPELINE_STOP = "pipeline_stop"            # Cleanup when pipeline completes normally
+    PIPELINE_STOP_FAILURE = "pipeline_stop_failure"  # Cleanup when pipeline fails mid-execution
+
+    # Permission lifecycle
+    PERMISSION_DENIED = "permission_denied"    # Tool permission denied (feeds denial tracker)
+
+    # Compaction lifecycle (Phase 2)
+    PRE_COMPACT = "pre_compact"                # Before context compaction runs
+    POST_COMPACT = "post_compact"              # After compaction completes (with token savings)
 ```
 
 ### Hook Types
@@ -424,6 +453,25 @@ class HookResponse:
     # Async
     is_async: bool = False
     async_timeout_s: int = 30
+```
+
+### Permission Precedence (Critical Invariant)
+
+A hook's "allow" decision does **NOT** bypass settings-based deny/ask rules. This matches Claude Code's `resolveHookPermissionDecision()` semantics:
+
+```
+Permission resolution order:
+1. Hook returns "deny"  → DENIED (highest precedence, immediate)
+2. Hook returns "allow" → still check settings-based rules:
+   a. Settings deny rule matches → DENIED (overrides hook allow)
+   b. Settings ask rule matches  → ASK user (overrides hook allow)
+   c. No settings rule matches   → ALLOWED
+3. Hook returns "ask"   → prompt user (even if settings would allow)
+4. No hook decision      → normal permission flow (settings rules only)
+
+Invariant: A permissive hook can NEVER bypass a restrictive settings rule.
+This prevents security holes where a custom hook accidentally allows
+destructive operations that settings explicitly block.
 ```
 
 ### Hook Registry & Execution
@@ -587,11 +635,51 @@ class StreamingToolExecutor:
         """Discard all results (streaming fallback)."""
 ```
 
+### Abort Hierarchy (Two-Level, adapted from Claude Code's AbortController)
+
+Python lacks `AbortController` hierarchies. We use two `asyncio.Event`s:
+
+```
+Parent abort (ToolContext.abort_signal)     ← Set by: user interrupt, session end
+    │
+    └─ Sibling abort (ToolContext.sibling_abort)  ← Set by: LLM tool error within a batch
+           │
+           ├─ Tool 1 checks: abort_signal OR sibling_abort
+           ├─ Tool 2 checks: abort_signal OR sibling_abort
+           └─ Tool 3 checks: abort_signal OR sibling_abort
+```
+
+**Signal propagation rules:**
+- **User interrupt** → parent `abort_signal` set → ALL tools see it
+- **LLM tool error** (e.g., OOM) → `sibling_abort` set → sibling tools in same batch see it, but parent query loop does NOT abort (it continues with error results)
+- **Non-LLM tool error** (e.g., DB write fails) → only that tool fails, siblings continue
+- **Permission denial** → only that tool blocked, siblings continue
+
+**Interrupt behavior enforcement:**
+- On user interrupt, check each executing tool's `interrupt_behavior()`:
+  - `'cancel'` → `task.cancel()`, generate synthetic "user interrupted" error
+  - `'block'` → let it finish, queue new user message until tool completes
+
+```python
+# In StreamingToolExecutor._execute_tool():
+if self._ctx.abort_signal.is_set():
+    if tracked.tool.interrupt_behavior() == "cancel":
+        tracked.result = self._create_synthetic_error(tracked, AbortReason.USER_INTERRUPTED)
+        tracked.status = ToolStatus.COMPLETED
+        return
+    # else "block": keep executing normally
+
+if self._sibling_abort.is_set():
+    tracked.result = self._create_synthetic_error(tracked, AbortReason.SIBLING_ERROR)
+    tracked.status = ToolStatus.COMPLETED
+    return
+```
+
 ### Execution Semantics
 
 - **Progress events** yield immediately (bypass completion ordering)
 - **Results** yield in tool-addition order (buffered until ready)
-- **Sibling abort:** LLM-backed tool errors cascade to siblings (OOM protection)
+- **Sibling abort:** LLM-backed tool errors cascade to siblings via `sibling_abort` event (OOM protection). Non-LLM tool errors do NOT cascade.
 - **Interrupt behavior:** `'cancel'` tools get synthetic error on user interrupt. `'block'` tools keep running.
 - **Context modifiers:** Only applied for non-concurrent tools (silently ignored for concurrent)
 - **Max concurrency:** Configurable via `JARVIS_MAX_TOOL_CONCURRENCY` env var (default 10)
@@ -726,6 +814,28 @@ User message arrives
     └─ Return/yield results
 ```
 
+### Pipeline Error Recovery Matrix
+
+Each PLAN_DAY pipeline step has explicit error handling (preserving existing `control_policy.py` behavior):
+
+| Step | On Failure | Recovery | User Sees |
+|------|-----------|----------|-----------|
+| P1: Fetch habits | DB error | Continue with empty habits | Schedule without habit constraints |
+| P1: Translate habits | LLM error / parse fail | Continue with empty slots | Schedule without habit time blocks |
+| P2: Compute horizon | Invalid timezone | Snap to now() | Normal schedule |
+| P3: Memory constraints | Memory store unavailable | Continue without PEARL constraints | Schedule without behavioral adaptations |
+| P4: Decompose (primary) | LLM error / < 5 tasks | Retry with cloud (Gemini) | Brief delay |
+| P4: Decompose (retry) | Cloud also fails | Return graceful "clarify your goal" message | "I had trouble breaking that down" |
+| P5: Multi-goal fusion | Dependency validation fails | Log error, proceed with new chunks only (drop pending) | Partial schedule |
+| P6: Compute horizon steps | No deadline info | Use default sequence [2880, 4320, 7200, 10080, 20160, 43200] | Normal |
+| P7: Schedule (per horizon) | INFEASIBLE (422) | Try next horizon in sequence | Transparent (retries hidden) |
+| P7: Schedule (all exhausted) | All horizons INFEASIBLE | Return anti-guilt message with recalibration suggestions | "This isn't feasible — consider..." |
+| P8: Create draft | DB error | Return schedule without draft (memory-only) | Schedule shown but can't accept |
+| P9: Await search | Timeout (10s) / error | Continue without search results | Normal response, no research section |
+| P10: Build response | N/A (pure formatting) | N/A | N/A |
+
+**Invariant:** No pipeline step failure produces a 5xx HTTP error. All failures yield a graceful `ChatResponse` with a helpful message.
+
 ### Multi-Layer Context Compaction
 
 5 stages in order (adapted from Claude Code):
@@ -740,7 +850,7 @@ Stage 5: autoCompact — full LLM-powered summarization (expensive, last resort)
 Reactive: on prompt-too-long error, try stages 2-5 as recovery
 ```
 
-For Jarvis Phase 2, implement stages 1, 3, and 5 (minimum viable compaction).
+For Jarvis Phase 2, implement stages 1, 2, 3, and 5 (minimum viable compaction). Stage 2 (snipCompact) is trivial — remove tool results older than N turns — and prevents premature triggering of stage 3. Stage 4 (contextCollapse) is deferred to Phase 5.
 
 ### Max Output Tokens Recovery
 
@@ -810,6 +920,8 @@ The frontend expects these exact event types (unchanged from current):
 | PEARL detection | **Preserved** — chained after memory extraction via hook |
 | All DB writes | **Preserved** — same tables, same operations |
 | All constants/thresholds | **Preserved** — same magic numbers |
+| Intent Discovery Engine | **Deferred** to Phase 5 — auto-mode classifier subsumes clustering; free-form CHAT path handles unknown intents via LLM tool calling until discovery is built |
+| Schedule Modification Flow | **Preserved** — Branch 1 in query loop detects `draft_schedule` and routes to `_run_schedule_modify_flow` using existing `schedule_modifier.py` and `task_rearranger.py` |
 
 ---
 
@@ -852,6 +964,80 @@ Based on Gemma 4 benchmarks (Arena Elo 1441, t2-bench 85.5%):
 | Cloud fallback | Gemini 2.5 Flash | Gemini 2.5 Flash (keep) | N/A | N/A |
 
 **Impact on concurrency:** With Gemma 4 MoE, LLM tools become `is_concurrency_safe=True`. PLAN_DAY goes from sequential (30s) to parallel (8-10s). Controlled by single config: `LLM_CONCURRENCY_SAFE=true`.
+
+---
+
+## Tool-to-Service File Mapping
+
+Each tool wraps an existing service. This is the migration guide:
+
+| Tool | Current Implementation | File |
+|------|----------------------|------|
+| `BrainDumpExtractTool` | `_run_brain_dump_extraction()` | `control_policy.py` |
+| `TranslateHabitsTool` | `translate_habits_to_slots()` | `habit_translator.py` |
+| `ExpandHorizonTool` | `expand_semantic_slots_to_time_slots()` | `horizon_expander.py` |
+| `DecomposeGoalTool` | `_call_decompose()` + retry logic | `control_policy.py` |
+| `FetchConstraintsTool` | `get_behavioral_context_for_calendar()` | `behavioral_store.py` |
+| `FetchPendingTasksTool` | `get_all_pending_tasks()` | `task_retrieval.py` |
+| `ScheduleTasksTool` | `run_schedule()` | `schedule.py` |
+| `PersistScheduleTool` | `_persist_fused_tasks()` | `control_policy.py` |
+| `IngestDocumentTool` | `process_ingestion()` | `orchestrator.py` |
+| `ExtractCalendarTool` | `extract_calendar_slots()` | `calendar_extractor.py` |
+| `LinkMaterialsTool` | `link_document_to_tasks()` | `task_material_linker.py` |
+| `StoreConstraintTool` | `store_behavioral_constraint()` | `behavioral_store.py` |
+| `DeleteConstraintTool` | `delete_behavioral_constraint()` | `behavioral_store.py` |
+| `EditTaskTool` | `handle_edit_task()` | `task_editor.py` |
+| `RearrangeTasksTool` | `handle_rearrange()` | `task_rearranger.py` |
+| `WorkspaceBuilderTool` | `build_task_workspace()` | `workspace_builder.py` |
+| `RecordCompletionTool` | `record_completion()` | `sm2_engine.py` |
+| `ExtractMemoriesTool` | `safe_extract_memories()` | `memory/extractor.py` |
+| `DraftAcceptTool` | `draft_store.accept_draft()` + `_persist_fused_tasks()` | `draft_store.py` + `control_policy.py` |
+| `DraftRejectTool` | `draft_store.reject_draft()` | `draft_store.py` |
+| `DirectQATool` | `_direct_qa_response()` | `control_policy.py` |
+| `SynthesizeResponseTool` | `synthesize_jarvis_response()` | `voice_of_jarvis.py` |
+| `ScheduleModifyTool` | `_run_schedule_modify_flow()` | `control_policy.py` + `schedule_modifier.py` |
+
+---
+
+## Migration Strategy
+
+Incremental migration from `control_policy.py` — NOT a big-bang rewrite:
+
+1. **Phase 1a:** Extract tools one at a time. Each tool wraps the existing function. `control_policy.py` calls the tool instead of the function directly. Tests pass at every step.
+2. **Phase 1b:** Add hook system. Register hooks. Existing side effects (memory extraction, cache invalidation) move from inline code to hooks one at a time.
+3. **Phase 1c:** Add streaming executor. Replace `asyncio.gather` calls (if any) with executor-managed concurrency.
+4. **Phase 2:** Build query loop. Initially, the query loop just calls `execute_agentic_flow` as a single "legacy tool." Then gradually move pipeline steps out of `control_policy.py` into the query loop's deterministic pipeline.
+5. **Final:** Delete `control_policy.py` when all logic has migrated.
+
+At every step, `pytest tests/` must pass. No step breaks the existing API.
+
+---
+
+## Observability
+
+Structured logging for debugging pipeline issues (adapted from Claude Code's telemetry):
+
+```python
+@dataclass
+class PipelineEvent:
+    event_type: str                    # "tool_start", "tool_complete", "tool_error", "compact", "retry"
+    tool_name: str | None = None
+    duration_ms: int | None = None
+    token_count: int | None = None
+    error: str | None = None
+    metadata: dict = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+```
+
+Key events to log:
+- Every tool start/complete/error with duration
+- Every LLM call with model, token count, latency
+- Every compaction trigger with tokens freed
+- Every pipeline step with phase name
+- Every retry attempt with reason
+- Every background task spawn/complete/error
+
+Logged to `~/.jarvis/logs/` in JSONL format. Optional structured export to analytics.
 
 ---
 
