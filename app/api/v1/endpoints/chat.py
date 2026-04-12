@@ -1285,7 +1285,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                             else:
                                 message_full += tok
                             yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
-                        _stream_model = SLM_ROUTER_MODEL
+                        _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else SLM_ROUTER_MODEL
                     except Exception as voj_exc:
                         print(f"[v2/stream] VoJ streaming failed: {voj_exc}")
                         _fallback = final_state.get("response_message") or "Done."

@@ -82,6 +82,7 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
             "execution_graph": state.get("execution_graph"),
             "research_results": state.get("research_results"),
             "ingestion_result": state.get("ingestion_result"),
+            "knowledge_ingested": bool(state.get("ingestion_result")),
             "clarification_request": state.get("clarification_request"),
             "error": state.get("error"),
             "user_prompt": state.get("user_message", ""),
