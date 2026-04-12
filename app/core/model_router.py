@@ -10,13 +10,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ValidationError
 
-from app.core.config import (
-    GEMMA_FAST_MODEL,
-    GEMMA_PRIMARY_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    LOCAL_LLM_URL,
-)
+import app.core.config as _cfg
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.orchestrator.hooks import ActionHooks, HookDecision
 
@@ -42,11 +36,14 @@ MODEL_ROUTING: dict[str, ModelRole] = {
     "real_time_research": ModelRole.CLOUD,
 }
 
-_ROLE_TO_MODEL = {
-    ModelRole.PRIMARY: GEMMA_PRIMARY_MODEL,
-    ModelRole.FAST: GEMMA_FAST_MODEL,
-    ModelRole.CLOUD: GEMINI_MODEL,
-}
+
+def _get_model_for_role(role: ModelRole) -> str:
+    """Read config at call time so startup detection is respected."""
+    if role == ModelRole.PRIMARY:
+        return _cfg.GEMMA_PRIMARY_MODEL
+    if role == ModelRole.FAST:
+        return _cfg.GEMMA_FAST_MODEL
+    return _cfg.GEMINI_MODEL
 
 _FENCE_RE = re.compile(r"```json|```")
 
@@ -71,9 +68,10 @@ async def route_llm_call(
         hooks = get_hooks()
 
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
-    model = _ROLE_TO_MODEL.get(role, GEMMA_FAST_MODEL)
+    model = _get_model_for_role(role)
 
-    if role in (ModelRole.PRIMARY, ModelRole.FAST):
+    # Skip local attempt if GEMINI_PRIMARY is set (no local models available)
+    if role in (ModelRole.PRIMARY, ModelRole.FAST) and not _cfg.GEMINI_PRIMARY:
         try:
             result = await hybrid_route_query(
                 user_prompt=prompt,
@@ -93,7 +91,7 @@ async def route_llm_call(
         if pii_result.decision == HookDecision.MODIFY:
             prompt = pii_result.modified_input["prompt"]
 
-    if not GEMINI_API_KEY:
+    if not _cfg.GEMINI_API_KEY:
         raise RuntimeError(f"Local LLM failed for {task} and no GEMINI_API_KEY set")
 
     from app.models.brain.litellm_conf import gemini_primary_route

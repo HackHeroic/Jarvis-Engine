@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 from pydantic import BaseModel, Field
 
@@ -240,7 +240,7 @@ async def _run_proactive_extraction(
             user_prompt=prompt,
             system_prompt=PROACTIVE_EXTRACTION_PROMPT,
             response_schema=ProactiveExtractionSchema,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
         )
         if isinstance(result, dict):
             return ProactiveExtractionSchema.model_validate(result)
