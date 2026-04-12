@@ -134,3 +134,46 @@ def test_needs_followup_false():
 def test_needs_followup_true():
     state = _make_state(needs_followup=True)
     assert check_needs_followup(state) is True
+
+
+# ---------------------------------------------------------------------------
+# Graph tests (Task 6)
+# ---------------------------------------------------------------------------
+
+import pytest
+from app.orchestrator.graph import build_jarvis_graph
+
+
+@pytest.mark.asyncio
+async def test_graph_compiles():
+    graph = build_jarvis_graph()
+    assert graph is not None
+
+
+@pytest.mark.asyncio
+async def test_graph_has_expected_nodes():
+    graph = build_jarvis_graph()
+    node_names = set(graph.nodes.keys())
+    expected = {
+        "load_context",
+        "extract_brain_dump",
+        "classify_intent",
+        "planning_module",
+        "research_agent",
+        "coach_module",
+        "knowledge_module",
+        "conversation_module",
+        "synthesize_response",
+        "observation_loop",
+    }
+    assert expected.issubset(node_names), f"Missing nodes: {expected - node_names}"
+
+
+@pytest.mark.asyncio
+async def test_graph_runs_chat_end_to_end():
+    graph = build_jarvis_graph()
+    initial_state = _make_state(user_message="hello")
+    result = await graph.ainvoke(initial_state)
+    assert result["response_message"] == "Hello! I'm Jarvis."
+    assert "conversation_module" in result["modules_invoked"]
+    assert result["needs_followup"] is False
