@@ -1085,6 +1085,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "negotiation_state": NegotiationPhase.NONE,
         "modules_invoked": [],
         "needs_followup": False,
+        "needs_consent": None,
         "error": None,
         "progress_callback": progress_cb,
     }

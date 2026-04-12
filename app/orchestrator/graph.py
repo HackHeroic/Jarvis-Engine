@@ -45,9 +45,15 @@ async def _planning_module_node(state: JarvisState) -> dict:
     """Wrap the planning sub-graph as an orchestrator node."""
     hooks = get_hooks()
     pre = await hooks.execute("PreModuleExecution", module="planning_module", initiated_by=state.get("initiated_by", "user"))
-    if pre.decision.value in ("deny", "ask"):
+    if pre.decision.value == "deny":
+        return {
+            "response_message": pre.reason or "Action blocked.",
+            "modules_invoked": state.get("modules_invoked", []) + ["planning_module"],
+        }
+    if pre.decision.value == "ask":
         return {
             "response_message": pre.reason or "Action requires consent.",
+            "needs_consent": True,
             "modules_invoked": state.get("modules_invoked", []) + ["planning_module"],
         }
 
@@ -91,9 +97,15 @@ async def _knowledge_module_node(state: JarvisState) -> dict:
     """Wrap the knowledge sub-graph as an orchestrator node."""
     hooks = get_hooks()
     pre = await hooks.execute("PreModuleExecution", module="knowledge_module", initiated_by=state.get("initiated_by", "user"))
-    if pre.decision.value in ("deny", "ask"):
+    if pre.decision.value == "deny":
+        return {
+            "response_message": pre.reason or "Action blocked.",
+            "modules_invoked": state.get("modules_invoked", []) + ["knowledge_module"],
+        }
+    if pre.decision.value == "ask":
         return {
             "response_message": pre.reason or "Action requires consent.",
+            "needs_consent": True,
             "modules_invoked": state.get("modules_invoked", []) + ["knowledge_module"],
         }
 
@@ -129,9 +141,15 @@ async def _research_agent_node(state: JarvisState) -> dict:
     """Wrap the research sub-graph as an orchestrator node."""
     hooks = get_hooks()
     pre = await hooks.execute("PreModuleExecution", module="research_agent", initiated_by=state.get("initiated_by", "user"))
-    if pre.decision.value in ("deny", "ask"):
+    if pre.decision.value == "deny":
+        return {
+            "response_message": pre.reason or "Action blocked.",
+            "modules_invoked": state.get("modules_invoked", []) + ["research_agent"],
+        }
+    if pre.decision.value == "ask":
         return {
             "response_message": pre.reason or "Action requires consent.",
+            "needs_consent": True,
             "modules_invoked": state.get("modules_invoked", []) + ["research_agent"],
         }
 

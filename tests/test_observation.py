@@ -24,7 +24,9 @@ def _make_state(**overrides):
         "negotiation_state": NegotiationPhase.NONE,
         "modules_invoked": ["planning_module"],
         "needs_followup": False,
+        "needs_consent": None,
         "error": None,
+        "progress_callback": None,
     }
     base.update(overrides)
     return base

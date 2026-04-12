@@ -42,7 +42,9 @@ def test_jarvis_state_is_typed_dict():
         "negotiation_state": NegotiationPhase.NONE,
         "modules_invoked": [],
         "needs_followup": False,
+        "needs_consent": None,
         "error": None,
+        "progress_callback": None,
     }
     assert state["user_message"] == "plan my day"
     assert state["conversation_phase"] == ConversationPhase.GREETING
@@ -90,7 +92,9 @@ def _make_state(**overrides) -> JarvisState:
         "negotiation_state": NegotiationPhase.NONE,
         "modules_invoked": [],
         "needs_followup": False,
+        "needs_consent": None,
         "error": None,
+        "progress_callback": None,
     }
     base.update(overrides)
     return base
