@@ -122,6 +122,7 @@ async def _planning_module_node(state: JarvisState) -> dict:
         "clarification_request": None,
         "error": None,
         "progress_callback": state.get("progress_callback"),
+        "progress_queue": state.get("progress_queue"),
     }
 
     result = await _planning_compiled.ainvoke(planning_state)
