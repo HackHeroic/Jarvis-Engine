@@ -1090,6 +1090,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "conversation_history": conversation_history,
         "memory_context": memory_context,
         "progress_callback": progress_cb,
+        "progress_queue": progress_queue,
     }
 
     async def event_gen():
@@ -1101,7 +1102,21 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 # Drain progress queue — sub-graph phase events
                 while not progress_queue.empty():
                     try:
-                        yield f"event: phase\ndata: {progress_queue.get_nowait()}\n\n"
+                        raw = progress_queue.get_nowait()
+                        try:
+                            parsed = json_mod.loads(raw)
+                            evt_type = parsed.pop("_event_type", "phase")
+                        except (json_mod.JSONDecodeError, TypeError):
+                            evt_type = "phase"
+                            parsed = None
+                        if evt_type == "tool_use":
+                            yield f"event: tool_use\ndata: {json_mod.dumps(parsed)}\n\n"
+                        elif evt_type == "memory_extracted":
+                            yield f"event: memory_extracted\ndata: {json_mod.dumps(parsed)}\n\n"
+                        elif evt_type == "pattern_detected":
+                            yield f"event: pattern_detected\ndata: {json_mod.dumps(parsed)}\n\n"
+                        else:
+                            yield f"event: phase\ndata: {raw}\n\n"
                     except asyncio.QueueEmpty:
                         break
 
@@ -1111,9 +1126,38 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     node_state = {}  # normalize None / non-dict to empty dict
                 final_state.update(node_state)
 
+                from app.utils.spinner_verbs import get_spinner_verb
+
                 phase = NODE_TO_PHASE.get(node_name)
                 if phase:
-                    yield f"event: phase\ndata: {json_mod.dumps({'phase': phase})}\n\n"
+                    phase_detail = {
+                        "phase": phase,
+                        "verb": get_spinner_verb(phase),
+                    }
+                    # Enrich with node-specific detail
+                    # _existing_memories is captured from enclosing scope via closure
+                    # (defined before event_gen — safe)
+                    if node_name == "load_context":
+                        conv_hist = initial_state.get("conversation_history") or []
+                        phase_detail["detail"] = {
+                            "memories_count": len(_existing_memories),
+                            "conversation_turns": len(conv_hist),
+                        }
+                    elif node_name == "classify_intent" and node_state.get("intent"):
+                        phase_detail["detail"] = {
+                            "intent": str(node_state["intent"]),
+                            "method": "rule-based",
+                        }
+                    elif node_name in ("planning_module", "research_agent", "coach_module", "knowledge_module", "conversation_module"):
+                        phase_detail["detail"] = {
+                            "module": node_name,
+                        }
+                    elif node_name == "observation_loop":
+                        phase_detail["detail"] = {
+                            "memories_extracted": node_state.get("memories_extracted_count", 0),
+                            "patterns_detected": node_state.get("patterns_detected_count", 0),
+                        }
+                    yield f"event: phase\ndata: {json_mod.dumps(phase_detail)}\n\n"
 
                 if node_name == "classify_intent" and node_state.get("intent"):
                     yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
@@ -1131,7 +1175,21 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             # Drain any remaining progress events
             while not progress_queue.empty():
                 try:
-                    yield f"event: phase\ndata: {progress_queue.get_nowait()}\n\n"
+                    raw = progress_queue.get_nowait()
+                    try:
+                        parsed = json_mod.loads(raw)
+                        evt_type = parsed.pop("_event_type", "phase")
+                    except (json_mod.JSONDecodeError, TypeError):
+                        evt_type = "phase"
+                        parsed = None
+                    if evt_type == "tool_use":
+                        yield f"event: tool_use\ndata: {json_mod.dumps(parsed)}\n\n"
+                    elif evt_type == "memory_extracted":
+                        yield f"event: memory_extracted\ndata: {json_mod.dumps(parsed)}\n\n"
+                    elif evt_type == "pattern_detected":
+                        yield f"event: pattern_detected\ndata: {json_mod.dumps(parsed)}\n\n"
+                    else:
+                        yield f"event: phase\ndata: {raw}\n\n"
                 except asyncio.QueueEmpty:
                     break
 
