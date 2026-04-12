@@ -70,3 +70,17 @@ def test_knowledge_graph_has_expected_nodes():
     node_names = set(graph.nodes.keys())
     expected = {"classify_content", "extract_calendar", "ingest_document", "link_to_tasks", "file_operations", "propose_actions"}
     assert expected.issubset(node_names)
+
+
+def test_research_graph_compiles():
+    from app.modules.research_graph import build_research_graph
+    graph = build_research_graph()
+    assert graph is not None
+
+
+def test_research_graph_has_expected_nodes():
+    from app.modules.research_graph import build_research_graph
+    graph = build_research_graph()
+    node_names = set(graph.nodes.keys())
+    expected = {"plan_research", "execute_search", "evaluate_results", "summarize", "link_to_tasks"}
+    assert expected.issubset(node_names)
