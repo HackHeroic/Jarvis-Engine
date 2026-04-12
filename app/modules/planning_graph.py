@@ -1,5 +1,6 @@
 """Planning sub-graph — wraps existing pipeline functions as LangGraph nodes."""
 
+import json as _json
 from typing import Any, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -21,9 +22,27 @@ class PlanningState(TypedDict):
     clarification_request: Optional[str]
     error: Optional[str]
     progress_callback: Any
+    progress_queue: Any
+
+
+def _emit_tool_use(state: dict, tool: str, status: str, detail: dict | None = None) -> None:
+    """Emit a tool_use event directly onto the SSE queue (bypasses progress_callback)."""
+    queue = state.get("progress_queue")
+    if not queue:
+        return
+    event = {
+        "_event_type": "tool_use",
+        "module": "planning_module",
+        "tool": tool,
+        "status": status,
+    }
+    if detail:
+        event["detail"] = detail
+    queue.put_nowait(_json.dumps(event))
 
 
 async def fetch_constraints(state: PlanningState) -> dict:
+    _emit_tool_use(state, "fetch_constraints", "started")
     cb = state.get("progress_callback")
     if cb:
         cb("habits_fetched")
@@ -31,23 +50,30 @@ async def fetch_constraints(state: PlanningState) -> dict:
     if user_model:
         constraints = await user_model.get_behavioral_constraints()
         habits_text = "\n".join(c.get("raw_text", "") for c in constraints if c.get("constraint_type") == "habit")
+        _emit_tool_use(state, "fetch_constraints", "done", {"rows": len(constraints)})
         return {"constraints": constraints, "habits_text": habits_text}
+    _emit_tool_use(state, "fetch_constraints", "done", {"rows": 0})
     return {"constraints": [], "habits_text": ""}
 
 
 async def translate_habits(state: PlanningState) -> dict:
+    _emit_tool_use(state, "translate_habits", "started")
     cb = state.get("progress_callback")
     if cb:
         cb("translating")
     habits_text = state.get("habits_text", "")
     if not habits_text.strip():
+        _emit_tool_use(state, "translate_habits", "done", {"slots": 0})
         return {"semantic_slots": []}
     try:
         from app.services.analytical.habit_translator import translate_habits_to_slots
         slots = await translate_habits_to_slots(habits_text)
-        return {"semantic_slots": [s.model_dump() for s in slots] if slots else []}
+        result = [s.model_dump() for s in slots] if slots else []
+        _emit_tool_use(state, "translate_habits", "done", {"slots": len(result)})
+        return {"semantic_slots": result}
     except Exception as e:
         logger.warning(f"Habit translation failed: {e}")
+        _emit_tool_use(state, "translate_habits", "error", {"error": str(e)})
         return {"semantic_slots": []}
 
 
@@ -85,6 +111,7 @@ def is_goal_clear(state: PlanningState) -> bool:
 
 
 async def decompose_goal(state: PlanningState) -> dict:
+    _emit_tool_use(state, "decompose_goal", "started")
     cb = state.get("progress_callback")
     if cb:
         cb("decomposing")
@@ -109,9 +136,12 @@ async def decompose_goal(state: PlanningState) -> dict:
             clean = re.sub(r"```json|```", "", str(result)).strip()
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
-        return {"task_chunks": [tc.model_dump() for tc in graph.decomposition]}
+        chunks = [tc.model_dump() for tc in graph.decomposition]
+        _emit_tool_use(state, "decompose_goal", "done", {"task_count": len(chunks)})
+        return {"task_chunks": chunks}
     except Exception as e:
         logger.error(f"Decomposition failed: {e}")
+        _emit_tool_use(state, "decompose_goal", "error", {"error": str(e)})
         return {"error": f"Decomposition failed: {e}", "task_chunks": []}
 
 
@@ -128,9 +158,11 @@ async def fuse_tasks(state: PlanningState) -> dict:
 
 async def solve_schedule(state: PlanningState) -> dict:
     from app.core.or_tools.solver import JarvisScheduler
+    _emit_tool_use(state, "or_tools_solve", "started")
     chunks = state.get("task_chunks", [])
     horizon = state.get("horizon_minutes", 2880)
     if not chunks:
+        _emit_tool_use(state, "or_tools_solve", "error", {"error": "No tasks"})
         return {"error": "No tasks to schedule", "schedule": None}
     scheduler = JarvisScheduler(horizon_minutes=horizon)
     for slot in state.get("time_slots", []):
@@ -151,7 +183,13 @@ async def solve_schedule(state: PlanningState) -> dict:
     scheduler.build_dependencies()
     result, status = scheduler.solve()
     if status == "INFEASIBLE":
+        _emit_tool_use(state, "or_tools_solve", "done", {"status": "INFEASIBLE"})
         return {"schedule": None, "error": "INFEASIBLE"}
+    _emit_tool_use(state, "or_tools_solve", "done", {
+        "status": "OPTIMAL",
+        "task_count": len(chunks),
+        "horizon_h": horizon // 60,
+    })
     return {"schedule": result, "error": None}
 
 
