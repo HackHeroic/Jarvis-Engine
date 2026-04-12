@@ -36,6 +36,8 @@ async def execute_search(state: ResearchState) -> dict:
 
 
 def needs_more(state: ResearchState) -> bool:
+    if state.get("error"):
+        return False  # don't retry on error
     results = state.get("search_results", [])
     iterations = state.get("iteration_count", 0)
     max_iter = state.get("max_iterations", 3)
