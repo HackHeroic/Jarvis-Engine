@@ -495,6 +495,7 @@ def _needs_clarification(
 async def _run_brain_dump_extraction(
     user_prompt: str,
     conversation_history: list[dict] | None = None,
+    system_prompt_override: str | None = None,
 ) -> Optional[BrainDumpExtraction]:
     """Extract all components from brain-dump prompt. Returns None on failure."""
     try:
@@ -504,9 +505,10 @@ async def _run_brain_dump_extraction(
                 {"role": m["role"], "content": m["content"][:200] + ("..." if len(m["content"]) > 200 else "")}
                 for m in conversation_history[-4:]
             ]
+        _system_prompt = system_prompt_override if system_prompt_override else BRAIN_DUMP_EXTRACTION_PROMPT
         result = await gemini_primary_route(
             user_prompt=user_prompt,
-            system_prompt=BRAIN_DUMP_EXTRACTION_PROMPT,
+            system_prompt=_system_prompt,
             response_schema=BrainDumpExtraction,
             fallback_model=SLM_ROUTER_MODEL,
             conversation_history=_slm_history,
@@ -819,12 +821,13 @@ async def _run_plan_day_flow(
         constraint = "[Constraint: Each task must be " + " and ".join(parts) + ".] "
         enriched_planning_goal = constraint + enriched_planning_goal
 
-    # Inject memory context into decomposition prompt
+    # Build decomposition inputs — memory context goes into system prompt, not user prompt
     decompose_input = enriched_planning_goal
+    _decompose_system_prompt = SYSTEM_PROMPT
     if memory_context:
-        decompose_input = (
-            f"[User Context from Memory]\n{memory_context}\n\n"
-            f"[Planning Goal]\n{enriched_planning_goal}"
+        _decompose_system_prompt = (
+            SYSTEM_PROMPT
+            + f"\n\nUser context from memory:\n{memory_context}"
         )
 
     async def _call_decompose(force_cloud: bool = False) -> dict:
@@ -832,7 +835,7 @@ async def _run_plan_day_flow(
             # Explicit cloud retry (undersized decomposition fallback)
             result = await hybrid_route_query(
                 user_prompt=decompose_input,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=_decompose_system_prompt,
                 response_schema=ExecutionGraph,
                 force_cloud=True,
                 lenient_validation=True,
@@ -840,7 +843,7 @@ async def _run_plan_day_flow(
         else:
             result = await gemini_primary_route(
                 user_prompt=decompose_input,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=_decompose_system_prompt,
                 response_schema=ExecutionGraph,
                 fallback_model=_LLM_27B,
             )
@@ -1320,9 +1323,14 @@ async def execute_agentic_flow(
         except Exception as e:
             print(f"[Control Policy] File extraction failed: {e}")
 
-    # Inject archival memory so the LLM has user context
+    # Build system prompt with memory context for brain dump extraction
+    # Memory is injected into the system prompt to avoid contaminating the user message
+    _brain_dump_system_prompt: str | None = None
     if memory_context:
-        effective_prompt = memory_context + "\n\n---\n\nUser message: " + effective_prompt
+        _brain_dump_system_prompt = (
+            BRAIN_DUMP_EXTRACTION_PROMPT
+            + f"\n\nUser context from memory:\n{memory_context}"
+        )
 
     # Resolve model names for progress visibility
     from app.core.config import LOCAL_LLM_MODEL
@@ -1362,7 +1370,11 @@ async def execute_agentic_flow(
             "model_mode": model_mode,
             "started_at_ms": int(time_mod.time() * 1000),
         })
-    extraction = await _run_brain_dump_extraction(effective_prompt, conversation_history=conversation_history)
+    extraction = await _run_brain_dump_extraction(
+        effective_prompt,
+        conversation_history=conversation_history,
+        system_prompt_override=_brain_dump_system_prompt,
+    )
     _extraction_duration = int((time_mod.monotonic() - _phase_start) * 1000)
 
     # Check if clarification is needed before proceeding
