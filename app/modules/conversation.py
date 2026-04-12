@@ -37,6 +37,17 @@ async def run_general_chat(state: dict) -> dict:
         if memory_context:
             system_prompt += f"\n\nWhat you know about this user:\n{memory_context}"
 
+        # Inject relevant knowledge from ChromaDB if available
+        try:
+            from app.utils.chroma_client import query_knowledge
+            user_model = state.get("user_model")
+            if user_model:
+                chunks = query_knowledge(user_model.user_id, user_message, n_results=3)
+                if chunks:
+                    system_prompt += "\n\nRelevant knowledge from user's documents:\n" + "\n---\n".join(chunks[:3])
+        except Exception:
+            pass  # ChromaDB unavailable — proceed without RAG
+
         result = await route_llm_call(
             task="voice_of_jarvis",
             prompt=user_message,

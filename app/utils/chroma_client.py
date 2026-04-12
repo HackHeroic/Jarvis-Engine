@@ -20,3 +20,20 @@ def get_chroma_client():
     client = chromadb.Client(Settings(anonymized_telemetry=False))
     JARVIS_LOGGER.info("Successfully connected to ChromaDB (local mode)")
     return client
+
+
+def query_knowledge(user_id: str, query: str, n_results: int = 5) -> list[str]:
+    """Query ChromaDB for relevant knowledge chunks. Returns list of text chunks."""
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection("jarvis_knowledge", metadata={"hnsw:space": "cosine"})
+        results = collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            where={"user_id": user_id},
+        )
+        if results and results.get("documents") and len(results["documents"]) > 0:
+            return [doc for doc in results["documents"][0] if doc]
+        return []
+    except Exception:
+        return []
