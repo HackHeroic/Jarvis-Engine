@@ -1197,7 +1197,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
             _has_schedule = bool(final_state.get("schedule"))
 
-            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'v2', 'synthesis_model': LOCAL_LLM_MODEL})}\n\n"
+            from app.core.config import GEMINI_PRIMARY, GEMINI_MODEL
+            _active_model = GEMINI_MODEL if GEMINI_PRIMARY else LOCAL_LLM_MODEL
+            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'v2', 'synthesis_model': _active_model})}\n\n"
 
             # --- Token streaming (matches v1/stream SSE contract) ---
             _start = time_mod.monotonic()
