@@ -106,18 +106,19 @@ def detect_duration_preference(
     avg_edited = sum(t["duration_minutes"] for t in edited) / len(edited)
     pattern_content = f"User prefers shorter tasks (avg edited from {avg_original:.0f} to {avg_edited:.0f} minutes)"
 
-    existing = memory_store.find_similar_memory(user_id, "behavioral_pattern", "duration_preference")
+    existing = memory_store.find_similar_memory(user_id, pattern_content, memory_type="behavioral_pattern")
     if existing:
-        memory_store.reinforce_memory(existing["id"], user_id)
+        memory_store.reinforce_memory(existing["id"], user_id=user_id)
         return [{"pattern": "duration_preference", "action": "reinforced"}]
 
-    memory_store.store_memory(
-        user_id=user_id,
-        memory_type="behavioral_pattern",
-        content=pattern_content,
-        confidence=min(0.9, rate),
-        metadata={"pattern_name": "duration_preference", "applied_as": "adjust_defaults", "avg_duration": avg_edited},
-    )
+    memory_store.store_memory(user_id, {
+        "type": "behavioral_pattern",
+        "content": pattern_content,
+        "confidence": min(0.9, rate),
+        "source": "behavior",
+        "applied_as": "adjust_defaults",
+        "observation_count": len(edited),
+    })
     return [{"pattern": "duration_preference", "action": "created", "avg_duration": avg_edited}]
 
 
