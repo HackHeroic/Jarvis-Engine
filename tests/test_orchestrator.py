@@ -128,12 +128,12 @@ def test_negotiation_shortcut_normal():
 
 def test_needs_followup_false():
     state = _make_state(needs_followup=False)
-    assert check_needs_followup(state) is False
+    assert check_needs_followup(state) == "done"
 
 
 def test_needs_followup_true():
     state = _make_state(needs_followup=True)
-    assert check_needs_followup(state) is True
+    assert check_needs_followup(state) == "continue"
 
 
 # ---------------------------------------------------------------------------

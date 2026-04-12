@@ -9,7 +9,6 @@ INTENT_TO_MODULE: dict[str, str] = {
     "ACCEPT_DRAFT": "planning_module",
     "REJECT_DRAFT": "planning_module",
     "ADD_CONSTRAINT": "planning_module",
-    "INGEST_DOCUMENT": "knowledge_module",
     "CALENDAR_SYNC": "knowledge_module",
     "KNOWLEDGE_INGESTION": "knowledge_module",
     "CHECK_PROGRESS": "coach_module",
@@ -41,5 +40,7 @@ def check_negotiation_shortcut(state: JarvisState) -> str:
     return "normal"
 
 
-def check_needs_followup(state: JarvisState) -> bool:
-    return state.get("needs_followup", False)
+def check_needs_followup(state: JarvisState) -> str:
+    if state.get("needs_followup", False):
+        return "continue"
+    return "done"
