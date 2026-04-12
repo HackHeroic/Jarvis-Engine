@@ -56,3 +56,17 @@ async def test_coach_module_returns_message():
     result = await run_coaching_response(state)
     assert "response_message" in result
     assert "coach_module" in result["modules_invoked"]
+
+
+def test_knowledge_graph_compiles():
+    from app.modules.knowledge_graph import build_knowledge_graph
+    graph = build_knowledge_graph()
+    assert graph is not None
+
+
+def test_knowledge_graph_has_expected_nodes():
+    from app.modules.knowledge_graph import build_knowledge_graph
+    graph = build_knowledge_graph()
+    node_names = set(graph.nodes.keys())
+    expected = {"classify_content", "extract_calendar", "ingest_document", "link_to_tasks", "file_operations", "propose_actions"}
+    assert expected.issubset(node_names)
