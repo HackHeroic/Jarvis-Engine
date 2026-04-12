@@ -124,3 +124,15 @@ def register_all_hooks(hooks: ActionHooks) -> None:
     hooks.register("PreMemoryWrite", memory_write_gate)
     hooks.register("CostThreshold", cost_threshold_check)
     hooks.register("ProactiveSuggestion", proactive_suggestion_gate)
+
+
+# Module-level singleton — initialized once, used by all nodes
+_default_hooks: ActionHooks | None = None
+
+
+def get_hooks() -> ActionHooks:
+    global _default_hooks
+    if _default_hooks is None:
+        _default_hooks = ActionHooks()
+        register_all_hooks(_default_hooks)
+    return _default_hooks

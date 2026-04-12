@@ -66,6 +66,10 @@ async def route_llm_call(
     """Route LLM call with fallback chain. Local-first always."""
     from app.models.brain.litellm_conf import hybrid_route_query
 
+    if hooks is None:
+        from app.orchestrator.hooks import get_hooks
+        hooks = get_hooks()
+
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
     model = _ROLE_TO_MODEL.get(role, GEMMA_FAST_MODEL)
 

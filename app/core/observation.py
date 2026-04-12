@@ -39,6 +39,11 @@ async def bridge_patterns_to_constraints(user_model, patterns: list[dict]) -> No
 
 async def run_observation_loop(state: dict) -> dict:
     """Post-turn behavioral intelligence. Blocking but fast (~200-500ms)."""
+    # Max iteration guard — prevent infinite loops
+    modules_invoked = state.get("modules_invoked", [])
+    if len(modules_invoked) >= 10:  # max 10 module invocations per turn
+        return {"needs_followup": False}
+
     user_model = state.get("user_model")
     if not user_model:
         return {"needs_followup": False}
