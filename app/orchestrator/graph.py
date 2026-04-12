@@ -12,6 +12,7 @@ from app.orchestrator.routing import (
     check_negotiation_shortcut,
     route_to_module,
 )
+from app.modules.planning_graph import build_planning_graph
 
 
 async def _stub_load_context(state: JarvisState) -> dict:
@@ -26,8 +27,40 @@ async def _stub_classify_intent(state: JarvisState) -> dict:
     return {"intent": "CHAT"}
 
 
-async def _stub_planning(state: JarvisState) -> dict:
-    return {"modules_invoked": state.get("modules_invoked", []) + ["planning_module"]}
+_planning_compiled = build_planning_graph()
+
+
+async def _planning_module_node(state: JarvisState) -> dict:
+    """Wrap the planning sub-graph as an orchestrator node."""
+    user_model = state.get("user_model")
+    brain_dump = state.get("brain_dump")
+
+    planning_state = {
+        "user_id": user_model.user_id if user_model else "demo",
+        "user_model": user_model,
+        "planning_goal": brain_dump.planning_goal if brain_dump and hasattr(brain_dump, 'planning_goal') else state.get("user_message", ""),
+        "habits_text": "",
+        "semantic_slots": [],
+        "time_slots": [],
+        "constraints": [],
+        "task_chunks": [],
+        "pending_tasks": [],
+        "schedule": None,
+        "horizon_minutes": 2880,
+        "retry_count": 0,
+        "clarification_request": None,
+        "error": None,
+        "progress_callback": None,
+    }
+
+    result = await _planning_compiled.ainvoke(planning_state)
+    return {
+        "schedule": result.get("schedule"),
+        "execution_graph": {"decomposition": result.get("task_chunks", [])} if result.get("task_chunks") else None,
+        "clarification_request": result.get("clarification_request"),
+        "error": result.get("error"),
+        "modules_invoked": state.get("modules_invoked", []) + ["planning_module"],
+    }
 
 
 async def _stub_research(state: JarvisState) -> dict:
@@ -64,7 +97,7 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_node("load_context", _stub_load_context)
     graph.add_node("extract_brain_dump", _stub_extract_brain_dump)
     graph.add_node("classify_intent", _stub_classify_intent)
-    graph.add_node("planning_module", _stub_planning)
+    graph.add_node("planning_module", _planning_module_node)
     graph.add_node("research_agent", _stub_research)
     graph.add_node("coach_module", _stub_coach)
     graph.add_node("knowledge_module", _stub_knowledge)
