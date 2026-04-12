@@ -59,7 +59,8 @@ async def lifespan(app: FastAPI):
     register_default_patterns()
 
     from app.orchestrator.graph import build_jarvis_graph
-    app.state.jarvis_graph = build_jarvis_graph()
+    from langgraph.checkpoint.memory import MemorySaver
+    app.state.jarvis_graph = build_jarvis_graph(checkpointer=MemorySaver())
 
     # Warmup LM Studio models using explicit load endpoint (avoids model-swap on chat/completions)
     from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL, LM_STUDIO_NATIVE_URL
