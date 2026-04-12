@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code — Complete Verified Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d0d0d; color: #ccc; font-family: -apple-system, 'Segoe UI', sans-serif; padding: 24px; max-width: 1200px; margin: 0 auto; }
+  h1 { color: #fff; font-size: 22px; margin-bottom: 4px; }
+  h2 { color: #e8a838; font-size: 16px; margin: 32px 0 12px; border-bottom: 1px solid #333; padding-bottom: 6px; }
+  h3 { color: #fff; font-size: 13px; margin: 16px 0 8px; }
+  .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+  .box { background: #111; border: 1px solid #333; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  .orange { border-color: #e8a838; }
+  .green { border-color: #4ade80; }
+  .purple { border-color: #a78bfa; }
+  .blue { border-color: #38bdf8; }
+  .red { border-color: #f97316; }
+  .yellow { border-color: #fbbf24; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .grid4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; }
+  .tag { display: inline-block; background: #1a1a2e; border: 1px solid #444; border-radius: 4px; padding: 2px 8px; font-size: 10px; margin: 2px; color: #ccc; }
+  .tag.core { border-color: #e8a838; color: #e8a838; }
+  .tag.hook { border-color: #a78bfa; color: #a78bfa; }
+  .tag.perm { border-color: #4ade80; color: #4ade80; }
+  .tag.feat { border-color: #38bdf8; color: #38bdf8; }
+  code { background: #1a1a1a; padding: 1px 6px; border-radius: 3px; font-size: 11px; color: #e8a838; }
+  .sm { font-size: 10px; color: #666; }
+  .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 11px; line-height: 1.9; }
+  .step { display: flex; gap: 12px; margin-bottom: 8px; }
+  .step-num { background: #1a1a2e; border: 1px solid #a78bfa; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #a78bfa; flex-shrink: 0; }
+  .step-text { font-size: 11px; line-height: 1.6; }
+  .correction { background: #1a1000; border-left: 3px solid #f97316; padding: 6px 12px; margin: 4px 0; font-size: 11px; }
+  .flow-arrow { color: #666; text-align: center; padding: 4px; font-size: 18px; }
+  .highlight { color: #e8a838; font-weight: 600; }
+  .section-nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+  .section-nav a { color: #888; text-decoration: none; font-size: 11px; padding: 4px 10px; border: 1px solid #333; border-radius: 4px; }
+  .section-nav a:hover { border-color: #e8a838; color: #e8a838; }
+</style>
+</head>
+<body>
+
+<h1>Claude Code — Complete Verified Architecture</h1>
+<p class="subtitle">Every claim verified against source code + peer-reviewed. 4 deep-dive agents, 300K+ tokens analyzed. v2 — corrected after review.</p>
+
+<div class="section-nav">
+  <a href="#level1">L1: High-Level</a>
+  <a href="#level2">L2: Reasoning Loop</a>
+  <a href="#level3">L3: Sub-Agents</a>
+  <a href="#level4">L4: 27 Hook Events</a>
+  <a href="#level5">L5: Permission Pipeline</a>
+  <a href="#level6">L6: 4 Compaction Types</a>
+  <a href="#level7">L7: Tool & Skill System</a>
+  <a href="#level8">L8: Feature Gates</a>
+  <a href="#level9">L9: AsyncGenerator Streaming</a>
+  <a href="#corrections">Corrections</a>
+</div>
+
+<!-- ═══════════ LEVEL 1: HIGH-LEVEL ═══════════ -->
+<h2 id="level1">Level 1 — High-Level Architecture</h2>
+
+<div class="box">
+<svg viewBox="0 0 1100 750" style="width:100%;display:block;" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="a" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#666"/></marker>
+    <marker id="ao" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#f97316"/></marker>
+    <marker id="ap" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#a78bfa"/></marker>
+    <marker id="ag" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#4ade80"/></marker>
+    <marker id="ab" markerWidth="7" markerHeight="5" refX="7" refY="2.5" orient="auto"><path d="M0,0 L7,2.5 L0,5" fill="#38bdf8"/></marker>
+  </defs>
+
+  <!-- User -->
+  <circle cx="55" cy="320" r="24" fill="none" stroke="#888" stroke-width="1.5"/>
+  <text x="55" y="324" text-anchor="middle" fill="#ccc" font-size="11">You</text>
+  <line x1="80" y1="320" x2="155" y2="320" stroke="#666" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <!-- QueryEngine -->
+  <rect x="160" y="275" width="145" height="90" rx="6" fill="#111" stroke="#e8a838" stroke-width="1.5"/>
+  <text x="232" y="296" text-anchor="middle" fill="#e8a838" font-size="11" font-weight="bold">QueryEngine</text>
+  <text x="232" y="312" text-anchor="middle" fill="#999" font-size="8">submitMessage()</text>
+  <text x="232" y="325" text-anchor="middle" fill="#999" font-size="8">Session mgmt + transcript</text>
+  <text x="232" y="338" text-anchor="middle" fill="#999" font-size="8">Slash commands</text>
+  <text x="232" y="358" text-anchor="middle" fill="#555" font-size="7">QueryEngine.ts:184</text>
+
+  <line x1="305" y1="320" x2="375" y2="320" stroke="#666" stroke-width="1.2" marker-end="url(#a)"/>
+
+  <!-- queryLoop (CORE) -->
+  <rect x="380" y="245" width="195" height="150" rx="6" fill="#111" stroke="#fff" stroke-width="2"/>
+  <text x="477" y="268" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold">queryLoop()</text>
+  <text x="477" y="283" text-anchor="middle" fill="#e8a838" font-size="9">THE REASONING LOOP</text>
+  <text x="477" y="303" text-anchor="middle" fill="#999" font-size="8">while(true) {</text>
+  <text x="477" y="316" text-anchor="middle" fill="#aaa" font-size="8">  1. compact (4 types)</text>
+  <text x="477" y="329" text-anchor="middle" fill="#aaa" font-size="8">  2. callModel() stream</text>
+  <text x="477" y="342" text-anchor="middle" fill="#aaa" font-size="8">  3. tools (parallel ok)</text>
+  <text x="477" y="355" text-anchor="middle" fill="#aaa" font-size="8">  4. hooks (27 events)</text>
+  <text x="477" y="368" text-anchor="middle" fill="#aaa" font-size="8">  5. permissions (9 steps)</text>
+  <text x="477" y="381" text-anchor="middle" fill="#aaa" font-size="8">}</text>
+  <text x="477" y="400" text-anchor="middle" fill="#555" font-size="7">query.ts:307</text>
+
+  <!-- Feature Gate overlay -->
+  <rect x="375" y="400" width="205" height="28" rx="4" fill="#0a1a2a" stroke="#38bdf8" stroke-width="1" stroke-dasharray="3"/>
+  <text x="477" y="418" text-anchor="middle" fill="#38bdf8" font-size="8">89 feature() gates — Bun DCE at build time</text>
+
+  <!-- HOOKS -->
+  <rect x="650" y="155" width="150" height="95" rx="6" fill="#111" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="725" y="175" text-anchor="middle" fill="#a78bfa" font-size="11" font-weight="bold">Hook Pipeline</text>
+  <text x="725" y="190" text-anchor="middle" fill="#999" font-size="8">27 event types</text>
+  <text x="725" y="203" text-anchor="middle" fill="#999" font-size="8">PreToolUse / PostToolUse</text>
+  <text x="725" y="216" text-anchor="middle" fill="#999" font-size="8">SessionStart / Stop</text>
+  <text x="725" y="229" text-anchor="middle" fill="#999" font-size="8">SubagentStart / CwdChanged</text>
+  <text x="725" y="242" text-anchor="middle" fill="#999" font-size="8">+ 21 more...</text>
+  <line x1="575" y1="290" x2="650" y2="210" stroke="#a78bfa" stroke-width="1" marker-end="url(#ap)"/>
+
+  <!-- PERMISSIONS -->
+  <rect x="650" y="270" width="150" height="80" rx="6" fill="#111" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="725" y="290" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="bold">Permission Pipeline</text>
+  <text x="725" y="305" text-anchor="middle" fill="#999" font-size="8">9-step decision tree</text>
+  <text x="725" y="318" text-anchor="middle" fill="#999" font-size="8">Deny → Ask → Tool check → Safety</text>
+  <text x="725" y="331" text-anchor="middle" fill="#999" font-size="8">→ Mode → Allow → YOLO → Hooks</text>
+  <text x="725" y="344" text-anchor="middle" fill="#999" font-size="8">→ Interactive prompt</text>
+  <line x1="575" y1="320" x2="650" y2="310" stroke="#4ade80" stroke-width="1" marker-end="url(#ag)"/>
+
+  <!-- TOOLS -->
+  <rect x="850" y="195" width="200" height="100" rx="6" fill="#111" stroke="#4ade80" stroke-width="1.5"/>
+  <text x="950" y="215" text-anchor="middle" fill="#4ade80" font-size="11" font-weight="bold">Tools (54 possible)</text>
+  <text x="910" y="232" text-anchor="middle" fill="#999" font-size="8">Bash  FileRead  Grep</text>
+  <text x="910" y="245" text-anchor="middle" fill="#999" font-size="8">WebSearch  AgentTool</text>
+  <text x="990" y="232" text-anchor="middle" fill="#999" font-size="8">Edit  Write</text>
+  <text x="990" y="245" text-anchor="middle" fill="#999" font-size="8">SkillTool  MCP</text>
+  <text x="950" y="265" text-anchor="middle" fill="#e8a838" font-size="8">StreamingToolExecutor</text>
+  <text x="950" y="278" text-anchor="middle" fill="#e8a838" font-size="7">tools start WHILE model streams</text>
+  <text x="950" y="291" text-anchor="middle" fill="#666" font-size="7">concurrent if isConcurrencySafe</text>
+  <line x1="800" y1="245" x2="850" y2="245" stroke="#4ade80" stroke-width="1" marker-end="url(#ag)"/>
+
+  <!-- SUB-AGENTS -->
+  <rect x="850" y="340" width="200" height="120" rx="6" fill="#111" stroke="#f97316" stroke-width="1.5"/>
+  <text x="950" y="360" text-anchor="middle" fill="#f97316" font-size="11" font-weight="bold">Sub-Agents</text>
+  <text x="950" y="376" text-anchor="middle" fill="#e8a838" font-size="8">Each: own query() + hooks + tools</text>
+  <text x="950" y="392" text-anchor="middle" fill="#999" font-size="8">LocalAgentTask (background)</text>
+  <text x="950" y="405" text-anchor="middle" fill="#999" font-size="8">InProcessTeammateTask (swarm)</text>
+  <text x="950" y="418" text-anchor="middle" fill="#999" font-size="8">RemoteAgentTask (cloud)</text>
+  <text x="950" y="431" text-anchor="middle" fill="#999" font-size="8">DreamTask (memory consolidation)</text>
+  <text x="950" y="454" text-anchor="middle" fill="#666" font-size="7">Parent sees: text + stats only</text>
+  <line x1="575" y1="370" x2="850" y2="390" stroke="#f97316" stroke-width="1" marker-end="url(#ao)"/>
+  <line x1="850" y1="410" x2="575" y2="385" stroke="#f97316" stroke-width="1" stroke-dasharray="4" marker-end="url(#a)"/>
+  <text x="710" y="378" text-anchor="middle" fill="#f97316" font-size="7">AgentTool spawns</text>
+  <text x="710" y="408" text-anchor="middle" fill="#888" font-size="7">AgentToolResult</text>
+
+  <!-- MEMORY -->
+  <rect x="380" y="480" width="195" height="110" rx="6" fill="#111" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="477" y="500" text-anchor="middle" fill="#38bdf8" font-size="11" font-weight="bold">Memory System</text>
+  <text x="477" y="516" text-anchor="middle" fill="#999" font-size="8">Transcript (JSONL per-project)</text>
+  <text x="477" y="530" text-anchor="middle" fill="#999" font-size="8">Auto-memory (memdir/)</text>
+  <text x="477" y="544" text-anchor="middle" fill="#e8a838" font-size="8">4 compaction types:</text>
+  <text x="477" y="557" text-anchor="middle" fill="#aaa" font-size="7">micro | auto | snip | reactive</text>
+  <text x="477" y="573" text-anchor="middle" fill="#a78bfa" font-size="8">Recall: Sonnet side-query scoring</text>
+  <text x="477" y="586" text-anchor="middle" fill="#666" font-size="7">memdir/ + compact/ + sessionStorage</text>
+  <line x1="477" y1="395" x2="477" y2="480" stroke="#38bdf8" stroke-width="1" marker-end="url(#ab)"/>
+
+  <!-- CONTEXT -->
+  <rect x="160" y="480" width="145" height="110" rx="6" fill="#111" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="232" y="500" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="bold">Context (Startup)</text>
+  <text x="232" y="516" text-anchor="middle" fill="#999" font-size="8">4-tier CLAUDE.md chain:</text>
+  <text x="232" y="530" text-anchor="middle" fill="#aaa" font-size="7">managed→user→project→local</text>
+  <text x="232" y="546" text-anchor="middle" fill="#999" font-size="8">Skills (lazy frontmatter)</text>
+  <text x="232" y="560" text-anchor="middle" fill="#999" font-size="8">MEMORY.md (200 line cap)</text>
+  <text x="232" y="574" text-anchor="middle" fill="#999" font-size="8">@include (depth 5)</text>
+  <text x="232" y="586" text-anchor="middle" fill="#666" font-size="7">claudemd.ts + loadSkillsDir.ts</text>
+  <line x1="232" y1="480" x2="232" y2="365" stroke="#fbbf24" stroke-width="1" marker-end="url(#a)"/>
+  <text x="260" y="430" text-anchor="middle" fill="#fbbf24" font-size="7">on startup</text>
+
+  <!-- AsyncGenerator label -->
+  <rect x="160" y="640" width="890" height="30" rx="4" fill="#0a0a1a" stroke="#c084fc" stroke-width="1" stroke-dasharray="4"/>
+  <text x="605" y="660" text-anchor="middle" fill="#c084fc" font-size="9">Entire system uses AsyncGenerator&lt;Message&gt; — query(), tools, hooks all yield in real-time. No callbacks.</text>
+</svg>
+</div>
+
+<!-- ═══════════ LEVEL 2: REASONING LOOP ═══════════ -->
+<h2 id="level2">Level 2 — The Reasoning Loop (queryLoop)</h2>
+
+<div class="box mono">
+<div style="color:#555">// query.ts:307 — THE HEART OF CLAUDE CODE</div>
+<div style="color:#c084fc">while</span>(true) {</div>
+<div style="padding-left:16px">
+
+<div style="color:#fbbf24;margin-top:8px">// PHASE 1: Pre-flight compression (every iteration)</div>
+<div>messages = <span style="color:#4ade80">getMessagesAfterCompactBoundary</span>(messages)</div>
+<div><span style="color:#38bdf8">applyToolResultBudget</span>(messages) <span style="color:#555">// cap oversized tool results</span></div>
+<div><span style="color:#38bdf8">snipCompactIfNeeded</span>() <span style="color:#555">// [HISTORY_SNIP] remove old messages</span></div>
+<div><span style="color:#38bdf8">microcompact</span>(messages) <span style="color:#555">// lightweight token reduction</span></div>
+<div><span style="color:#38bdf8">applyCollapsesIfNeeded</span>() <span style="color:#555">// [CONTEXT_COLLAPSE] staged collapse</span></div>
+
+<div style="color:#fbbf24;margin-top:12px">// PHASE 2: Auto-compaction check</div>
+<div><span style="color:#e8a838">autoCompactIfNeeded</span>(messages, model) <span style="color:#555">// fires if tokens ≥ 90% ctx window</span></div>
+<div><span style="color:#555">// → summarizes old messages via forked API call</span></div>
+<div><span style="color:#555">// → inserts boundary marker, preserves last 5 file reads</span></div>
+<div><span style="color:#555">// → circuit breaker: 3 consecutive failures → stop</span></div>
+
+<div style="color:#fbbf24;margin-top:12px">// PHASE 3: Stream from Claude API</div>
+<div><span style="color:#c084fc">for await</span> (msg <span style="color:#c084fc">of</span> <span style="color:#f97316">callModel</span>({messages, tools, system, ...})) {</div>
+<div style="padding-left:16px">
+  <div><span style="color:#c084fc">if</span> (msg.type === <span style="color:#4ade80">'tool_use'</span>) needsFollowUp = true</div>
+  <div><span style="color:#c084fc">if</span> (<span style="color:#38bdf8">streamingToolExecution</span>) executor.<span style="color:#f97316">addTool</span>(block) <span style="color:#e8a838">// start DURING stream!</span></div>
+  <div><span style="color:#c084fc">yield</span> msg <span style="color:#555">// → AsyncGenerator → UI renders in real-time</span></div>
+</div>
+<div>}</div>
+
+<div style="color:#fbbf24;margin-top:12px">// PHASE 4: Decision</div>
+<div><span style="color:#c084fc">if</span> (!needsFollowUp) { <span style="color:#555">// Model done — no tool calls</span></div>
+<div style="padding-left:16px">
+  <div><span style="color:#555">// Recovery: 413 → collapse drain → reactive compact</span></div>
+  <div><span style="color:#555">// Recovery: max_output_tokens → escalate 8K→64K → multi-turn</span></div>
+  <div><span style="color:#a78bfa">handleStopHooks</span>() <span style="color:#555">// 27 event types, fire-and-forget background:</span></div>
+  <div><span style="color:#555">//   → extractMemories, autoDream, promptSuggestion, jobClassify</span></div>
+  <div><span style="color:#4ade80">checkTokenBudget</span>() <span style="color:#555">// if &lt;90% budget + not diminishing → nudge continue</span></div>
+  <div><span style="color:#c084fc">return</span> 'completed'</div>
+</div>
+<div>} <span style="color:#c084fc">else</span> { <span style="color:#555">// Tools were called</span></div>
+<div style="padding-left:16px">
+  <div><span style="color:#a78bfa">runPreToolUseHooks</span>(tool, input) <span style="color:#555">// can modify input or deny</span></div>
+  <div><span style="color:#4ade80">checkPermissions</span>(tool, input) <span style="color:#555">// 9-step pipeline → allow/deny/ask</span></div>
+  <div><span style="color:#f97316">tool.call</span>(args, context) <span style="color:#555">// actual execution</span></div>
+  <div><span style="color:#a78bfa">runPostToolUseHooks</span>(tool, result) <span style="color:#555">// can modify result</span></div>
+  <div><span style="color:#4ade80">getAttachmentMessages</span>() <span style="color:#555">// file changes, queued commands</span></div>
+  <div>messages = [...messages, assistantMsg, ...toolResults]</div>
+  <div><span style="color:#c084fc">continue</span> <span style="color:#555">// → next iteration</span></div>
+</div>
+<div>}</div>
+
+</div>
+<div style="color:#c084fc">}</div>
+</div>
+
+<!-- ═══════════ LEVEL 3: SUB-AGENTS ═══════════ -->
+<h2 id="level3">Level 3 — Sub-Agent Isolation (Verified TRUE)</h2>
+
+<div class="grid2">
+  <div class="box" style="border-color:#fff">
+    <h3 style="color:#fff">Parent Agent</h3>
+    <div style="font-size:11px;line-height:1.9;margin-top:8px">
+      <code>QueryEngine.submitMessage()</code><br/>
+      → <code>query()</code> → <code>queryLoop()</code><br/>
+      → model calls <span style="color:#f97316">AgentTool</span><br/>
+      → <code>runAgent()</code> spawns child<br/><br/>
+      <span style="color:#888">Parent receives ONLY:</span><br/>
+      <span style="color:#ccc">AgentToolResult {</span><br/>
+      <span style="color:#ccc;padding-left:12px">content: text[]</span><br/>
+      <span style="color:#ccc;padding-left:12px">totalTokens, totalToolUseCount</span><br/>
+      <span style="color:#ccc;padding-left:12px">totalDurationMs</span><br/>
+      <span style="color:#ccc">}</span><br/><br/>
+      <span style="color:#e8a838">CANNOT see child's:</span><br/>
+      individual tool calls, hook results,<br/>
+      intermediate messages, compaction events
+    </div>
+  </div>
+
+  <div class="box red">
+    <h3 style="color:#f97316">Sub-Agent (Child)</h3>
+    <div style="font-size:11px;line-height:1.9;margin-top:8px">
+      <span style="color:#e8a838">Calls query() DIRECTLY</span> (not QueryEngine)<br/>
+      via <code>createSubagentContext()</code><br/><br/>
+      <span style="color:#4ade80">Gets its OWN:</span><br/>
+      &#10003; Fresh ToolUseContext + agentId<br/>
+      &#10003; Own AbortController<br/>
+      &#10003; Own readFileState cache<br/>
+      &#10003; Filtered tool set (resolveAgentTools)<br/>
+      &#10003; Own queryTracking chain<br/><br/>
+      <span style="color:#a78bfa">OWN hook pipeline:</span><br/>
+      &#10003; Global hooks (settings.json) — shared<br/>
+      &#10003; Session hooks (agentId-scoped)<br/>
+      &#10003; Frontmatter hooks (registerFrontmatterHooks)<br/>
+      &#10003; Cleaned up via clearSessionHooks()
+    </div>
+  </div>
+</div>
+
+<div class="grid4" style="margin-top:8px">
+  <div class="box green" style="padding:10px">
+    <div style="color:#4ade80;font-weight:bold;font-size:11px">LocalAgentTask</div>
+    <div style="font-size:9px;color:#888;margin-top:4px">Background, same process, async query() loop</div>
+  </div>
+  <div class="box blue" style="padding:10px">
+    <div style="color:#38bdf8;font-weight:bold;font-size:11px">InProcessTeammate</div>
+    <div style="font-size:9px;color:#888;margin-top:4px">Swarm member, team identity, mailbox, idle state</div>
+  </div>
+  <div class="box purple" style="padding:10px">
+    <div style="color:#a78bfa;font-weight:bold;font-size:11px">RemoteAgentTask</div>
+    <div style="font-size:9px;color:#888;margin-top:4px">Cloud CCR, polling progress, ant-only</div>
+  </div>
+  <div class="box yellow" style="padding:10px">
+    <div style="color:#fbbf24;font-weight:bold;font-size:11px">DreamTask</div>
+    <div style="font-size:9px;color:#888;margin-top:4px">Memory consolidation, auto-dream background</div>
+  </div>
+</div>
+
+<div class="correction" style="margin-top:8px">
+  <strong style="color:#f97316">Recursive nesting:</strong> Fork guard applies to ALL users (not USER_TYPE restricted). Fork children explicitly block recursive spawning via FORK_BOILERPLATE_TAG detection. queryTracking.depth tracks depth for telemetry only — no hard limit enforced.
+</div>
+
+<!-- ═══════════ LEVEL 4: HOOKS ═══════════ -->
+<h2 id="level4">Level 4 — All 27 Hook Events</h2>
+
+<div class="box purple">
+<div class="grid3">
+  <div>
+    <h3 style="color:#a78bfa">Tool Lifecycle (6)</h3>
+    <span class="tag hook">PreToolUse</span>
+    <span class="tag hook">PostToolUse</span>
+    <span class="tag hook">PostToolUseFailure</span>
+    <span class="tag hook">PermissionRequest</span>
+    <span class="tag hook">PermissionDenied</span>
+    <span class="tag hook">Notification</span>
+  </div>
+  <div>
+    <h3 style="color:#a78bfa">Session Lifecycle (7)</h3>
+    <span class="tag hook">SessionStart</span>
+    <span class="tag hook">SessionEnd</span>
+    <span class="tag hook">Setup</span>
+    <span class="tag hook">Stop</span>
+    <span class="tag hook">StopFailure</span>
+    <span class="tag hook">TeammateIdle</span>
+    <span class="tag hook">InstructionsLoaded</span>
+  </div>
+  <div>
+    <h3 style="color:#a78bfa">Agent Events (3)</h3>
+    <span class="tag hook">SubagentStart</span>
+    <span class="tag hook">SubagentStop</span>
+    <span class="tag hook">ConfigChange</span>
+  </div>
+  <div>
+    <h3 style="color:#a78bfa">Task Events (2)</h3>
+    <span class="tag hook">TaskCreated</span>
+    <span class="tag hook">TaskCompleted</span>
+  </div>
+  <div>
+    <h3 style="color:#a78bfa">Context Events (6)</h3>
+    <span class="tag hook">CwdChanged</span>
+    <span class="tag hook">FileChanged</span>
+    <span class="tag hook">WorktreeCreate</span>
+    <span class="tag hook">WorktreeRemove</span>
+    <span class="tag hook">PreCompact</span>
+    <span class="tag hook">PostCompact</span>
+  </div>
+  <div>
+    <h3 style="color:#a78bfa">User Interaction (3)</h3>
+    <span class="tag hook">UserPromptSubmit</span>
+    <span class="tag hook">Elicitation</span>
+    <span class="tag hook">ElicitationResult</span>
+  </div>
+</div>
+<div style="margin-top:12px;font-size:10px;color:#888">
+  Source: <code>entrypoints/sdk/coreTypes.ts:25-53</code> | Types: <code>types/hooks.ts</code> | Schemas: <code>schemas/hooks.ts</code><br/>
+  Hook scoping: Global (settings.json) + Session (agentId-keyed) + Frontmatter (per agent def) + SDK registered<br/>
+  <span style="color:#e8a838">Verified against coreTypes.ts:26-52. 27 total across 6 categories.</span>
+</div>
+</div>
+
+<!-- ═══════════ LEVEL 5: PERMISSIONS ═══════════ -->
+<h2 id="level5">Level 5 — Permission Pipeline (9 Steps)</h2>
+
+<div class="box green">
+<div class="step"><div class="step-num">1</div><div class="step-text"><strong>Deny rules match?</strong> — Check <code>alwaysDenyRules[source][]</code> from 8 rule sources (userSettings, projectSettings, localSettings, flagSettings, policySettings, cliArg, command, session). If match → <span style="color:#f97316">DENY</span>.</div></div>
+<div class="step"><div class="step-num">2</div><div class="step-text"><strong>Ask rules match?</strong> — Check <code>alwaysAskRules[source][]</code>. If match → <span style="color:#fbbf24">ASK</span>. Exception: Bash may auto-allow if sandboxed.</div></div>
+<div class="step"><div class="step-num">3</div><div class="step-text"><strong>tool.checkPermissions(input)</strong> — Tool-specific permission logic (e.g., BashTool checks for dangerous commands). Returns allow/ask/deny/passthrough. <span style="color:#e8a838">(Corrected: was step 0, actually step 3)</span></div></div>
+<div class="step"><div class="step-num">4</div><div class="step-text"><strong>Safety check</strong> — Protected paths (.git/, .claude/, .vscode/, shell configs). Bypass-immune — even bypassPermissions mode can't suppress. → <span style="color:#fbbf24">ASK</span>.</div></div>
+<div class="step"><div class="step-num">5</div><div class="step-text"><strong>Mode-based allow?</strong> — If bypassPermissions mode → <span style="color:#4ade80">ALLOW</span>.</div></div>
+<div class="step"><div class="step-num">6</div><div class="step-text"><strong>Always-allow rules</strong> — Check <code>alwaysAllowRules[source][]</code>. If match → <span style="color:#4ade80">ALLOW</span>. <span style="color:#e8a838">(Corrected: separated from mode-based allow)</span></div></div>
+<div class="step"><div class="step-num">7</div><div class="step-text"><strong>YOLO Classifier</strong> (auto mode only, gated by TRANSCRIPT_CLASSIFIER) — Fast paths: safe tool allowlist (Read, Grep, Glob, Task tools) → instant ALLOW. Otherwise: API call to classifier with transcript + action. Returns shouldBlock + confidence. Denial tracking: after 5 consecutive blocks → fallback to prompting.</div></div>
+<div class="step"><div class="step-num">8</div><div class="step-text"><strong>Permission hooks</strong> — Can override any previous decision. Hook result can set behavior to allow/deny/ask. <span style="color:#e8a838">(headless agents only)</span></div></div>
+<div class="step"><div class="step-num">9</div><div class="step-text"><strong>Interactive prompt</strong> — If still ASK: show permission dialog to user. Coordinator workers: await automated checks first. Swarm workers: special handler. User can approve, deny, or modify input.</div></div>
+</div>
+
+<div style="font-size:10px;color:#666;margin-top:4px">
+  Source: <code>utils/permissions/permissions.ts</code> | Classifier: <code>utils/permissions/yoloClassifier.ts</code> | Types: <code>types/permissions.ts</code>
+</div>
+
+<!-- ═══════════ LEVEL 6: COMPACTION ═══════════ -->
+<h2 id="level6">Level 6 — 4 Compaction Types</h2>
+
+<div class="grid2">
+  <div class="box blue">
+    <h3 style="color:#38bdf8">1. Micro-compact</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      <strong>When:</strong> Every iteration, before API call<br/>
+      <strong>What:</strong> Lightweight token reduction — shrink tool results, remove redundant whitespace<br/>
+      <strong>Cost:</strong> Zero API calls<br/>
+      <strong>Gate:</strong> CACHED_MICROCOMPACT<br/>
+      <code style="font-size:9px">services/compact/microCompact.ts</code>
+    </div>
+  </div>
+  <div class="box blue">
+    <h3 style="color:#38bdf8">2. Auto-compact</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      <strong>When:</strong> Token count ≥ contextWindow - 20K - 13K<br/>
+      <strong>What:</strong> Full summarization via forked API call. Preserves last 5 file reads, plan info, skills<br/>
+      <strong>Cost:</strong> 1 API call (forked model)<br/>
+      <strong>Breaker:</strong> 3 consecutive failures → stops<br/>
+      <code style="font-size:9px">services/compact/autoCompact.ts</code>
+    </div>
+  </div>
+  <div class="box blue">
+    <h3 style="color:#38bdf8">3. Snip-compact</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      <strong>When:</strong> Every iteration (gated HISTORY_SNIP)<br/>
+      <strong>What:</strong> Remove old messages by history boundary — no summarization, just cut<br/>
+      <strong>Cost:</strong> Zero API calls<br/>
+      <strong>Gate:</strong> HISTORY_SNIP feature flag<br/>
+      <code style="font-size:9px">query.ts:401 → snipCompactIfNeeded</code>
+    </div>
+  </div>
+  <div class="box blue">
+    <h3 style="color:#38bdf8">4. Reactive-compact</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      <strong>When:</strong> AFTER 413 prompt-too-long error<br/>
+      <strong>What:</strong> Emergency recovery — 3 stages: context collapse drain → full reactive compact → give up<br/>
+      <strong>Cost:</strong> 1+ API calls<br/>
+      <strong>Gate:</strong> REACTIVE_COMPACT<br/>
+      <code style="font-size:9px">query.ts:1119-1166</code>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ LEVEL 7: TOOLS + SKILLS ═══════════ -->
+<h2 id="level7">Level 7 — Tool & Skill System</h2>
+
+<div class="grid2">
+  <div class="box green">
+    <h3 style="color:#4ade80">Tool (Tool.ts interface)</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      54 possible tools (19 unconditional + 35 feature-gated), each implements:<br/>
+      <code>inputSchema</code> (Zod) → exposed to LLM<br/>
+      <code>call(args, ctx)</code> → execution<br/>
+      <code>checkPermissions(input, ctx)</code> → allow/ask/deny<br/>
+      <code>isConcurrencySafe(input)</code> → parallel ok?<br/>
+      <code>isReadOnly(input)</code> → side-effect free?<br/>
+      <code>maxResultSizeChars</code> → disk if exceeded<br/><br/>
+      <strong style="color:#e8a838">StreamingToolExecutor:</strong><br/>
+      Read-only tools (Grep, Glob, Read) run in parallel.<br/>
+      Mutating tools (Bash, Edit, Write) sequential.<br/>
+      Bash errors abort siblings; others don't.
+    </div>
+  </div>
+  <div class="box purple">
+    <h3 style="color:#c084fc">Skill (SkillTool → Command)</h3>
+    <div style="font-size:10px;color:#999;margin-top:6px;line-height:1.8">
+      Markdown files with YAML frontmatter<br/>
+      Sources: bundled, user, project, plugin, MCP<br/><br/>
+      <strong style="color:#e8a838">Lazy loading:</strong> only frontmatter at startup<br/>
+      Full content loaded on invocation<br/><br/>
+      <strong>Two execution modes:</strong><br/>
+      <span style="color:#ccc">Inline:</span> inject into current conversation<br/>
+      <span style="color:#ccc">Fork:</span> spawn sub-agent via runAgent()<br/><br/>
+      <strong>Key frontmatter fields:</strong><br/>
+      allowed-tools, model, context (fork|inline),<br/>
+      hooks, agent, effort, paths, arguments<br/><br/>
+      Skills CAN invoke tools. Skills ARE invoked<br/>
+      via SkillTool (a meta-tool in the 54).
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ LEVEL 8: FEATURE GATES ═══════════ -->
+<h2 id="level8">Level 8 — Feature Gating (89 flags)</h2>
+
+<div class="box" style="border-color:#38bdf8">
+<div style="font-size:11px;color:#ccc;margin-bottom:12px">
+  <code>feature('FLAG')</code> → boolean. <strong style="color:#38bdf8">Bun's built-in DCE</strong> — dead code eliminated at build time. Not env vars at runtime.
+</div>
+
+<div class="grid3" style="gap:6px">
+  <div>
+    <div style="color:#f97316;font-size:10px;font-weight:bold;margin-bottom:4px">Agents & Coordination (7)</div>
+    <span class="tag feat">COORDINATOR_MODE</span>
+    <span class="tag feat">FORK_SUBAGENT</span>
+    <span class="tag feat">AGENT_TRIGGERS</span>
+    <span class="tag feat">AGENT_TRIGGERS_REMOTE</span>
+    <span class="tag feat">AGENT_MEMORY_SNAPSHOT</span>
+    <span class="tag feat">BG_SESSIONS</span>
+    <span class="tag feat">BUILTIN_EXPLORE_PLAN_AGENTS</span>
+  </div>
+  <div>
+    <div style="color:#4ade80;font-size:10px;font-weight:bold;margin-bottom:4px">Tools & Capabilities (14)</div>
+    <span class="tag feat">WEB_BROWSER_TOOL</span>
+    <span class="tag feat">WORKFLOW_SCRIPTS</span>
+    <span class="tag feat">MONITOR_TOOL</span>
+    <span class="tag feat">TOKEN_BUDGET</span>
+    <span class="tag feat">ULTRAPLAN</span>
+    <span class="tag feat">ULTRATHINK</span>
+    <span class="tag feat">MCP_SKILLS</span>
+    <span class="tag feat">EXPERIMENTAL_SKILL_SEARCH</span>
+    <span class="tag feat">TEMPLATES</span>
+    <span class="tag feat">DAEMON</span>
+    <span class="tag feat">TORCH</span>
+    <span class="tag feat">LODESTONE</span>
+    <span class="tag feat">SKILL_IMPROVEMENT</span>
+    <span class="tag feat">RUN_SKILL_GENERATOR</span>
+  </div>
+  <div>
+    <div style="color:#a78bfa;font-size:10px;font-weight:bold;margin-bottom:4px">Memory & Context (7)</div>
+    <span class="tag feat">EXTRACT_MEMORIES</span>
+    <span class="tag feat">CONTEXT_COLLAPSE</span>
+    <span class="tag feat">HISTORY_SNIP</span>
+    <span class="tag feat">REACTIVE_COMPACT</span>
+    <span class="tag feat">CACHED_MICROCOMPACT</span>
+    <span class="tag feat">COMPACT_REMINDERS</span>
+    <span class="tag feat">AWAY_SUMMARY</span>
+  </div>
+  <div>
+    <div style="color:#38bdf8;font-size:10px;font-weight:bold;margin-bottom:4px">Classifier & Perms (4)</div>
+    <span class="tag feat">TRANSCRIPT_CLASSIFIER</span>
+    <span class="tag feat">BASH_CLASSIFIER</span>
+    <span class="tag feat">POWERSHELL_AUTO_MODE</span>
+    <span class="tag feat">VERIFICATION_AGENT</span>
+  </div>
+  <div>
+    <div style="color:#fbbf24;font-size:10px;font-weight:bold;margin-bottom:4px">Kairos & Assistant (8)</div>
+    <span class="tag feat">KAIROS</span>
+    <span class="tag feat">KAIROS_BRIEF</span>
+    <span class="tag feat">KAIROS_CHANNELS</span>
+    <span class="tag feat">KAIROS_DREAM</span>
+    <span class="tag feat">KAIROS_GITHUB_WEBHOOKS</span>
+    <span class="tag feat">KAIROS_PUSH_NOTIFICATION</span>
+    <span class="tag feat">PROACTIVE</span>
+    <span class="tag feat">BUILDING_CLAUDE_APPS</span>
+  </div>
+  <div>
+    <div style="color:#888;font-size:10px;font-weight:bold;margin-bottom:4px">Infrastructure (15+)</div>
+    <span class="tag">BRIDGE_MODE</span>
+    <span class="tag">DIRECT_CONNECT</span>
+    <span class="tag">SSH_REMOTE</span>
+    <span class="tag">CHICAGO_MCP</span>
+    <span class="tag">VOICE_MODE</span>
+    <span class="tag">BUDDY</span>
+    <span class="tag">STREAMLINED_OUTPUT</span>
+    <span class="tag">TERMINAL_PANEL</span>
+    <span class="tag">PERFETTO_TRACING</span>
+    <span class="tag">+ 30 more...</span>
+  </div>
+</div>
+</div>
+
+<!-- ═══════════ LEVEL 9: ASYNC GENERATORS ═══════════ -->
+<h2 id="level9">Level 9 — AsyncGenerator Streaming Architecture</h2>
+
+<div class="box" style="border-color:#c084fc">
+<div style="font-size:11px;color:#ccc;margin-bottom:12px">
+  The entire system uses <code>AsyncGenerator&lt;T&gt;</code> — not callbacks, not promises, not event emitters. This is an architectural choice that enables <strong style="color:#c084fc">real-time streaming at every layer</strong> with backpressure.
+</div>
+
+<div class="mono" style="font-size:10px;line-height:2">
+<span style="color:#c084fc">// Layer 1: API → query loop</span><br/>
+<span style="color:#e8a838">async function*</span> queryModelWithStreaming(): <span style="color:#38bdf8">AsyncGenerator&lt;StreamEvent&gt;</span><br/><br/>
+
+<span style="color:#c084fc">// Layer 2: query loop → QueryEngine</span><br/>
+<span style="color:#e8a838">async function*</span> query(): <span style="color:#38bdf8">AsyncGenerator&lt;Message | StreamEvent&gt;</span><br/><br/>
+
+<span style="color:#c084fc">// Layer 3: QueryEngine → UI/SDK</span><br/>
+<span style="color:#e8a838">async function*</span> submitMessage(): <span style="color:#38bdf8">AsyncGenerator&lt;NormalizedMessage&gt;</span><br/><br/>
+
+<span style="color:#c084fc">// Layer 4: Tool execution</span><br/>
+<span style="color:#e8a838">async function*</span> getRemainingResults(): <span style="color:#38bdf8">AsyncGenerator&lt;ToolResult | Progress&gt;</span><br/><br/>
+
+<span style="color:#c084fc">// Layer 5: Stop hooks</span><br/>
+<span style="color:#e8a838">async function*</span> handleStopHooks(): <span style="color:#38bdf8">AsyncGenerator&lt;StopHookResult&gt;</span><br/><br/>
+
+<span style="color:#c084fc">// Every layer yields → consumer pulls on demand → natural backpressure</span><br/>
+<span style="color:#c084fc">// No buffering, no dropped messages, no callback hell</span>
+</div>
+</div>
+
+<!-- ═══════════ CORRECTIONS ═══════════ -->
+<h2 id="corrections">Corrections to Simplified Diagram</h2>
+
+<div class="box" style="border-left:3px solid #f97316;border-color:#f97316">
+<div style="font-size:11px;line-height:2.4">
+  <span style="color:#f97316">1.</span> "Agent → Reasoning Loop" = <span class="highlight">QueryEngine.submitMessage() → query() → queryLoop()</span> — 3 layers<br/>
+  <span style="color:#f97316">2.</span> Sub-agents call <span class="highlight">query() directly</span>, NOT QueryEngine<br/>
+  <span style="color:#f97316">3.</span> Hooks are <span class="highlight">inside the loop</span> wrapping each tool, not between Agent and Tools<br/>
+  <span style="color:#f97316">4.</span> Memory fires <span class="highlight">proactively at loop top</span>, not reactively "when full"<br/>
+  <span style="color:#f97316">5.</span> Tools execute <span class="highlight">during streaming</span>, not sequentially after<br/>
+  <span style="color:#f97316">6.</span> Sub-agent hooks are <span class="highlight">session-scoped by agentId</span>, not inherited<br/>
+  <span style="color:#f97316">7.</span> Skills are a <span class="highlight">meta-tool</span> (SkillTool) — not same as tools<br/>
+  <span style="color:#f97316">8.</span> Context = <span class="highlight">4-tier chain</span> (managed→user→project→local), not just "CLAUDE.md"<br/>
+  <span style="color:#f97316">9.</span> Memory recall uses <span class="highlight">Sonnet side-query</span>, not embedding similarity<br/>
+  <span style="color:#f97316">10.</span> Stop hooks trigger <span class="highlight">memory extraction + auto-dream + prompt suggestion</span><br/>
+  <span style="color:#f97316">11.</span> <span class="highlight">27 hook events</span> (not just Pre/PostToolUse) across 6 categories<br/>
+  <span style="color:#f97316">12.</span> <span class="highlight">89 feature gates</span> via Bun DCE control which subsystems exist at build time<br/>
+  <span style="color:#f97316">13.</span> <span class="highlight">9-step permission pipeline</span> — deny rules FIRST, then ask, then tool.checkPermissions, safety, mode, allow rules, YOLO classifier, hooks, interactive<br/>
+  <span style="color:#f97316">14.</span> <span class="highlight">4 compaction types</span> (micro, auto, snip, reactive) — not just "auto-compacts"<br/>
+  <span style="color:#f97316">15.</span> Entire system uses <span class="highlight">AsyncGenerator</span> for real-time streaming with backpressure<br/>
+  <span style="color:#f97316">16.</span> <span class="highlight">54 possible tools</span> (19 unconditional + 35 feature-gated), not 43
+</div>
+</div>
+
+</body>
+</html>
