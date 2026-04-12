@@ -1094,7 +1094,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     }
 
     async def event_gen():
-        from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL
+        import app.core.config as _cfg
+        LOCAL_LLM_MODEL = _cfg.LOCAL_LLM_MODEL
+        SLM_ROUTER_MODEL = _cfg.SLM_ROUTER_MODEL
 
         try:
             final_state = {}
@@ -1197,8 +1199,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
             _has_schedule = bool(final_state.get("schedule"))
 
-            from app.core.config import GEMINI_PRIMARY, GEMINI_MODEL
-            _active_model = GEMINI_MODEL if GEMINI_PRIMARY else LOCAL_LLM_MODEL
+            _active_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else LOCAL_LLM_MODEL
             yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'v2', 'synthesis_model': _active_model})}\n\n"
 
             # --- Token streaming (matches v1/stream SSE contract) ---
@@ -1207,7 +1208,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _token_count = 0
             thinking_full = ""
             message_full = ""
-            _stream_model = LOCAL_LLM_MODEL
+            _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else LOCAL_LLM_MODEL
 
             if _has_schedule and _intent == "PLAN_DAY":
                 # Schedule responses: emit pre-computed message, no VoJ streaming needed
