@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import json as json_mod
 import re
 import time as time_mod
 from collections.abc import AsyncGenerator
@@ -23,6 +24,19 @@ from app.services.analytical.voice_of_jarvis import (
 from app.models.brain.litellm_conf import hybrid_route_query
 
 router = APIRouter()
+
+NODE_TO_PHASE = {
+    "load_context": "loading_context",
+    "extract_brain_dump": "brain_dump_extraction",
+    "classify_intent": "intent_classified",
+    "planning_module": "planning",
+    "research_agent": "researching",
+    "coach_module": "coaching",
+    "knowledge_module": "ingesting",
+    "conversation_module": "responding",
+    "synthesize_response": "synthesizing",
+    "observation_loop": "learning",
+}
 
 
 class ChatRequest(BaseModel):
@@ -1002,3 +1016,61 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
         "schedule": updated_schedule,
         "schedule_status": "draft",
     }
+
+
+@router.post("/v2/stream")
+async def chat_stream_v2(request: ChatRequest, http_request: Request):
+    """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
+    from app.core.user_model import UserModel
+    from app.orchestrator.state import ConversationPhase, NegotiationPhase
+
+    jarvis_graph = http_request.app.state.jarvis_graph
+    db_client = http_request.app.state.db_client
+    user_model = UserModel(user_id=request.user_id, db=db_client)
+
+    if hasattr(http_request.app.state, "memory_store"):
+        user_model.set_memory_store(http_request.app.state.memory_store)
+
+    initial_state = {
+        "user_model": user_model,
+        "user_message": request.user_prompt,
+        "brain_dump": None,
+        "intent": None,
+        "initiated_by": "user",
+        "execution_graph": None,
+        "schedule": None,
+        "draft_response": None,
+        "research_results": None,
+        "ingestion_result": None,
+        "clarification_request": None,
+        "thinking_process": None,
+        "response_message": None,
+        "conversation_phase": ConversationPhase.GREETING,
+        "negotiation_state": NegotiationPhase.NONE,
+        "modules_invoked": [],
+        "needs_followup": False,
+        "error": None,
+    }
+
+    config = {"configurable": {"thread_id": request.user_id}}
+
+    async def event_gen():
+        try:
+            async for event in jarvis_graph.astream(initial_state, config):
+                node_name = list(event.keys())[0]
+                node_state = event[node_name]
+
+                phase = NODE_TO_PHASE.get(node_name)
+                if phase:
+                    yield f"event: phase\ndata: {json_mod.dumps({'phase': phase})}\n\n"
+
+                if node_name == "classify_intent" and node_state.get("intent"):
+                    yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
+
+            final = jarvis_graph.get_state(config).values
+            yield f"event: step\ndata: {json_mod.dumps({'intent': str(final.get('intent', 'CHAT')), 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
+            yield f"event: complete\ndata: {json_mod.dumps({'intent': str(final.get('intent', 'CHAT')), 'message': final.get('response_message', ''), 'thinking_process': final.get('thinking_process')})}\n\n"
+        except Exception as exc:
+            yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
