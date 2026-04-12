@@ -51,6 +51,24 @@ async def translate_habits(state: PlanningState) -> dict:
         return {"semantic_slots": []}
 
 
+async def expand_slots(state: PlanningState) -> dict:
+    """Expand semantic slots to concrete time slots for OR-Tools."""
+    semantic_slots = state.get("semantic_slots", [])
+    if not semantic_slots:
+        return {"time_slots": []}
+    try:
+        from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
+        from app.schemas.context import SemanticTimeSlot
+        # Convert dicts back to SemanticTimeSlot objects
+        slot_objects = [SemanticTimeSlot.model_validate(s) for s in semantic_slots]
+        horizon = state.get("horizon_minutes", 2880)
+        time_slots = expand_semantic_slots_to_time_slots(slot_objects, horizon)
+        return {"time_slots": [ts.model_dump() if hasattr(ts, 'model_dump') else ts for ts in time_slots]}
+    except Exception as e:
+        logger.warning(f"Horizon expansion failed: {e}")
+        return {"time_slots": []}
+
+
 async def memory_to_constraints(state: PlanningState) -> dict:
     return {}
 
@@ -76,16 +94,21 @@ async def decompose_goal(state: PlanningState) -> dict:
         "actionable micro-tasks of 15-25 minutes each. Each task must have clear completion criteria."
     )
     try:
-        from app.models.brain.litellm_conf import hybrid_route_query
+        from app.core.model_router import route_llm_call
         from app.schemas.context import ExecutionGraph
-        import json, re
-        result = await hybrid_route_query(user_prompt=goal, system_prompt=system_prompt, response_schema=ExecutionGraph)
-        if isinstance(result, str):
-            clean = re.sub(r"```json|```", "", result).strip()
+        result = await route_llm_call(
+            task="socratic_chunker",
+            prompt=goal,
+            system_prompt=system_prompt,
+            response_schema=ExecutionGraph,
+        )
+        if isinstance(result, ExecutionGraph):
+            graph = result
+        else:
+            import json, re
+            clean = re.sub(r"```json|```", "", str(result)).strip()
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
-        else:
-            graph = result if isinstance(result, ExecutionGraph) else ExecutionGraph.model_validate(result)
         return {"task_chunks": [tc.model_dump() for tc in graph.decomposition]}
     except Exception as e:
         logger.error(f"Decomposition failed: {e}")
@@ -163,6 +186,7 @@ def build_planning_graph():
     graph = StateGraph(PlanningState)
     graph.add_node("fetch_constraints", fetch_constraints)
     graph.add_node("translate_habits", translate_habits)
+    graph.add_node("expand_slots", expand_slots)
     graph.add_node("memory_to_constraints", memory_to_constraints)
     graph.add_node("validate_goal", validate_goal)
     graph.add_node("decompose_goal", decompose_goal)
@@ -172,7 +196,8 @@ def build_planning_graph():
 
     graph.set_entry_point("fetch_constraints")
     graph.add_edge("fetch_constraints", "translate_habits")
-    graph.add_edge("translate_habits", "memory_to_constraints")
+    graph.add_edge("translate_habits", "expand_slots")
+    graph.add_edge("expand_slots", "memory_to_constraints")
     graph.add_edge("memory_to_constraints", "validate_goal")
     graph.add_conditional_edges("validate_goal", is_goal_clear, {True: "decompose_goal", False: END})
     graph.add_edge("decompose_goal", "fuse_tasks")
