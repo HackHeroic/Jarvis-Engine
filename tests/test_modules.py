@@ -47,7 +47,7 @@ async def test_coach_module_returns_message():
         "modules_invoked": [],
         "error": None,
     }
-    state["user_model"].get_pending_tasks = AsyncMock(return_value=[
+    state["user_model"].get_all_tasks = AsyncMock(return_value=[
         {"status": "completed", "title": "Study DSA"},
         {"status": "pending", "title": "Read chapter 5"},
     ])

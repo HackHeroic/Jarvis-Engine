@@ -56,6 +56,18 @@ class UserModel:
             self._cache["pending_tasks"] = result.data
         return self._cache["pending_tasks"]
 
+    async def get_all_tasks(self) -> list[dict]:
+        """All tasks (any status) for progress tracking."""
+        if "all_tasks" not in self._cache:
+            result = await asyncio.to_thread(
+                lambda: self._db.supabase.table("user_tasks")
+                .select("*")
+                .eq("user_id", self._user_id)
+                .execute()
+            )
+            self._cache["all_tasks"] = result.data
+        return self._cache["all_tasks"]
+
     async def get_active_goals(self) -> list[dict]:
         if "active_goals" not in self._cache:
             result = await asyncio.to_thread(

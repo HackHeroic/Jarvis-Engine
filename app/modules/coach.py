@@ -25,7 +25,7 @@ async def run_coaching_response(state: dict) -> dict:
 
     try:
         if user_model:
-            tasks = await user_model.get_pending_tasks()
+            tasks = await user_model.get_all_tasks()
             completed = sum(1 for t in tasks if t.get("status") == "completed")
             pending = sum(1 for t in tasks if t.get("status") == "pending")
             total = len(tasks)

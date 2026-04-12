@@ -8,6 +8,7 @@ until LM Studio is available. All other modules are wired to real implementation
 from langgraph.graph import END, StateGraph
 
 from app.orchestrator.state import JarvisState
+from app.orchestrator.hooks import ActionHooks, register_all_hooks
 from app.orchestrator.routing import (
     check_needs_followup,
     check_negotiation_shortcut,
@@ -132,6 +133,9 @@ async def _research_agent_node(state: JarvisState) -> dict:
 
 def build_jarvis_graph(checkpointer=None):
     """Build and compile the Jarvis orchestrator graph."""
+    hooks = ActionHooks()
+    register_all_hooks(hooks)
+
     graph = StateGraph(JarvisState)
 
     # LLM-dependent nodes (stubs until LM Studio is available)
@@ -179,7 +183,7 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_conditional_edges(
         "observation_loop",
         check_needs_followup,
-        {True: "classify_intent", False: END},
+        {"continue": "classify_intent", "done": END},
     )
 
     return graph.compile(checkpointer=checkpointer)
