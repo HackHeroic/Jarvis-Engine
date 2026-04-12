@@ -91,9 +91,16 @@ async def hybrid_route_query(
     If model_override is set, bypass routing and use that model (e.g. SLM for Semantic Router).
     """
     if model_override is not None:
-        target_model = model_override
-        use_cloud = False
-        print(f"[LiteLLM Router] Using model_override: {model_override}")
+        # If GEMINI_PRIMARY is set (no local models available), redirect to cloud
+        # even when model_override requests a local model
+        if _cfg.GEMINI_PRIMARY and _cfg.GEMINI_API_KEY and not force_cloud:
+            target_model = _cfg.GEMINI_MODEL
+            use_cloud = True
+            print(f"[LiteLLM Router] model_override={model_override} but no local models — redirecting to Gemini")
+        else:
+            target_model = model_override
+            use_cloud = False
+            print(f"[LiteLLM Router] Using model_override: {model_override}")
     else:
         # Gemini-primary routing: use cloud for schema-critical tasks
         if (
