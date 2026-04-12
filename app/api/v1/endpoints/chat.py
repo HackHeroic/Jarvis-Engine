@@ -1056,9 +1056,11 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
     async def event_gen():
         try:
+            final_state = {}
             async for event in jarvis_graph.astream(initial_state, config):
                 node_name = list(event.keys())[0]
                 node_state = event[node_name]
+                final_state.update(node_state)  # accumulate state updates
 
                 phase = NODE_TO_PHASE.get(node_name)
                 if phase:
@@ -1067,9 +1069,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 if node_name == "classify_intent" and node_state.get("intent"):
                     yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
 
-            final = jarvis_graph.get_state(config).values
-            yield f"event: step\ndata: {json_mod.dumps({'intent': str(final.get('intent', 'CHAT')), 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
-            yield f"event: complete\ndata: {json_mod.dumps({'intent': str(final.get('intent', 'CHAT')), 'message': final.get('response_message', ''), 'thinking_process': final.get('thinking_process')})}\n\n"
+            # Use accumulated state instead of get_state() — graph may not have a checkpointer
+            yield f"event: step\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
+            yield f"event: complete\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'message': final_state.get('response_message', ''), 'thinking_process': final_state.get('thinking_process')})}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
 

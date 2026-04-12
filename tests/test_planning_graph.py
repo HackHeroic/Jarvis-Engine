@@ -14,6 +14,7 @@ def test_planning_graph_has_expected_nodes():
     expected = {
         "fetch_constraints",
         "translate_habits",
+        "expand_slots",
         "memory_to_constraints",
         "validate_goal",
         "decompose_goal",
