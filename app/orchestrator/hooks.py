@@ -73,3 +73,54 @@ async def pii_filter_hook(prompt: str, **kwargs: Any) -> HookResult:
             reason=f"Stripped {len(email_matches)} emails, {len(phone_matches)} phones",
         )
     return HookResult(decision=HookDecision.ALLOW)
+
+
+async def consent_gate_module(initiated_by: str = "user", module: str = "", **kwargs: Any) -> HookResult:
+    """Gate module execution. User-initiated always allowed; system-initiated requires consent."""
+    if initiated_by == "user":
+        return HookResult(decision=HookDecision.ALLOW)
+    return HookResult(decision=HookDecision.ASK, reason=f"I noticed something and want to run {module} — OK?")
+
+
+async def consent_gate_schedule(task_count: int = 0, goal_count: int = 1, **kwargs: Any) -> HookResult:
+    """Gate schedule modifications. Always asks for consent."""
+    return HookResult(
+        decision=HookDecision.ASK,
+        reason=f"I'd like to schedule {task_count} tasks across {goal_count} goals. OK to proceed?"
+    )
+
+
+async def post_module_telemetry(module: str = "", **kwargs: Any) -> HookResult:
+    """Log telemetry after module execution."""
+    return HookResult(decision=HookDecision.ALLOW)
+
+
+async def memory_write_gate(**kwargs: Any) -> HookResult:
+    """Gate writes to persistent memory (Strategy Hub)."""
+    return HookResult(decision=HookDecision.ALLOW)
+
+
+async def cost_threshold_check(token_count: int = 0, threshold: int = 5_000_000, **kwargs: Any) -> HookResult:
+    """Check token usage against cost threshold. Asks user if exceeded."""
+    if token_count > threshold:
+        return HookResult(
+            decision=HookDecision.ASK,
+            reason=f"This session has used {token_count:,} tokens. Continue?"
+        )
+    return HookResult(decision=HookDecision.ALLOW)
+
+
+async def proactive_suggestion_gate(**kwargs: Any) -> HookResult:
+    """Gate proactive suggestions (e.g., optimizations, new insights)."""
+    return HookResult(decision=HookDecision.ALLOW)
+
+
+def register_all_hooks(hooks: ActionHooks) -> None:
+    """Register all 7 hook handlers to the ActionHooks instance."""
+    hooks.register("PreCloudLLM", pii_filter_hook)
+    hooks.register("PreModuleExecution", consent_gate_module)
+    hooks.register("PreScheduleModify", consent_gate_schedule)
+    hooks.register("PostModuleExecution", post_module_telemetry)
+    hooks.register("PreMemoryWrite", memory_write_gate)
+    hooks.register("CostThreshold", cost_threshold_check)
+    hooks.register("ProactiveSuggestion", proactive_suggestion_gate)

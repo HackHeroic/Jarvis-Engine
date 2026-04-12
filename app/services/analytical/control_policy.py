@@ -563,7 +563,32 @@ async def _direct_qa_response(
             thinking_process=thinking_process,
         )
     except Exception as e:
-        print(f"[Direct QA] Failed: {e}")
+        print(f"[Direct QA] Local model failed: {e}, falling back to Gemini...")
+        from app.core.config import GEMINI_API_KEY
+        if GEMINI_API_KEY:
+            try:
+                result = await hybrid_route_query(
+                    user_prompt=user_prompt,
+                    system_prompt=(
+                        "You are Jarvis, an intelligent AI assistant. Answer the user's question clearly and helpfully. "
+                        "If the question is about a concept, algorithm, or topic, explain it well with examples. "
+                        "Be thorough but concise."
+                    ),
+                    response_schema=None,
+                    force_cloud=True,
+                    conversation_history=conversation_history,
+                )
+                msg = result if isinstance(result, str) else str(result)
+                msg = msg.strip() if msg else "I couldn't generate a response."
+                from app.services.analytical.voice_of_jarvis import _extract_thinking_process
+                message, thinking_process = _extract_thinking_process(msg)
+                return ChatResponse(
+                    intent=IntentType.GENERAL_QA.value,
+                    message=message,
+                    thinking_process=thinking_process,
+                )
+            except Exception as gemini_err:
+                print(f"[Direct QA] Gemini fallback also failed: {gemini_err}")
         return ChatResponse(
             intent=IntentType.GENERAL_QA.value,
             message=f"I encountered an error answering your question: {e}",

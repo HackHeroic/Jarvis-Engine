@@ -62,3 +62,24 @@ async def test_pii_filter_hook_strips_email():
     assert result.decision == HookDecision.MODIFY
     assert "john@example.com" not in result.modified_input["prompt"]
     assert "[EMAIL]" in result.modified_input["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_consent_gate_allows_user_initiated():
+    from app.orchestrator.hooks import consent_gate_module
+    result = await consent_gate_module(initiated_by="user", module="planning_module")
+    assert result.decision == HookDecision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_consent_gate_asks_for_system_initiated():
+    from app.orchestrator.hooks import consent_gate_module
+    result = await consent_gate_module(initiated_by="system", module="planning_module")
+    assert result.decision == HookDecision.ASK
+
+
+@pytest.mark.asyncio
+async def test_schedule_consent_always_asks():
+    from app.orchestrator.hooks import consent_gate_schedule
+    result = await consent_gate_schedule(task_count=6, goal_count=2)
+    assert result.decision == HookDecision.ASK
