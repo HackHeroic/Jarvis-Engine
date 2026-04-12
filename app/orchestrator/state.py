@@ -41,6 +41,9 @@ class JarvisState(TypedDict):
 
     # Current turn
     user_message: str
+    file_base64: Optional[str]
+    file_media_type: Optional[str]
+    file_name: Optional[str]
     brain_dump: Optional[BrainDumpExtraction]
     intent: Optional[IntentType]
     initiated_by: str  # "user" | "system" | "pearl"

@@ -62,6 +62,10 @@ async def _classify_intent(state: JarvisState) -> dict:
     """Classify intent from extracted brain dump fields. Rule-based, no LLM needed."""
     from app.schemas.context import IntentType
 
+    # File upload → always KNOWLEDGE_INGESTION regardless of brain dump
+    if state.get("file_base64"):
+        return {"intent": IntentType.KNOWLEDGE_INGESTION}
+
     bd = state.get("brain_dump")
     if not bd:
         return {"intent": IntentType.CHAT}
@@ -157,13 +161,21 @@ async def _knowledge_module_node(state: JarvisState) -> dict:
         }
 
     user_model = state.get("user_model")
+
+    # Decode file if present
+    _file_bytes = None
+    _file_b64 = state.get("file_base64")
+    if _file_b64:
+        import base64
+        _file_bytes = base64.b64decode(_file_b64)
+
     knowledge_state = {
         "user_id": user_model.user_id if user_model else "demo",
         "user_model": user_model,
         "content": state.get("user_message", ""),
-        "file_bytes": None,
-        "media_type": None,
-        "file_name": None,
+        "file_bytes": _file_bytes,
+        "media_type": state.get("file_media_type"),
+        "file_name": state.get("file_name"),
         "content_type": None,
         "ingestion_result": None,
         "calendar_result": None,
