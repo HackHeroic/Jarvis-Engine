@@ -62,4 +62,8 @@ class JarvisState(TypedDict):
     negotiation_state: NegotiationPhase
     modules_invoked: list[str]
     needs_followup: bool
+    needs_consent: Optional[bool]
     error: Optional[str]
+
+    # Progress bridge — callable emitting SSE phase events from sub-graphs
+    progress_callback: Any

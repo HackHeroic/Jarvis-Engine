@@ -28,7 +28,9 @@ def _make_initial_state(message="hello"):
         "negotiation_state": NegotiationPhase.NONE,
         "modules_invoked": [],
         "needs_followup": False,
+        "needs_consent": None,
         "error": None,
+        "progress_callback": None,
     }
 
 
