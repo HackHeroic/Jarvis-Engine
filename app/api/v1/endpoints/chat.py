@@ -1070,6 +1070,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     initial_state = {
         "user_model": user_model,
         "user_message": request.user_prompt,
+        "file_base64": request.file_base64,
+        "file_media_type": request.media_type,
+        "file_name": request.file_name,
         "brain_dump": None,
         "intent": None,
         "initiated_by": "user",
