@@ -1023,13 +1023,49 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
     from app.core.user_model import UserModel
     from app.orchestrator.state import ConversationPhase, NegotiationPhase
+    from app.services.chat_history import (
+        get_or_create_session,
+        save_user_message,
+        save_assistant_message,
+        build_context_messages,
+    )
 
     jarvis_graph = http_request.app.state.jarvis_graph
-    db_client = http_request.app.state.db_client
-    user_model = UserModel(user_id=request.user_id, db=db_client)
+    db_client = getattr(http_request.app.state, "db_client", None)
+    memory_store = getattr(http_request.app.state, "memory_store", None)
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
-    if hasattr(http_request.app.state, "memory_store"):
-        user_model.set_memory_store(http_request.app.state.memory_store)
+    # --- Session management ---
+    session_id = await get_or_create_session(
+        request.user_id, request.conversation_id, supabase
+    )
+    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+    conversation_history = await build_context_messages(
+        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
+    )
+
+    # Inject archival memory
+    memory_context = ""
+    if memory_store:
+        from app.services.memory.retriever import build_memory_context
+        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
+
+    # Fetch existing memories for frontend MemoryPanel
+    _existing_memories: list[dict] = []
+    if memory_store:
+        _existing_memories = await asyncio.to_thread(
+            memory_store.get_active_memories, request.user_id
+        )
+
+    user_model = UserModel(user_id=request.user_id, db=db_client)
+    if memory_store:
+        user_model.set_memory_store(memory_store)
+
+    # --- Progress bridge: sub-graph callbacks → SSE phase events ---
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    def progress_cb(phase, **detail):
+        progress_queue.put_nowait(json_mod.dumps({"phase": phase, **detail}))
 
     initial_state = {
         "user_model": user_model,
@@ -1050,6 +1086,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "modules_invoked": [],
         "needs_followup": False,
         "error": None,
+        "progress_callback": progress_cb,
     }
 
     config = {"configurable": {"thread_id": request.user_id}}
@@ -1058,6 +1095,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         try:
             final_state = {}
             async for event in jarvis_graph.astream(initial_state, config):
+                # Drain progress queue — sub-graph phase events
+                while not progress_queue.empty():
+                    try:
+                        yield f"event: phase\ndata: {progress_queue.get_nowait()}\n\n"
+                    except asyncio.QueueEmpty:
+                        break
+
                 node_name = list(event.keys())[0]
                 node_state = event[node_name]
                 final_state.update(node_state)  # accumulate state updates
@@ -1069,6 +1113,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 if node_name == "classify_intent" and node_state.get("intent"):
                     yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
 
+                # Emit consent_request if a hook asked for consent
+                if node_state.get("needs_consent"):
+                    yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
+
                 if node_name == "observation_loop":
                     # Emit new additive SSE events (frontend ignores if not ready)
                     if node_state.get("memories_extracted"):
@@ -1076,10 +1124,68 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     if node_state.get("patterns_detected"):
                         yield f"event: pattern_detected\ndata: {json_mod.dumps(node_state['patterns_detected'])}\n\n"
 
-            # Use accumulated state instead of get_state() — graph may not have a checkpointer
-            yield f"event: step\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
-            yield f"event: complete\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'message': final_state.get('response_message', ''), 'thinking_process': final_state.get('thinking_process')})}\n\n"
+            # Drain any remaining progress events
+            while not progress_queue.empty():
+                try:
+                    yield f"event: phase\ndata: {progress_queue.get_nowait()}\n\n"
+                except asyncio.QueueEmpty:
+                    break
+
+            # --- Save assistant message ---
+            _assistant_msg = final_state.get("response_message") or "Done."
+            _intent = str(final_state.get("intent", "CHAT"))
+            _msg_id = await save_assistant_message(
+                session_id, request.user_id, _assistant_msg, _intent,
+                {
+                    "schedule": final_state.get("schedule"),
+                    "draft_id": final_state.get("draft_id"),
+                    "intent": _intent,
+                },
+                supabase,
+            )
+
+            # Fire-and-forget memory extraction
+            if memory_store:
+                from app.services.memory.extractor import safe_extract_memories
+                asyncio.create_task(safe_extract_memories(
+                    request.user_id, request.user_prompt, _assistant_msg, memory_store,
+                    db_client=supabase,
+                ))
+
+            # --- Build full ChatResponse payload ---
+            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
+
+            complete_payload = {
+                "intent": _intent,
+                "message": final_state.get("response_message", ""),
+                "schedule": final_state.get("schedule"),
+                "execution_graph": final_state.get("execution_graph"),
+                "ingestion_result": final_state.get("ingestion_result"),
+                "action_proposals": None,
+                "search_result": None,
+                "suggested_action": None,
+                "thinking_process": final_state.get("thinking_process"),
+                "awaiting_task_confirmation": False,
+                "schedule_status": "draft" if final_state.get("schedule") else None,
+                "draft_id": final_state.get("draft_id"),
+                "conversation_id": session_id,
+                "message_id": _msg_id,
+                "clarification_options": None,
+                "memories": (
+                    [
+                        {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
+                        for m in _existing_memories[:20]
+                    ]
+                    if _existing_memories else None
+                ),
+                "pearl_insights": None,
+            }
+            yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
