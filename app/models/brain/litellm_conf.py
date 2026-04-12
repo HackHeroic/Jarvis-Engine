@@ -1,4 +1,4 @@
-"""Hybrid routing logic for LiteLLM: Local Qwen (LM Studio) vs Cloud Gemini."""
+"""Hybrid routing logic for LiteLLM: Local Gemma (LM Studio) vs Cloud Gemini."""
 
 import json
 import logging
@@ -9,21 +9,18 @@ from collections.abc import AsyncGenerator
 import litellm
 from pydantic import BaseModel
 
+import app.core.config as _cfg
 from app.core.config import (
-    LOCAL_LLM_URL,
-    LOCAL_LLM_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    GEMINI_PRIMARY,
     LITELLM_VERBOSE,
-    SLM_ROUTER_MODEL,
-    SLM_ROUTER_URL,
 )
+
+# These are read dynamically via _cfg.X so startup detection is respected.
+# Only LITELLM_VERBOSE is import-time safe (never changes after startup).
 
 logger = logging.getLogger(__name__)
 
 # Cloud keywords: Real-Time Research (L9) only. Local-First: all other requests
-# (including decomposition, academic topics like SARIMAX) go to local Qwen.
+# (including decomposition, academic topics like SARIMAX) go to local Gemma.
 # Cloud Gemini is reserved exclusively for real-time/research queries.
 CLOUD_KEYWORDS = [
     "latest news",
@@ -88,8 +85,8 @@ async def hybrid_route_query(
     prefer_local: bool = False,
 ) -> str | dict | AsyncGenerator[str, None]:
     """
-    Route the query to Local Qwen or Cloud Gemini. Local-First: all requests
-    go to local Qwen unless (a) CLOUD_KEYWORDS match (Real-Time Research L9),
+    Route the query to Local Gemma or Cloud Gemini. Local-First: all requests
+    go to local Gemma unless (a) CLOUD_KEYWORDS match (Real-Time Research L9),
     or (b) force_cloud=True (last-resort fallback when local fails validation).
     If model_override is set, bypass routing and use that model (e.g. SLM for Semantic Router).
     """
@@ -101,23 +98,23 @@ async def hybrid_route_query(
         # Gemini-primary routing: use cloud for schema-critical tasks
         if (
             model_override is None
-            and GEMINI_PRIMARY
+            and _cfg.GEMINI_PRIMARY
             and not prefer_local
             and not force_cloud
-            and GEMINI_API_KEY
+            and _cfg.GEMINI_API_KEY
             and response_schema is not None
         ):
             force_cloud = True
 
         prompt_lower = user_prompt.lower()
         use_cloud = force_cloud or any(kw in prompt_lower for kw in CLOUD_KEYWORDS)
-        target_model = GEMINI_MODEL if use_cloud else LOCAL_LLM_MODEL
+        target_model = _cfg.GEMINI_MODEL if use_cloud else _cfg.LOCAL_LLM_MODEL
 
         if use_cloud:
             reason = "force_cloud fallback" if force_cloud else "Real-Time Research (L9)"
             print(f"[LiteLLM Router] Routing to Cloud Gemini ({reason})")
         else:
-            print("[LiteLLM Router] Routing to Local Qwen (Local-First)")
+            print("[LiteLLM Router] Routing to Local Gemma (Local-First)")
 
     messages = [{"role": "system", "content": system_prompt}]
     if conversation_history:
@@ -135,16 +132,16 @@ async def hybrid_route_query(
         completion_kwargs["max_tokens"] = 4096
 
     if use_cloud:
-        if GEMINI_API_KEY:
-            completion_kwargs["api_key"] = GEMINI_API_KEY
+        if _cfg.GEMINI_API_KEY:
+            completion_kwargs["api_key"] = _cfg.GEMINI_API_KEY
     else:
-        if model_override is not None and SLM_ROUTER_URL:
-            completion_kwargs["api_base"] = SLM_ROUTER_URL
+        if model_override is not None and _cfg.SLM_ROUTER_URL:
+            completion_kwargs["api_base"] = _cfg.SLM_ROUTER_URL
         elif model_override is not None and "ollama/" not in model_override:
-            completion_kwargs["api_base"] = LOCAL_LLM_URL  # LM Studio or custom
+            completion_kwargs["api_base"] = _cfg.LOCAL_LLM_URL  # LM Studio or custom
         elif model_override is None:
-            completion_kwargs["api_base"] = LOCAL_LLM_URL
-        # else: model_override with ollama/ and no SLM_ROUTER_URL — LiteLLM uses Ollama default
+            completion_kwargs["api_base"] = _cfg.LOCAL_LLM_URL
+        # else: model_override with ollama/ and no _cfg.SLM_ROUTER_URL — LiteLLM uses Ollama default
         completion_kwargs["api_key"] = "lm-studio"  # Dummy key; LM Studio/Ollama don't validate it
 
     # Streaming path: only for unstructured calls (no response_schema)
@@ -230,7 +227,7 @@ async def hybrid_route_query(
 
     # Guard: empty LLM response when structured output expected
     if response_schema is not None and not content:
-        if not force_cloud and model_override is None and GEMINI_API_KEY:
+        if not force_cloud and model_override is None and _cfg.GEMINI_API_KEY:
             print(f"[LiteLLM Router] Empty response from local model for {response_schema.__name__}, retrying with cloud")
             return await hybrid_route_query(
                 user_prompt=user_prompt,
@@ -268,7 +265,7 @@ async def gemini_primary_route(
     conversation_history: list[dict] | None = None,
 ) -> str | dict:
     """Route to Gemini 2.5 Flash primary. Fall back to local on failure."""
-    if GEMINI_API_KEY:
+    if _cfg.GEMINI_API_KEY:
         try:
             return await hybrid_route_query(
                 user_prompt=user_prompt,
@@ -281,17 +278,17 @@ async def gemini_primary_route(
         except Exception as e:
             logger.warning(
                 "Gemini primary failed (falling back to %s): %s: %s",
-                fallback_model or SLM_ROUTER_MODEL,
+                fallback_model or _cfg.SLM_ROUTER_MODEL,
                 type(e).__name__,
                 str(e)[:500],
             )
     else:
-        logger.info("No GEMINI_API_KEY set, skipping cloud routing")
+        logger.info("No _cfg.GEMINI_API_KEY set, skipping cloud routing")
     return await hybrid_route_query(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
         response_schema=response_schema,
-        model_override=fallback_model or SLM_ROUTER_MODEL,
+        model_override=fallback_model or _cfg.SLM_ROUTER_MODEL,
         stream=stream,
         conversation_history=conversation_history,
     )
@@ -305,8 +302,8 @@ async def local_primary_route(
     stream: bool = False,
     conversation_history: list[dict] | None = None,
 ) -> str | dict:
-    """Route to local Qwen-4B SLM primary. Fall back to Gemini on failure."""
-    target = model_override or SLM_ROUTER_MODEL
+    """Route to local Gemma SLM primary. Fall back to Gemini on failure."""
+    target = model_override or _cfg.SLM_ROUTER_MODEL
     try:
         return await hybrid_route_query(
             user_prompt=user_prompt,
@@ -318,7 +315,7 @@ async def local_primary_route(
         )
     except Exception as e:
         logger.warning("Local primary (%s) failed, falling back to Gemini: %s", target, e)
-        if GEMINI_API_KEY:
+        if _cfg.GEMINI_API_KEY:
             return await hybrid_route_query(
                 user_prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -337,7 +334,7 @@ async def run_deep_research(queries: list[str]) -> dict:
     """
     if not queries:
         return {"queries": [], "summaries": []}
-    if not GEMINI_API_KEY:
+    if not _cfg.GEMINI_API_KEY:
         return {"queries": queries, "summaries": ["(Gemini not configured for search)"] * len(queries)}
 
     summaries: list[str] = []
@@ -369,18 +366,18 @@ async def gemini_web_search(
     """Run Gemini with Google Search grounding for real-time web results (L9).
 
     Used by Proactive Task Workspace for YouTube/article/LeetCode link surfacing.
-    Requires GEMINI_API_KEY. Falls back to empty string if unavailable.
+    Requires _cfg.GEMINI_API_KEY. Falls back to empty string if unavailable.
     """
-    if not GEMINI_API_KEY:
+    if not _cfg.GEMINI_API_KEY:
         return ""
     try:
         completion_kwargs = {
-            "model": GEMINI_MODEL,
+            "model": _cfg.GEMINI_MODEL,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "api_key": GEMINI_API_KEY,
+            "api_key": _cfg.GEMINI_API_KEY,
             "temperature": 0.1,
             "web_search_options": {"search_context_size": "medium"},
         }

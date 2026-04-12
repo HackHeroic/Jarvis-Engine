@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import ActionItemProposal
 from pydantic import BaseModel, Field
@@ -47,7 +47,7 @@ async def propose_action_item(extracted_text: str) -> ActionItemProposal:
         user_prompt=extracted_text,
         system_prompt=ACTION_ITEM_EXTRACTION_PROMPT,
         response_schema=ActionItemExtraction,
-        model_override=SLM_ROUTER_MODEL,  # 4B suffices for extraction
+        model_override=_cfg.SLM_ROUTER_MODEL,  # 4B suffices for extraction
     )
 
     if isinstance(result, dict):

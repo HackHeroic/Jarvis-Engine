@@ -8,7 +8,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.core.config import LM_STUDIO_NATIVE_URL, LOCAL_LLM_MODEL
+import app.core.config as _cfg
+from app.core.config import LM_STUDIO_NATIVE_URL
 from app.core.jarvis_logger import log_step
 
 router = APIRouter()
@@ -85,10 +86,10 @@ async def lmstudio_stream(request: LMStudioChatRequest, http_request: Request) -
     upstream_url = f"{LM_STUDIO_NATIVE_URL}/api/v1/chat"
 
     # Resolve model ID — default to configured local model, strip LiteLLM "openai/" prefix
-    model_id = request.model or LOCAL_LLM_MODEL
+    model_id = request.model or _cfg.LOCAL_LLM_MODEL
     if model_id.startswith("openai/"):
         model_id = model_id[len("openai/"):]
-    # Also strip mlx-community/ prefix — LM Studio uses short names (e.g. "qwen3.5-4b")
+    # Also strip publisher prefix — LM Studio uses short names (e.g. "gemma-4-9b-it")
     if "/" in model_id:
         model_id = model_id.rsplit("/", 1)[-1]
 

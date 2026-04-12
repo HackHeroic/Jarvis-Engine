@@ -196,7 +196,7 @@ _FENCE_RE = re.compile(
 
 
 def _sanitize_llm_json(raw: str) -> str:
-    """Strip markdown code fences that local models (e.g. Qwen-27B)
+    """Strip markdown code fences that local models (e.g. Gemma)
     sometimes wrap around otherwise valid JSON."""
     stripped = raw.strip()
     match = _FENCE_RE.match(stripped)
@@ -291,7 +291,7 @@ async def decompose_goal(
         return json.loads(sanitized)
 
     try:
-        # Local-First: always try local Qwen first (academic topics like SARIMAX
+        # Local-First: always try local Gemma first (academic topics like SARIMAX
         # are handled locally—the model is capable; formatting constraints were
         # the prior bottleneck, now mitigated by sanitization and max_tokens).
         data = await _call_and_get_data(force_cloud=False)

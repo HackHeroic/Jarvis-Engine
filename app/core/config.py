@@ -23,20 +23,20 @@ SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 # LM Studio: http://127.0.0.1:1234 — both models hit the same server; model name selects which
 LOCAL_LLM_URL: str = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
 LOCAL_LLM_MODEL: str = os.getenv(
-    "LOCAL_LLM_MODEL", "openai/mlx-community/qwen3.5-27b"
-)  # Heavy lifting: decomposition, reasoning
+    "LOCAL_LLM_MODEL", "openai/google/gemma-4-26b-a4b"
+)  # Heavy lifting: decomposition, reasoning (Gemma 4 26B A4B)
 
-# Gemma 4 models (replacing Qwen)
+# Gemma 4 models
 GEMMA_PRIMARY_MODEL: str = os.getenv("GEMMA_PRIMARY_MODEL", "openai/google/gemma-4-26b-a4b")
-GEMMA_FAST_MODEL: str = os.getenv("GEMMA_FAST_MODEL", "openai/google/gemma-4-e4b")
+GEMMA_FAST_MODEL: str = os.getenv("GEMMA_FAST_MODEL", "openai/google/gemma-4-26b-a4b")  # same as primary when E4B not loaded
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 _raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
-GEMINI_PRIMARY: bool = os.getenv("GEMINI_PRIMARY", "true").lower() == "true"
+GEMINI_PRIMARY: bool = os.getenv("GEMINI_PRIMARY", "false").lower() == "true"
 
 # SLM for Semantic Router (Level 2 - fast intent detection, ~100ms)
-# Uses qwen3.5-4b for rapid classification; same LM Studio server as LOCAL_LLM
-SLM_ROUTER_MODEL: str = os.getenv("SLM_ROUTER_MODEL", "openai/qwen3.5-4b")
+# Uses Gemma fast model for rapid classification; same LM Studio server as LOCAL_LLM
+SLM_ROUTER_MODEL: str = os.getenv("SLM_ROUTER_MODEL", "openai/google/gemma-4-26b-a4b")  # uses same 26B when E4B not loaded
 SLM_ROUTER_URL: str | None = os.getenv("SLM_ROUTER_URL")  # Optional; if unset, uses LOCAL_LLM_URL
 
 # LM Studio native API (non-OpenAI endpoint) for direct streaming chat

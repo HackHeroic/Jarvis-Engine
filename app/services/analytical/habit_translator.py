@@ -7,7 +7,7 @@ import re
 import time as _time
 from typing import List, Optional
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query
 from app.schemas.context import SemanticTimeSlot, SemanticTimeSlotsResponse
 
@@ -259,7 +259,7 @@ async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
         user_prompt=habits_text,
         system_prompt=HABIT_TRANSLATOR_PROMPT,
         response_schema=SemanticTimeSlotsResponse,
-        fallback_model=SLM_ROUTER_MODEL,
+        fallback_model=_cfg.SLM_ROUTER_MODEL,
     )
     if isinstance(result, dict):
         parsed = SemanticTimeSlotsResponse.model_validate(result)

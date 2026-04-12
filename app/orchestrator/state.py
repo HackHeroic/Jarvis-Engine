@@ -65,5 +65,9 @@ class JarvisState(TypedDict):
     needs_consent: Optional[bool]
     error: Optional[str]
 
+    # Conversation context — prior messages + archival memory for multi-turn coherence
+    conversation_history: Optional[list[dict]]
+    memory_context: Optional[str]
+
     # Progress bridge — callable emitting SSE phase events from sub-graphs
     progress_callback: Any
