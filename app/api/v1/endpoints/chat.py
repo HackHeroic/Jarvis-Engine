@@ -1069,6 +1069,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 if node_name == "classify_intent" and node_state.get("intent"):
                     yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
 
+                if node_name == "observation_loop":
+                    # Emit new additive SSE events (frontend ignores if not ready)
+                    if node_state.get("memories_extracted"):
+                        yield f"event: memory_extracted\ndata: {json_mod.dumps(node_state['memories_extracted'])}\n\n"
+                    if node_state.get("patterns_detected"):
+                        yield f"event: pattern_detected\ndata: {json_mod.dumps(node_state['patterns_detected'])}\n\n"
+
             # Use accumulated state instead of get_state() — graph may not have a checkpointer
             yield f"event: step\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
             yield f"event: complete\ndata: {json_mod.dumps({'intent': str(final_state.get('intent', 'CHAT')), 'message': final_state.get('response_message', ''), 'thinking_process': final_state.get('thinking_process')})}\n\n"
