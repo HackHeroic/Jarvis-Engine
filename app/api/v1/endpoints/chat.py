@@ -1101,6 +1101,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         LOCAL_LLM_MODEL = _cfg.LOCAL_LLM_MODEL
         SLM_ROUTER_MODEL = _cfg.SLM_ROUTER_MODEL
 
+        def _intent_str(intent) -> str:
+            """Safely convert IntentType enum or string to plain string."""
+            if hasattr(intent, "value"):
+                return intent.value
+            return str(intent)
+
         try:
             final_state = {}
             async for event in jarvis_graph.astream(initial_state):
@@ -1150,7 +1156,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         }
                     elif node_name == "classify_intent" and node_state.get("intent"):
                         phase_detail["detail"] = {
-                            "intent": str(node_state["intent"]),
+                            "intent": _intent_str(node_state["intent"]),
                             "method": "rule-based",
                         }
                     elif node_name in ("planning_module", "research_agent", "coach_module", "knowledge_module", "conversation_module"):
@@ -1165,7 +1171,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     yield f"event: phase\ndata: {json_mod.dumps(phase_detail)}\n\n"
 
                 if node_name == "classify_intent" and node_state.get("intent"):
-                    yield f"event: step\ndata: {json_mod.dumps({'intent': str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
+                    yield f"event: step\ndata: {json_mod.dumps({'intent': _intent_str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
 
                 # Emit consent_request if a hook asked for consent
                 if node_state.get("needs_consent"):
@@ -1198,7 +1204,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 except asyncio.QueueEmpty:
                     break
 
-            _intent = str(final_state.get("intent", "CHAT"))
+            _intent = _intent_str(final_state.get("intent", "CHAT"))
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
             _has_schedule = bool(final_state.get("schedule"))
 
