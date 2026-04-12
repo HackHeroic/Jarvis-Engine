@@ -71,3 +71,4 @@ class JarvisState(TypedDict):
 
     # Progress bridge — callable emitting SSE phase events from sub-graphs
     progress_callback: Any
+    progress_queue: Any
