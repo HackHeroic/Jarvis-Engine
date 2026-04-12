@@ -3,6 +3,7 @@ from app.orchestrator.state import (
     NegotiationPhase,
     JarvisState,
 )
+from app.schemas.context import IntentType
 
 
 def test_conversation_phase_values():
@@ -45,3 +46,14 @@ def test_jarvis_state_is_typed_dict():
     }
     assert state["user_message"] == "plan my day"
     assert state["conversation_phase"] == ConversationPhase.GREETING
+
+
+def test_new_intent_types_exist():
+    assert IntentType.EDIT_TASK == "EDIT_TASK"
+    assert IntentType.REARRANGE == "REARRANGE"
+    assert IntentType.ACCEPT_DRAFT == "ACCEPT_DRAFT"
+    assert IntentType.REJECT_DRAFT == "REJECT_DRAFT"
+    assert IntentType.ADD_CONSTRAINT == "ADD_CONSTRAINT"
+    assert IntentType.CHECK_PROGRESS == "CHECK_PROGRESS"
+    assert IntentType.RESEARCH == "RESEARCH"
+    assert IntentType.CHAT == "CHAT"

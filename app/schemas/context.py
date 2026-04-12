@@ -34,6 +34,14 @@ class IntentType(str, Enum):
     BEHAVIORAL_CONSTRAINT = "BEHAVIORAL_CONSTRAINT"  # Work preferences, back-bench modes
     ACTION_ITEM = "ACTION_ITEM"  # Direct goals or tasks to be scheduled
     PLAN_DAY = "PLAN_DAY"  # User wants to plan day, schedule tasks, break down a goal
+    EDIT_TASK = "EDIT_TASK"  # User wants to modify an existing task
+    REARRANGE = "REARRANGE"  # User wants to reorder or reschedule tasks
+    ACCEPT_DRAFT = "ACCEPT_DRAFT"  # User accepts a proposed schedule draft
+    REJECT_DRAFT = "REJECT_DRAFT"  # User rejects a proposed schedule draft
+    ADD_CONSTRAINT = "ADD_CONSTRAINT"  # User adds a new scheduling constraint
+    CHECK_PROGRESS = "CHECK_PROGRESS"  # User wants to review task/goal progress
+    RESEARCH = "RESEARCH"  # User wants real-time web research
+    CHAT = "CHAT"  # General conversational turn not fitting other intents
 
 
 LearningStyle = Literal["watcher", "reader", "interactive"]
