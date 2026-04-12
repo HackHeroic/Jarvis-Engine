@@ -36,3 +36,23 @@ async def test_synthesize_response_wraps_module_output():
     state["user_model"].get_estimated_energy = AsyncMock(return_value=0.8)
     result = await voice_of_jarvis_synthesis(state)
     assert "response_message" in result
+
+
+@pytest.mark.asyncio
+async def test_coach_module_returns_message():
+    from app.modules.coach import run_coaching_response
+    state = {
+        "user_model": MagicMock(),
+        "user_message": "how am I doing?",
+        "modules_invoked": [],
+        "error": None,
+    }
+    state["user_model"].get_pending_tasks = AsyncMock(return_value=[
+        {"status": "completed", "title": "Study DSA"},
+        {"status": "pending", "title": "Read chapter 5"},
+    ])
+    state["user_model"].get_pearl_patterns = AsyncMock(return_value=[])
+    state["user_model"].get_estimated_energy = AsyncMock(return_value=0.7)
+    result = await run_coaching_response(state)
+    assert "response_message" in result
+    assert "coach_module" in result["modules_invoked"]
