@@ -5,7 +5,7 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 
 # ContextVar used by /stream endpoint to capture execution_summary without calling VoJ.
@@ -130,7 +130,10 @@ def _build_voj_parts(execution_summary: dict[str, Any]) -> list[str]:
     return parts
 
 
-async def synthesize_jarvis_response(execution_summary: dict[str, Any]) -> tuple[str, str | None]:
+async def synthesize_jarvis_response(
+    execution_summary: dict[str, Any],
+    conversation_history: list[dict] | None = None,
+) -> tuple[str, str | None]:
     """Generate message and extract thinking process. Returns (message, thinking_process).
 
     When _summary_capture ContextVar is set (streaming mode), captures the summary
@@ -154,11 +157,18 @@ async def synthesize_jarvis_response(execution_summary: dict[str, Any]) -> tuple
 
     summary_text = "\n".join(parts)
     try:
+        # Include memory context in system prompt for personalization
+        voj_prompt = VOICE_OF_JARVIS_PROMPT
+        mem_ctx = execution_summary.get("memory_context", "")
+        if mem_ctx:
+            voj_prompt += f"\n\nUser context:\n{mem_ctx}"
+
         result = await hybrid_route_query(
             user_prompt=summary_text,
-            system_prompt=VOICE_OF_JARVIS_PROMPT,
+            system_prompt=voj_prompt,
             response_schema=None,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
+            conversation_history=conversation_history,
         )
         msg = result if isinstance(result, str) else str(result)
         msg = msg.strip() if msg else "Done."
@@ -212,7 +222,7 @@ async def synthesize_jarvis_response_stream(
             user_prompt=summary_text,
             system_prompt=VOICE_OF_JARVIS_PROMPT,
             response_schema=None,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
             stream=True,
         )
 

@@ -2,7 +2,7 @@
 """LLM-based memory extraction from conversation turns.
 
 Runs as a fire-and-forget background task after each /chat response.
-Uses Qwen-4B (prefer_local=True) since this is a background task
+Uses local Gemma (prefer_local=True) since this is a background task
 that doesn't need to be perfect — a missed extraction is fine.
 """
 

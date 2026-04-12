@@ -22,18 +22,64 @@ from app.modules.research_graph import build_research_graph
 from app.core.observation import run_observation_loop
 
 
-# --- LLM-dependent stubs (kept until LM Studio is available) ---
+# --- Real LLM-powered nodes (replacing stubs) ---
 
-async def _stub_load_context(state: JarvisState) -> dict:
+async def _load_context(state: JarvisState) -> dict:
+    """Load user context. UserModel is already created in chat_stream_v2."""
     return {}
 
 
-async def _stub_extract_brain_dump(state: JarvisState) -> dict:
-    return {"brain_dump": None}
+async def _extract_brain_dump(state: JarvisState) -> dict:
+    """Extract planning goal, habits, action items from user message using LLM."""
+    from app.schemas.context import BrainDumpExtraction
+    from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT
+    from app.core.model_router import route_llm_call
+
+    user_msg = state.get("user_message", "")
+    if not user_msg.strip():
+        return {"brain_dump": None}
+
+    try:
+        result = await route_llm_call(
+            task="brain_dump_extraction",
+            prompt=user_msg,
+            system_prompt=BRAIN_DUMP_EXTRACTION_PROMPT,
+            response_schema=BrainDumpExtraction,
+            conversation_history=state.get("conversation_history"),
+        )
+        if isinstance(result, BrainDumpExtraction):
+            return {"brain_dump": result}
+        if isinstance(result, dict):
+            return {"brain_dump": BrainDumpExtraction.model_validate(result)}
+        return {"brain_dump": None}
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Brain dump extraction failed: {e}")
+        return {"brain_dump": None}
 
 
-async def _stub_classify_intent(state: JarvisState) -> dict:
-    return {"intent": "CHAT"}
+async def _classify_intent(state: JarvisState) -> dict:
+    """Classify intent from extracted brain dump fields. Rule-based, no LLM needed."""
+    from app.schemas.context import IntentType
+
+    bd = state.get("brain_dump")
+    if not bd:
+        return {"intent": IntentType.CHAT}
+
+    # Rule-based classification matching control_policy.py logic
+    if bd.planning_goal:
+        return {"intent": IntentType.PLAN_DAY}
+    if bd.has_calendar:
+        return {"intent": IntentType.CALENDAR_SYNC}
+    if bd.has_knowledge:
+        return {"intent": IntentType.KNOWLEDGE_INGESTION}
+    if bd.inline_habits:
+        return {"intent": IntentType.BEHAVIORAL_CONSTRAINT}
+    if bd.action_items:
+        return {"intent": IntentType.ACTION_ITEM}
+    if bd.search_queries:
+        return {"intent": IntentType.RESEARCH}
+    return {"intent": IntentType.CHAT}
 
 
 # --- Planning sub-graph wrapper ---
@@ -177,10 +223,10 @@ def build_jarvis_graph(checkpointer=None):
     """Build and compile the Jarvis orchestrator graph."""
     graph = StateGraph(JarvisState)
 
-    # LLM-dependent nodes (stubs until LM Studio is available)
-    graph.add_node("load_context", _stub_load_context)
-    graph.add_node("extract_brain_dump", _stub_extract_brain_dump)
-    graph.add_node("classify_intent", _stub_classify_intent)
+    # LLM-powered nodes
+    graph.add_node("load_context", _load_context)
+    graph.add_node("extract_brain_dump", _extract_brain_dump)
+    graph.add_node("classify_intent", _classify_intent)
 
     # Real module nodes
     graph.add_node("planning_module", _planning_module_node)

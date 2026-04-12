@@ -1087,15 +1087,17 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "needs_followup": False,
         "needs_consent": None,
         "error": None,
+        "conversation_history": conversation_history,
+        "memory_context": memory_context,
         "progress_callback": progress_cb,
     }
 
-    config = {"configurable": {"thread_id": request.user_id}}
-
     async def event_gen():
+        from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL
+
         try:
             final_state = {}
-            async for event in jarvis_graph.astream(initial_state, config):
+            async for event in jarvis_graph.astream(initial_state):
                 # Drain progress queue — sub-graph phase events
                 while not progress_queue.empty():
                     try:
@@ -1105,7 +1107,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
                 node_name = list(event.keys())[0]
                 node_state = event[node_name]
-                final_state.update(node_state)  # accumulate state updates
+                if not isinstance(node_state, dict):
+                    node_state = {}  # normalize None / non-dict to empty dict
+                final_state.update(node_state)
 
                 phase = NODE_TO_PHASE.get(node_name)
                 if phase:
@@ -1119,7 +1123,6 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
 
                 if node_name == "observation_loop":
-                    # Emit new additive SSE events (frontend ignores if not ready)
                     if node_state.get("memories_extracted"):
                         yield f"event: memory_extracted\ndata: {json_mod.dumps(node_state['memories_extracted'])}\n\n"
                     if node_state.get("patterns_detected"):
@@ -1132,9 +1135,108 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 except asyncio.QueueEmpty:
                     break
 
-            # --- Save assistant message ---
-            _assistant_msg = final_state.get("response_message") or "Done."
             _intent = str(final_state.get("intent", "CHAT"))
+            _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
+            _has_schedule = bool(final_state.get("schedule"))
+
+            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'v2', 'synthesis_model': LOCAL_LLM_MODEL})}\n\n"
+
+            # --- Token streaming (matches v1/stream SSE contract) ---
+            _start = time_mod.monotonic()
+            _ttft: float | None = None
+            _token_count = 0
+            thinking_full = ""
+            message_full = ""
+            _stream_model = LOCAL_LLM_MODEL
+
+            if _has_schedule and _intent == "PLAN_DAY":
+                # Schedule responses: emit pre-computed message, no VoJ streaming needed
+                _pre_msg = final_state.get("response_message") or "Here's your schedule."
+                _pre_think = final_state.get("thinking_process")
+                if _pre_think:
+                    yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                    thinking_full = _pre_think
+                yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                message_full = _pre_msg
+                _token_count = 1
+                _stream_model = "none (structured response)"
+
+            elif _is_chat:
+                # CHAT/GREETING/GENERAL_QA: stream LLM response live for typing effect
+                _pre_msg = final_state.get("response_message", "")
+                _pre_think = final_state.get("thinking_process")
+
+                if _pre_msg:
+                    # Graph already computed the response — stream it word-by-word for UX
+                    if _pre_think:
+                        yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                        thinking_full = _pre_think
+                    yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                    message_full = _pre_msg
+                    _token_count = 1
+                else:
+                    yield f"event: message\ndata: {json.dumps({'token': 'Hey! What can I help with?'})}\n\n"
+                    message_full = "Hey! What can I help with?"
+                    _token_count = 1
+
+            else:
+                # Pipeline intents (ingestion, behavioral, etc.): stream VoJ synthesis
+                _pre_msg = final_state.get("response_message", "")
+                _pre_think = final_state.get("thinking_process")
+
+                if _pre_msg and _pre_msg not in ("", "Done."):
+                    # VoJ already computed in synthesize_response node — emit it
+                    if _pre_think:
+                        yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                        thinking_full = _pre_think
+                    # Stream message word-by-word for typing effect
+                    yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                    message_full = _pre_msg
+                    _token_count = 1
+                else:
+                    # Fallback: generate a fresh VoJ synthesis via streaming
+                    try:
+                        _captured_summary = {
+                            "intent": _intent,
+                            "schedule": final_state.get("schedule"),
+                            "execution_graph": final_state.get("execution_graph"),
+                            "research_results": final_state.get("research_results"),
+                            "ingestion_result": final_state.get("ingestion_result"),
+                            "clarification_request": final_state.get("clarification_request"),
+                            "error": final_state.get("error"),
+                            "user_prompt": request.user_prompt,
+                        }
+                        async for event_type, tok in synthesize_jarvis_response_stream(_captured_summary):
+                            if _ttft is None:
+                                _ttft = (time_mod.monotonic() - _start) * 1000
+                            _token_count += 1
+                            if event_type == "thinking":
+                                thinking_full += tok
+                            else:
+                                message_full += tok
+                            yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
+                        _stream_model = SLM_ROUTER_MODEL
+                    except Exception as voj_exc:
+                        print(f"[v2/stream] VoJ streaming failed: {voj_exc}")
+                        _fallback = final_state.get("response_message") or "Done."
+                        yield f"event: message\ndata: {json.dumps({'token': _fallback})}\n\n"
+                        message_full = _fallback
+                        _token_count = 1
+
+            _total_s = time_mod.monotonic() - _start
+
+            # Clean up think tags
+            message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
+            thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
+
+            # If no separate reasoning, try regex extraction
+            if not thinking_clean and message_clean:
+                message_clean, thinking_extracted = _extract_thinking_process(message_clean)
+                thinking_clean = thinking_extracted or ""
+
+            _assistant_msg = message_clean or final_state.get("response_message") or "Done."
+
+            # --- Save assistant message ---
             _msg_id = await save_assistant_message(
                 session_id, request.user_id, _assistant_msg, _intent,
                 {
@@ -1154,20 +1256,18 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 ))
 
             # --- Build full ChatResponse payload ---
-            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'gemma', 'synthesis_model': 'gemma-4-e4b'})}\n\n"
-
             complete_payload = {
                 "intent": _intent,
-                "message": final_state.get("response_message", ""),
+                "message": _assistant_msg,
                 "schedule": final_state.get("schedule"),
                 "execution_graph": final_state.get("execution_graph"),
                 "ingestion_result": final_state.get("ingestion_result"),
                 "action_proposals": None,
                 "search_result": None,
                 "suggested_action": None,
-                "thinking_process": final_state.get("thinking_process"),
+                "thinking_process": thinking_clean or final_state.get("thinking_process"),
                 "awaiting_task_confirmation": False,
-                "schedule_status": "draft" if final_state.get("schedule") else None,
+                "schedule_status": "draft" if _has_schedule else None,
                 "draft_id": final_state.get("draft_id"),
                 "conversation_id": session_id,
                 "message_id": _msg_id,
@@ -1180,9 +1280,18 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     if _existing_memories else None
                 ),
                 "pearl_insights": None,
+                "generation_metrics": {
+                    "total_tokens": _token_count,
+                    "total_time_s": round(_total_s, 2),
+                    "tok_per_sec": round(_token_count / _total_s, 2) if _total_s > 0 else 0,
+                    "ttft_ms": round(_ttft, 1) if _ttft is not None else None,
+                    "model": _stream_model,
+                },
             }
             yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
         except Exception as exc:
+            import traceback
+            traceback.print_exc()  # full traceback to server terminal
             yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
 
     return StreamingResponse(

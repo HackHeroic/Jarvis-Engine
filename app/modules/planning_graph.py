@@ -95,7 +95,7 @@ async def decompose_goal(state: PlanningState) -> dict:
     )
     try:
         from app.core.model_router import route_llm_call
-        from app.schemas.context import ExecutionGraph
+        from app.api.v1.endpoints.reasoning import ExecutionGraph
         result = await route_llm_call(
             task="socratic_chunker",
             prompt=goal,

@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 
 
@@ -84,7 +84,7 @@ async def parse_modification_request(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
             response_schema=ScheduleModification,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
         )
         if isinstance(result, dict):
             return ScheduleModification.model_validate(result)

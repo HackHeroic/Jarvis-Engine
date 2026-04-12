@@ -59,68 +59,49 @@ async def lifespan(app: FastAPI):
     register_default_patterns()
 
     from app.orchestrator.graph import build_jarvis_graph
-    from langgraph.checkpoint.memory import MemorySaver
-    app.state.jarvis_graph = build_jarvis_graph(checkpointer=MemorySaver())
+    # No checkpointer — UserModel is not msgpack-serializable.
+    # Checkpoint/resume requires excluding UserModel from persisted state.
+    app.state.jarvis_graph = build_jarvis_graph()
 
-    # Warmup LM Studio models using explicit load endpoint (avoids model-swap on chat/completions)
-    from app.core.config import LOCAL_LLM_MODEL, SLM_ROUTER_MODEL, LM_STUDIO_NATIVE_URL
+    # Detect loaded LM Studio models — NEVER load/unload models (OOM risk on 24GB).
+    # Maps whatever is loaded to LOCAL_LLM_MODEL and SLM_ROUTER_MODEL dynamically.
+    # If nothing is loaded or LM Studio is off → force GEMINI_PRIMARY so all calls go to cloud.
+    import app.core.config as _cfg
+    from app.core.config import LM_STUDIO_NATIVE_URL
+
+    def _force_gemini_only(reason: str) -> None:
+        """No local models available — route everything to Gemini."""
+        _cfg.GEMINI_PRIMARY = True
+        print(f" ⚠️  {reason} — all LLM calls will use Gemini cloud")
+
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # Fetch LM Studio's downloaded model list once for ID resolution
-            _lms_models: list[dict] = []
-            _list_resp = await client.get(f"{LM_STUDIO_NATIVE_URL}/api/v1/models")
-            if _list_resp.status_code == 200:
-                _lms_models = _list_resp.json().get("data", [])
-
-            # Fetch currently loaded models (OpenAI /v1/models only returns in-memory models)
-            _loaded_ids: set[str] = set()
+        async with httpx.AsyncClient(timeout=10.0) as client:
             _loaded_resp = await client.get(f"{LM_STUDIO_NATIVE_URL}/v1/models")
             if _loaded_resp.status_code == 200:
-                _loaded_ids = {m["id"] for m in _loaded_resp.json().get("data", [])}
-
-            async def load_model(model_id: str, label: str) -> None:
-                bare_id = model_id.removeprefix("openai/")
-
-                # Check if already loaded (exact match or fuzzy match against loaded set)
-                search_key = bare_id.split("/")[-1].lower()
-                already_loaded = next(
-                    (mid for mid in _loaded_ids if search_key in mid.lower()), None
-                )
-                if already_loaded:
-                    print(f" ✅ {label} model already loaded ({already_loaded})")
-                    return
-
-                resp = await client.post(
-                    f"{LM_STUDIO_NATIVE_URL}/api/v1/models/load",
-                    json={"model": bare_id},
-                )
-                if resp.status_code in (200, 201):
-                    print(f" ✅ {label} model warmed up")
-                    return
-                if resp.status_code == 404 and _lms_models:
-                    # Fuzzy-match against downloaded models (case-insensitive, ignore publisher prefix)
-                    match = next(
-                        (m["id"] for m in _lms_models if search_key in m["id"].lower()),
-                        None,
-                    )
-                    if match:
-                        retry = await client.post(
-                            f"{LM_STUDIO_NATIVE_URL}/api/v1/models/load",
-                            json={"model": match},
-                        )
-                        if retry.status_code in (200, 201):
-                            print(f" ✅ {label} model warmed up (resolved: {match})")
-                            return
-                        print(f" ⚠️  {label} model load failed after resolve ({match}): {retry.status_code}")
-                        return
-                    print(f" ⚠️  {label}: no downloaded model matches '{bare_id}' — check LM Studio")
-                    return
-                print(f" ⚠️  {label} model load returned {resp.status_code}: {resp.text[:120]}")
-
-            await load_model(SLM_ROUTER_MODEL, "4B")
-            await load_model(LOCAL_LLM_MODEL, "27B")
+                _loaded_models = _loaded_resp.json().get("data", [])
+                _loaded_ids = [m["id"] for m in _loaded_models]
+                if _loaded_ids:
+                    # Use the first loaded model for all local tasks (single-model setup)
+                    _primary = f"openai/{_loaded_ids[0]}"
+                    _cfg.LOCAL_LLM_MODEL = _primary
+                    _cfg.GEMMA_PRIMARY_MODEL = _primary
+                    # If multiple models loaded, use second as fast/SLM; else same model
+                    _fast = f"openai/{_loaded_ids[1]}" if len(_loaded_ids) > 1 else _primary
+                    _cfg.SLM_ROUTER_MODEL = _fast
+                    _cfg.GEMMA_FAST_MODEL = _fast
+                    _cfg.GEMINI_PRIMARY = False  # local models available → local-first
+                    print(f" ✅ Detected loaded model(s): {_loaded_ids}")
+                    print(f"    PRIMARY → {_cfg.LOCAL_LLM_MODEL}")
+                    if _fast != _primary:
+                        print(f"    FAST/SLM → {_cfg.SLM_ROUTER_MODEL}")
+                else:
+                    _force_gemini_only("No models loaded in LM Studio")
+            else:
+                _force_gemini_only(f"LM Studio /v1/models returned {_loaded_resp.status_code}")
+    except httpx.ConnectError:
+        _force_gemini_only("LM Studio not running")
     except Exception as e:
-        print(f" ⚠️  Model warmup failed (non-fatal): {e}")
+        _force_gemini_only(f"Model detection failed: {e}")
 
     yield
     print("Shutting down Jarvis Reasoning Engine.")
@@ -180,7 +161,7 @@ class ChatRequest(BaseModel):
 async def test_chat(request: ChatRequest):
     """
     Temporary endpoint to test the LiteLLM Hybrid Router.
-    - Local Qwen: prompts without cloud keywords (e.g. study schedule)
+    - Local Gemma: prompts without cloud keywords (e.g. study schedule)
     - Cloud Gemini: prompts with keywords like "latest news", "current events"
     """
     print(f"📥 Received prompt: {request.prompt}")

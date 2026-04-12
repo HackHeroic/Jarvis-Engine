@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
 from app.services.extraction.behavioral_store import delete_behavioral_constraint
@@ -97,7 +97,7 @@ async def ingest(request: IngestionRequest) -> IntentClassification:
             user_prompt=text,
             system_prompt=SEMANTIC_ROUTER_SYSTEM_PROMPT,
             response_schema=IntentClassification,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
         )
         if isinstance(result, dict):
             return IntentClassification.model_validate(result)

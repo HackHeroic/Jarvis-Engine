@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.core.config import SLM_ROUTER_MODEL
+import app.core.config as _cfg
 from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import (
     ActionItemProposal,
@@ -69,7 +69,7 @@ async def _classify(text: str) -> IntentClassification:
         user_prompt=text,
         system_prompt=SEMANTIC_ROUTER_SYSTEM_PROMPT,
         response_schema=IntentClassification,
-        model_override=SLM_ROUTER_MODEL,
+        model_override=_cfg.SLM_ROUTER_MODEL,
     )
     if isinstance(result, dict):
         return IntentClassification.model_validate(result)
