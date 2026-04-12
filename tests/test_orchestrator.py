@@ -57,3 +57,80 @@ def test_new_intent_types_exist():
     assert IntentType.CHECK_PROGRESS == "CHECK_PROGRESS"
     assert IntentType.RESEARCH == "RESEARCH"
     assert IntentType.CHAT == "CHAT"
+
+
+# ---------------------------------------------------------------------------
+# Routing tests (Task 5)
+# ---------------------------------------------------------------------------
+
+from app.orchestrator.routing import (
+    route_to_module,
+    check_negotiation_shortcut,
+    check_needs_followup,
+    INTENT_TO_MODULE,
+)
+
+
+def _make_state(**overrides) -> JarvisState:
+    base: JarvisState = {
+        "user_model": None,
+        "user_message": "test",
+        "brain_dump": None,
+        "intent": "PLAN_DAY",
+        "initiated_by": "user",
+        "execution_graph": None,
+        "schedule": None,
+        "draft_response": None,
+        "research_results": None,
+        "ingestion_result": None,
+        "clarification_request": None,
+        "thinking_process": None,
+        "response_message": None,
+        "conversation_phase": ConversationPhase.CHAT,
+        "negotiation_state": NegotiationPhase.NONE,
+        "modules_invoked": [],
+        "needs_followup": False,
+        "error": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_route_plan_day():
+    state = _make_state(intent="PLAN_DAY")
+    assert route_to_module(state) == "planning_module"
+
+
+def test_route_chat_fallback():
+    state = _make_state(intent="UNKNOWN_INTENT")
+    assert route_to_module(state) == "conversation_module"
+
+
+def test_route_negotiation_overrides_intent():
+    state = _make_state(intent="CHAT", conversation_phase=ConversationPhase.NEGOTIATION)
+    assert route_to_module(state) == "planning_module"
+
+
+def test_route_infeasible_fallback_to_coach():
+    state = _make_state(intent="PLAN_DAY", modules_invoked=["planning_module"], error="INFEASIBLE")
+    assert route_to_module(state) == "coach_module"
+
+
+def test_negotiation_shortcut_active():
+    state = _make_state(negotiation_state=NegotiationPhase.REVIEWING)
+    assert check_negotiation_shortcut(state) == "negotiation_active"
+
+
+def test_negotiation_shortcut_normal():
+    state = _make_state(negotiation_state=NegotiationPhase.NONE)
+    assert check_negotiation_shortcut(state) == "normal"
+
+
+def test_needs_followup_false():
+    state = _make_state(needs_followup=False)
+    assert check_needs_followup(state) is False
+
+
+def test_needs_followup_true():
+    state = _make_state(needs_followup=True)
+    assert check_needs_followup(state) is True
