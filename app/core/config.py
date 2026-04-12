@@ -25,6 +25,10 @@ LOCAL_LLM_URL: str = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
 LOCAL_LLM_MODEL: str = os.getenv(
     "LOCAL_LLM_MODEL", "openai/mlx-community/qwen3.5-27b"
 )  # Heavy lifting: decomposition, reasoning
+
+# Gemma 4 models (replacing Qwen)
+GEMMA_PRIMARY_MODEL: str = os.getenv("GEMMA_PRIMARY_MODEL", "openai/google/gemma-4-26b-a4b")
+GEMMA_FAST_MODEL: str = os.getenv("GEMMA_FAST_MODEL", "openai/google/gemma-4-e4b")
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 _raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
