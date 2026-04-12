@@ -8,7 +8,7 @@ until LM Studio is available. All other modules are wired to real implementation
 from langgraph.graph import END, StateGraph
 
 from app.orchestrator.state import JarvisState
-from app.orchestrator.hooks import ActionHooks, register_all_hooks
+from app.orchestrator.hooks import get_hooks
 from app.orchestrator.routing import (
     check_needs_followup,
     check_negotiation_shortcut,
@@ -43,6 +43,14 @@ _planning_compiled = build_planning_graph()
 
 async def _planning_module_node(state: JarvisState) -> dict:
     """Wrap the planning sub-graph as an orchestrator node."""
+    hooks = get_hooks()
+    pre = await hooks.execute("PreModuleExecution", module="planning_module", initiated_by=state.get("initiated_by", "user"))
+    if pre.decision.value in ("deny", "ask"):
+        return {
+            "response_message": pre.reason or "Action requires consent.",
+            "modules_invoked": state.get("modules_invoked", []) + ["planning_module"],
+        }
+
     user_model = state.get("user_model")
     brain_dump = state.get("brain_dump")
 
@@ -81,6 +89,14 @@ _knowledge_compiled = build_knowledge_graph()
 
 async def _knowledge_module_node(state: JarvisState) -> dict:
     """Wrap the knowledge sub-graph as an orchestrator node."""
+    hooks = get_hooks()
+    pre = await hooks.execute("PreModuleExecution", module="knowledge_module", initiated_by=state.get("initiated_by", "user"))
+    if pre.decision.value in ("deny", "ask"):
+        return {
+            "response_message": pre.reason or "Action requires consent.",
+            "modules_invoked": state.get("modules_invoked", []) + ["knowledge_module"],
+        }
+
     user_model = state.get("user_model")
     knowledge_state = {
         "user_id": user_model.user_id if user_model else "demo",
@@ -111,6 +127,14 @@ _research_compiled = build_research_graph()
 
 async def _research_agent_node(state: JarvisState) -> dict:
     """Wrap the research sub-graph as an orchestrator node."""
+    hooks = get_hooks()
+    pre = await hooks.execute("PreModuleExecution", module="research_agent", initiated_by=state.get("initiated_by", "user"))
+    if pre.decision.value in ("deny", "ask"):
+        return {
+            "response_message": pre.reason or "Action requires consent.",
+            "modules_invoked": state.get("modules_invoked", []) + ["research_agent"],
+        }
+
     user_model = state.get("user_model")
     research_state = {
         "user_id": user_model.user_id if user_model else "demo",
@@ -133,9 +157,6 @@ async def _research_agent_node(state: JarvisState) -> dict:
 
 def build_jarvis_graph(checkpointer=None):
     """Build and compile the Jarvis orchestrator graph."""
-    hooks = ActionHooks()
-    register_all_hooks(hooks)
-
     graph = StateGraph(JarvisState)
 
     # LLM-dependent nodes (stubs until LM Studio is available)

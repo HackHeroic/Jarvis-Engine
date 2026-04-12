@@ -37,11 +37,20 @@ class ActionHooks:
         self._handlers.setdefault(event, []).append(handler)
 
     async def execute(self, event: str, **context: Any) -> HookResult:
-        """Run all handlers for an event. First DENY or ASK wins."""
+        """Run all handlers for an event. First DENY or ASK wins. MODIFY transforms and continues."""
+        last_modify: HookResult | None = None
         for handler in self._handlers.get(event, []):
+            # If a previous handler modified the input, pass the modified version
+            if last_modify and last_modify.modified_input:
+                context.update(last_modify.modified_input)
             result = await handler(**context)
-            if result.decision in (HookDecision.DENY, HookDecision.ASK, HookDecision.MODIFY):
+            if result.decision in (HookDecision.DENY, HookDecision.ASK):
                 return result
+            if result.decision == HookDecision.MODIFY:
+                last_modify = result
+        # If any handler modified the input, return the last modification
+        if last_modify:
+            return last_modify
         return HookResult(decision=HookDecision.ALLOW)
 
 

@@ -16,6 +16,12 @@ class UserModel:
         self._user_id = user_id
         self._db = db
         self._cache: dict[str, Any] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _get_lock(self, key: str) -> asyncio.Lock:
+        if key not in self._locks:
+            self._locks[key] = asyncio.Lock()
+        return self._locks[key]
 
     @property
     def user_id(self) -> str:
@@ -34,50 +40,54 @@ class UserModel:
         self._cache["semantic_store"] = store
 
     async def get_behavioral_constraints(self) -> list[dict]:
-        if "constraints" not in self._cache:
-            result = await asyncio.to_thread(
-                lambda: self._db.supabase.table("behavioral_constraints")
-                .select("*")
-                .eq("user_id", self._user_id)
-                .execute()
-            )
-            self._cache["constraints"] = result.data
-        return self._cache["constraints"]
+        async with self._get_lock("constraints"):
+            if "constraints" not in self._cache:
+                result = await asyncio.to_thread(
+                    lambda: self._db.supabase.table("behavioral_constraints")
+                    .select("*")
+                    .eq("user_id", self._user_id)
+                    .execute()
+                )
+                self._cache["constraints"] = result.data
+            return self._cache["constraints"]
 
     async def get_pending_tasks(self) -> list[dict]:
-        if "pending_tasks" not in self._cache:
-            result = await asyncio.to_thread(
-                lambda: self._db.supabase.table("user_tasks")
-                .select("*")
-                .eq("user_id", self._user_id)
-                .eq("status", "pending")
-                .execute()
-            )
-            self._cache["pending_tasks"] = result.data
-        return self._cache["pending_tasks"]
+        async with self._get_lock("pending_tasks"):
+            if "pending_tasks" not in self._cache:
+                result = await asyncio.to_thread(
+                    lambda: self._db.supabase.table("user_tasks")
+                    .select("*")
+                    .eq("user_id", self._user_id)
+                    .eq("status", "pending")
+                    .execute()
+                )
+                self._cache["pending_tasks"] = result.data
+            return self._cache["pending_tasks"]
 
     async def get_all_tasks(self) -> list[dict]:
         """All tasks (any status) for progress tracking."""
-        if "all_tasks" not in self._cache:
-            result = await asyncio.to_thread(
-                lambda: self._db.supabase.table("user_tasks")
-                .select("*")
-                .eq("user_id", self._user_id)
-                .execute()
-            )
-            self._cache["all_tasks"] = result.data
-        return self._cache["all_tasks"]
+        async with self._get_lock("all_tasks"):
+            if "all_tasks" not in self._cache:
+                result = await asyncio.to_thread(
+                    lambda: self._db.supabase.table("user_tasks")
+                    .select("*")
+                    .eq("user_id", self._user_id)
+                    .execute()
+                )
+                self._cache["all_tasks"] = result.data
+            return self._cache["all_tasks"]
 
     async def get_active_goals(self) -> list[dict]:
-        if "active_goals" not in self._cache:
-            result = await asyncio.to_thread(
-                lambda: self._db.supabase.table("user_plan_updates")
-                .select("*")
-                .eq("user_id", self._user_id)
-                .execute()
-            )
-            self._cache["active_goals"] = result.data
-        return self._cache["active_goals"]
+        async with self._get_lock("active_goals"):
+            if "active_goals" not in self._cache:
+                result = await asyncio.to_thread(
+                    lambda: self._db.supabase.table("user_plan_updates")
+                    .select("*")
+                    .eq("user_id", self._user_id)
+                    .execute()
+                )
+                self._cache["active_goals"] = result.data
+            return self._cache["active_goals"]
 
     async def get_active_draft(self) -> Optional[dict]:
         return self._cache.get("active_draft")
