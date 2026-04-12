@@ -232,7 +232,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     # --- 27B DIRECT MODE: bypass pipeline, stream 27B directly ---
     if model_mode == "27b":
         return StreamingResponse(
-            _stream_direct_27b(request, db_client, session_id=session_id, supabase=supabase),
+            _stream_direct_27b(request, db_client, session_id=session_id, supabase=supabase, memory_store=memory_store),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
@@ -587,7 +587,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     )
 
 
-async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str | None = None, supabase=None) -> AsyncGenerator:
+async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str | None = None, supabase=None, memory_store=None) -> AsyncGenerator:
     """Stream 27B model response directly — no pipeline routing.
 
     Captures reasoning_content separately, tracks tok/sec, TTFT, token count.
@@ -652,6 +652,14 @@ async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str 
             session_id, request.user_id, _assistant_msg, "GENERAL_QA",
             {}, supabase,
         )
+
+    # Fire-and-forget memory extraction
+    if memory_store:
+        from app.services.memory.extractor import safe_extract_memories
+        asyncio.create_task(safe_extract_memories(
+            request.user_id, request.user_prompt, _assistant_msg, memory_store,
+            db_client=supabase,
+        ))
 
     complete_data = {
         "intent": "GENERAL_QA",
