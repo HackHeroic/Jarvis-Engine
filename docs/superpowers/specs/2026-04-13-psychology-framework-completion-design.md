@@ -123,7 +123,7 @@ def _calculate_sr(user_id: str, goal_id: str | None, db) -> float:
         tasks = db.table("user_tasks").select("status").eq("user_id", user_id).execute()
     total = len(tasks.data) if tasks.data else 0
     completed = sum(1 for t in (tasks.data or []) if t["status"] == "completed")
-    return completed / total if total > 0 else 1.0
+    return completed / total if total > 0 else 0.5  # neutral prior for cold start
 ```
 
 **Mastery computation (3 signals):**
@@ -254,6 +254,7 @@ async def run_coaching_response(state: dict) -> dict:
     
     from app.services.analytical.mastery_tracker import get_mastery_summary, _calculate_sr
     
+    db = user_model._db.supabase  # explicit path — avoids wiring bug from knowledge module
     mastery = await asyncio.to_thread(get_mastery_summary, user_model.user_id, db)
     sr = await asyncio.to_thread(_calculate_sr, user_model.user_id, None, db)
     all_tasks = await user_model.get_all_tasks()
