@@ -54,3 +54,41 @@ def test_planning_module__state_mappers_exist():
 
     assert planning_module.state_in is not None
     assert planning_module.state_out is not None
+
+
+def test_research_module__has_correct_steps():
+    from app.modules.research_graph import research_module
+
+    step_names = [s.name for s in research_module.steps]
+    assert step_names == [
+        "plan_research",
+        "execute_search",
+        "evaluate_results",
+        "summarize",
+        "link_to_tasks",
+    ]
+
+
+def test_research_module__self_loop():
+    from app.modules.research_graph import research_module
+
+    evaluate = next(s for s in research_module.steps if s.name == "evaluate_results")
+    assert evaluate.routes_to is not None
+    for _cond, dests in evaluate.routes_to.items():
+        assert dests.get(True) == "execute_search"
+        assert dests.get(False) == "summarize"
+
+
+def test_research_module__compiles():
+    from app.modules.research_graph import research_module
+    from app.core.module_framework import build_module_graph
+
+    graph = build_module_graph(research_module)
+    assert graph is not None
+
+
+def test_research_module__state_mappers_exist():
+    from app.modules.research_graph import research_module
+
+    assert research_module.state_in is not None
+    assert research_module.state_out is not None
