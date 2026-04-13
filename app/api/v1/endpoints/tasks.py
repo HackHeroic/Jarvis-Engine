@@ -254,10 +254,28 @@ async def update_task(
         "task_id", task_id
     ).eq("user_id", body.user_id).execute()
 
+    # Trigger background replan when schedule-affecting fields change
+    schedule_affecting = {"duration_minutes", "difficulty_weight", "deadline_hint", "status"}
+    replan_triggered = False
+    if schedule_affecting & set(update_payload.keys()):
+        db_client = getattr(request.app.state, "db_client", None)
+        replan_triggered = await _try_trigger_replan(
+            body.user_id, db_client, reason=f"task_edited:{task_id}",
+        )
+
+        # Fire-and-forget: detect behavioral patterns (duration edits feed detect_duration_preference)
+        memory_store = getattr(request.app.state, "memory_store", None)
+        if memory_store and supabase:
+            from app.services.memory.pearl import detect_patterns
+            asyncio.create_task(asyncio.to_thread(
+                detect_patterns, body.user_id, supabase, memory_store
+            ))
+
     return TaskResponse(
         task_id=task_id,
         status=body.status or "updated",
         message="Task updated.",
+        replan_triggered=replan_triggered,
     )
 
 
