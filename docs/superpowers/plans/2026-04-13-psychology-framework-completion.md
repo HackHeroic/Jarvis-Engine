@@ -339,14 +339,12 @@ Find the section in `schedule.py` where `_compute_tmt_priority` is called (in `r
 from app.services.analytical.mastery_tracker import _calculate_sr
 import asyncio
 
-# Fetch SR once for this user (sync via to_thread if needed)
-_sr = 0.5  # default
+# Fetch SR once for this user — reuse existing db_client, never create new Supabase client
+_sr = 0.5  # neutral prior
 try:
-    from app.core.config import SUPABASE_URL, SUPABASE_SERVICE_KEY
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        from supabase import create_client
-        _db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        _sr = _calculate_sr(user_id, goal_id, _db)
+    # db_client passed from chat endpoint or available via request.app.state
+    if db_client and hasattr(db_client, 'supabase'):
+        _sr = _calculate_sr(user_id, goal_id, db_client.supabase)
 except Exception:
     pass
 
@@ -731,13 +729,12 @@ async def skip_task(
         memory_store = getattr(request.app.state, "memory_store", None)
         if memory_store:
             try:
-                memory_store.store_memory(
-                    user_id=body.user_id,
-                    content=f"User struggles with '{task_title}' — needs re-decomposition into smaller chunks",
-                    memory_type="behavioral_pattern",
-                    source="pacing_pushed",
-                    confidence=0.8,
-                )
+                memory_store.store_memory(body.user_id, {
+                    "type": "behavioral_pattern",
+                    "content": f"User struggles with '{task_title}' — needs re-decomposition into smaller chunks",
+                    "source": "pacing_pushed",
+                    "confidence": 0.8,
+                })
             except Exception as e:
                 logger.warning(f"Failed to store re-decomposition memory: {e}")
 
@@ -1134,19 +1131,19 @@ def main():
     memory_store = None
     try:
         from app.services.memory.store import MemoryStore
-        memory_store = MemoryStore()
-        memory_store.store_memory(
-            user_id=user_id,
-            content="User skips tasks during 14:00-15:00 consistently",
-            memory_type="behavioral_pattern", source="pearl",
-            confidence=0.75,
-        )
-        memory_store.store_memory(
-            user_id=user_id,
-            content="User completes morning tasks faster and with higher quality",
-            memory_type="behavioral_pattern", source="pearl",
-            confidence=0.8,
-        )
+        memory_store = MemoryStore(supabase_client=db)
+        memory_store.store_memory(user_id, {
+            "type": "behavioral_pattern",
+            "content": "User skips tasks during 14:00-15:00 consistently",
+            "source": "pearl",
+            "confidence": 0.75,
+        })
+        memory_store.store_memory(user_id, {
+            "type": "behavioral_pattern",
+            "content": "User completes morning tasks faster and with higher quality",
+            "source": "pearl",
+            "confidence": 0.8,
+        })
         print("  ✓ 2 PEARL behavioral patterns")
     except Exception as e:
         print(f"  ⚠ PEARL memories skipped: {e}")
