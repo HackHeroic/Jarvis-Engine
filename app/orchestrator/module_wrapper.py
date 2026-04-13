@@ -16,7 +16,7 @@ def create_module_wrapper(module_name: str, registry: ModuleRegistry) -> Callabl
     """Generate an orchestrator node that wraps a module sub-graph."""
 
     async def wrapper(state: dict) -> dict:
-        from app.orchestrator.hooks import get_hooks
+        from app.orchestrator.hooks import get_hooks, HookDecision
 
         hooks = get_hooks()
 
@@ -26,12 +26,12 @@ def create_module_wrapper(module_name: str, registry: ModuleRegistry) -> Callabl
             module_id=module_name,
             initiated_by=state.get("initiated_by", "user"),
         )
-        if pre.decision.value == "deny":
+        if pre.decision == HookDecision.DENY:
             return {
                 "response_message": pre.reason or "Action blocked.",
                 "modules_invoked": state.get("modules_invoked", []) + [module_name],
             }
-        if pre.decision.value == "ask":
+        if pre.decision == HookDecision.ASK:
             return {
                 "response_message": pre.reason or "Action requires consent.",
                 "needs_consent": True,
