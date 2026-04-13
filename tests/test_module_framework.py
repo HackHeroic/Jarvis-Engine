@@ -378,3 +378,77 @@ async def test_build_module_graph__parallel_fan_out_fan_in():
     assert "a" in result["items"]
     assert "b" in result["items"]
     assert "done" in result["items"]
+
+
+@pytest.mark.asyncio
+async def test_module_registry__register_and_compile():
+    from app.core.module_framework import ModuleStep, ModuleDefinition, ModuleRegistry
+
+    async def noop(state):
+        return {}
+
+    defn = ModuleDefinition(
+        name="test_mod",
+        state_class=SimpleState,
+        steps=[ModuleStep(name="only", handler=noop)],
+    )
+    registry = ModuleRegistry()
+    registry.register(defn)
+
+    assert "test_mod" in registry.registered_names()
+
+    compiled = registry.get_compiled("test_mod")
+    result = await compiled.ainvoke({"value": 0, "progress_queue": None, "error": None})
+    assert isinstance(result, dict)
+
+
+def test_module_registry__get_compiled_caches():
+    from app.core.module_framework import ModuleStep, ModuleDefinition, ModuleRegistry
+
+    async def noop(state):
+        return {}
+
+    defn = ModuleDefinition(
+        name="cached",
+        state_class=SimpleState,
+        steps=[ModuleStep(name="only", handler=noop)],
+    )
+    registry = ModuleRegistry()
+    registry.register(defn)
+
+    c1 = registry.get_compiled("cached")
+    c2 = registry.get_compiled("cached")
+    assert c1 is c2
+
+
+def test_module_registry__unknown_module_raises():
+    from app.core.module_framework import ModuleRegistry
+
+    registry = ModuleRegistry()
+    with pytest.raises(KeyError, match="No module 'ghost'"):
+        registry.get_compiled("ghost")
+
+
+def test_module_registry__re_register_invalidates_cache():
+    from app.core.module_framework import ModuleStep, ModuleDefinition, ModuleRegistry
+
+    async def noop(state):
+        return {}
+
+    defn = ModuleDefinition(
+        name="evolving",
+        state_class=SimpleState,
+        steps=[ModuleStep(name="v1", handler=noop)],
+    )
+    registry = ModuleRegistry()
+    registry.register(defn)
+    c1 = registry.get_compiled("evolving")
+
+    defn2 = ModuleDefinition(
+        name="evolving",
+        state_class=SimpleState,
+        steps=[ModuleStep(name="v2", handler=noop)],
+    )
+    registry.register(defn2)
+    c2 = registry.get_compiled("evolving")
+    assert c1 is not c2
