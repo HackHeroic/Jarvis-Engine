@@ -224,3 +224,35 @@ def build_module_graph(definition: ModuleDefinition):
             graph.add_edge(step.name, END)
 
     return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# Module Registry
+# ---------------------------------------------------------------------------
+
+
+class ModuleRegistry:
+    """Registry for cognitive modules. Compiles and caches LangGraph sub-graphs."""
+
+    def __init__(self) -> None:
+        self._modules: dict[str, ModuleDefinition] = {}
+        self._compiled: dict[str, Any] = {}
+
+    def register(self, definition: ModuleDefinition) -> None:
+        for step in definition.steps:
+            step.module_name = definition.name
+        self._modules[definition.name] = definition
+        self._compiled.pop(definition.name, None)
+
+    def get_compiled(self, name: str) -> Any:
+        if name not in self._compiled:
+            if name not in self._modules:
+                raise KeyError(f"No module '{name}' registered")
+            self._compiled[name] = build_module_graph(self._modules[name])
+        return self._compiled[name]
+
+    def get_definition(self, name: str) -> ModuleDefinition:
+        return self._modules[name]
+
+    def registered_names(self) -> list[str]:
+        return list(self._modules.keys())
