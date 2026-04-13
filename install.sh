@@ -50,7 +50,8 @@ $CONDA_CMD run -n "$ENV_NAME" python -c "
 import fastapi
 import mlx.core as mx
 from ortools.sat.python import cp_model
-print('OK: fastapi, mlx, and ortools imports succeeded.')
+from langgraph.graph import StateGraph
+print('OK: fastapi, mlx, ortools, and langgraph imports succeeded.')
 " || {
     echo "Warning: Smoke test failed. Check dependencies manually."
 }
