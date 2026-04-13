@@ -83,6 +83,11 @@ async def _classify_intent(state: JarvisState) -> dict:
         return {"intent": IntentType.ACTION_ITEM}
     if bd.search_queries:
         return {"intent": IntentType.RESEARCH}
+    # Check for progress-related keywords in the original message
+    user_msg = (state.get("user_message") or "").lower()
+    progress_keywords = ["how am i doing", "my progress", "check progress", "how's my", "mastery", "how far", "status update", "how much have i"]
+    if any(kw in user_msg for kw in progress_keywords):
+        return {"intent": IntentType.CHECK_PROGRESS}
     return {"intent": IntentType.CHAT}
 
 
