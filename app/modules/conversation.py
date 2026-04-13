@@ -83,12 +83,22 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
 
     Runs after Planning, Research, Coach, Knowledge modules.
     NOT used for CHAT (conversation module handles its own synthesis).
+
+    If the upstream module already produced a complete response_message
+    (e.g., coach module with LLM-generated mastery coaching), pass it through
+    instead of re-synthesizing — avoids overwriting with a generic message.
     """
+    # Coach module already produces a complete, personality-rich response via LLM
+    # with mastery data baked in. Don't re-synthesize — pass through.
+    intent = str(state.get("intent", ""))
+    if intent == "CHECK_PROGRESS" and state.get("response_message"):
+        return {}  # keep coach's response_message as-is
+
     try:
         from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
 
         execution_summary = {
-            "intent": state.get("intent", "CHAT"),
+            "intent": intent,
             "schedule": state.get("schedule"),
             "execution_graph": state.get("execution_graph"),
             "research_results": state.get("research_results"),
@@ -98,6 +108,7 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
             "error": state.get("error"),
             "user_prompt": state.get("user_message", ""),
             "memory_context": state.get("memory_context", ""),
+            "coaching_data": state.get("coaching_data"),  # pass through if present
         }
         message, thinking = await synthesize_jarvis_response(
             execution_summary,
@@ -106,4 +117,4 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
         return {"response_message": message, "thinking_process": thinking}
     except Exception as e:
         logger.error(f"Voice of Jarvis synthesis error: {e}")
-        return {"response_message": state.get("clarification_request", "Here's what I've got for you.")}
+        return {"response_message": state.get("response_message") or state.get("clarification_request", "Here's what I've got for you.")}
