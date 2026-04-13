@@ -7,6 +7,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
+
 router = APIRouter()
 
 
@@ -168,28 +170,86 @@ async def complete_task(
 @router.post(
     "/{task_id}/skip",
     response_model=TaskResponse,
-    summary="Skip a task",
-    description="Marks task as skipped and triggers replan.",
+    summary="Skip / reschedule a task (anti-guilt)",
+    description="Marks task as pacing_pushed (not 'overdue' or 'failed'). "
+    "Applies slippery deadline logic: buffer reallocation, energy decay, "
+    "and re-decomposition memory if pushed 3+ times.",
 )
 async def skip_task(
     task_id: str,
     body: TaskDeleteRequest,
     request: Request,
 ) -> TaskResponse:
-    """Skip a task without completing it."""
+    """Anti-guilt task rescheduling — 'Slippery Deadlines'.
+
+    Never says 'overdue' or 'failed'. Reframes as adaptive pacing.
+    Blueprint: handle_missed_deadline() logic.
+    """
     supabase = _get_supabase(request)
 
+    # 1. Fetch current task to get reschedule_count
+    task_result = await asyncio.to_thread(
+        lambda: supabase.table("user_tasks")
+        .select("reschedule_count, duration_minutes, title, goal_id")
+        .eq("task_id", task_id)
+        .eq("user_id", body.user_id)
+        .limit(1)
+        .execute()
+    )
+    current_count = 0
+    task_title = task_id
+    task_duration = 25
+    task_goal_id = None
+    if task_result.data:
+        row = task_result.data[0]
+        current_count = row.get("reschedule_count", 0) or 0
+        task_title = row.get("title", task_id)
+        task_duration = row.get("duration_minutes", 25)
+        task_goal_id = row.get("goal_id")
+
+    new_count = current_count + 1
+
+    # 2. Update status to pacing_pushed (NOT 'skipped' or 'overdue')
     await asyncio.to_thread(
-        _update_task_status_sync,
-        supabase, task_id, body.user_id, "skipped", None,
+        lambda: supabase.table("user_tasks")
+        .update({"status": "pacing_pushed", "reschedule_count": new_count})
+        .eq("task_id", task_id)
+        .eq("user_id", body.user_id)
+        .execute()
     )
 
+    # 3. Determine reassignment (buffer reallocation)
+    from app.utils.pacing import compute_adaptive_daily_cap
+    daily_cap = compute_adaptive_daily_cap(horizon_minutes=2880, total_task_minutes=480)
+    buffer_minutes = daily_cap * 0.25  # 25% anti-guilt reserve
+    if task_duration <= buffer_minutes:
+        reassignment = "today_buffer"
+        message = f"Life happened — I've slotted '{task_title}' into today's buffer time."
+    else:
+        reassignment = "tomorrow_morning_peak"
+        message = f"Life happened — '{task_title}' moves to tomorrow morning. No stress."
+
+    # 4. Reschedule count >= 3 → memory: needs re-decomposition
+    if new_count >= 3:
+        memory_store = getattr(request.app.state, "memory_store", None)
+        if memory_store:
+            try:
+                memory_store.store_memory(body.user_id, {
+                    "type": "behavioral_pattern",
+                    "content": f"User struggles with '{task_title}' — needs re-decomposition into smaller chunks",
+                    "source": "pacing_pushed",
+                    "confidence": 0.8,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to store re-decomposition memory: {e}")
+
+    # 5. Trigger background replan
     db_client = getattr(request.app.state, "db_client", None)
     replan_triggered = await _try_trigger_replan(
-        body.user_id, db_client, reason=f"task_skipped:{task_id}",
+        body.user_id, db_client, reason=f"pacing_pushed:{task_id}",
     )
 
-    # Fire-and-forget: detect behavioral patterns from task history
+    # 6. Fire-and-forget: detect behavioral patterns
     memory_store = getattr(request.app.state, "memory_store", None)
     if memory_store and supabase:
         from app.services.memory.pearl import detect_patterns
@@ -199,8 +259,8 @@ async def skip_task(
 
     return TaskResponse(
         task_id=task_id,
-        status="skipped",
-        message="Task skipped. Schedule adjusted.",
+        status="pacing_pushed",
+        message=message,
         replan_triggered=replan_triggered,
     )
 
