@@ -1,9 +1,15 @@
 """Planning sub-graph — wraps existing pipeline functions as LangGraph nodes."""
 
 import json as _json
-from typing import Any, Optional, TypedDict
+import operator
+from typing import Annotated, Any, Optional, TypedDict
 from langgraph.graph import END, StateGraph
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+
+
+def _merge_lists(left: list, right: list) -> list:
+    """Reducer: merge two lists (used for parallel fan-in on time_slots)."""
+    return left + right
 
 
 class PlanningState(TypedDict):
@@ -12,7 +18,7 @@ class PlanningState(TypedDict):
     planning_goal: Optional[str]
     habits_text: str
     semantic_slots: list
-    time_slots: list
+    time_slots: Annotated[list, _merge_lists]  # parallel nodes can both add slots
     constraints: list
     task_chunks: list
     pending_tasks: list
@@ -114,8 +120,8 @@ async def memory_to_constraints(state: PlanningState) -> dict:
         if not slots:
             return {}
         extra = [s.model_dump() if hasattr(s, 'model_dump') else s for s in slots]
-        existing_slots = state.get("time_slots", [])
-        return {"time_slots": existing_slots + extra}
+        # Reducer _merge_lists handles combining with expand_slots output
+        return {"time_slots": extra}
     except Exception as e:
         from app.core.jarvis_logger import JARVIS_LOGGER as logger
         logger.warning(f"memory_to_constraints failed (non-fatal): {e}")
@@ -294,12 +300,43 @@ def build_planning_graph():
     graph.add_node("solve_schedule", solve_schedule)
     graph.add_node("handle_infeasible", handle_infeasible)
 
+    # --- Graph topology with parallel fan-out where safe ---
+    # Inspired by Claude Code's StreamingToolExecutor concurrency model:
+    # - Concurrent-safe nodes run in parallel (fan-out edges)
+    # - Data-dependent nodes run sequentially (linear edges)
+    # - LangGraph waits for ALL incoming edges before executing a node (fan-in)
+    #
+    # Parallel branch 1: habits pipeline (fetch → translate → expand_slots)
+    # Parallel branch 2: PEARL constraints (memory_to_constraints)
+    # Parallel branch 3: goal validation (validate_goal)
+    # Fan-in: decompose_goal waits for all three branches
+    #
+    # Current (sequential, ~12s):
+    #   fetch → translate → expand → memory → validate → decompose → fuse → solve
+    # New (parallel, ~7s):
+    #   fetch → translate → expand ──┐
+    #   memory_to_constraints ───────┤──→ decompose → fuse → solve
+    #   validate_goal ───────────────┘
+
     graph.set_entry_point("fetch_constraints")
+
+    # Branch 1: habits pipeline (sequential — each step needs prior output)
     graph.add_edge("fetch_constraints", "translate_habits")
     graph.add_edge("translate_habits", "expand_slots")
-    graph.add_edge("expand_slots", "memory_to_constraints")
-    graph.add_edge("memory_to_constraints", "validate_goal")
+
+    # Branch 2: PEARL constraints (parallel with habits — reads user_model, not habits)
+    graph.add_edge("fetch_constraints", "memory_to_constraints")
+
+    # Branch 3: goal validation (parallel with habits — reads planning_goal, not habits)
+    graph.add_edge("fetch_constraints", "validate_goal")
+
+    # Fan-in: all three branches must complete before decomposition
+    # LangGraph waits for ALL incoming edges before executing a node
     graph.add_conditional_edges("validate_goal", is_goal_clear, {True: "decompose_goal", False: END})
+    graph.add_edge("expand_slots", "decompose_goal")
+    graph.add_edge("memory_to_constraints", "decompose_goal")
+
+    # Sequential: decompose → fuse → solve (strict data dependency)
     graph.add_edge("decompose_goal", "fuse_tasks")
     graph.add_edge("fuse_tasks", "solve_schedule")
     graph.add_conditional_edges("solve_schedule", check_feasibility, {"OPTIMAL": END, "INFEASIBLE": "handle_infeasible"})
