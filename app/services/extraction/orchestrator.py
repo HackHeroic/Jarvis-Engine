@@ -197,17 +197,42 @@ async def process_ingestion(
 
         # Record in ingested_documents for document management UI
         if user_id and supabase:
+            # Upload original file to S3 for later preview (non-fatal)
+            s3_key: str | None = None
+            if file_bytes and user_id:
+                try:
+                    import boto3
+                    from app.core.config import AWS_BUCKET_NAME, AWS_REGION
+
+                    s3 = boto3.client(
+                        "s3",
+                        region_name=AWS_REGION,
+                    )
+                    s3_key = f"documents/{user_id}/{source_id}/{file_name or 'document'}"
+                    s3.put_object(
+                        Bucket=AWS_BUCKET_NAME,
+                        Key=s3_key,
+                        Body=file_bytes,
+                        ContentType=media_type or "application/octet-stream",
+                    )
+                    print(f"[Orchestrator] Uploaded to S3: {s3_key}")
+                except Exception as e:
+                    print(f"[Orchestrator] S3 upload failed (non-fatal): {e}")
+
             try:
+                upsert_row: dict = {
+                    "user_id": user_id,
+                    "source_id": source_id,
+                    "file_name": file_name,
+                    "media_type": media_type,
+                    "document_topics": kr.document_topics or [],
+                    "chunk_count": kr.stored_chunk_count or 0,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if s3_key is not None:
+                    upsert_row["s3_key"] = s3_key
                 supabase.table("ingested_documents").upsert(
-                    {
-                        "user_id": user_id,
-                        "source_id": source_id,
-                        "file_name": file_name,
-                        "media_type": media_type,
-                        "document_topics": kr.document_topics or [],
-                        "chunk_count": kr.stored_chunk_count or 0,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    },
+                    upsert_row,
                     on_conflict="user_id,source_id",
                 ).execute()
             except Exception as e:

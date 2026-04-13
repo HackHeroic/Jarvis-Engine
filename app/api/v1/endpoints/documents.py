@@ -1,4 +1,4 @@
-"""Document management endpoints: list and delete user-ingested documents."""
+"""Document management endpoints: list, delete, and view chunks for user-ingested documents."""
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -112,3 +112,28 @@ async def delete_document(
         raise HTTPException(500, f"Failed to delete document record: {exc}") from exc
 
     return {"status": "deleted", "source_id": source_id}
+
+
+@router.get(
+    "/{source_id}/chunks",
+    summary="Get document chunks",
+    description="Returns extracted text chunks for a document from ChromaDB.",
+)
+async def get_document_chunks(
+    source_id: str,
+    http_request: Request,
+    user_id: str = Query(...),
+) -> dict:
+    """Fetch text chunks for a document from ChromaDB."""
+    try:
+        from app.utils.chroma_client import get_chroma_client
+
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            "jarvis_knowledge", metadata={"hnsw:space": "cosine"}
+        )
+        results = collection.get(where={"source_id": source_id})
+        chunks = results.get("documents", []) if results else []
+        return {"source_id": source_id, "chunks": chunks, "count": len(chunks)}
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to fetch chunks: {exc}") from exc
