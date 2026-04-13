@@ -76,14 +76,23 @@ async def update_cognitive_state(state: dict) -> None:
 
 
 async def bridge_patterns_to_constraints(state: dict, patterns: list[dict]) -> int:
-    """Convert high-confidence patterns to scheduler constraints. Returns count bridged."""
+    """Persist high-confidence PEARL patterns as memory constraints.
+
+    Patterns with rate/confidence >= 0.7 are already stored in the memory store
+    by the PEARL detectors themselves. This function logs the count and returns it
+    so the caller can report how many were bridged.
+
+    The actual memory → TimeSlot conversion happens in planning_graph.memory_to_constraints
+    (called during _run_plan_day_flow before solve_schedule).
+    """
     bridged = 0
     for pattern in patterns:
-        confidence = pattern.get("confidence", 0.0)
+        # Normalise: PEARL detectors use "rate"; generic patterns use "confidence"
+        confidence = pattern.get("rate", pattern.get("confidence", 0.0))
         if confidence < 0.7:
             continue
-        pattern_type = pattern.get("type", "")
-        logger.debug(f"PEARL pattern {pattern_type} (conf={confidence}) ready for bridging")
+        pattern_type = pattern.get("pattern", pattern.get("type", ""))
+        logger.debug(f"PEARL pattern '{pattern_type}' (conf={confidence:.2f}) stored in memory — will apply on next replan")
         bridged += 1
     return bridged
 
@@ -114,12 +123,14 @@ async def _run_observation_inner(state: dict) -> dict:
 
     patterns = await detect_pearl_patterns(state)
     for pattern in patterns:
+        # PEARL detectors return dicts with "pattern", "inference", "rate" keys
+        # (not "type", "content", "confidence") — normalise before emitting SSE.
         _emit_event(state, "pattern_detected", {
-            "type": pattern.get("type", "behavioral_pattern"),
-            "content": pattern.get("content", ""),
-            "confidence": pattern.get("confidence", 0.0),
-            "occurrence_count": pattern.get("occurrence_count", 1),
-            "action": pattern.get("action", "none"),
+            "type": pattern.get("pattern", pattern.get("type", "behavioral_pattern")),
+            "content": pattern.get("inference", pattern.get("content", "")),
+            "confidence": pattern.get("rate", pattern.get("confidence", 0.0)),
+            "occurrence_count": pattern.get("total", pattern.get("occurrence_count", 1)),
+            "action": pattern.get("action", "detected"),
         })
 
     await update_cognitive_state(state)
