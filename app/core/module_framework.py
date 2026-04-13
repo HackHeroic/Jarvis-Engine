@@ -140,3 +140,88 @@ def _wrap_step(step: ModuleStep) -> Callable:
 
     wrapped.__name__ = f"{step.module_name}__{step.name}"
     return wrapped
+
+
+# ---------------------------------------------------------------------------
+# Graph builder
+# ---------------------------------------------------------------------------
+
+END_SENTINEL = "__END__"
+
+
+def build_module_graph(definition: ModuleDefinition):
+    """Build a compiled LangGraph from a ModuleDefinition."""
+    from langgraph.graph import END, StateGraph
+
+    for step in definition.steps:
+        step.module_name = definition.name
+
+    graph = StateGraph(definition.state_class)
+
+    lookup: dict[str, ModuleStep] = {}
+    for step in definition.steps:
+        lookup[step.name] = step
+        wrapped = _wrap_step(step)
+        graph.add_node(step.name, wrapped)
+
+    def _resolve_end(destinations: dict[str, str]) -> dict:
+        return {k: END if v == END_SENTINEL else v for k, v in destinations.items()}
+
+    # Collect all steps that are destinations of routes_to
+    routed_targets: set[str] = set()
+    for s in definition.steps:
+        if s.routes_to:
+            for _cond, dests in s.routes_to.items():
+                for target in dests.values():
+                    if target != END_SENTINEL:
+                        routed_targets.add(target)
+
+    # Detect entry point
+    if definition.entry_step:
+        entry = definition.entry_step
+    else:
+        candidates = [s for s in definition.steps if not s.depends_on]
+        entry_candidates = [s for s in candidates if s.name not in routed_targets]
+        if len(entry_candidates) >= 1:
+            entry = entry_candidates[0].name
+        elif candidates:
+            entry = candidates[0].name
+        else:
+            raise ValueError(
+                f"Module '{definition.name}' has no entry point: all steps have depends_on"
+            )
+    graph.set_entry_point(entry)
+
+    # Wire edges
+    for step in definition.steps:
+        if step.routes_to:
+            for condition_fn, destinations in step.routes_to.items():
+                graph.add_conditional_edges(step.name, condition_fn, _resolve_end(destinations))
+        elif step.depends_on and step.name not in routed_targets:
+            for dep_name in step.depends_on:
+                dep_step = lookup.get(dep_name)
+                if dep_step and not dep_step.routes_to:
+                    graph.add_edge(dep_name, step.name)
+
+    # Wire extra_edges
+    for edge in definition.extra_edges:
+        graph.add_conditional_edges(edge.from_step, edge.condition, _resolve_end(edge.destinations))
+
+    # Detect terminal steps and wire to END
+    depended_on: set[str] = set()
+    for step in definition.steps:
+        for dep in step.depends_on:
+            depended_on.add(dep)
+    has_outgoing: set[str] = {s.name for s in definition.steps if s.routes_to}
+    has_outgoing |= {e.from_step for e in definition.extra_edges}
+
+    for step in definition.steps:
+        is_terminal = (
+            step.name not in depended_on
+            and step.name not in has_outgoing
+            and step.name not in routed_targets
+        )
+        if is_terminal:
+            graph.add_edge(step.name, END)
+
+    return graph.compile()
