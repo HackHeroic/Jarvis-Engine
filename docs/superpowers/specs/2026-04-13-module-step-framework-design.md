@@ -1020,3 +1020,57 @@ module_registry.register(meeting_module)
 And add the intent routing in the orchestrator. No graph topology code. No manual SSE emission. No wrapper boilerplate. The framework handles parallelism, SSE events, timeouts, feature flags, and hook integration automatically.
 
 That's the path from "productivity planner" to "Tony Stark's JARVIS" — one `ModuleDefinition` at a time.
+
+---
+
+## 10. Next Specs (Ready to Brainstorm)
+
+After this framework is implemented, these specs become unblocked. Each includes a starter prompt and reference files for the brainstorm session.
+
+### 1. Hook System Expansion (L4)
+
+**Prompt:** "Expand Jarvis from 7 to ~25 hooks across 6 categories, adapting Claude Code's 27 hook events for productivity intelligence. Extension point: ModuleStep.hook_event field in the ModuleStep framework."
+
+**Reference files:**
+- `Jarvis-Engine/.superpowers/brainstorm/9519-1775987100/content/claude-code-full-architecture.html` — Level 4: All 27 Hook Events (6 categories, source: coreTypes.ts:25-53)
+- `Jarvis-Engine/docs/claude-code-architecture.md` — Hook Pipeline section
+- `Jarvis-Engine/app/orchestrator/hooks.py` — current 7 hooks + ActionHooks class
+- `Jarvis-Engine/docs/superpowers/specs/2026-04-13-module-step-framework-design.md` — Section 7 (flagged items)
+- `Jarvis-Engine/docs/superpowers/specs/2026-04-12-jarvis-architecture-v2-design.md` — Section 9, Feature #2
+
+### 2. Context Compaction (L6)
+
+**Prompt:** "Implement 4 compaction types (micro, auto, snip, reactive) adapted from Claude Code for Jarvis conversation context management. Extension points: PreCompact/PostCompact hook events from the hook expansion spec."
+
+**Reference files:**
+- `Jarvis-Engine/.superpowers/brainstorm/9519-1775987100/content/claude-code-full-architecture.html` — Level 6: 4 Compaction Types
+- `Jarvis-Engine/docs/superpowers/specs/2026-03-28-jarvis-architecture-reset-design.md` — Memory & Context Architecture section (Tier 2 Recall Memory)
+- `Jarvis-Engine/app/services/chat_history.py` — current hard-cap context management
+- `Jarvis-Engine/docs/superpowers/specs/2026-04-12-jarvis-architecture-v2-design.md` — Section 9, Feature #3
+
+### 3. Permission Pipeline (L5)
+
+**Prompt:** "Build step-level permission pipeline with deny/ask/allow rules, consent tracking, and tiered modes (cautious/balanced/autonomous) adapted from Claude Code's 9-step pipeline. Extension point: _wrap_step hook check in ModuleStep framework."
+
+**Reference files:**
+- `Jarvis-Engine/.superpowers/brainstorm/9519-1775987100/content/claude-code-full-architecture.html` — Level 5: Permission Pipeline (9 Steps)
+- `Jarvis-Engine/app/orchestrator/hooks.py` — current ALLOW/DENY/ASK/MODIFY system
+- `Jarvis-Engine/docs/superpowers/specs/2026-04-12-jarvis-architecture-v2-design.md` — Section 9, Feature #13
+
+### 4. Feature Flag System (L8)
+
+**Prompt:** "Build runtime feature flag system with Supabase config table and admin UI for enterprise. Extension point: ModuleStep.feature_flag field + is_feature_enabled() in config.py."
+
+**Reference files:**
+- `Jarvis-Engine/.superpowers/brainstorm/9519-1775987100/content/claude-code-full-architecture.html` — Level 8: Feature Gating (89 flags, 6 categories)
+- `Jarvis-Engine/app/core/config.py` — current config with is_feature_enabled() added by this spec
+- `Jarvis-Engine/docs/superpowers/specs/2026-04-13-module-step-framework-design.md` — feature_flag field definition
+
+### 5. AsyncGenerator Migration (L9)
+
+**Prompt:** "Replace asyncio.Queue with AsyncGenerator at module level for natural backpressure. Scalability optimization for concurrent users."
+
+**Reference files:**
+- `Jarvis-Engine/.superpowers/brainstorm/9519-1775987100/content/claude-code-full-architecture.html` — Level 9: AsyncGenerator Streaming Architecture (5 layers)
+- `Jarvis-Engine/app/api/v1/endpoints/chat.py` — current Queue + SSE pattern
+- `claude-code-src-code-main/src/services/tools/StreamingToolExecutor.ts` — Claude Code's async generator pattern
