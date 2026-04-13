@@ -43,3 +43,24 @@ def test_conditional_edge__fields():
     )
     assert edge.from_step == "solve"
     assert edge.destinations["ok"] == "__END__"
+
+
+import os
+
+
+def test_is_feature_enabled__default_enabled():
+    from app.core.config import is_feature_enabled
+    os.environ.pop("JARVIS_ENABLE_PEARL", None)
+    assert is_feature_enabled("ENABLE_PEARL") is True
+
+
+def test_is_feature_enabled__explicitly_disabled(monkeypatch):
+    from app.core.config import is_feature_enabled
+    monkeypatch.setenv("JARVIS_ENABLE_PEARL", "0")
+    assert is_feature_enabled("ENABLE_PEARL") is False
+
+
+def test_is_feature_enabled__explicitly_enabled(monkeypatch):
+    from app.core.config import is_feature_enabled
+    monkeypatch.setenv("JARVIS_ENABLE_PEARL", "1")
+    assert is_feature_enabled("ENABLE_PEARL") is True

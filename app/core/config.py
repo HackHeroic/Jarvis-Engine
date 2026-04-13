@@ -73,3 +73,12 @@ AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
 AWS_BUCKET_NAME: str = os.getenv("AWS_BUCKET_NAME", "jarvis-dev-0-storage")
+
+
+def is_feature_enabled(flag: str) -> bool:
+    """Check if a feature flag is enabled. Runtime check via env vars.
+
+    Convention: JARVIS_{FLAG_NAME} env var. Default: enabled ("1").
+    Set to "0" to disable.
+    """
+    return os.environ.get(f"JARVIS_{flag}", "1") == "1"
