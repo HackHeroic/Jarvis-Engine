@@ -107,9 +107,11 @@ def compute_mastery(user_id: str, goal_id: Optional[str], db) -> float:
         + max(0.0, 1.0 - reschedule_count * 0.1) * 0.2
     )
 
-    target = _get_mastery_target(user_id, goal_id, db)
-    if target and target > 0:
-        return min(raw_mastery / (target / 5.0), 1.0)
+    # mastery_level_target (1-5) sets the bar — higher target = harder to reach 100%
+    # target=5 means raw_mastery IS the score (full scale)
+    # target=3 means you need raw_mastery of 0.6 to hit 100% — NO, that inflates scores
+    # Correct: target just labels ambition. Raw mastery is the actual score.
+    # Don't normalize by target — it distorts the signal.
     return raw_mastery
 
 
