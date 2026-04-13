@@ -86,12 +86,14 @@ class MemoryStore:
             .eq("user_id", user_id)
             .eq("memory_type", memory_type)
             .is_("superseded_by", "null")
-            .gt("strength", 0.1)
         )
         if min_confidence > 0:
             query = query.gt("confidence", min_confidence)
         result = query.execute()
-        return result.data or []
+        rows = result.data or []
+        # Post-fetch: apply time-decayed strength filter (consistent with get_active_memories)
+        now = datetime.now(timezone.utc)
+        return [m for m in rows if compute_memory_strength(m, now) >= 0.1]
 
     def get_memory(self, memory_id: str, user_id: str = None) -> dict | None:
         """Get a single memory. Always filters by user_id when provided.

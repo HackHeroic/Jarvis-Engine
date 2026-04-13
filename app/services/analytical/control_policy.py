@@ -1437,6 +1437,9 @@ async def execute_agentic_flow(
                 return _guard_resp
 
     execution_summary: dict[str, Any] = {}
+    # Inject memory context early so VoJ can personalize its response
+    if memory_context:
+        execution_summary["memory_context"] = memory_context
     action_proposals: list[dict] = []
     search_result: Optional[dict] = None
     ingestion_result: Optional[dict] = None
@@ -1782,6 +1785,20 @@ async def trigger_replan(
     else:
         semantic_slots = []
 
+    # Load PEARL behavioral patterns as additional constraints
+    pearl_constraint_slots: list[TimeSlot] = []
+    try:
+        from app.services.memory.store import MemoryStore
+        from app.services.memory.constraint_bridge import memories_to_constraints
+        memory_store = MemoryStore(supabase_client=supabase)
+        pearl_constraint_slots = await asyncio.to_thread(
+            memories_to_constraints, user_id, memory_store
+        )
+        if pearl_constraint_slots:
+            log_step("REPLAN_PEARL", "Loaded PEARL constraint slots", {"count": len(pearl_constraint_slots)})
+    except Exception as _pearl_err:
+        log_step("REPLAN_PEARL_WARN", f"PEARL constraint load skipped: {_pearl_err}")
+
     # Compute horizon from deadlines
     plan_deadlines = _get_plan_deadlines_from_db(user_id, None, supabase)
     inferred_horizon = compute_horizon_from_deadlines(
@@ -1795,7 +1812,7 @@ async def trigger_replan(
     else:
         horizon_steps = [h for h in [2880, 4320, 7200, 10080] if h <= MAX_HORIZON_MINUTES]
 
-    # Build daily context (habit blocks + past time)
+    # Build daily context (habit blocks + past time + PEARL pattern constraints)
     def _build_ctx(horizon_minutes: int) -> list:
         ctx = expand_semantic_slots_to_time_slots(
             semantic_slots,
@@ -1811,6 +1828,8 @@ async def trigger_replan(
                 recurring=False,
             )
             ctx.insert(0, past_slot)
+        # Merge PEARL-inferred constraints after habit slots
+        ctx.extend(pearl_constraint_slots)
         return ctx
 
     # Build synthetic graph from pending tasks

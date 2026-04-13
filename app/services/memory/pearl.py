@@ -297,6 +297,18 @@ def detect_patterns(
 
 # ── Proactive Surfacing ───────────────────────────────────
 
+
+def _hour_to_time_str(hour: int) -> str:
+    """Convert a 24-hour integer to a human-readable time string."""
+    if hour == 0:
+        return "12 AM"
+    if hour < 12:
+        return f"{hour} AM"
+    if hour == 12:
+        return "12 PM"
+    return f"{hour - 12} PM"
+
+
 def generate_proactive_insights(
     user_id: str,
     memory_store,
@@ -328,22 +340,29 @@ def generate_proactive_insights(
             match = re.search(r"hour (\d+)", content)
             if match:
                 hour = int(match.group(1))
-                if hour == 0:
-                    time_desc = "12 AM"
-                elif hour < 12:
-                    time_desc = f"{hour} AM"
-                elif hour == 12:
-                    time_desc = "12 PM"
-                else:
-                    time_desc = f"{hour - 12} PM"
+                time_desc = _hour_to_time_str(hour)
                 insights.append(
                     f"I've noticed you tend to skip tasks around {time_desc}. "
                     f"I've adjusted your schedule to avoid scheduling deep work at that time."
+                )
+        elif "most productive during hour" in content:
+            match = re.search(r"hour (\d+)", content)
+            if match:
+                hour = int(match.group(1))
+                time_desc = _hour_to_time_str(hour)
+                insights.append(
+                    f"I've noticed you're most productive around {time_desc}. "
+                    f"I'll prioritise your hardest tasks during that window."
                 )
         elif "prefers shorter tasks" in content:
             insights.append(
                 f"I've noticed you often shorten task durations. "
                 f"I'll default to shorter time blocks for new tasks."
+            )
+        elif "extend" in content and "deadline" in content:
+            insights.append(
+                f"I've noticed you tend to extend deadlines. "
+                f"I'll build in a buffer when scheduling around due dates."
             )
         else:
             insights.append(f"Pattern observed: {content}")
