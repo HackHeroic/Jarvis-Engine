@@ -188,7 +188,25 @@ async def fuse_tasks(state: PlanningState) -> dict:
     pending = []
     if user_model:
         pending = await user_model.get_pending_tasks()
-    return {"pending_tasks": pending}
+
+    # Merge: add pending tasks that aren't already in new task_chunks
+    new_chunks = state.get("task_chunks", [])
+    new_ids = {c.get("task_id") for c in new_chunks if c.get("task_id")}
+    merged = list(new_chunks)  # start with new tasks
+    for p in pending:
+        pid = p.get("task_id")
+        if pid and pid not in new_ids:
+            # Convert pending task row to TaskChunk-compatible dict
+            merged.append({
+                "task_id": pid,
+                "title": p.get("title", ""),
+                "duration_minutes": p.get("duration_minutes", 25),
+                "difficulty_weight": p.get("difficulty_weight", 0.5),
+                "dependencies": p.get("dependencies", []),
+                "deadline_hint": p.get("deadline_hint"),
+            })
+
+    return {"task_chunks": merged, "pending_tasks": pending}
 
 
 async def solve_schedule(state: PlanningState) -> dict:
