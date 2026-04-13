@@ -219,7 +219,6 @@ def build_module_graph(definition: ModuleDefinition):
         is_terminal = (
             step.name not in depended_on
             and step.name not in has_outgoing
-            and step.name not in routed_targets
         )
         if is_terminal:
             graph.add_edge(step.name, END)
