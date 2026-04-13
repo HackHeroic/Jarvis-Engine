@@ -169,9 +169,13 @@ async def _knowledge_module_node(state: JarvisState) -> dict:
         import base64
         _file_bytes = base64.b64decode(_file_b64)
 
+    # Pass db_client through so process_ingestion can write to ingested_documents
+    _db_client = getattr(user_model, '_db', None) if user_model else None
+
     knowledge_state = {
         "user_id": user_model.user_id if user_model else "demo",
         "user_model": user_model,
+        "db_client": _db_client,
         "content": state.get("user_message", ""),
         "file_bytes": _file_bytes,
         "media_type": state.get("file_media_type"),

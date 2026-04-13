@@ -8,6 +8,7 @@ from app.core.jarvis_logger import JARVIS_LOGGER as logger
 class KnowledgeState(TypedDict):
     user_id: str
     user_model: Any
+    db_client: Any  # DatabaseClient — needed for ingested_documents persistence
     content: Optional[str]
     file_bytes: Optional[bytes]
     media_type: Optional[str]
@@ -47,6 +48,7 @@ async def ingest_document(state: KnowledgeState) -> dict:
             media_type=state.get("media_type"),
             user_id=state.get("user_id"),
             file_name=state.get("file_name"),
+            db_client=state.get("db_client"),
         )
         return {"ingestion_result": result.model_dump() if hasattr(result, "model_dump") else {"status": "ok"}}
     except Exception as e:
