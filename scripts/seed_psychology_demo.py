@@ -184,16 +184,24 @@ def main():
 
     # --- 5. Verify mastery tracker ---
     try:
-        from app.services.analytical.mastery_tracker import compute_mastery, get_mastery_summary, _calculate_sr
-        mastery = get_mastery_summary(user_id, db)
+        from app.services.analytical.mastery_tracker import (
+            compute_mastery, get_mastery_summary, _calculate_sr,
+            _get_avg_quality, _get_reschedule_count, _get_mastery_target,
+        )
         sr = _calculate_sr(user_id, None, db)
-        print(f"\n  📊 Mastery summary: {json.dumps({k: round(v, 2) for k, v in mastery.items()})}")
-        print(f"  📊 Overall SR: {sr:.0%}")
-        for gid, score in mastery.items():
+        print(f"\n  📊 Overall SR: {sr:.0%}")
+        for gid in [goal_a_id, goal_b_id]:
             label = "DSA" if "dsa" in gid else "Calculus"
-            print(f"  📊 {label}: {score:.0%} mastery")
+            g_sr = _calculate_sr(user_id, gid, db)
+            g_q = _get_avg_quality(user_id, gid, db)
+            g_r = _get_reschedule_count(user_id, gid, db)
+            g_t = _get_mastery_target(user_id, gid, db)
+            g_m = compute_mastery(user_id, gid, db)
+            print(f"  📊 {label}: mastery={g_m:.0%} (SR={g_sr:.2f} quality={g_q:.1f}/5 reschedule={g_r} target={g_t})")
     except Exception as e:
+        import traceback
         print(f"  ⚠ Mastery verification failed: {e}")
+        traceback.print_exc()
 
     print(f"\n✅ Seed complete. Test with:")
     print(f'  curl -N -X POST http://localhost:8000/api/v1/chat/v2/stream \\')

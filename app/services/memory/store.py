@@ -58,7 +58,8 @@ class MemoryStore:
             "updated_at": now,
         }
         if embedding:
-            row["embedding"] = embedding
+            # Convert numpy float32 to native float for JSON serialization
+            row["embedding"] = [float(x) for x in embedding]
         result = self._supabase.table("user_memories").insert(row).execute()
         return result.data[0] if result.data else None
 
