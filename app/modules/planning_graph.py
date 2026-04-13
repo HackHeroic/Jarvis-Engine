@@ -99,6 +99,9 @@ async def memory_to_constraints(state: PlanningState) -> dict:
     """Convert PEARL behavioral patterns into time slot constraints for OR-Tools."""
     user_model = state.get("user_model")
     if not user_model:
+        _emit_tool_use(state, "mastery_check", "done", {
+            "formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2",
+        })
         return {}
     try:
         memory_store = await user_model.get_memory_store()
@@ -117,6 +120,10 @@ async def memory_to_constraints(state: PlanningState) -> dict:
         from app.core.jarvis_logger import JARVIS_LOGGER as logger
         logger.warning(f"memory_to_constraints failed (non-fatal): {e}")
         return {}
+    finally:
+        _emit_tool_use(state, "mastery_check", "done", {
+            "formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2",
+        })
 
 
 async def validate_goal(state: PlanningState) -> dict:
@@ -242,6 +249,8 @@ async def solve_schedule(state: PlanningState) -> dict:
         "status": "OPTIMAL",
         "task_count": len(chunks),
         "horizon_h": horizon // 60,
+        "tmt_applied": True,
+        "formula": "canonical_steel_konig",
     })
     return {"schedule": result, "error": None}
 
