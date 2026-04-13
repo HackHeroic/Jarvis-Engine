@@ -96,7 +96,27 @@ async def expand_slots(state: PlanningState) -> dict:
 
 
 async def memory_to_constraints(state: PlanningState) -> dict:
-    return {}
+    """Convert PEARL behavioral patterns into time slot constraints for OR-Tools."""
+    user_model = state.get("user_model")
+    if not user_model:
+        return {}
+    try:
+        memory_store = await user_model.get_memory_store()
+        if not memory_store:
+            return {}
+        from app.services.memory.constraint_bridge import memories_to_constraints
+        import asyncio
+        user_id = state.get("user_id", "demo")
+        slots = await asyncio.to_thread(memories_to_constraints, user_id, memory_store)
+        if not slots:
+            return {}
+        extra = [s.model_dump() if hasattr(s, 'model_dump') else s for s in slots]
+        existing_slots = state.get("time_slots", [])
+        return {"time_slots": existing_slots + extra}
+    except Exception as e:
+        from app.core.jarvis_logger import JARVIS_LOGGER as logger
+        logger.warning(f"memory_to_constraints failed (non-fatal): {e}")
+        return {}
 
 
 async def validate_goal(state: PlanningState) -> dict:
