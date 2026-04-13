@@ -92,3 +92,41 @@ def test_research_module__state_mappers_exist():
 
     assert research_module.state_in is not None
     assert research_module.state_out is not None
+
+
+def test_knowledge_module__has_correct_steps():
+    from app.modules.knowledge_graph import knowledge_module
+
+    step_names = [s.name for s in knowledge_module.steps]
+    assert step_names == [
+        "classify_content",
+        "extract_calendar",
+        "ingest_document",
+        "link_to_tasks",
+        "propose_actions",
+        "file_operations",
+    ]
+
+
+def test_knowledge_module__three_way_branch():
+    from app.modules.knowledge_graph import knowledge_module
+
+    classify = next(s for s in knowledge_module.steps if s.name == "classify_content")
+    assert classify.routes_to is not None
+    for _cond, dests in classify.routes_to.items():
+        assert set(dests.values()) == {"extract_calendar", "ingest_document", "file_operations"}
+
+
+def test_knowledge_module__compiles():
+    from app.modules.knowledge_graph import knowledge_module
+    from app.core.module_framework import build_module_graph
+
+    graph = build_module_graph(knowledge_module)
+    assert graph is not None
+
+
+def test_knowledge_module__state_mappers_exist():
+    from app.modules.knowledge_graph import knowledge_module
+
+    assert knowledge_module.state_in is not None
+    assert knowledge_module.state_out is not None
