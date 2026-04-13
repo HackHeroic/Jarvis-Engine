@@ -298,7 +298,7 @@ def planning_state_out(result: dict, module_name: str) -> dict:
 
 
 planning_module = ModuleDefinition(
-    name="planning",
+    name="planning_module",
     state_class=PlanningState,
     state_in=planning_state_in,
     state_out=planning_state_out,

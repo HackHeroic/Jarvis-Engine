@@ -83,7 +83,7 @@ def research_state_out(result: dict, module_name: str) -> dict:
 
 
 research_module = ModuleDefinition(
-    name="research",
+    name="research_agent",
     state_class=ResearchState,
     state_in=research_state_in,
     state_out=research_state_out,
