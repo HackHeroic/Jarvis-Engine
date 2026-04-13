@@ -22,7 +22,7 @@ def _emit_event(state: dict, event_type: str, data: dict) -> None:
 
 
 async def extract_and_store_memories(state: dict) -> list[dict]:
-    """Extract memories from this conversation turn. Returns extracted memories."""
+    """Extract memories from this conversation turn using LLM."""
     user_model = state.get("user_model")
     if not user_model:
         return []
@@ -31,19 +31,39 @@ async def extract_and_store_memories(state: dict) -> list[dict]:
         return []
     user_message = state.get("user_message", "")
     response_message = state.get("response_message", "")
-    if not user_message and not response_message:
+    if not user_message.strip():
         return []
-    # Placeholder: real extraction will use LLM. For now, emit a stub observation.
-    return []
+    try:
+        from app.services.memory.extractor import extract_memories_from_turn
+        extracted = await extract_memories_from_turn(
+            user_model.user_id, user_message, response_message, memory_store
+        )
+        return extracted if isinstance(extracted, list) else []
+    except Exception as e:
+        logger.warning(f"Memory extraction failed (non-fatal): {e}")
+        return []
 
 
 async def detect_pearl_patterns(state: dict) -> list[dict]:
-    """Detect recurring behavioral patterns. Returns detected patterns."""
+    """Detect recurring behavioral patterns from task history."""
     user_model = state.get("user_model")
     if not user_model:
         return []
-    patterns = await user_model.get_pearl_patterns()
-    return patterns
+    try:
+        db = getattr(user_model, "_db", None)
+        supabase = db.supabase if db and hasattr(db, "supabase") else None
+        if not supabase:
+            return []
+        memory_store = await user_model.get_memory_store()
+        if not memory_store:
+            return []
+        from app.services.memory.pearl import detect_patterns
+        import asyncio
+        patterns = await asyncio.to_thread(detect_patterns, user_model.user_id, supabase, memory_store)
+        return patterns if isinstance(patterns, list) else []
+    except Exception as e:
+        logger.warning(f"PEARL pattern detection failed (non-fatal): {e}")
+        return []
 
 
 async def update_cognitive_state(state: dict) -> None:
