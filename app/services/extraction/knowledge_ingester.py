@@ -132,6 +132,7 @@ async def ingest_knowledge(
     intent: str = "KNOWLEDGE_INGESTION",
     deadline_detected: Optional[str] = None,
     source_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> KnowledgeIngestionResult:
     """Chunk text and store in Vector DB. Falls back to metadata-only when Chroma unavailable.
 
@@ -173,6 +174,8 @@ async def ingest_knowledge(
             }
             if source_id:
                 meta["source_id"] = source_id
+            if user_id:
+                meta["user_id"] = user_id
             meta.update(chunk_metas[i] if i < len(chunk_metas) else {})
             meta = _sanitize_chroma_metadata(meta)
             collection.add(
