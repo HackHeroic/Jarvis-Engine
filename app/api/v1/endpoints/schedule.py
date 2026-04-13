@@ -26,9 +26,9 @@ from app.schemas.context import Availability, TimeSlot
 # TMT (Temporal Motivation Theory) constants
 # ---------------------------------------------------------------------------
 
-EXPECTANCY = 1.0  # Default: user expects to complete
 IMPULSIVENESS = 1.5  # Constant; higher = more discounting of delayed rewards
 DEFAULT_DELAY_HOURS = 24  # Used when deadline_hint is missing
+DEFAULT_SELF_EFFICACY = 0.8  # Proxy for task-level confidence
 
 
 class _ChunkWithDeadline(Protocol):
@@ -50,30 +50,37 @@ def _delay_hours_for_chunk(
         return 1.0
     delta_days = (parsed.date() - horizon_start.date()).days
     hours = delta_days * 24
-    return max(1.0, hours)
+    return max(0.1, hours)  # floor 0.1 prevents zero
 
 
 def _compute_tmt_priority(
     difficulty_weight: float,
     delay_hours: float = DEFAULT_DELAY_HOURS,
+    success_rate: float = 0.5,
+    self_efficacy_proxy: float = DEFAULT_SELF_EFFICACY,
+    mastery_value: float | None = None,
 ) -> tuple[float, int]:
-    """Compute TMT motivation score and integer priority.
+    """Canonical TMT (Steel & König 2006).
 
-    Formula: Motivation = (Expectancy * Value) / (Impulsiveness * Delay)
-    Value = difficulty_weight (0–1). Scale to integer: max(1, int(motivation * 100)).
+    Motivation = (Expectancy × Value) / (1 + Impulsiveness × Delay)
 
     Args:
-        difficulty_weight: Task value from TaskChunk (0.0–1.0).
-        delay_hours: Hours until deadline; default 24 if missing.
+        difficulty_weight: Cognitive load (0-1). Inverted to reward if no mastery_value.
+        delay_hours: Hours until deadline. Floor 0.1.
+        success_rate: From mastery tracker _calculate_sr(). Feeds Expectancy.
+        self_efficacy_proxy: Task-level confidence (default 0.8).
+        mastery_value: Explicit value (1-5) from goal_metadata if available.
 
     Returns:
         Tuple of (raw_tmt_score, priority_score integer).
     """
-    value = difficulty_weight
-    motivation = (EXPECTANCY * value) / (IMPULSIVENESS * delay_hours)
+    expectancy = success_rate * self_efficacy_proxy
+    value = mastery_value if mastery_value is not None else (1.0 - difficulty_weight + 0.1)
+    delay = max(delay_hours, 0.1)
+
+    motivation = (expectancy * value) / (1.0 + IMPULSIVENESS * delay)
     priority_score = max(1, int(motivation * 100))
-    tmt_display = min(100, round(motivation * 1000))
-    return (tmt_display, priority_score)
+    return (motivation, priority_score)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +199,8 @@ def run_schedule(
     min_daily_deep_work_minutes: Optional[int] = None,
     max_task_duration_minutes: Optional[int] = None,
     min_task_duration_minutes: Optional[int] = None,
+    user_id: Optional[str] = None,
+    db_client: object = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
     Raises HTTPException on INFEASIBLE."""
@@ -260,14 +269,28 @@ def run_schedule(
             )
         # FULL_FOCUS: no block added
 
+    # Fetch success rate for TMT Expectancy (reuse existing db_client)
+    _sr = 0.5  # neutral prior
+    if user_id and db_client and hasattr(db_client, "supabase"):
+        try:
+            from app.services.analytical.mastery_tracker import _calculate_sr
+
+            goal_id = getattr(graph.goal_metadata, "goal_id", None)
+            _sr = _calculate_sr(user_id, goal_id, db_client.supabase)
+        except Exception:
+            pass
+
     # TMT scores and task mapping (per-chunk delay from deadline_hint)
     tmt_scores: dict[str, float] = {}
     for chunk in graph.decomposition:
         duration = clamped_durations[chunk.task_id]
         delay_h = _delay_hours_for_chunk(chunk, resolved_horizon_start)
+        _mastery_val = getattr(graph.goal_metadata, "mastery_level_target", None)
         tmt_display, priority_score = _compute_tmt_priority(
-            chunk.difficulty_weight,
-            delay_h,
+            difficulty_weight=chunk.difficulty_weight,
+            delay_hours=delay_h,
+            success_rate=_sr,
+            mastery_value=float(_mastery_val) if _mastery_val else None,
         )
         tmt_scores[chunk.task_id] = tmt_display
         scheduler.add_task(
