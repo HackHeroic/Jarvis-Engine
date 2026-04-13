@@ -107,11 +107,25 @@ def compute_mastery(user_id: str, goal_id: Optional[str], db) -> float:
         + max(0.0, 1.0 - reschedule_count * 0.1) * 0.2
     )
 
-    # mastery_level_target (1-5) sets the bar — higher target = harder to reach 100%
-    # target=5 means raw_mastery IS the score (full scale)
-    # target=3 means you need raw_mastery of 0.6 to hit 100% — NO, that inflates scores
-    # Correct: target just labels ambition. Raw mastery is the actual score.
-    # Don't normalize by target — it distorts the signal.
+    # mastery_level_target (1-5) sets the bar for 100%
+    # target=3 means raw_mastery of 0.6 (3/5) = 100% progress toward YOUR goal
+    # target=5 means you need raw_mastery of 1.0 for 100%
+    # Formula: progress = raw_mastery / (target / 5.0), capped at 1.0
+    # BUT raw_mastery rarely exceeds 0.7 in practice (quality 3.5/5, SR 0.8, 0 reschedules = 0.59)
+    # So we scale: how much of the target quality have you achieved?
+    target = _get_mastery_target(user_id, goal_id, db)
+    if target and target > 0:
+        # Target quality threshold: what avg_quality you need for your target
+        # target=3 → need avg_quality ~3.0/5; target=5 → need ~5.0/5
+        target_quality = target / 5.0  # 0.6 for target=3, 1.0 for target=5
+        actual_quality = avg_quality / 5.0
+        quality_progress = min(actual_quality / target_quality, 1.0) if target_quality > 0 else 1.0
+        # Blend: quality progress toward target (0.5) + SR (0.3) + reschedule (0.2)
+        return (
+            quality_progress * 0.5
+            + sr * 0.3
+            + max(0.0, 1.0 - reschedule_count * 0.1) * 0.2
+        )
     return raw_mastery
 
 
