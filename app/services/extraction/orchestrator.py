@@ -153,6 +153,7 @@ async def process_ingestion(
                 intent=classification.intent.value,
                 deadline_detected=None,
                 source_id=source_id,
+                user_id=user_id,
             )
         else:
             kr = await ingest_knowledge(
@@ -161,6 +162,7 @@ async def process_ingestion(
                 intent=classification.intent.value,
                 deadline_detected=None,
                 source_id=source_id,
+                user_id=user_id,
             )
         base_result.knowledge_result = {
             "stored_chunk_count": kr.stored_chunk_count,
