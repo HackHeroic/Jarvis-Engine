@@ -67,3 +67,9 @@ PACING_COGNITIVE_LOAD_MED: float = 0.9  # factor when intrinsic_load >= 0.7
 CHROMA_API_KEY: str | None = os.getenv("CHROMA_API_KEY")
 CHROMA_TENANT: str | None = os.getenv("CHROMA_TENANT")
 CHROMA_DATABASE: str = os.getenv("CHROMA_DATABASE", "Jarvis-Vector-Db")
+
+# AWS S3 (document storage)
+AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
+AWS_BUCKET_NAME: str = os.getenv("AWS_BUCKET_NAME", "jarvis-dev-0-storage")
