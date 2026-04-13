@@ -104,7 +104,7 @@ def knowledge_state_out(result: dict, module_name: str) -> dict:
 
 
 knowledge_module = ModuleDefinition(
-    name="knowledge",
+    name="knowledge_module",
     state_class=KnowledgeState,
     state_in=knowledge_state_in,
     state_out=knowledge_state_out,
