@@ -316,18 +316,26 @@ async def build_task_workspace(
                     wish = task_title
                     outcome = ""
                     if goal_id:
-                        goal_result = sb.table("user_plan_updates").select("goal_metadata, planning_goal").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
+                        # goal_metadata is stored inside context_snippet (JSONB)
+                        goal_result = sb.table("user_plan_updates").select("context_snippet").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
                         if goal_result.data:
-                            gm = goal_result.data[0]
-                            wish = gm.get("planning_goal", task_title)
-                            meta = gm.get("goal_metadata") or {}
-                            if isinstance(meta, str):
+                            snippet = goal_result.data[0].get("context_snippet") or {}
+                            if isinstance(snippet, str):
                                 import json
                                 try:
-                                    meta = json.loads(meta)
+                                    snippet = json.loads(snippet)
                                 except (json.JSONDecodeError, TypeError):
-                                    meta = {}
-                            outcome = meta.get("outcome_visualization", "")
+                                    snippet = {}
+                            if isinstance(snippet, dict):
+                                wish = snippet.get("planning_goal", task_title)
+                                meta = snippet.get("goal_metadata") or {}
+                                if isinstance(meta, str):
+                                    import json
+                                    try:
+                                        meta = json.loads(meta)
+                                    except (json.JSONDecodeError, TypeError):
+                                        meta = {}
+                                outcome = meta.get("outcome_visualization", "") if isinstance(meta, dict) else ""
                     woop_card = WoopCard(wish=wish, outcome=outcome, obstacle=obstacle, plan=plan)
     except Exception as e:
         logger.warning(f"WOOP card construction failed (non-fatal): {e}")

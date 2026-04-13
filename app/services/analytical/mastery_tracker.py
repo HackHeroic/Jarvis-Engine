@@ -64,14 +64,23 @@ def _get_reschedule_count(user_id: str, goal_id: Optional[str], db) -> int:
 
 
 def _get_mastery_target(user_id: str, goal_id: Optional[str], db) -> Optional[int]:
-    """Get mastery_level_target (1-5) from goal_metadata if available."""
+    """Get mastery_level_target (1-5) from goal_metadata stored in context_snippet."""
     if not goal_id:
         return None
     try:
-        result = db.table("user_plan_updates").select("goal_metadata").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
+        result = db.table("user_plan_updates").select("context_snippet").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
         rows = result.data or []
-        if rows and rows[0].get("goal_metadata"):
-            return rows[0]["goal_metadata"].get("mastery_level_target")
+        if not rows:
+            return None
+        snippet = rows[0].get("context_snippet")
+        if not snippet:
+            return None
+        import json
+        if isinstance(snippet, str):
+            snippet = json.loads(snippet)
+        meta = snippet.get("goal_metadata") if isinstance(snippet, dict) else None
+        if meta and isinstance(meta, dict):
+            return meta.get("mastery_level_target")
     except Exception:
         pass
     return None
