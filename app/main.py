@@ -58,6 +58,9 @@ async def lifespan(app: FastAPI):
     from app.services.memory.pearl import register_default_patterns
     register_default_patterns()
 
+    from app.modules import register_default_modules
+    register_default_modules()
+
     from app.orchestrator.graph import build_jarvis_graph
     # No checkpointer — UserModel is not msgpack-serializable.
     # Checkpoint/resume requires excluding UserModel from persisted state.
