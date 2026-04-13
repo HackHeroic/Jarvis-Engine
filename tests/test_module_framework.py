@@ -452,3 +452,37 @@ def test_module_registry__re_register_invalidates_cache():
     registry.register(defn2)
     c2 = registry.get_compiled("evolving")
     assert c1 is not c2
+
+
+@pytest.mark.asyncio
+async def test_create_module_wrapper__invokes_module():
+    from app.core.module_framework import ModuleStep, ModuleDefinition, ModuleRegistry
+    from app.orchestrator.module_wrapper import create_module_wrapper
+
+    executed = []
+
+    async def my_handler(state):
+        executed.append(True)
+        return {"value": 99}
+
+    defn = ModuleDefinition(
+        name="wrapper_test",
+        state_class=SimpleState,
+        steps=[ModuleStep(name="only", handler=my_handler)],
+        state_in=lambda s: {"value": 0, "progress_queue": None, "error": None},
+        state_out=lambda r, n: {"schedule": r.get("value")},
+    )
+
+    registry = ModuleRegistry()
+    registry.register(defn)
+
+    wrapper = create_module_wrapper("wrapper_test", registry)
+    result = await wrapper({
+        "initiated_by": "user",
+        "modules_invoked": [],
+        "progress_queue": None,
+    })
+
+    assert executed == [True]
+    assert result["modules_invoked"] == ["wrapper_test"]
+    assert result.get("schedule") == 99
