@@ -1,9 +1,7 @@
 """Planning sub-graph — wraps existing pipeline functions as LangGraph nodes."""
 
-import json as _json
 import operator
 from typing import Annotated, Any, Optional, TypedDict
-from langgraph.graph import END, StateGraph
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
 
@@ -31,55 +29,33 @@ class PlanningState(TypedDict):
     progress_queue: Any
 
 
-def _emit_tool_use(state: dict, tool: str, status: str, detail: dict | None = None) -> None:
-    """Emit a tool_use event directly onto the SSE queue (bypasses progress_callback)."""
-    queue = state.get("progress_queue")
-    if not queue:
-        return
-    event = {
-        "_event_type": "tool_use",
-        "module": "planning_module",
-        "tool": tool,
-        "status": status,
-    }
-    if detail:
-        event["detail"] = detail
-    queue.put_nowait(_json.dumps(event))
-
 
 async def fetch_constraints(state: PlanningState) -> dict:
-    _emit_tool_use(state, "fetch_constraints", "started")
-    cb = state.get("progress_callback")
-    if cb:
-        cb("habits_fetched")
     user_model = state["user_model"]
     if user_model:
         constraints = await user_model.get_behavioral_constraints()
-        habits_text = "\n".join(c.get("raw_text", "") for c in constraints if c.get("constraint_type") == "habit")
-        _emit_tool_use(state, "fetch_constraints", "done", {"rows": len(constraints)})
-        return {"constraints": constraints, "habits_text": habits_text}
-    _emit_tool_use(state, "fetch_constraints", "done", {"rows": 0})
+        habits_text = "\n".join(
+            c.get("raw_text", "") for c in constraints if c.get("constraint_type") == "habit"
+        )
+        return {
+            "constraints": constraints,
+            "habits_text": habits_text,
+            "_tool_detail": {"rows": len(constraints)},
+        }
     return {"constraints": [], "habits_text": ""}
 
 
 async def translate_habits(state: PlanningState) -> dict:
-    _emit_tool_use(state, "translate_habits", "started")
-    cb = state.get("progress_callback")
-    if cb:
-        cb("translating")
     habits_text = state.get("habits_text", "")
     if not habits_text.strip():
-        _emit_tool_use(state, "translate_habits", "done", {"slots": 0})
-        return {"semantic_slots": []}
+        return {"semantic_slots": [], "_tool_detail": {"slots": 0}}
     try:
         from app.services.analytical.habit_translator import translate_habits_to_slots
         slots = await translate_habits_to_slots(habits_text)
         result = [s.model_dump() for s in slots] if slots else []
-        _emit_tool_use(state, "translate_habits", "done", {"slots": len(result)})
-        return {"semantic_slots": result}
+        return {"semantic_slots": result, "_tool_detail": {"slots": len(result)}}
     except Exception as e:
         logger.warning(f"Habit translation failed: {e}")
-        _emit_tool_use(state, "translate_habits", "error", {"error": str(e)})
         return {"semantic_slots": []}
 
 
@@ -105,31 +81,26 @@ async def memory_to_constraints(state: PlanningState) -> dict:
     """Convert PEARL behavioral patterns into time slot constraints for OR-Tools."""
     user_model = state.get("user_model")
     if not user_model:
-        _emit_tool_use(state, "mastery_check", "done", {
-            "formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2",
-        })
-        return {}
+        return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
     try:
         memory_store = await user_model.get_memory_store()
         if not memory_store:
-            return {}
+            return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
         from app.services.memory.constraint_bridge import memories_to_constraints
         import asyncio
         user_id = state.get("user_id", "demo")
         slots = await asyncio.to_thread(memories_to_constraints, user_id, memory_store)
         if not slots:
-            return {}
+            return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
         extra = [s.model_dump() if hasattr(s, 'model_dump') else s for s in slots]
         # Reducer _merge_lists handles combining with expand_slots output
-        return {"time_slots": extra}
+        return {
+            "time_slots": extra,
+            "_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"},
+        }
     except Exception as e:
-        from app.core.jarvis_logger import JARVIS_LOGGER as logger
         logger.warning(f"memory_to_constraints failed (non-fatal): {e}")
-        return {}
-    finally:
-        _emit_tool_use(state, "mastery_check", "done", {
-            "formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2",
-        })
+        return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
 
 
 async def validate_goal(state: PlanningState) -> dict:
@@ -144,10 +115,6 @@ def is_goal_clear(state: PlanningState) -> bool:
 
 
 async def decompose_goal(state: PlanningState) -> dict:
-    _emit_tool_use(state, "decompose_goal", "started")
-    cb = state.get("progress_callback")
-    if cb:
-        cb("decomposing")
     goal = state.get("planning_goal", "")
     system_prompt = (
         "You are a task decomposition expert. Break the user's goal into 5-8 concrete, "
@@ -185,18 +152,13 @@ async def decompose_goal(state: PlanningState) -> dict:
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
         chunks = [tc.model_dump() for tc in graph.decomposition]
-        _emit_tool_use(state, "decompose_goal", "done", {"task_count": len(chunks)})
-        return {"task_chunks": chunks}
+        return {"task_chunks": chunks, "_tool_detail": {"task_count": len(chunks)}}
     except Exception as e:
         logger.error(f"Decomposition failed: {e}")
-        _emit_tool_use(state, "decompose_goal", "error", {"error": str(e)})
         return {"error": f"Decomposition failed: {e}", "task_chunks": []}
 
 
 async def fuse_tasks(state: PlanningState) -> dict:
-    cb = state.get("progress_callback")
-    if cb:
-        cb("scheduling")
     user_model = state.get("user_model")
     pending = []
     if user_model:
@@ -224,11 +186,9 @@ async def fuse_tasks(state: PlanningState) -> dict:
 
 async def solve_schedule(state: PlanningState) -> dict:
     from app.core.or_tools.solver import JarvisScheduler
-    _emit_tool_use(state, "or_tools_solve", "started")
     chunks = state.get("task_chunks", [])
     horizon = state.get("horizon_minutes", 2880)
     if not chunks:
-        _emit_tool_use(state, "or_tools_solve", "error", {"error": "No tasks"})
         return {"error": "No tasks to schedule", "schedule": None}
     scheduler = JarvisScheduler(horizon_minutes=horizon)
     for slot in state.get("time_slots", []):
@@ -249,16 +209,22 @@ async def solve_schedule(state: PlanningState) -> dict:
     scheduler.build_dependencies()
     result, status = scheduler.solve()
     if status == "INFEASIBLE":
-        _emit_tool_use(state, "or_tools_solve", "done", {"status": "INFEASIBLE"})
-        return {"schedule": None, "error": "INFEASIBLE"}
-    _emit_tool_use(state, "or_tools_solve", "done", {
-        "status": "OPTIMAL",
-        "task_count": len(chunks),
-        "horizon_h": horizon // 60,
-        "tmt_applied": True,
-        "formula": "canonical_steel_konig",
-    })
-    return {"schedule": result, "error": None}
+        return {
+            "schedule": None,
+            "error": "INFEASIBLE",
+            "_tool_detail": {"status": "INFEASIBLE"},
+        }
+    return {
+        "schedule": result,
+        "error": None,
+        "_tool_detail": {
+            "status": "OPTIMAL",
+            "task_count": len(chunks),
+            "horizon_h": horizon // 60,
+            "tmt_applied": True,
+            "formula": "canonical_steel_konig",
+        },
+    }
 
 
 async def handle_infeasible(state: PlanningState) -> dict:
@@ -288,58 +254,80 @@ def can_retry(state: PlanningState) -> str:
     return "retry"
 
 
+from app.core.module_framework import ModuleStep, ModuleDefinition
+
+
+def planning_state_in(state) -> dict:
+    user_model = state.get("user_model")
+    brain_dump = state.get("brain_dump")
+    return {
+        "user_id": user_model.user_id if user_model else "demo",
+        "user_model": user_model,
+        "planning_goal": (
+            brain_dump.planning_goal
+            if brain_dump and hasattr(brain_dump, "planning_goal")
+            else state.get("user_message", "")
+        ),
+        "habits_text": "",
+        "semantic_slots": [],
+        "time_slots": [],
+        "constraints": [],
+        "task_chunks": [],
+        "pending_tasks": [],
+        "schedule": None,
+        "horizon_minutes": 2880,
+        "retry_count": 0,
+        "clarification_request": None,
+        "error": None,
+        "progress_callback": state.get("progress_callback"),
+        "progress_queue": state.get("progress_queue"),
+    }
+
+
+def planning_state_out(result: dict, module_name: str) -> dict:
+    return {
+        "schedule": result.get("schedule"),
+        "execution_graph": (
+            {"decomposition": result.get("task_chunks", [])}
+            if result.get("task_chunks")
+            else None
+        ),
+        "clarification_request": result.get("clarification_request"),
+        "error": result.get("error"),
+    }
+
+
+planning_module = ModuleDefinition(
+    name="planning",
+    state_class=PlanningState,
+    state_in=planning_state_in,
+    state_out=planning_state_out,
+    steps=[
+        ModuleStep(name="fetch_constraints", handler=fetch_constraints, concurrent_safe=True),
+        ModuleStep(name="translate_habits", handler=translate_habits,
+                   depends_on=["fetch_constraints"], timeout_ms=45_000),
+        ModuleStep(name="expand_slots", handler=expand_slots,
+                   depends_on=["translate_habits"], concurrent_safe=True, read_only=True),
+        ModuleStep(name="memory_to_constraints", handler=memory_to_constraints,
+                   depends_on=["fetch_constraints"], concurrent_safe=True,
+                   feature_flag="ENABLE_PEARL"),
+        ModuleStep(name="validate_goal", handler=validate_goal,
+                   depends_on=["fetch_constraints"], concurrent_safe=True, read_only=True,
+                   routes_to={is_goal_clear: {True: "decompose_goal", False: "__END__"}}),
+        ModuleStep(name="decompose_goal", handler=decompose_goal,
+                   depends_on=["expand_slots", "memory_to_constraints", "validate_goal"],
+                   timeout_ms=60_000),
+        ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
+        ModuleStep(name="solve_schedule", handler=solve_schedule,
+                   depends_on=["fuse_tasks"],
+                   routes_to={check_feasibility: {"OPTIMAL": "__END__", "INFEASIBLE": "handle_infeasible"}}),
+        ModuleStep(name="handle_infeasible", handler=handle_infeasible,
+                   routes_to={can_retry: {"retry": "solve_schedule", "exhausted": "__END__"}}),
+    ],
+)
+
+
 def build_planning_graph():
-    graph = StateGraph(PlanningState)
-    graph.add_node("fetch_constraints", fetch_constraints)
-    graph.add_node("translate_habits", translate_habits)
-    graph.add_node("expand_slots", expand_slots)
-    graph.add_node("memory_to_constraints", memory_to_constraints)
-    graph.add_node("validate_goal", validate_goal)
-    graph.add_node("decompose_goal", decompose_goal)
-    graph.add_node("fuse_tasks", fuse_tasks)
-    graph.add_node("solve_schedule", solve_schedule)
-    graph.add_node("handle_infeasible", handle_infeasible)
-
-    # --- Graph topology with parallel fan-out where safe ---
-    # Inspired by Claude Code's StreamingToolExecutor concurrency model:
-    # - Concurrent-safe nodes run in parallel (fan-out edges)
-    # - Data-dependent nodes run sequentially (linear edges)
-    # - LangGraph waits for ALL incoming edges before executing a node (fan-in)
-    #
-    # Parallel branch 1: habits pipeline (fetch → translate → expand_slots)
-    # Parallel branch 2: PEARL constraints (memory_to_constraints)
-    # Parallel branch 3: goal validation (validate_goal)
-    # Fan-in: decompose_goal waits for all three branches
-    #
-    # Current (sequential, ~12s):
-    #   fetch → translate → expand → memory → validate → decompose → fuse → solve
-    # New (parallel, ~7s):
-    #   fetch → translate → expand ──┐
-    #   memory_to_constraints ───────┤──→ decompose → fuse → solve
-    #   validate_goal ───────────────┘
-
-    graph.set_entry_point("fetch_constraints")
-
-    # Branch 1: habits pipeline (sequential — each step needs prior output)
-    graph.add_edge("fetch_constraints", "translate_habits")
-    graph.add_edge("translate_habits", "expand_slots")
-
-    # Branch 2: PEARL constraints (parallel with habits — reads user_model, not habits)
-    graph.add_edge("fetch_constraints", "memory_to_constraints")
-
-    # Branch 3: goal validation (parallel with habits — reads planning_goal, not habits)
-    graph.add_edge("fetch_constraints", "validate_goal")
-
-    # Fan-in: all three branches must complete before decomposition
-    # LangGraph waits for ALL incoming edges before executing a node
-    graph.add_conditional_edges("validate_goal", is_goal_clear, {True: "decompose_goal", False: END})
-    graph.add_edge("expand_slots", "decompose_goal")
-    graph.add_edge("memory_to_constraints", "decompose_goal")
-
-    # Sequential: decompose → fuse → solve (strict data dependency)
-    graph.add_edge("decompose_goal", "fuse_tasks")
-    graph.add_edge("fuse_tasks", "solve_schedule")
-    graph.add_conditional_edges("solve_schedule", check_feasibility, {"OPTIMAL": END, "INFEASIBLE": "handle_infeasible"})
-    graph.add_conditional_edges("handle_infeasible", can_retry, {"retry": "solve_schedule", "exhausted": END})
-
-    return graph.compile()
+    """Backward-compatible shim — delegates to build_module_graph(planning_module)."""
+    from app.core.module_framework import build_module_graph
+    return build_module_graph(planning_module)
