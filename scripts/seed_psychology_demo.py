@@ -66,13 +66,23 @@ def main():
     goal_a_id = "goal-dsa-" + str(uuid4())[:8]
     goal_b_id = "goal-calc-" + str(uuid4())[:8]
 
+    # user_plan_updates columns: id, user_id, goal_id, source, deadline_date, deadline_raw, context_snippet, created_at
+    # Store planning_goal + goal_metadata inside context_snippet (JSONB-serialized)
     goals = [
-        {"user_id": user_id, "goal_id": goal_a_id, "planning_goal": "Master Dynamic Programming",
-         "deadline_date": friday.isoformat(),
-         "goal_metadata": json.dumps({"objective": "Master DP", "outcome_visualization": "I'll ace the contest and feel confident", "mastery_level_target": 4})},
-        {"user_id": user_id, "goal_id": goal_b_id, "planning_goal": "Learn Calculus basics",
-         "deadline_date": next_wed.isoformat(),
-         "goal_metadata": json.dumps({"objective": "Calculus fundamentals", "outcome_visualization": "Solve integrals fluently", "mastery_level_target": 3})},
+        {"user_id": user_id, "goal_id": goal_a_id, "source": "chat",
+         "deadline_date": friday.date().isoformat(),
+         "deadline_raw": f"Friday {friday.strftime('%Y-%m-%d')}",
+         "context_snippet": json.dumps({
+             "planning_goal": "Master Dynamic Programming",
+             "goal_metadata": {"objective": "Master DP", "outcome_visualization": "I'll ace the contest and feel confident", "mastery_level_target": 4},
+         })},
+        {"user_id": user_id, "goal_id": goal_b_id, "source": "chat",
+         "deadline_date": next_wed.date().isoformat(),
+         "deadline_raw": f"Wednesday {next_wed.strftime('%Y-%m-%d')}",
+         "context_snippet": json.dumps({
+             "planning_goal": "Learn Calculus basics",
+             "goal_metadata": {"objective": "Calculus fundamentals", "outcome_visualization": "Solve integrals fluently", "mastery_level_target": 3},
+         })},
     ]
     for g in goals:
         db.table("user_plan_updates").insert(g).execute()
