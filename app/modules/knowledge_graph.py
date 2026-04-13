@@ -19,6 +19,7 @@ class KnowledgeState(TypedDict):
     linked_tasks: list
     action_proposals: list
     error: Optional[str]
+    progress_queue: Any
 
 
 async def classify_content(state: KnowledgeState) -> dict:
@@ -93,6 +94,7 @@ def knowledge_state_in(state) -> dict:
         "linked_tasks": [],
         "action_proposals": [],
         "error": None,
+        "progress_queue": state.get("progress_queue"),
     }
 
 

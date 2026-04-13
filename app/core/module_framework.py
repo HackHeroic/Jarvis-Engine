@@ -109,10 +109,10 @@ def _wrap_step(step: ModuleStep) -> Callable:
                 module_id=module_name,
                 step=step.name,
             )
-            if hook_result.decision == HookDecision.DENY:
+            if hook_result.decision in (HookDecision.DENY, HookDecision.ASK):
                 _emit_tool_use(
                     queue, module_name, step.name, "skipped",
-                    {"reason": hook_result.reason or "denied by hook"},
+                    {"reason": hook_result.reason or "blocked by hook"},
                 )
                 return {}
 
