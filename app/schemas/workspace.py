@@ -37,6 +37,19 @@ class StudyAsset(BaseModel):
     )
 
 
+class WoopCard(BaseModel):
+    """Full MCII (Mental Contrasting with Implementation Intentions) card.
+
+    All 4 stages of WOOP — research shows 60% more practice completion
+    with all 4 stages vs if-then alone.
+    """
+
+    wish: str = Field(description="Goal objective (Wish stage)")
+    outcome: str = Field(default="", description="Emotional outcome visualization (Outcome stage)")
+    obstacle: str = Field(description="Personal barrier / obstacle trigger (Obstacle stage)")
+    plan: str = Field(description="If-then behavioral response (Plan stage)")
+
+
 class TaskWorkspace(BaseModel):
     """Proactive workspace assembled when user opens a scheduled task."""
 
@@ -48,4 +61,8 @@ class TaskWorkspace(BaseModel):
     surfaced_assets: List[StudyAsset] = Field(
         default_factory=list,
         description="RAG chunks, curated links, and generated practice assets",
+    )
+    woop_card: Optional[WoopCard] = Field(
+        default=None,
+        description="MCII card with obstacle/response if available for this task",
     )
