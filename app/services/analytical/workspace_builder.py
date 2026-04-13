@@ -6,7 +6,8 @@ from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.models.brain.litellm_conf import gemini_web_search, hybrid_route_query
-from app.schemas.workspace import StudyAsset, TaskWorkspace
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
 from app.services.user_preferences import get_learning_style
 from supabase import create_client
 
@@ -291,9 +292,50 @@ async def build_task_workspace(
     surfaced.extend(web_assets)
     surfaced.extend(practice_assets)
 
+    # Build WOOP card from task's implementation_intention + goal metadata
+    woop_card = None
+    task_data = None
+    try:
+        sb = _get_supabase()
+        if sb:
+            task_result = sb.table("user_tasks").select("implementation_intention, goal_id").eq("task_id", task_id).eq("user_id", user_id).limit(1).execute()
+            if task_result.data:
+                task_data = task_result.data[0]
+                intention = task_data.get("implementation_intention") or {}
+                if isinstance(intention, str):
+                    import json
+                    try:
+                        intention = json.loads(intention)
+                    except (json.JSONDecodeError, TypeError):
+                        intention = {}
+                obstacle = intention.get("obstacle_trigger", "")
+                plan = intention.get("behavioral_response", "")
+                if obstacle and plan:
+                    # Fetch goal metadata for Wish + Outcome stages
+                    goal_id = task_data.get("goal_id", "")
+                    wish = task_title
+                    outcome = ""
+                    if goal_id:
+                        goal_result = sb.table("user_plan_updates").select("goal_metadata, planning_goal").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
+                        if goal_result.data:
+                            gm = goal_result.data[0]
+                            wish = gm.get("planning_goal", task_title)
+                            meta = gm.get("goal_metadata") or {}
+                            if isinstance(meta, str):
+                                import json
+                                try:
+                                    meta = json.loads(meta)
+                                except (json.JSONDecodeError, TypeError):
+                                    meta = {}
+                            outcome = meta.get("outcome_visualization", "")
+                    woop_card = WoopCard(wish=wish, outcome=outcome, obstacle=obstacle, plan=plan)
+    except Exception as e:
+        logger.warning(f"WOOP card construction failed (non-fatal): {e}")
+
     return TaskWorkspace(
         task_id=task_id,
         task_title=task_title,
         primary_objective=primary_objective,
         surfaced_assets=surfaced,
+        woop_card=woop_card,
     )
