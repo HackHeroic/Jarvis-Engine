@@ -360,7 +360,7 @@ Located in `app/modules/planning_graph.py` (refactored).
 from app.core.module_framework import ModuleStep, ModuleDefinition
 
 planning_module = ModuleDefinition(
-    name="planning",
+    name="planning_module",
     state_class=PlanningState,
     state_in=planning_state_in,
     state_out=planning_state_out,
@@ -480,7 +480,7 @@ Located in `app/modules/research_graph.py` (refactored).
 
 ```python
 research_module = ModuleDefinition(
-    name="research",
+    name="research_agent",
     state_class=ResearchState,
     state_in=research_state_in,
     state_out=research_state_out,
@@ -549,7 +549,7 @@ Located in `app/modules/knowledge_graph.py` (refactored).
 
 ```python
 knowledge_module = ModuleDefinition(
-    name="knowledge",
+    name="knowledge_module",
     state_class=KnowledgeState,
     state_in=knowledge_state_in,
     state_out=knowledge_state_out,

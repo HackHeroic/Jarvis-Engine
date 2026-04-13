@@ -14,6 +14,7 @@ class ResearchState(TypedDict):
     summary: Optional[str]
     linked_tasks: list
     error: Optional[str]
+    progress_queue: Any
 
 
 async def plan_research(state: ResearchState) -> dict:
@@ -52,11 +53,6 @@ async def link_to_tasks(state: ResearchState) -> dict:
     return {"linked_tasks": []}
 
 
-def build_research_graph():
-    from app.core.module_framework import build_module_graph
-    return build_module_graph(research_module)
-
-
 from app.core.module_framework import ModuleStep, ModuleDefinition
 
 
@@ -72,6 +68,7 @@ def research_state_in(state) -> dict:
         "summary": None,
         "linked_tasks": [],
         "error": None,
+        "progress_queue": state.get("progress_queue"),
     }
 
 
@@ -99,3 +96,9 @@ research_module = ModuleDefinition(
                    depends_on=["summarize"]),
     ],
 )
+
+
+def build_research_graph():
+    """Backward-compatible shim — delegates to framework."""
+    from app.core.module_framework import build_module_graph
+    return build_module_graph(research_module)
