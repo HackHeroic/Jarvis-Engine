@@ -1,7 +1,6 @@
 """Research agent sub-graph — autonomous, can iterate."""
 
 from typing import Any, Optional, TypedDict
-from langgraph.graph import END, StateGraph
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
 
@@ -54,17 +53,49 @@ async def link_to_tasks(state: ResearchState) -> dict:
 
 
 def build_research_graph():
-    graph = StateGraph(ResearchState)
-    graph.add_node("plan_research", plan_research)
-    graph.add_node("execute_search", execute_search)
-    graph.add_node("evaluate_results", lambda s: {})
-    graph.add_node("summarize", summarize)
-    graph.add_node("link_to_tasks", link_to_tasks)
+    from app.core.module_framework import build_module_graph
+    return build_module_graph(research_module)
 
-    graph.set_entry_point("plan_research")
-    graph.add_edge("plan_research", "execute_search")
-    graph.add_edge("execute_search", "evaluate_results")
-    graph.add_conditional_edges("evaluate_results", needs_more, {True: "execute_search", False: "summarize"})
-    graph.add_edge("summarize", "link_to_tasks")
-    graph.add_edge("link_to_tasks", END)
-    return graph.compile()
+
+from app.core.module_framework import ModuleStep, ModuleDefinition
+
+
+def research_state_in(state) -> dict:
+    user_model = state.get("user_model")
+    return {
+        "user_id": user_model.user_id if user_model else "demo",
+        "user_model": user_model,
+        "query": state.get("user_message", ""),
+        "search_results": [],
+        "iteration_count": 0,
+        "max_iterations": 3,
+        "summary": None,
+        "linked_tasks": [],
+        "error": None,
+    }
+
+
+def research_state_out(result: dict, module_name: str) -> dict:
+    return {
+        "research_results": result.get("search_results"),
+        "error": result.get("error"),
+    }
+
+
+research_module = ModuleDefinition(
+    name="research",
+    state_class=ResearchState,
+    state_in=research_state_in,
+    state_out=research_state_out,
+    steps=[
+        ModuleStep(name="plan_research", handler=plan_research),
+        ModuleStep(name="execute_search", handler=execute_search,
+                   depends_on=["plan_research"], timeout_ms=30_000),
+        ModuleStep(name="evaluate_results", handler=lambda s: {},
+                   depends_on=["execute_search"], read_only=True,
+                   routes_to={needs_more: {True: "execute_search", False: "summarize"}}),
+        ModuleStep(name="summarize", handler=summarize, timeout_ms=45_000),
+        ModuleStep(name="link_to_tasks", handler=link_to_tasks,
+                   depends_on=["summarize"]),
+    ],
+)
