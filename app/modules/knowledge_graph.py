@@ -1,7 +1,7 @@
 """Knowledge module sub-graph — document ingestion, file ops, ChromaDB, task linking."""
 
 from typing import Any, Optional, TypedDict
-from langgraph.graph import END, StateGraph
+
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
 
@@ -68,24 +68,64 @@ async def propose_actions(state: KnowledgeState) -> dict:
     return {"action_proposals": []}
 
 
-def build_knowledge_graph():
-    graph = StateGraph(KnowledgeState)
-    graph.add_node("classify_content", classify_content)
-    graph.add_node("extract_calendar", extract_calendar)
-    graph.add_node("ingest_document", ingest_document)
-    graph.add_node("link_to_tasks", link_to_tasks)
-    graph.add_node("file_operations", file_operations)
-    graph.add_node("propose_actions", propose_actions)
+from app.core.module_framework import ModuleStep, ModuleDefinition
 
-    graph.set_entry_point("classify_content")
-    graph.add_conditional_edges("classify_content", content_type_router, {
-        "calendar": "extract_calendar",
-        "document": "ingest_document",
-        "file_op": "file_operations",
-    })
-    graph.add_edge("ingest_document", "link_to_tasks")
-    graph.add_edge("link_to_tasks", "propose_actions")
-    graph.add_edge("propose_actions", END)
-    graph.add_edge("extract_calendar", END)
-    graph.add_edge("file_operations", END)
-    return graph.compile()
+
+def knowledge_state_in(state) -> dict:
+    user_model = state.get("user_model")
+    _file_bytes = None
+    _file_b64 = state.get("file_base64")
+    if _file_b64:
+        import base64
+        _file_bytes = base64.b64decode(_file_b64)
+    _db_client = getattr(user_model, "_db", None) if user_model else None
+    return {
+        "user_id": user_model.user_id if user_model else "demo",
+        "user_model": user_model,
+        "db_client": _db_client,
+        "content": state.get("user_message", ""),
+        "file_bytes": _file_bytes,
+        "media_type": state.get("file_media_type"),
+        "file_name": state.get("file_name"),
+        "content_type": None,
+        "ingestion_result": None,
+        "calendar_result": None,
+        "linked_tasks": [],
+        "action_proposals": [],
+        "error": None,
+    }
+
+
+def knowledge_state_out(result: dict, module_name: str) -> dict:
+    return {
+        "ingestion_result": result.get("ingestion_result"),
+        "error": result.get("error"),
+    }
+
+
+knowledge_module = ModuleDefinition(
+    name="knowledge",
+    state_class=KnowledgeState,
+    state_in=knowledge_state_in,
+    state_out=knowledge_state_out,
+    steps=[
+        ModuleStep(name="classify_content", handler=classify_content, read_only=True,
+                   routes_to={content_type_router: {
+                       "calendar": "extract_calendar",
+                       "document": "ingest_document",
+                       "file_op": "file_operations",
+                   }}),
+        ModuleStep(name="extract_calendar", handler=extract_calendar),
+        ModuleStep(name="ingest_document", handler=ingest_document, timeout_ms=60_000),
+        ModuleStep(name="link_to_tasks", handler=link_to_tasks,
+                   depends_on=["ingest_document"]),
+        ModuleStep(name="propose_actions", handler=propose_actions,
+                   depends_on=["link_to_tasks"]),
+        ModuleStep(name="file_operations", handler=file_operations),
+    ],
+)
+
+
+def build_knowledge_graph():
+    from app.core.module_framework import build_module_graph
+    return build_module_graph(knowledge_module)
