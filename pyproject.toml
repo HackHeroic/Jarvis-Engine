@@ -52,3 +52,11 @@ guardrails = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so `app` and `tests.fakes` both resolve under
+# the documented bare `pytest tests/` form. Without this only
+# `python -m pytest` works, because that form happens to put CWD on sys.path —
+# and `app` is not installed into the venv, so it relies on the same accident.
+# Resolved relative to rootdir, so the CWD it is invoked from does not matter.
+pythonpath = ["."]
