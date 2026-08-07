@@ -90,8 +90,24 @@ def _is_trivial_input(text: str) -> bool:
 # --- Real LLM-powered nodes (replacing stubs) ---
 
 async def _load_context(state: JarvisState) -> dict:
-    """Load user context. UserModel is already created in chat_stream_v2."""
-    return {}
+    """Hydrate the UserModel facade for checkpoint-resumed turns.
+
+    Live requests arrive with a pre-wired user_model (shared db_client /
+    memory_store) and this is a no-op. A turn resumed from a checkpoint has
+    only the serializable ``user_id`` — the facade was never persisted — so
+    rebuild it here. Without a user_id there is no identity to rebuild from,
+    so leave state untouched.
+    """
+    if state.get("user_model") is not None:
+        return {}
+
+    user_id = state.get("user_id")
+    if not user_id:
+        return {}
+
+    from app.core.user_model import UserModel
+
+    return {"user_model": UserModel(user_id=user_id, db=None)}
 
 
 async def _extract_brain_dump(state: JarvisState) -> dict:
