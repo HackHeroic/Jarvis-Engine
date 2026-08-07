@@ -1,9 +1,11 @@
 """Task-based model routing. Replaces hybrid_route_query().
 
-Local-first always. Gemini fallback only for web research or validation failure.
+Local-first by default. Gemini fallback for web research, validation failure,
+OR when the current request explicitly opted into cloud (model picker).
 PII filter hook runs exactly once before any cloud call.
 """
 
+import contextvars
 import re
 from enum import Enum
 from typing import Any, Optional
@@ -13,6 +15,12 @@ from pydantic import BaseModel, ValidationError
 import app.core.config as _cfg
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.orchestrator.hooks import ActionHooks, HookDecision
+
+# Per-request override: set by chat.py when frontend model picker selects Gemini.
+# ContextVar so concurrent requests don't stomp each other.
+force_cloud_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "force_cloud_var", default=False
+)
 
 
 class ModelRole(str, Enum):
@@ -59,8 +67,15 @@ async def route_llm_call(
     response_schema: Optional[type[BaseModel]] = None,
     hooks: Optional[ActionHooks] = None,
     conversation_history: Optional[list[dict]] = None,
+    force_cloud: Optional[bool] = None,
 ) -> str | BaseModel:
-    """Route LLM call with fallback chain. Local-first always."""
+    """Route LLM call with fallback chain.
+
+    Priority for cloud routing:
+      1. explicit force_cloud=True kwarg
+      2. force_cloud_var ContextVar (set by chat endpoint when user picks Gemini)
+      3. _cfg.GEMINI_PRIMARY (no local models loaded)
+    """
     from app.models.brain.litellm_conf import hybrid_route_query
 
     if hooks is None:
@@ -70,8 +85,11 @@ async def route_llm_call(
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
     model = _get_model_for_role(role)
 
-    # Skip local attempt if GEMINI_PRIMARY is set (no local models available)
-    if role in (ModelRole.PRIMARY, ModelRole.FAST) and not _cfg.GEMINI_PRIMARY:
+    # Resolve the cloud preference for THIS call
+    use_cloud = bool(force_cloud) or force_cloud_var.get() or _cfg.GEMINI_PRIMARY
+
+    # Skip local attempt if cloud is requested for this turn
+    if role in (ModelRole.PRIMARY, ModelRole.FAST) and not use_cloud:
         try:
             result = await hybrid_route_query(
                 user_prompt=prompt,

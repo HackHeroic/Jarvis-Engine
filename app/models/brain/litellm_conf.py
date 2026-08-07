@@ -90,13 +90,21 @@ async def hybrid_route_query(
     or (b) force_cloud=True (last-resort fallback when local fails validation).
     If model_override is set, bypass routing and use that model (e.g. SLM for Semantic Router).
     """
+    # Per-request cloud override (model picker → Gemini): honor before any other routing.
+    try:
+        from app.core.model_router import force_cloud_var
+        if force_cloud_var.get():
+            force_cloud = True
+    except Exception:
+        pass
+
     if model_override is not None:
-        # If GEMINI_PRIMARY is set (no local models available), redirect to cloud
-        # even when model_override requests a local model
-        if _cfg.GEMINI_PRIMARY and _cfg.GEMINI_API_KEY and not force_cloud:
+        # Cloud takes priority: GEMINI_PRIMARY (no local) or per-request override
+        if (_cfg.GEMINI_PRIMARY or force_cloud) and _cfg.GEMINI_API_KEY:
             target_model = _cfg.GEMINI_MODEL
             use_cloud = True
-            print(f"[LiteLLM Router] model_override={model_override} but no local models — redirecting to Gemini")
+            reason = "force_cloud (model picker)" if force_cloud else "no local models"
+            print(f"[LiteLLM Router] model_override={model_override} → redirecting to Gemini ({reason})")
         else:
             target_model = model_override
             use_cloud = False
@@ -180,7 +188,7 @@ async def hybrid_route_query(
                     continue
 
                 # Fallback: detect <think>…</think> embedded in content stream.
-                # Qwen models emit the thinking block as content when the OpenAI-compatible
+                # Some local models emit the thinking block as content when the OpenAI-compatible
                 # endpoint doesn't separate reasoning_content.
                 text = tag_buf + raw_content
                 tag_buf = ""

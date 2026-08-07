@@ -5,8 +5,11 @@ Queries on first access, caches per-session, invalidates on writes.
 """
 
 import asyncio
+import logging
 from datetime import datetime
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 
 class UserModel:
@@ -128,3 +131,69 @@ class UserModel:
             .execute()
         )
         self.invalidate("constraints")
+
+    async def build_chat_context(self, limit_memories: int = 5, limit_tasks: int = 8) -> str:
+        """Build a compact text block for injection into the LLM system prompt.
+
+        Includes top-N SM-2 memories, pending tasks, active goals, current energy.
+        Used by conversation module so Jarvis 'understands you' across chats.
+        """
+        lines: list[str] = []
+
+        try:
+            mem_store = await self.get_memory_store()
+            if mem_store is not None:
+                # Recall top-K memories by SM-2 score (handles list/coroutine return shapes)
+                recall_fn = getattr(mem_store, "recall_for_user", None) or getattr(mem_store, "top_k", None)
+                if recall_fn:
+                    raw = recall_fn(self._user_id, limit_memories) if not asyncio.iscoroutinefunction(recall_fn) \
+                        else await recall_fn(self._user_id, limit_memories)
+                    for m in (raw or [])[:limit_memories]:
+                        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+                        mtype = m.get("memory_type") if isinstance(m, dict) else getattr(m, "memory_type", "")
+                        if content:
+                            lines.append(f"- [{mtype or 'note'}] {content}")
+        except Exception as _e:
+            _log.warning(f"build_chat_context section failed for user {self._user_id}: {_e}")
+
+        try:
+            tasks = await self.get_pending_tasks()
+            if tasks:
+                lines.append("")
+                lines.append(f"Pending tasks ({len(tasks)} total, showing {min(limit_tasks, len(tasks))}):")
+                for t in tasks[:limit_tasks]:
+                    title = t.get("title", "untitled")
+                    deadline = t.get("deadline_hint") or t.get("deadline_date")
+                    suffix = f" — due {deadline}" if deadline else ""
+                    lines.append(f"  • {title}{suffix}")
+        except Exception as _e:
+            _log.warning(f"build_chat_context section failed for user {self._user_id}: {_e}")
+
+        try:
+            goals = await self.get_active_goals()
+            if goals:
+                lines.append("")
+                lines.append("Active goals:")
+                for g in goals[:5]:
+                    desc = g.get("goal_description") or g.get("title") or g.get("goal_id")
+                    if desc:
+                        lines.append(f"  • {desc}")
+        except Exception as _e:
+            _log.warning(f"build_chat_context section failed for user {self._user_id}: {_e}")
+
+        try:
+            draft = await self.get_active_draft()
+            if draft:
+                lines.append("")
+                lines.append("There is an active schedule draft awaiting review.")
+        except Exception as _e:
+            _log.warning(f"build_chat_context section failed for user {self._user_id}: {_e}")
+
+        try:
+            energy = await self.get_estimated_energy()
+            lines.append("")
+            lines.append(f"Estimated cognitive energy right now: {energy:.2f} (0=low, 1=peak)")
+        except Exception as _e:
+            _log.warning(f"build_chat_context section failed for user {self._user_id}: {_e}")
+
+        return "\n".join(lines).strip()

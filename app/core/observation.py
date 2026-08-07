@@ -97,34 +97,76 @@ async def bridge_patterns_to_constraints(state: dict, patterns: list[dict]) -> i
     return bridged
 
 
+# Strong-reference set so background tasks don't get GC'd mid-await.
+# Add task → discard on completion. See Python asyncio.create_task docs.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(t)
+    t.add_done_callback(_BACKGROUND_TASKS.discard)
+    return t
+
+
 async def run_observation_loop(state: dict) -> dict:
-    """Post-turn behavioral intelligence. Blocking but fast (~200-500ms)."""
+    """Post-turn behavioral intelligence.
+
+    - Emits phase_start + phase_end SSE so frontend timing is accurate.
+    - Skips entirely on trivial inputs (greetings/emotional) — no memories from "hi".
+    - Memory extraction runs as a tracked BACKGROUND task (chat returns instantly).
+    - PEARL + cognitive update run inline with a real 500ms cap (no shield —
+      cancellation must propagate so we honor the cap).
+    """
     modules_invoked = state.get("modules_invoked", [])
     if len(modules_invoked) >= 10:
         return {"needs_followup": False}
 
+    user_msg = (state.get("user_message") or "").strip().lower()
+    is_trivial = state.get("trivial_input") or len(user_msg) < 6
+    if is_trivial:
+        _emit_event(state, "phase_end", {"phase": "learning", "skipped": True})
+        return {"needs_followup": False, "memories_extracted_count": 0, "patterns_detected_count": 0}
+
+    _emit_event(state, "phase_start", {"phase": "learning"})
+
+    # Memory extraction → tracked background task (held in _BACKGROUND_TASKS so it
+    # cannot be GC'd before completing).
     try:
-        coro = _run_observation_inner(state)
-        return await asyncio.wait_for(coro, timeout=0.5)
+        _spawn_background(_background_memory_extraction(state))
+    except Exception as e:
+        logger.warning(f"Failed to schedule background memory extraction: {e}")
+
+    # PEARL + cognitive state are cheap stats/math; run inline with a REAL 500ms cap.
+    # No asyncio.shield — we want the work cancelled when the cap fires, not leaked.
+    try:
+        result = await asyncio.wait_for(_run_inline_observation(state), timeout=0.5)
+        _emit_event(state, "phase_end", {"phase": "learning"})
+        return result
     except asyncio.TimeoutError:
-        logger.warning("Observation loop exceeded 500ms budget — skipping")
+        logger.warning("Inline observation (PEARL+cognitive) exceeded 500ms — cancelled and skipped")
+        _emit_event(state, "phase_end", {"phase": "learning", "timeout": True})
         return {"needs_followup": False}
 
 
-async def _run_observation_inner(state: dict) -> dict:
-    """Inner observation loop with timeout guard."""
-    memories = await extract_and_store_memories(state)
-    for mem in memories:
-        _emit_event(state, "memory_extracted", {
-            "type": mem.get("memory_type", "observation"),
-            "content": mem.get("content", ""),
-            "confidence": mem.get("confidence", 0.5),
-        })
+async def _background_memory_extraction(state: dict) -> None:
+    """Run memory extraction off the chat critical path. Logs failures, never raises."""
+    try:
+        memories = await extract_and_store_memories(state)
+        for mem in memories:
+            _emit_event(state, "memory_extracted", {
+                "type": mem.get("memory_type", "observation"),
+                "content": mem.get("content", ""),
+                "confidence": mem.get("confidence", 0.5),
+            })
+    except Exception as e:
+        logger.warning(f"Background memory extraction failed: {e}")
 
+
+async def _run_inline_observation(state: dict) -> dict:
+    """Cheap inline work — PEARL stats + cognitive math. Targets <500ms."""
     patterns = await detect_pearl_patterns(state)
     for pattern in patterns:
-        # PEARL detectors return dicts with "pattern", "inference", "rate" keys
-        # (not "type", "content", "confidence") — normalise before emitting SSE.
         _emit_event(state, "pattern_detected", {
             "type": pattern.get("pattern", pattern.get("type", "behavioral_pattern")),
             "content": pattern.get("inference", pattern.get("content", "")),
@@ -134,10 +176,9 @@ async def _run_observation_inner(state: dict) -> dict:
         })
 
     await update_cognitive_state(state)
-    bridged = await bridge_patterns_to_constraints(state, patterns)
+    await bridge_patterns_to_constraints(state, patterns)
 
     return {
         "needs_followup": False,
-        "memories_extracted_count": len(memories),
         "patterns_detected_count": len(patterns),
     }

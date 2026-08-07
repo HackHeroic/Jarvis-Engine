@@ -285,15 +285,32 @@ def planning_state_in(state) -> dict:
 
 
 def planning_state_out(result: dict, module_name: str) -> dict:
+    schedule = result.get("schedule")
+    task_chunks = result.get("task_chunks") or []
+    clarification = result.get("clarification_request")
+    error = result.get("error")
+
+    # Defensive default: if the sub-graph produced NOTHING actionable AND no
+    # error/clarification, emit a clarification so synthesis has a signal to
+    # surface — prevents silent fallback to "Standing by, sir." on an empty plan.
+    if not schedule and not task_chunks and not clarification and not error:
+        clarification = (
+            "I couldn't put a plan together from that, sir. "
+            "Could you give me a bit more — the deadline, the subject, or what you're aiming at?"
+        )
+
     return {
-        "schedule": result.get("schedule"),
+        "schedule": schedule,
         "execution_graph": (
-            {"decomposition": result.get("task_chunks", [])}
-            if result.get("task_chunks")
-            else None
+            {"decomposition": task_chunks} if task_chunks else None
         ),
-        "clarification_request": result.get("clarification_request"),
-        "error": result.get("error"),
+        "clarification_request": clarification,
+        "error": error,
+        # NOTE: anti_guilt_message and missed_deadlines are not yet computed in
+        # the v2 sub-graph — placeholder for the upcoming port of
+        # detect_and_mark_missed (currently lives in control_policy._run_plan_day_flow).
+        "anti_guilt_message": result.get("anti_guilt_message"),
+        "missed_deadlines": result.get("missed_deadlines"),
     }
 
 

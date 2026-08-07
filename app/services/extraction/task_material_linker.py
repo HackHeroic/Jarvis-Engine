@@ -95,6 +95,20 @@ async def link_document_to_tasks(
             except Exception:
                 pass  # Upsert may fail if table/constraint differs
 
+        # Invalidate workspace cache for every newly-linked task so the next
+        # workspace fetch rebuilds with the new document.
+        if matched:
+            try:
+                from app.services.analytical.workspace_builder import invalidate_workspace_cache
+                import asyncio as _asyncio
+                for tid in matched:
+                    try:
+                        await invalidate_workspace_cache(user_id, tid)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         return matched
     except Exception:
         return []
