@@ -18,13 +18,16 @@ from pydantic import ValidationError
 
 from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk, SYSTEM_PROMPT, _sanitize_llm_json
 from app.api.v1.endpoints.schedule import run_schedule
+import app.core.config as _cfg
 from app.core.config import (
     DAY_START_HOUR,
     DEFAULT_HORIZON_MINUTES,
     GEMINI_API_KEY,
     MAX_HORIZON_MINUTES,
-    SLM_ROUTER_MODEL,
 )
+# IMPORTANT: _cfg.SLM_ROUTER_MODEL and LOCAL_LLM_MODEL are mutated at runtime by
+# detect_loaded_models(). Always reference _cfg.X (not a captured import) so
+# we pick up the actual loaded model name. Single-26B setups depend on this.
 from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query, local_primary_route, run_deep_research
 from app.schemas.context import (
     Availability,
@@ -68,13 +71,21 @@ BRAIN_DUMP_EXTRACTION_PROMPT = (
     "E.g. 'Plan my week for deep learning contest Friday and calculus exam Monday', NOT just 'Plan my week'. "
     "Use null for greetings, chitchat, questions, or very short non-goals (e.g. 'hi', 'hello', 'what is X', 'teach me X'). "
     "Only extract when the user clearly wants to plan or schedule.\n"
-    "inline_habits: Extract the EXACT, VERBATIM phrase for each long-term constraint. "
+    "inline_habits: Extract the EXACT, VERBATIM phrase for each LONG-TERM behavioral RULE. "
     "DO NOT summarize or shorten. CRITICAL: Preserve all time anchors (e.g. 'before 11 AM', "
     "'after 2 PM', 'no work until noon') — the scheduler needs these for math. "
     "Example: 'I hate mornings, never schedule work before 11 AM' -> "
     "[\"I hate working in the mornings, so please never schedule work before 11 AM\"] (full phrase, not \"I hate mornings\"). "
     "Return as a list of complete phrases. Character, not mood.\n"
-    "state_updates: Temporary today-only mood (I'm tired, feeling sick, take it easy, go light on difficulty). Never store.\n"
+    "STRICT NEGATIVES — return null/empty for inline_habits when ANY of these apply:\n"
+    "  - Emotional disclosure ('I am sad', 'I feel anxious', 'I'm tired', 'feeling low', 'I'm overwhelmed')\n"
+    "  - Greetings or chitchat ('hi', 'hey', 'hmm', 'ok', 'thanks')\n"
+    "  - Questions or knowledge queries ('what is X', 'teach me Y', 'explain Z')\n"
+    "  - Single-word fragments or text under 5 characters\n"
+    "  - Vague feelings without a concrete time/preference rule\n"
+    "Emotional input belongs in state_updates, NOT inline_habits.\n"
+    "state_updates: Temporary today-only mood OR emotional disclosure (I'm tired, feeling sick, "
+    "feeling sad, anxious today, take it easy, go light on difficulty). Never stored as a habit.\n"
     "action_items: Reminders, tasks to create or schedule later. "
     "Examples: 'call my mom', 'apply for internship', 'create a task to study X', "
     "'add a task for Y', 'make a task to do Z', 'remind me to do X'.\n"
@@ -111,8 +122,12 @@ UNIFIED_CLASSIFICATION_PROMPT = (
     "flight times, deep-work blocks.\n"
     "KNOWLEDGE_INGESTION: ONLY for document uploads — syllabi, DPP, sample papers, PDFs, study material files. "
     "NOT for questions about topics.\n"
-    "BEHAVIORAL_CONSTRAINT: 'I sit in back bench', 'no meetings before 10', "
-    "work preferences, habits, e.g. 'I hate mornings'.\n"
+    "BEHAVIORAL_CONSTRAINT: A LONG-TERM behavioral RULE the user wants the scheduler to respect. "
+    "Examples: 'I sit in back bench', 'no meetings before 10', 'I hate mornings', "
+    "'never schedule deep work after 9 PM', 'I prefer light tasks on Sundays'. "
+    "MUST contain a concrete rule or preference. "
+    "NOT for emotional disclosure: 'I am sad', 'I feel anxious', 'I'm tired today', "
+    "'feeling low', 'overwhelmed' — those are GENERAL_QA (the user wants support, not a constraint).\n"
     "ACTION_ITEM: 'Apply for internship', 'prepare pitch', 'create a task to study X', "
     "'add a task for Y', 'make a task to do Z', 'remind me to X', tasks with deadlines, "
     "direct goals to be created or scheduled.\n\n"
@@ -142,7 +157,7 @@ async def _extract_and_stage_inline_habits(
         extracted = await hybrid_route_query(
             user_prompt=text,
             system_prompt=INLINE_HABIT_EXTRACTION_PROMPT,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
         )
         if not extracted:
             return []
@@ -150,7 +165,8 @@ async def _extract_and_stage_inline_habits(
         raw = raw.strip()
         if "NONE" in raw.upper() or len(raw) <= 5:
             return []
-        return [stage_habit(raw, user_id)]
+        staged = stage_habit(raw, user_id)
+        return [staged] if staged is not None else []
     except Exception as e:
         print(f"[Memory] Inline extraction failed: {e}")
         return []
@@ -510,7 +526,7 @@ async def _run_brain_dump_extraction(
             user_prompt=user_prompt,
             system_prompt=_system_prompt,
             response_schema=BrainDumpExtraction,
-            fallback_model=SLM_ROUTER_MODEL,
+            fallback_model=_cfg.SLM_ROUTER_MODEL,
             conversation_history=_slm_history,
         )
         if isinstance(result, dict):
@@ -617,7 +633,7 @@ async def _fallback_single_intent(
             user_prompt=user_prompt,
             system_prompt=UNIFIED_CLASSIFICATION_PROMPT,
             response_schema=IntentClassification,
-            model_override=SLM_ROUTER_MODEL,
+            model_override=_cfg.SLM_ROUTER_MODEL,
         )
         if isinstance(classify_result, dict):
             classification = IntentClassification.model_validate(classify_result)
@@ -640,7 +656,7 @@ async def _fallback_single_intent(
 
     # Resolve which model will handle this intent
     from app.core.config import LOCAL_LLM_MODEL
-    _fallback_model = LOCAL_LLM_MODEL if intent == IntentType.GENERAL_QA else SLM_ROUTER_MODEL
+    _fallback_model = _cfg.LOCAL_LLM_MODEL if intent == IntentType.GENERAL_QA else _cfg.SLM_ROUTER_MODEL
     if progress_callback:
         await progress_callback("intent_classified", {"intent": intent.value, "fallback": True, "model": _fallback_model})
 
@@ -721,6 +737,18 @@ async def _run_plan_day_flow(
 
     from app.core.config import LOCAL_LLM_MODEL as _LLM_27B
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+
+    # Anti-Guilt auto-reschedule: scan for past-deadline pending tasks BEFORE planning.
+    # Marks them `missed` so they don't poison TMT priority weights, surfaces a
+    # blame-free framing in the synthesis.
+    try:
+        from app.services.analytical.missed_deadlines import detect_and_mark_missed, build_anti_guilt_message
+        _overdue = await detect_and_mark_missed(user_id, supabase)
+        if _overdue and execution_summary is not None:
+            execution_summary["missed_deadlines"] = _overdue
+            execution_summary["anti_guilt_message"] = build_anti_guilt_message(_overdue)
+    except Exception as _e:
+        logger.warning(f"Missed-deadline scan failed (non-fatal): {_e}")
 
     log_step("P1_HABITS_FETCH", "Fetching behavioral context for calendar")
     # Inline habit extraction (skip if primary path already staged from extraction)
@@ -1085,7 +1113,7 @@ async def _run_plan_day_flow(
                 search_result = {"queries": [], "summaries": []}
 
         if progress_callback:
-            await progress_callback("synthesizing", {"model": SLM_ROUTER_MODEL})
+            await progress_callback("synthesizing", {"model": _cfg.SLM_ROUTER_MODEL})
         # Skip VoJ when frontend will render structured schedule data directly.
         # VoJ was adding 5-10s for a message the user doesn't read when they can
         # see the visual schedule. Use deterministic fallback instead.
@@ -1171,7 +1199,7 @@ async def _run_schedule_modify_flow(
 
     if progress_callback:
         await progress_callback("modifying_schedule", {
-            "model": SLM_ROUTER_MODEL,
+            "model": _cfg.SLM_ROUTER_MODEL,
             "phase_summary": "Parsing your schedule change...",
         })
 
@@ -1335,8 +1363,8 @@ async def execute_agentic_flow(
     # Resolve model names for progress visibility
     from app.core.config import LOCAL_LLM_MODEL
     model_labels = {
-        "auto": {"classifier": SLM_ROUTER_MODEL, "reasoner": LOCAL_LLM_MODEL},
-        "4b": {"classifier": SLM_ROUTER_MODEL, "reasoner": SLM_ROUTER_MODEL},
+        "auto": {"classifier": _cfg.SLM_ROUTER_MODEL, "reasoner": LOCAL_LLM_MODEL},
+        "4b": {"classifier": _cfg.SLM_ROUTER_MODEL, "reasoner": _cfg.SLM_ROUTER_MODEL},
         "27b": {"classifier": LOCAL_LLM_MODEL, "reasoner": LOCAL_LLM_MODEL},
     }
     active_models = model_labels.get(model_mode, model_labels["auto"])
@@ -1498,8 +1526,12 @@ async def execute_agentic_flow(
         staged_habits = []
         for h in extraction.inline_habits:
             if h and h.strip():
-                staged_habits.append(stage_habit(h.strip(), user_id))
-                print(f"[Memory] Inline habit staged: {h.strip()}")
+                staged = stage_habit(h.strip(), user_id)
+                if staged is not None:  # filters fallback strings + trivially-short habits
+                    staged_habits.append(staged)
+                    print(f"[Memory] Inline habit staged: {h.strip()}")
+                else:
+                    print(f"[Memory] Inline habit rejected (fallback/too-short): {h.strip()!r}")
         execution_summary["habits_staged"] = staged_habits
         if progress_callback:
             await progress_callback("habits_staged", {

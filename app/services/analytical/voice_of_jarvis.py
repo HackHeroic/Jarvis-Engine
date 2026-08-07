@@ -16,28 +16,38 @@ _summary_capture: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
 )
 
 VOICE_OF_JARVIS_PROMPT = (
-    "You are Jarvis, a warm, capable AI assistant. The user sent a message and we executed "
-    "the following actions.\n\n"
+    "You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), the user's personal AI. "
+    "Loyal, brilliant, composed. British cadence, formal but warm. Address the user as 'sir'. "
+    "The user sent a message and we executed the following actions.\n\n"
     "You MUST use this EXACT format — no exceptions:\n"
     "<think>\n"
     "2-4 sentences explaining what we did internally.\n"
     "</think>\n"
-    "Your warm 1-2 sentence response to the user.\n\n"
-    "RULES:\n"
+    "Your composed 1-2 sentence response to the user as JARVIS.\n\n"
+    "VOICE RULES:\n"
     "- You MUST start your response with <think> (the literal XML tag)\n"
     "- You MUST close the thinking block with </think> (the literal XML tag)\n"
     "- After </think>, write ONLY your 1-2 sentence response — nothing else\n"
-    "- Do NOT number steps, do NOT use bullet points, do NOT explain your process outside the tags\n"
-    "- Be concise and human\n"
-    "- If we built a schedule, end with something like 'Here's your schedule.'\n"
-    "- NEEDS_END_DATE_INSTRUCTION: If needs_end_date is true, politely ask when their semester ends\n\n"
-    "EXAMPLE:\n"
+    "- Use British cadence: 'Shall I...', 'If I may, sir...', 'I've taken the liberty of...'\n"
+    "- Lead with information or status, not pleasantries\n"
+    "- Show care through competence, not flattery. No 'I'd be happy to!' or 'Great!'\n"
+    "- Dry wit through understatement, never sarcasm or condescension\n"
+    "- No emoji, no exclamation marks, no filler phrases\n"
+    "- Never begin the response with 'I' — rephrase to lead with the fact or action\n"
+    "- NEEDS_END_DATE_INSTRUCTION: If needs_end_date is true, ask when the semester ends\n\n"
+    "EXAMPLES:\n"
     "<think>\n"
-    "I classified the user's input as a planning request and decomposed their goal into 6 micro-tasks. "
-    "I applied their gym habit as a hard block and ran the scheduler.\n"
+    "Classified as a planning request. Decomposed into 6 micro-tasks, applied gym habit as "
+    "a hard block, ran the CP-SAT solver with TMT priority weighting.\n"
     "</think>\n"
-    "I've broken down your study plan into focused 25-minute tasks and scheduled them around your gym sessions. "
-    "Here's your schedule."
+    "Your schedule is set, sir — six tasks, routed around your gym blocks. "
+    "Deadline-adjacent items have been given priority.\n\n"
+    "<think>\n"
+    "User uploaded a PDF. Extracted 12 pages via Docling, chunked into 34 segments, "
+    "embedded in ChromaDB, linked to 3 active tasks.\n"
+    "</think>\n"
+    "Document processed and linked to your active tasks, sir. "
+    "Shall I pull the relevant sections into your next study session?"
 )
 
 
@@ -62,8 +72,8 @@ def _build_thinking_fallback(execution_summary: dict[str, Any]) -> str | None:
         bullets.append("I spread the schedule across multiple days to fit your constraints.")
     if execution_summary.get("greeting"):
         bullets.append(
-            "User sent a greeting. Routed via 4B SLM (no planning goal detected). "
-            "Responding warmly and surfacing what Jarvis can do."
+            "User sent a greeting. Routed via 4B SLM — no planning goal detected. "
+            "Acknowledging and standing by."
         )
     if not bullets:
         return None
@@ -87,8 +97,50 @@ def _extract_thinking_process(raw_text: str) -> tuple[str, str | None]:
         clean_text = parts[-1].strip() if len(parts) > 1 else clean_text.split("\n\n")[-1]
     clean_text = clean_text.strip().replace('"', "").replace("*", "")
     if not clean_text:
-        clean_text = "Done."
+        clean_text = "Standing by, sir."
     return clean_text, thinking_process
+
+
+def build_summary_from_state(state: dict, intent: str = "") -> dict[str, Any]:
+    """Build the dict that _build_voj_parts can consume from raw orchestrator state.
+
+    Bridges v2 graph state (which carries `schedule`, `execution_graph`, etc.)
+    to the boolean-flag contract `_build_voj_parts` expects (`schedule_generated`,
+    `knowledge_ingested`, etc.). Used by both the orchestrator's
+    voice_of_jarvis_synthesis node AND the chat-stream fallback path so they
+    can never drift out of sync.
+    """
+    schedule = state.get("schedule")
+    execution_graph = state.get("execution_graph")
+    ingestion_result = state.get("ingestion_result")
+    research_results = state.get("research_results")
+    cal_extracted = bool(
+        ingestion_result
+        and isinstance(ingestion_result, dict)
+        and ingestion_result.get("calendar_extracted")
+    )
+    return {
+        "intent": intent or str(state.get("intent", "")),
+        "schedule": schedule,
+        "execution_graph": execution_graph,
+        "research_results": research_results,
+        "ingestion_result": ingestion_result,
+        "knowledge_ingested": bool(ingestion_result),
+        "calendar_extracted": cal_extracted,
+        "search_done": bool(research_results),
+        "schedule_generated": bool(schedule) or bool(execution_graph),
+        "task_count": (
+            len(execution_graph.get("decomposition") or [])
+            if isinstance(execution_graph, dict) else 0
+        ),
+        "anti_guilt_message": state.get("anti_guilt_message"),
+        "missed_deadlines": state.get("missed_deadlines"),
+        "clarification_request": state.get("clarification_request"),
+        "error": state.get("error"),
+        "user_prompt": state.get("user_message", "") or state.get("user_prompt", ""),
+        "memory_context": state.get("memory_context", ""),
+        "coaching_data": state.get("coaching_data"),
+    }
 
 
 def _build_voj_parts(execution_summary: dict[str, Any]) -> list[str]:
@@ -127,6 +179,11 @@ def _build_voj_parts(execution_summary: dict[str, Any]) -> list[str]:
             "Respond warmly in 1-2 sentences. Introduce yourself briefly. "
             "Tell them they can plan their day, drop a syllabus, or set habits."
         )
+    if execution_summary.get("anti_guilt_message"):
+        parts.append(
+            f"anti_guilt: {execution_summary['anti_guilt_message']} "
+            "Lead with this framing — composed, never apologetic, never shaming."
+        )
     return parts
 
 
@@ -153,7 +210,15 @@ async def synthesize_jarvis_response(
 
     parts = _build_voj_parts(execution_summary)
     if not parts:
-        return "Done.", None
+        # Before falling back, surface a clarification or error if upstream
+        # produced one — never let signal die silently.
+        clar = execution_summary.get("clarification_request")
+        if clar:
+            return clar, None
+        err = execution_summary.get("error")
+        if err:
+            return f"Sir, something hiccupped on my end: {err}. Shall we try again?", None
+        return "Standing by, sir.", None
 
     summary_text = "\n".join(parts)
     try:
@@ -171,7 +236,7 @@ async def synthesize_jarvis_response(
             conversation_history=conversation_history,
         )
         msg = result if isinstance(result, str) else str(result)
-        msg = msg.strip() if msg else "Done."
+        msg = msg.strip() if msg else "Standing by, sir."
         message, thinking_process = _extract_thinking_process(msg)
 
         # Use fallback for missing or trivially short thinking (e.g. model outputs "...")
@@ -192,7 +257,7 @@ async def synthesize_jarvis_response(
             return "I've processed and stored your materials.", thinking
         if execution_summary.get("calendar_extracted"):
             return "I've extracted your timetable for review.", thinking
-        return "Done.", thinking
+        return "Standing by, sir.", thinking
 
 
 async def synthesize_jarvis_response_stream(
@@ -213,7 +278,15 @@ async def synthesize_jarvis_response_stream(
 
     parts = _build_voj_parts(execution_summary)
     if not parts:
-        yield ("message", "Done.")
+        clar = execution_summary.get("clarification_request")
+        if clar:
+            yield ("message", clar)
+            return
+        err = execution_summary.get("error")
+        if err:
+            yield ("message", f"Sir, something hiccupped on my end: {err}. Shall we try again?")
+            return
+        yield ("message", "Standing by, sir.")
         return
 
     summary_text = "\n".join(parts)
@@ -298,12 +371,12 @@ async def synthesize_jarvis_response_stream(
                 yield ("thinking", fallback_thinking)
 
         if not had_content:
-            yield ("message", "Done.")
+            yield ("message", "Standing by, sir.")
 
     except Exception as e:
         print(f"[Voice of Jarvis Stream] Failed: {e}")
         thinking = _build_thinking_fallback(execution_summary)
         if thinking:
             yield ("thinking", thinking)
-        msg = "Here's your schedule." if execution_summary.get("schedule_generated") else "Done."
+        msg = "Your schedule is set, sir." if execution_summary.get("schedule_generated") else "All sorted, sir."
         yield ("message", msg)

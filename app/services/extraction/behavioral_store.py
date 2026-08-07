@@ -114,13 +114,39 @@ async def delete_behavioral_constraint(
         return {"status": "error", "reason": str(e)}
 
 
-def stage_habit(raw_text: str, user_id: str) -> dict:
+_SYSTEM_FALLBACK_PHRASES = {
+    "standing by, sir.",
+    "at your service, sir.",
+    "all sorted, sir.",
+    "your schedule is set, sir.",
+    "a minor hiccup on my end, sir. shall we try that again?",
+    "done.",
+    "hello!",
+    "hey! what can i help with?",
+}
+
+
+def is_system_fallback(text: str) -> bool:
+    """True if text matches a known system fallback phrase. Used to filter
+    fallback strings out of habit staging — never save 'Standing by, sir.'
+    as a behavioral constraint."""
+    if not text:
+        return True
+    return text.strip().lower() in _SYSTEM_FALLBACK_PHRASES
+
+
+def stage_habit(raw_text: str, user_id: str) -> dict | None:
     """Create a habit proposal without persisting to DB.
 
-    Returns a dict suitable for DraftComponent.data.
+    Returns None if raw_text is empty, a system fallback string, or trivially
+    short (< 5 chars). The orchestrator's habit-staging loop must drop None
+    entries — never offer 'Standing by, sir.' as 'New habit detected'.
     """
+    cleaned = (raw_text or "").strip()
+    if not cleaned or is_system_fallback(cleaned) or len(cleaned) < 5:
+        return None
     return {
-        "raw_text": raw_text.strip(),
+        "raw_text": cleaned,
         "user_id": user_id,
         "constraint_type": "behavioral",
         "status": "staged",

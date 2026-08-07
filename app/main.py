@@ -67,44 +67,29 @@ async def lifespan(app: FastAPI):
     app.state.jarvis_graph = build_jarvis_graph()
 
     # Detect loaded LM Studio models — NEVER load/unload models (OOM risk on 24GB).
-    # Maps whatever is loaded to LOCAL_LLM_MODEL and SLM_ROUTER_MODEL dynamically.
-    # If nothing is loaded or LM Studio is off → force GEMINI_PRIMARY so all calls go to cloud.
+    # Prefers 26B for primary, E4B for fast. If only one Gemma loaded, points both at it.
+    # If LM Studio unreachable → force GEMINI_PRIMARY so all calls go to cloud.
     import app.core.config as _cfg
-    from app.core.config import LM_STUDIO_NATIVE_URL
 
     def _force_gemini_only(reason: str) -> None:
-        """No local models available — route everything to Gemini."""
         _cfg.GEMINI_PRIMARY = True
         print(f" ⚠️  {reason} — all LLM calls will use Gemini cloud")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            _loaded_resp = await client.get(f"{LM_STUDIO_NATIVE_URL}/v1/models")
-            if _loaded_resp.status_code == 200:
-                _loaded_models = _loaded_resp.json().get("data", [])
-                _loaded_ids = [m["id"] for m in _loaded_models]
-                if _loaded_ids:
-                    # Use the first loaded model for all local tasks (single-model setup)
-                    _primary = f"openai/{_loaded_ids[0]}"
-                    _cfg.LOCAL_LLM_MODEL = _primary
-                    _cfg.GEMMA_PRIMARY_MODEL = _primary
-                    # If multiple models loaded, use second as fast/SLM; else same model
-                    _fast = f"openai/{_loaded_ids[1]}" if len(_loaded_ids) > 1 else _primary
-                    _cfg.SLM_ROUTER_MODEL = _fast
-                    _cfg.GEMMA_FAST_MODEL = _fast
-                    _cfg.GEMINI_PRIMARY = False  # local models available → local-first
-                    print(f" ✅ Detected loaded model(s): {_loaded_ids}")
-                    print(f"    PRIMARY → {_cfg.LOCAL_LLM_MODEL}")
-                    if _fast != _primary:
-                        print(f"    FAST/SLM → {_cfg.SLM_ROUTER_MODEL}")
-                else:
-                    _force_gemini_only("No models loaded in LM Studio")
-            else:
-                _force_gemini_only(f"LM Studio /v1/models returned {_loaded_resp.status_code}")
-    except httpx.ConnectError:
-        _force_gemini_only("LM Studio not running")
-    except Exception as e:
-        _force_gemini_only(f"Model detection failed: {e}")
+    detect_result = _cfg.detect_loaded_models()
+    if detect_result.get("error") or detect_result.get("warning"):
+        warn = detect_result.get("warning") or detect_result.get("error")
+        if not detect_result.get("loaded"):
+            _force_gemini_only(warn or "No local models")
+        else:
+            print(f" ⚠️  {warn}")
+    else:
+        _cfg.GEMINI_PRIMARY = False
+        print(f" ✅ Detected Gemma model(s): {detect_result.get('loaded')}")
+        print(f"    PRIMARY → {_cfg.GEMMA_PRIMARY_MODEL}")
+        if detect_result.get("single_model"):
+            print(f"    FAST    → {_cfg.GEMMA_FAST_MODEL}  (single-model fallback; same as primary)")
+        else:
+            print(f"    FAST    → {_cfg.GEMMA_FAST_MODEL}")
 
     yield
     print("Shutting down Jarvis Reasoning Engine.")
