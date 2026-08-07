@@ -204,6 +204,19 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
     draft_store = getattr(http_request.app.state, "draft_store", None)
     memory_store = getattr(http_request.app.state, "memory_store", None)
     model_mode = request.model_mode or "auto"
+    # Frontend sends "4b" or "cloud" when user picks Gemini in the picker
+    # (legacy: "4b" was the SLM label, now repurposed as cloud override).
+    # We treat both as "force cloud Gemini for this turn".
+    force_cloud_request = model_mode in ("4b", "cloud", "gemini")
+    if force_cloud_request:
+        # Set the per-request cloud override so every route_llm_call in this
+        # request hits Gemini, regardless of LM Studio loaded models.
+        try:
+            from app.core.model_router import force_cloud_var
+            force_cloud_var.set(True)
+            print(f"[chat] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
+        except Exception as _e:
+            print(f"[chat] Failed to set force_cloud_var: {_e}")
 
     # --- Session management (before any early returns) ---
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -314,15 +327,23 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             yield f"event: error\ndata: {json.dumps({'error': 'Pipeline returned no result'})}\n\n"
             return
 
+        import app.core.config as _cfg_v1
         from app.core.config import SLM_ROUTER_MODEL, LOCAL_LLM_MODEL
-        # GENERAL_QA uses 27B for the actual response; other intents use 4B for synthesis
-        _synthesis_model = LOCAL_LLM_MODEL if partial.intent == "GENERAL_QA" else SLM_ROUTER_MODEL
-        yield f"event: step\ndata: {json.dumps({'intent': partial.intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _synthesis_model})}\n\n"
+        try:
+            from app.core.model_router import force_cloud_var as _fc_v1
+            _v1_force_cloud = _fc_v1.get()
+        except Exception:
+            _v1_force_cloud = False
+        if _cfg_v1.GEMINI_PRIMARY or _v1_force_cloud:
+            _synthesis_model = _cfg_v1.GEMINI_MODEL
+        else:
+            _synthesis_model = LOCAL_LLM_MODEL if partial.intent == "GENERAL_QA" else SLM_ROUTER_MODEL
+        yield f"event: step\ndata: {json.dumps({'intent': partial.intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _synthesis_model, 'force_cloud': _v1_force_cloud})}\n\n"
 
         if partial.awaiting_task_confirmation:
             partial_dict = partial.model_dump()
             # Save assistant response and attach session info
-            _assistant_msg = partial.message or "Done."
+            _assistant_msg = partial.message or "Standing by, sir."
             _msg_id = await save_assistant_message(
                 session_id, request.user_id, _assistant_msg, partial.intent or "",
                 {},
@@ -397,7 +418,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 thinking_clean = thinking_extracted or ""
 
             partial_dict = partial.model_dump()
-            partial_dict["message"] = message_clean or partial.message or "Done."
+            partial_dict["message"] = message_clean or partial.message or "Standing by, sir."
             partial_dict["thinking_process"] = thinking_clean or None
             partial_dict["generation_metrics"] = {
                 "total_tokens": _qa_token_count,
@@ -407,7 +428,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 "model": LOCAL_LLM_MODEL,
             }
             # Save assistant response and attach session info
-            _assistant_msg = message_clean or partial.message or "Done."
+            _assistant_msg = message_clean or partial.message or "Standing by, sir."
             _msg_id = await save_assistant_message(
                 session_id, request.user_id, _assistant_msg, "GENERAL_QA",
                 {},
@@ -431,17 +452,25 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             return
 
         if _is_qa and partial.intent == "GREETING":
-            # Greeting: emit pre-computed message directly
+            # Greeting: re-stream through the LLM if pre-computed message is empty.
+            # Never hardcode a greeting reply — user explicit constraint.
+            if not partial.message:
+                from app.modules.conversation import run_general_chat as _run_gc
+                _gc_state = {"user_message": request.user_prompt, "user_model": None,
+                             "memory_context": "", "conversation_history": []}
+                _gc_out = await _run_gc(_gc_state)
+                partial.message = _gc_out.get("response_message") or "Standing by, sir."
+                partial.thinking_process = _gc_out.get("thinking_process") or partial.thinking_process
+
             if partial.thinking_process:
                 yield f"event: thinking\ndata: {json.dumps({'token': partial.thinking_process})}\n\n"
-            yield f"event: message\ndata: {json.dumps({'token': partial.message or 'Hello!'})}\n\n"
+            yield f"event: message\ndata: {json.dumps({'token': partial.message})}\n\n"
             partial_dict = partial.model_dump()
             partial_dict["generation_metrics"] = {
                 "total_tokens": 1, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
                 "model": SLM_ROUTER_MODEL,
             }
-            # Save assistant response and attach session info
-            _assistant_msg = partial.message or "Hello!"
+            _assistant_msg = partial.message
             _msg_id = await save_assistant_message(
                 session_id, request.user_id, _assistant_msg, "GREETING",
                 {},
@@ -449,9 +478,8 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             )
             partial_dict["conversation_id"] = session_id
             partial_dict["message_id"] = _msg_id
-            # Fire-and-forget memory extraction
             if memory_store:
-                _resp_text = partial.message or "Hello!"
+                _resp_text = partial.message
                 asyncio.create_task(safe_extract_memories(
                     request.user_id, request.user_prompt, _resp_text, memory_store,
                     db_client=supabase,
@@ -503,7 +531,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         # and use the pipeline's message directly.
         _pipeline_has_message = (
             partial.message
-            and partial.message not in ("", "Done.")
+            and partial.message not in ("", "Standing by, sir.")
             and not captured_summary
         )
 
@@ -538,7 +566,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 if fallback_thinking:
                     yield f"event: thinking\ndata: {json.dumps({'token': fallback_thinking})}\n\n"
                     thinking_full = fallback_thinking
-                fallback_msg = partial.message or "Done."
+                fallback_msg = partial.message or "Standing by, sir."
                 yield f"event: message\ndata: {json.dumps({'token': fallback_msg})}\n\n"
                 message_full = fallback_msg
 
@@ -547,7 +575,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
 
         partial_dict = partial.model_dump()
-        partial_dict["message"] = message_clean or partial.message or "Done."
+        partial_dict["message"] = message_clean or partial.message or "Standing by, sir."
         partial_dict["thinking_process"] = thinking_clean or partial.thinking_process or _build_thinking_fallback(captured_summary)
         # Add generation metrics
         partial_dict["generation_metrics"] = {
@@ -558,7 +586,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
             "model": _primary_model[0] if _primary_model else SLM_ROUTER_MODEL,
         }
         # Save assistant response and attach session info
-        _assistant_msg = message_clean or partial.message or "Done."
+        _assistant_msg = message_clean or partial.message or "Standing by, sir."
         _msg_id = await save_assistant_message(
             session_id, request.user_id, _assistant_msg, partial.intent or "",
             {},
@@ -644,7 +672,7 @@ async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str 
         thinking_clean = thinking_extracted or ""
 
     # Save assistant response and attach session info
-    _assistant_msg = message_clean or "Done."
+    _assistant_msg = message_clean or "Standing by, sir."
     _msg_id = None
     if session_id and supabase:
         from app.services.chat_history import save_assistant_message
@@ -827,7 +855,14 @@ async def confirm_schedule_stream(
             if used_horizon > DEFAULT_HORIZON_MINUTES:
                 execution_summary["spread_across_days"] = True
 
-            yield f"event: step\ndata: {json.dumps({'intent': 'PLAN_DAY', 'stage': 'pipeline_done', 'synthesis_model': SLM_ROUTER_MODEL})}\n\n"
+            try:
+                from app.core.model_router import force_cloud_var as _fc_pd
+                _pd_force_cloud = _fc_pd.get()
+            except Exception:
+                _pd_force_cloud = False
+            import app.core.config as _cfg_pd
+            _pd_synth = _cfg_pd.GEMINI_MODEL if (_cfg_pd.GEMINI_PRIMARY or _pd_force_cloud) else SLM_ROUTER_MODEL
+            yield f"event: step\ndata: {json.dumps({'intent': 'PLAN_DAY', 'stage': 'pipeline_done', 'synthesis_model': _pd_synth, 'force_cloud': _pd_force_cloud})}\n\n"
 
             # Step 2: Stream Voice of Jarvis
             captured_summary = execution_summary
@@ -1043,6 +1078,18 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     memory_store = getattr(http_request.app.state, "memory_store", None)
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
+    # Model selector: when user picks Gemini, force this whole turn to cloud.
+    # MUST be set BEFORE the graph is invoked so every LLM call inherits it.
+    model_mode = request.model_mode or "auto"
+    force_cloud_request = model_mode in ("4b", "cloud", "gemini")
+    if force_cloud_request:
+        try:
+            from app.core.model_router import force_cloud_var
+            force_cloud_var.set(True)
+            print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
+        except Exception as _e:
+            print(f"[chat/v2] Failed to set force_cloud_var: {_e}")
+
     # --- Session management ---
     session_id = await get_or_create_session(
         request.user_id, request.conversation_id, supabase
@@ -1102,6 +1149,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "memory_context": memory_context,
         "progress_callback": progress_cb,
         "progress_queue": progress_queue,
+        # When user picks Gemini in the model selector, force every LLM call
+        # in this turn to route to cloud — not local Gemma.
+        "force_cloud_request": force_cloud_request,
     }
 
     async def event_gen():
@@ -1216,8 +1266,14 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
             _has_schedule = bool(final_state.get("schedule"))
 
-            _active_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else LOCAL_LLM_MODEL
-            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': 'v2', 'synthesis_model': _active_model})}\n\n"
+            # Reflect actual routing: per-request force_cloud overrides static config.
+            try:
+                from app.core.model_router import force_cloud_var
+                _force_cloud_now = force_cloud_var.get()
+            except Exception:
+                _force_cloud_now = False
+            _active_model = _cfg.GEMINI_MODEL if (_cfg.GEMINI_PRIMARY or _force_cloud_now) else LOCAL_LLM_MODEL
+            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _active_model, 'force_cloud': _force_cloud_now})}\n\n"
 
             # --- Token streaming (matches v1/stream SSE contract) ---
             _start = time_mod.monotonic()
@@ -1253,8 +1309,22 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     message_full = _pre_msg
                     _token_count = 1
                 else:
-                    yield f"event: message\ndata: {json.dumps({'token': 'Hey! What can I help with?'})}\n\n"
-                    message_full = "Hey! What can I help with?"
+                    # Empty graph output for CHAT — last-resort: invoke conversation module
+                    # directly so the LLM still produces the reply (no hardcoded text).
+                    from app.modules.conversation import run_general_chat as _run_gc
+                    _gc_out = await _run_gc({
+                        "user_message": request.user_prompt,
+                        "user_model": final_state.get("user_model"),
+                        "memory_context": final_state.get("memory_context", ""),
+                        "conversation_history": final_state.get("conversation_history", []),
+                    })
+                    _llm_msg = _gc_out.get("response_message") or "Standing by, sir."
+                    _llm_think = _gc_out.get("thinking_process")
+                    if _llm_think:
+                        yield f"event: thinking\ndata: {json.dumps({'token': _llm_think})}\n\n"
+                        thinking_full = _llm_think
+                    yield f"event: message\ndata: {json.dumps({'token': _llm_msg})}\n\n"
+                    message_full = _llm_msg
                     _token_count = 1
 
             else:
@@ -1262,7 +1332,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 _pre_msg = final_state.get("response_message", "")
                 _pre_think = final_state.get("thinking_process")
 
-                if _pre_msg and _pre_msg not in ("", "Done."):
+                if _pre_msg and _pre_msg not in ("", "Standing by, sir."):
                     # VoJ already computed in synthesize_response node — emit it
                     if _pre_think:
                         yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
@@ -1272,18 +1342,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     message_full = _pre_msg
                     _token_count = 1
                 else:
-                    # Fallback: generate a fresh VoJ synthesis via streaming
+                    # Fallback: generate a fresh VoJ synthesis via streaming.
+                    # Use the shared bridge so this fallback can't drift from the
+                    # orchestrator's voice_of_jarvis_synthesis enrichment.
                     try:
-                        _captured_summary = {
-                            "intent": _intent,
-                            "schedule": final_state.get("schedule"),
-                            "execution_graph": final_state.get("execution_graph"),
-                            "research_results": final_state.get("research_results"),
-                            "ingestion_result": final_state.get("ingestion_result"),
-                            "clarification_request": final_state.get("clarification_request"),
-                            "error": final_state.get("error"),
-                            "user_prompt": request.user_prompt,
-                        }
+                        from app.services.analytical.voice_of_jarvis import build_summary_from_state
+                        _captured_summary = build_summary_from_state(final_state, _intent)
+                        _captured_summary["user_prompt"] = request.user_prompt
                         async for event_type, tok in synthesize_jarvis_response_stream(_captured_summary):
                             if _ttft is None:
                                 _ttft = (time_mod.monotonic() - _start) * 1000
@@ -1296,7 +1361,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else SLM_ROUTER_MODEL
                     except Exception as voj_exc:
                         print(f"[v2/stream] VoJ streaming failed: {voj_exc}")
-                        _fallback = final_state.get("response_message") or "Done."
+                        _fallback = final_state.get("response_message") or "Standing by, sir."
                         yield f"event: message\ndata: {json.dumps({'token': _fallback})}\n\n"
                         message_full = _fallback
                         _token_count = 1
@@ -1312,7 +1377,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 message_clean, thinking_extracted = _extract_thinking_process(message_clean)
                 thinking_clean = thinking_extracted or ""
 
-            _assistant_msg = message_clean or final_state.get("response_message") or "Done."
+            _assistant_msg = message_clean or final_state.get("response_message") or "Standing by, sir."
 
             # --- Save assistant message ---
             _msg_id = await save_assistant_message(

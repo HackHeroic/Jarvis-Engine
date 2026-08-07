@@ -1,9 +1,9 @@
 """Main LangGraph StateGraph — the Jarvis orchestrator.
 
 Replaces execute_agentic_flow() in control_policy.py.
-LLM-dependent nodes (load_context, extract_brain_dump, classify_intent) remain as stubs
-until LM Studio is available. All other modules are wired to real implementations.
 """
+
+import re
 
 from langgraph.graph import END, StateGraph
 
@@ -19,6 +19,73 @@ from app.core.observation import run_observation_loop
 from app.modules import module_registry
 from app.orchestrator.module_wrapper import create_module_wrapper
 
+# Trivial inputs that should ALWAYS be classified as CHAT — bypass 26B brain-dump extraction
+# (which over-extracts greetings into search_queries / action_items when E4B isn't loaded).
+_TRIVIAL_INPUT_RE = re.compile(
+    r"^\s*(hi+|hey+|hello+|yo+|sup|hola|namaste|hmm+|huh|aha|ah|oh|"
+    r"good\s+(morning|afternoon|evening|night)|"
+    r"how\s+(are\s+you|r\s+u|you\s+doing)|"
+    r"what'?s\s+up|wassup|"
+    r"thanks?|thank\s+you|ty|cheers|"
+    r"ok+|okay|cool|nice|great|alright|"
+    r"bye|goodbye|see\s+ya|cya"
+    r")[\s!.?]*$",
+    re.IGNORECASE,
+)
+
+# Emotional disclosure — the LLM should respond with empathy via the conversation
+# module, NOT extract this as a behavioral habit constraint.
+_EMOTIONAL_INPUT_RE = re.compile(
+    r"\b(i\s*(am|'m|m)\s+|i\s+(feel|felt|feeling)\s+|"
+    r"feeling\s+|i\s+got\s+|today\s+i'?m?\s+)"
+    r"(sad|happy|anxious|tired|exhausted|overwhelmed|stressed|angry|frustrated|"
+    r"depressed|low|down|lonely|scared|afraid|worried|nervous|hopeful|"
+    r"excited|grateful|content|relaxed|calm|peaceful|blah|meh|off|fine|okay|ok)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+
+# Planning / task verbs — if any of these appear, the message is NOT trivial
+# even if it ALSO contains emotional language (e.g. "I'm sad, please plan my week").
+# NOTE: bare "today" intentionally excluded — appears in "I am sad today"
+# without any planning intent. "tomorrow" and "tonight" stay (clearer signals).
+_PLANNING_VERBS_RE = re.compile(
+    r"\b(plan|schedule|organize|organise|prepare|prep|study|learn|build|create|"
+    r"design|write|review|finish|complete|deliver|tomorrow|tonight|"
+    r"this\s+(week|month|weekend|morning|afternoon|evening)|"
+    r"next\s+(week|month|day|weekend)|deadline|exam|test|interview|presentation|"
+    r"contest|hackathon|assignment|homework|task|goal|project|chapter|"
+    r"add\s+a\s+task|remind\s+me|create\s+a\s+task)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_trivial_input(text: str) -> bool:
+    """Return True for inputs that should bypass 26B brain-dump extraction.
+
+    Three categories route straight to CHAT (which DOES call the LLM via
+    conversation module — this never returns hardcoded text):
+      1. Empty/very short messages
+      2. Greetings, acks, fillers
+      3. SHORT emotional disclosure with NO planning verb
+         (avoids dropping legitimate work like "I'm sad, plan my week")
+    """
+    if not text or not text.strip():
+        return True
+    s = text.strip()
+    if len(s) < 3:
+        return True
+    if _TRIVIAL_INPUT_RE.match(s):
+        return True
+    # Emotional fast path is only safe when there's no work intent in the message
+    if _EMOTIONAL_INPUT_RE.search(s):
+        if _PLANNING_VERBS_RE.search(s):
+            return False  # legitimate planning request that happens to be emotional
+        if len(s) <= 80:
+            return True
+    return False
+
 
 # --- Real LLM-powered nodes (replacing stubs) ---
 
@@ -28,12 +95,21 @@ async def _load_context(state: JarvisState) -> dict:
 
 
 async def _extract_brain_dump(state: JarvisState) -> dict:
-    """Extract planning goal, habits, action items from user message using LLM."""
+    """Extract planning goal, habits, action items from user message using LLM.
+
+    Trivial inputs (greetings, acks) skip the LLM entirely → routes to CHAT.
+    Avoids 26B over-extraction when E4B isn't loaded.
+    """
     from app.schemas.context import BrainDumpExtraction
     from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT
     from app.core.model_router import route_llm_call
 
     user_msg = state.get("user_message", "")
+
+    # Greeting / ack fast path — no LLM call, returns null brain_dump → CHAT intent
+    if _is_trivial_input(user_msg):
+        return {"brain_dump": None, "trivial_input": True}
+
     if not user_msg.strip():
         return {"brain_dump": None}
 

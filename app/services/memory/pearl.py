@@ -40,12 +40,34 @@ def detect_skip_time_window(
     """
     detected = []
 
-    # Group tasks by scheduled hour
+    # Group tasks by scheduled hour. user_tasks stores scheduled_start (timestamptz).
+    # We derive hour in the user's local tz when JARVIS_USER_TZ env is set,
+    # otherwise UTC. UTC is a safe default for personal-machine demos.
+    import os
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        _tz_name = os.getenv("JARVIS_USER_TZ", "")
+        _user_tz = ZoneInfo(_tz_name) if _tz_name else None
+    except Exception:
+        _user_tz = None
+
     hour_buckets: dict[int, list[dict]] = {}
     for task in tasks:
         hour = task.get("scheduled_hour")
+        if hour is None:
+            ss = task.get("scheduled_start")
+            if ss:
+                try:
+                    s = str(ss).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(s)
+                    if _user_tz is not None and dt.tzinfo is not None:
+                        dt = dt.astimezone(_user_tz)
+                    hour = dt.hour
+                except Exception:
+                    hour = None
         if hour is not None:
-            hour_buckets.setdefault(hour, []).append(task)
+            hour_buckets.setdefault(int(hour), []).append(task)
 
     for hour, bucket in hour_buckets.items():
         total = len(bucket)
@@ -264,7 +286,7 @@ def detect_patterns(
     try:
         result = (
             supabase_client.table("user_tasks")
-            .select("task_id, status, scheduled_hour, duration_minutes, original_duration_minutes, difficulty_weight, deadline_hint, original_deadline_hint")
+            .select("task_id, status, scheduled_start, duration_minutes, original_duration_minutes, difficulty_weight, deadline_hint, original_deadline_hint")
             .eq("user_id", user_id)
             .execute()
         )

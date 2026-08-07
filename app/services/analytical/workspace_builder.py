@@ -1,7 +1,15 @@
-"""Proactive Task Workspace: RAG + learning-style web search + dynamic practice assets."""
+"""Proactive Task Workspace: RAG + learning-style web search + dynamic practice assets.
+
+Workspaces are now PERSISTED in `task_workspaces` table with a 24h TTL.
+get_or_build_task_workspace() is the public entry — checks cache, returns if fresh,
+else rebuilds via build_task_workspace() and upserts. Cache invalidates when
+task_material_linker links a new document to this task.
+"""
 
 import asyncio
+import json
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
@@ -10,6 +18,8 @@ from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
 from app.services.user_preferences import get_learning_style
 from supabase import create_client
+
+WORKSPACE_TTL_HOURS = 24
 
 
 def _get_supabase():
@@ -347,3 +357,98 @@ async def build_task_workspace(
         surfaced_assets=surfaced,
         woop_card=woop_card,
     )
+
+
+# ─── Workspace persistence ────────────────────────────────────────────
+
+async def _read_cached_workspace(user_id: str, task_id: str) -> Optional[TaskWorkspace]:
+    """Return cached workspace if still fresh (within TTL). Tolerates missing table."""
+    sb = _get_supabase()
+    if not sb:
+        return None
+    try:
+        result = await asyncio.to_thread(
+            lambda: sb.table("task_workspaces")
+            .select("workspace_json, expires_at")
+            .eq("user_id", user_id)
+            .eq("task_id", task_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        expires_at = row.get("expires_at")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp < datetime.now(timezone.utc):
+                    return None  # stale → caller will rebuild
+            except Exception:
+                pass
+        ws_json = row.get("workspace_json")
+        if isinstance(ws_json, str):
+            ws_json = json.loads(ws_json)
+        if isinstance(ws_json, dict):
+            return TaskWorkspace.model_validate(ws_json)
+    except Exception as e:
+        logger.debug(f"Workspace cache read failed (non-fatal — table may not exist yet): {e}")
+    return None
+
+
+async def _write_cached_workspace(user_id: str, task_id: str, ws: TaskWorkspace) -> None:
+    """Persist workspace with 24h TTL. Tolerates missing table (silent no-op)."""
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        payload = {
+            "user_id": user_id,
+            "task_id": task_id,
+            "workspace_json": ws.model_dump(mode="json"),
+            "built_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=WORKSPACE_TTL_HOURS)).isoformat(),
+        }
+        await asyncio.to_thread(
+            lambda: sb.table("task_workspaces")
+            .upsert(payload, on_conflict="user_id,task_id")
+            .execute()
+        )
+    except Exception as e:
+        logger.debug(f"Workspace cache write failed (non-fatal — table may not exist yet): {e}")
+
+
+async def invalidate_workspace_cache(user_id: str, task_id: str) -> None:
+    """Drop cached workspace for a task. Called when new materials get linked."""
+    sb = _get_supabase()
+    if not sb:
+        return
+    try:
+        await asyncio.to_thread(
+            lambda: sb.table("task_workspaces")
+            .delete()
+            .eq("user_id", user_id)
+            .eq("task_id", task_id)
+            .execute()
+        )
+    except Exception:
+        pass
+
+
+async def get_or_build_task_workspace(
+    user_id: str,
+    task_id: str,
+    user_prompt: Optional[str] = None,
+    refresh: bool = False,
+) -> TaskWorkspace:
+    """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True."""
+    if not refresh:
+        cached = await _read_cached_workspace(user_id, task_id)
+        if cached is not None:
+            return cached
+
+    ws = await build_task_workspace(user_id=user_id, task_id=task_id, user_prompt=user_prompt)
+    await _write_cached_workspace(user_id, task_id, ws)
+    return ws

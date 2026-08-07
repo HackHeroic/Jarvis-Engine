@@ -75,3 +75,7 @@ class JarvisState(TypedDict):
     # Progress bridge — callable emitting SSE phase events from sub-graphs
     progress_callback: Any
     progress_queue: Any
+
+    # Per-turn flags
+    trivial_input: Optional[bool]            # set when greeting/emotional fast-path fires
+    force_cloud_request: Optional[bool]      # set when frontend model picker chose Gemini
