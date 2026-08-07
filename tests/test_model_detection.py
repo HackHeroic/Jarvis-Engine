@@ -51,3 +51,16 @@ def test_resolve__pinned_primary__survives_detection(monkeypatch):
 
     assert primary == "openai/mistral/pinned-by-user"
     assert fast == "openai/google/gemma-4-e4b"
+
+
+def test_resolve__pinned_bare_id__gets_openai_prefix(monkeypatch):
+    """Users pin the bare id LM Studio displays; LiteLLM cannot route it unprefixed."""
+    monkeypatch.setattr(config, "GEMMA_PRIMARY_MODEL", "google/gemma-4-12b")
+    monkeypatch.setattr(config, "GEMMA_FAST_MODEL", "google/gemma-4-e4b")
+    monkeypatch.setattr(config, "_PRIMARY_PINNED", True)
+    monkeypatch.setattr(config, "_FAST_PINNED", True)
+
+    primary, fast = config._resolve_models("google/gemma-4-26b-a4b", "google/gemma-4-e2b")
+
+    assert primary == "openai/google/gemma-4-12b"
+    assert fast == "openai/google/gemma-4-e4b"
