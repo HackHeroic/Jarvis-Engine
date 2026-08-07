@@ -160,7 +160,7 @@ sequenceDiagram
 | 0.1 | Restore Supabase | — (user action) + `supabase/migrations/` | User unpauses project in dashboard. Then verify connectivity, apply the 2 loose May migrations (`2026-05-01_pearl_scheduled_hour.sql`, `2026-05-01_task_workspaces.sql`), and move them into `supabase/migrations/` so the CLI owns all schema. |
 | 0.2 | MemoryStore resilience | `app/services/memory/store.py:34`, `retriever.py` | Respect an explicitly-passed stub/None client (no silent `_get_supabase()` fallback); wrap reads in try/except returning empty context. DB-down chat degrades, never 500s. |
 | 0.3 | Routing fix | `app/models/brain/litellm_conf.py:114-122` | Honor `GEMINI_PRIMARY` for unstructured calls too — hoist the check above the schema branch. |
-| 0.4 | Model detection refresh | `app/core/config.py:43-77` | Broaden heavy-class match (`12b`, `14b`, size-agnostic env override `GEMMA_PRIMARY_MODEL` already exists); detect non-Gemma families (`qwen`) as candidates; log what was picked and why. |
+| 0.4 | Model detection refresh | `app/core/config.py:43-77` | Broaden heavy-class match (`12b`, `14b`); precedence: env override (`GEMMA_PRIMARY_MODEL`/`GEMMA_FAST_MODEL`) > loaded Gemma > loaded non-Gemma (`qwen`) as last-resort candidate; log what was picked and why. |
 | 0.5 | Tests green | `tests/` | Graph-build fixtures call `register_default_modules()`; re-point stale mocks (`GEMINI_API_KEY` moved to `app.core.config`); fix draft route 404s (trailing slash); fix draft-store lifecycle failures; mock the live-Gemini coach test. Target: 263/263, fully offline. |
 | 0.6 | Deps | `.venv`, `requirements.txt` | Install `chromadb`; verify `langgraph`/`uvicorn` pins match what's now installed (langgraph 1.2.10 vs `>=0.4.0` pin — pin a floor that matches tested behavior). |
 
@@ -169,11 +169,11 @@ sequenceDiagram
 | # | Item | Files | Detail |
 |---|------|-------|--------|
 | 1.1 | Port draft creation | `app/modules/planning_graph.py` | New `create_draft` step calling the existing DraftStore exactly as `control_policy.py` does; set `draft_id` in state so `chat.py:1413` stops lying. |
-| 1.2 | Port task persistence | `planning_graph.py` | Port `_persist_fused_tasks` call after solve; gate behind draft-accept where the v1 flow does. |
+| 1.2 | Port task persistence | `planning_graph.py` | v1 parity, made explicit: solve creates the **draft only**; `_persist_fused_tasks` runs **only on draft accept** (ACCEPT_DRAFT intent / confirm endpoint), never at solve time. |
 | 1.3 | Port TMT + cap + sleep blocks | `planning_graph.py:205` area | Replace positional priority with the v1 TMT deadline weighting; add `compute_adaptive_daily_cap` and biological sleep-block injection; adopt v1's longer horizon-retry ladder. |
 | 1.4 | Serializable state + checkpointer | `orchestrator/state.py`, `graph.py`, `main.py:65-67`, `chat.py` | `JarvisState` carries `user_id` (not the UserModel object); `load_context` hydrates the facade per-invocation; compile with `SqliteSaver` keyed by session thread_id; persist `negotiation_state`/`conversation_phase` across turns. This alone revives the negotiation shortcut and phase routing. |
 | 1.5 | Intent coverage | `orchestrator/graph.py:135-165` | Classifier emits `EDIT_TASK`, `REARRANGE`, `ACCEPT_DRAFT`, `REJECT_DRAFT`, `ADD_CONSTRAINT` (routing table already has them); wire to draft flow. |
-| 1.6 | Deprecate v1 | `chat.py` | v1 endpoints delegate to v2 (or return deprecation warning + delegate); mark `control_policy.py` deprecated at top; deletion is a later milestone once parity is demo-verified. |
+| 1.6 | Deprecate v1 | `chat.py`, `jarvis-frontend/lib/api.ts` | v1 endpoints delegate to v2 (or return deprecation warning + delegate); mark `control_policy.py` deprecated at top; remove the `NEXT_PUBLIC_USE_V2` frontend flag (v2 becomes the only path); deletion is a later milestone once parity is demo-verified. |
 | 1.7 | Real token streaming | `chat.py:1293,1308` | Stream synthesis tokens incrementally instead of one whole-message "token" (`total_tokens: 1` today). |
 | 1.8 | Doc truth pass | `docs/` | Rewrite `PROJECT_STATUS.md` against v2 reality; mark 04-05 spec **SUPERSEDED** in its header + INDEX; delete pasted-prompt junk from `POLICY_ENGINE_ARCHITECTURE.md:1156-1160`; add the four Apr/May specs to `INDEX.md`. |
 

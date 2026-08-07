@@ -72,7 +72,7 @@ No model involvement. Works with the DB-degraded flag from the One Brain spec (c
 
 ### 5.1 Catalog
 
-~20 components, defined **once** in Zod (`jarvis-frontend/lib/ui-catalog.ts`), mirrored as Pydantic models (`app/schemas/ui_catalog.py`), with a CI check that the JSON Schemas match. Initial set:
+~20 components, defined **once** in Zod (`jarvis-frontend/lib/ui-catalog.ts`), mirrored as Pydantic models (`app/schemas/ui_catalog.py`), with a contract test in the test suite asserting the two JSON Schemas match. Initial set:
 
 `Checklist`, `Timer`, `ProgressBar`, `StatRow`, `Flashcard`, `QuizQuestion`, `StudyPlanStep`, `Callout` (intuition/key-terms/exam-tip variants — the SVM-screenshot pattern), `MathBlock` (KaTeX), `CodeBlock`, `Table`, `Chart` (line/bar/donut via existing chart lib), `MermaidDiagram`, `CardGrid`, `TaskChip`, `WOOPForm`, `PomodoroCard`, `ScheduleMini`, `Divider`, `Text` (rich span runs).
 
@@ -142,7 +142,7 @@ sequenceDiagram
 
 ## 9. Testing
 
-- Catalog contract test: Zod ↔ Pydantic JSON Schema equality in CI.
+- Catalog contract test: Zod ↔ Pydantic JSON Schema equality, run as part of the normal test suite.
 - Golden-spec renders: each of the ~20 components snapshot-rendered from fixture JSON.
 - Constrained-generation integration test (LM Studio live, marked `@local`): 20 prompts × E4B → 100% schema-valid.
 - Streaming test: chunked JSONL patches → progressive DOM assertions (Playwright).
