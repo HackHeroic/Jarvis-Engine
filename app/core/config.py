@@ -25,7 +25,8 @@ LOCAL_LLM_URL: str = os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")
 
 # Gemma 4 model defaults — these are env-overridable.
 # At startup, detect_loaded_models() probes LM Studio and rewrites both PRIMARY+FAST
-# to whichever Gemma is actually loaded. Single-model setups work transparently.
+# to whichever model is actually loaded (Gemma preferred, qwen as last resort).
+# Single-model setups work transparently.
 LOCAL_LLM_MODEL: str = os.getenv("LOCAL_LLM_MODEL", "openai/google/gemma-4-26b-a4b")
 GEMMA_PRIMARY_MODEL: str = os.getenv("GEMMA_PRIMARY_MODEL", "openai/google/gemma-4-26b-a4b")
 GEMMA_FAST_MODEL: str = os.getenv("GEMMA_FAST_MODEL", "openai/google/gemma-4-e4b")
@@ -40,14 +41,44 @@ SLM_ROUTER_MODEL: str = os.getenv("SLM_ROUTER_MODEL", GEMMA_FAST_MODEL)
 SLM_ROUTER_URL: str | None = os.getenv("SLM_ROUTER_URL")  # Optional; if unset, uses LOCAL_LLM_URL
 
 
+# Capability-class markers, not pinned model ids — local model churn is ~quarterly
+# (Gemma 4 12B beats the older 27B-class at ~8 GB), so match by size class instead.
+_HEAVY_MARKERS = ("27b", "26b", "22b", "14b", "12b")
+_FAST_MARKERS = ("e4b", "e2b", "-4b", "1b", "3b")
+
+
+def _select_models(ids: list[str]) -> tuple[str | None, str | None]:
+    """Pick (primary, fast) from loaded model ids.
+
+    Gemma family preferred; non-Gemma (qwen) accepted as last resort.
+    A lone model serves both roles.
+    """
+    def _pick(pool: list[str]) -> tuple[str | None, str | None]:
+        heavy = next((i for i in pool if any(m in i for m in _HEAVY_MARKERS)), None)
+        fast = next((i for i in pool if any(m in i for m in _FAST_MARKERS)), None)
+        if heavy and fast:
+            return heavy, fast
+        if heavy:
+            return heavy, heavy
+        if fast:
+            return fast, fast
+        return (pool[0], pool[0]) if pool else (None, None)
+
+    gemmas = [i for i in ids if "gemma" in i.lower()]
+    if gemmas:
+        return _pick(gemmas)
+    others = [i for i in ids if "qwen" in i.lower()]
+    return _pick(others)
+
+
 def detect_loaded_models() -> dict:
-    """Probe LM Studio /v1/models and pick best Gemma for primary + fast.
+    """Probe LM Studio /v1/models and pick the best loaded model for primary + fast.
 
     Called at app startup. Mutates module globals GEMMA_PRIMARY_MODEL / GEMMA_FAST_MODEL
-    / SLM_ROUTER_MODEL / LOCAL_LLM_MODEL to whatever Gemma model(s) are actually loaded.
+    / SLM_ROUTER_MODEL / LOCAL_LLM_MODEL to whatever model(s) are actually loaded.
 
-    Strategy: prefer 26B for primary, prefer E4B for fast. If only one is loaded,
-    point both at it. If LM Studio unreachable, leave defaults.
+    Selection is delegated to _select_models (pure, testable). If only one model is
+    loaded, both roles point at it. If LM Studio is unreachable, leave defaults.
     """
     global GEMMA_PRIMARY_MODEL, GEMMA_FAST_MODEL, SLM_ROUTER_MODEL, LOCAL_LLM_MODEL
     try:
@@ -58,23 +89,10 @@ def detect_loaded_models() -> dict:
             r.raise_for_status()
             data = r.json().get("data", [])
         ids = [m.get("id", "").lower() for m in data]
-        # Match anything containing 'gemma'
-        gemmas = [i for i in ids if "gemma" in i]
-        if not gemmas:
-            return {"loaded": ids, "warning": "No Gemma model loaded in LM Studio"}
-
-        # Find heaviest (>= 20B in name) and fastest (e4b/e2b/4b)
-        heavy = next((i for i in gemmas if any(s in i for s in ["27b", "26b", "22b"])), None)
-        fast = next((i for i in gemmas if any(s in i for s in ["e4b", "e2b", "-4b", "1b"])), None)
-
-        if heavy and fast:
-            primary, fast_model = heavy, fast
-        elif heavy:
-            primary, fast_model = heavy, heavy
-        elif fast:
-            primary, fast_model = fast, fast
-        else:
-            primary, fast_model = gemmas[0], gemmas[0]
+        primary, fast_model = _select_models(ids)
+        if primary is None:
+            return {"loaded": ids, "warning": "No usable model loaded in LM Studio"}
+        print(f"[Model Detect] primary={primary} fast={fast_model} (from {len(ids)} loaded)")
 
         # LM Studio returns plain ids (e.g. "google/gemma-4-26b-a4b"); LiteLLM needs "openai/" prefix
         def _normalize(model_id: str) -> str:
