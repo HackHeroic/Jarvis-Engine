@@ -3,6 +3,7 @@
 Pure-function tests — no HTTP, no LM Studio, no mocking required.
 """
 
+import app.core.config as config
 from app.core.config import _select_models
 
 
@@ -35,3 +36,18 @@ def test_select__gemma_beats_qwen():
 
 def test_select__nothing_loaded():
     assert _select_models([]) == (None, None)
+
+
+def test_resolve__pinned_primary__survives_detection(monkeypatch):
+    """An explicitly pinned GEMMA_PRIMARY_MODEL is never clobbered by startup detection.
+
+    The unpinned fast slot still follows whatever LM Studio reports.
+    """
+    monkeypatch.setattr(config, "GEMMA_PRIMARY_MODEL", "openai/mistral/pinned-by-user")
+    monkeypatch.setattr(config, "_PRIMARY_PINNED", True)
+    monkeypatch.setattr(config, "_FAST_PINNED", False)
+
+    primary, fast = config._resolve_models("google/gemma-4-12b", "google/gemma-4-e4b")
+
+    assert primary == "openai/mistral/pinned-by-user"
+    assert fast == "openai/google/gemma-4-e4b"
