@@ -153,18 +153,27 @@ async def test_checkpointer__subgraph_live_objects_do_not_break_a_knowledge_turn
         )
         result = await graph.ainvoke(state, config=cfg)
 
+        # Reaching the module at all proves the scrub is write-path only: intent
+        # classification reads file_base64 *after* the first checkpoint write.
         assert "knowledge_module" in result["modules_invoked"]
+        assert (await graph.aget_state(cfg)).values["file_base64"] is None
 
 
 @pytest.mark.asyncio
-async def test_checkpointer__uploaded_file_bytes_are_never_persisted(no_llm, tmp_path):
-    """Documents are re-supplied per turn from the request — keep them out of SQLite."""
+async def test_checkpointer__uploaded_document_is_never_persisted(no_llm, tmp_path):
+    """Documents are re-supplied per turn from the request — keep them out of SQLite.
+
+    Scrubbing only the decoded ``file_bytes`` proves nothing: ``file_base64``
+    carries the identical document, and checkpoint rows are append-only, so the
+    upload turn's row would hold it forever.
+    """
     import base64
 
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
 
     secret = b"CONFIDENTIAL salary review"
+    encoded = base64.b64encode(secret)
     db_path = tmp_path / "ckpt.sqlite"
 
     async with open_checkpointer(str(db_path)) as saver:
@@ -172,14 +181,17 @@ async def test_checkpointer__uploaded_file_bytes_are_never_persisted(no_llm, tmp
         await graph.ainvoke(
             _live_state(
                 "file",
-                file_base64=base64.b64encode(secret).decode(),
+                file_base64=encoded.decode(),
                 file_media_type="text/plain",
-                file_name="pay.txt",
+                file_name="2026-salary-review.pdf",
             ),
             config={"configurable": {"thread_id": "u1:sess-1"}},
         )
 
-    assert secret not in db_path.read_bytes()
+    on_disk = db_path.read_bytes()
+    assert secret not in on_disk, "decoded upload persisted"
+    assert encoded not in on_disk, "base64 upload persisted — b64decode recovers it"
+    assert b"2026-salary-review.pdf" not in on_disk, "file name persisted"
 
 
 @pytest.mark.asyncio

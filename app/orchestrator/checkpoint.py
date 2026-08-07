@@ -10,15 +10,19 @@ nested ``checkpoint_ns`` through this same saver:
 * ``progress_callback`` — a closure over the SSE queue
 * ``progress_queue``  — the ``asyncio.Queue`` itself
 * ``db_client``       — the live ``DatabaseClient`` (KnowledgeState)
-* ``file_bytes``      — the decoded upload; re-read from the request each turn,
-  and it has no business sitting unencrypted in a local SQLite file
+* ``file_base64`` / ``file_bytes`` / ``file_name`` — the uploaded document in
+  both its encoded and decoded forms, plus its name. Not a serialization
+  problem, a privacy one: checkpoint rows are append-only with no pruning, so
+  the upload turn's row would hold the whole document — trivially recoverable
+  with ``b64decode`` — in an unencrypted local SQLite file forever.
 
 Without scrubbing, LangGraph's serializer raises
 ``TypeError: Type is not msgpack serializable: …`` and the whole turn dies.
-They are replaced with ``None`` on the way into SQLite; ``_load_context``
-rebuilds ``user_model`` from the checkpointed ``user_id``, and every other one
-is re-supplied per turn (``knowledge_state_in`` re-reads ``db_client`` from
-``user_model._db`` and re-decodes ``file_bytes`` from ``file_base64``).
+They are replaced with ``None`` on the way into SQLite — which touches the write
+path only, never the live channel values the running turn reads. ``_load_context``
+rebuilds ``user_model`` from the checkpointed ``user_id``; every other one is
+re-supplied per turn, the file fields from the request (chat.py) and
+``db_client`` by ``knowledge_state_in`` from ``user_model._db``.
 
 The key list is a fast path, not the safety net: any *new* live object added to
 any state class would silently reintroduce the crash. So the saver also catches
@@ -40,7 +44,9 @@ _TRANSIENT_KEYS = (
     "progress_callback",
     "progress_queue",
     "db_client",
+    "file_base64",
     "file_bytes",
+    "file_name",
 )
 
 
@@ -124,8 +130,9 @@ class ScrubbingSqliteSaver(AsyncSqliteSaver):
         try:
             return await super().aput_writes(config, scrubbed, task_id, task_path)
         except TypeError:
-            # The INSERTs are OR REPLACE / OR IGNORE on the same keys, so a retry
-            # after a partial executemany is idempotent.
+            # Every value is serialized while building executemany's argument
+            # list, so the failure precedes the INSERTs entirely — nothing was
+            # written and the retry starts from a clean slate.
             sanitized = [
                 (channel, self._make_serializable(channel, value)) for channel, value in scrubbed
             ]
