@@ -125,6 +125,87 @@ async def test_checkpointer__revives_the_negotiation_shortcut(no_llm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_checkpointer__subgraph_live_objects_do_not_break_a_knowledge_turn(
+    no_llm, tmp_path
+):
+    """Sub-graphs inherit the parent checkpointer, so their state hits the serde too.
+
+    ``knowledge_state_in`` puts the live ``DatabaseClient`` and the decoded
+    upload into ``KnowledgeState``. Those channel names never appear in
+    ``JarvisState``, so scrubbing the parent's keys alone leaves a
+    ``TypeError: Type is not msgpack serializable: FakeDBClient`` that kills
+    every KNOWLEDGE_INGESTION / CALENDAR_SYNC / ACTION_ITEM turn.
+    """
+    import base64
+
+    from app.orchestrator.checkpoint import open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        cfg = {"configurable": {"thread_id": "u1:sess-1"}}
+
+        state = _live_state(
+            "here are my notes",
+            file_base64=base64.b64encode(b"lecture notes").decode(),
+            file_media_type="text/plain",
+            file_name="notes.txt",
+        )
+        result = await graph.ainvoke(state, config=cfg)
+
+        assert "knowledge_module" in result["modules_invoked"]
+
+
+@pytest.mark.asyncio
+async def test_checkpointer__uploaded_file_bytes_are_never_persisted(no_llm, tmp_path):
+    """Documents are re-supplied per turn from the request — keep them out of SQLite."""
+    import base64
+
+    from app.orchestrator.checkpoint import open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+
+    secret = b"CONFIDENTIAL salary review"
+    db_path = tmp_path / "ckpt.sqlite"
+
+    async with open_checkpointer(str(db_path)) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        await graph.ainvoke(
+            _live_state(
+                "file",
+                file_base64=base64.b64encode(secret).decode(),
+                file_media_type="text/plain",
+                file_name="pay.txt",
+            ),
+            config={"configurable": {"thread_id": "u1:sess-1"}},
+        )
+
+    assert secret not in db_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_checkpointer__unknown_live_object_is_dropped_not_fatal(no_llm, tmp_path, caplog):
+    """Belt and braces: a key nobody listed must degrade to None, not kill the turn."""
+    from app.orchestrator.checkpoint import open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+
+    class _Unserializable:
+        def __init__(self):
+            self.lock = asyncio.Lock()
+
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        cfg = {"configurable": {"thread_id": "u1:sess-1"}}
+
+        state = _live_state("hi")
+        state["memory_context"] = _Unserializable()  # stands in for a future live object
+        result = await graph.ainvoke(state, config=cfg)
+
+        assert result["response_message"] == CANNED_LLM_REPLY
+        assert (await graph.aget_state(cfg)).values["memory_context"] is None
+        assert "memory_context" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_checkpointer__trivial_flag_does_not_leak_into_the_next_turn(no_llm, tmp_path):
     """Per-turn flags must be re-decided every turn, not inherited.
 
@@ -142,11 +223,13 @@ async def test_checkpointer__trivial_flag_does_not_leak_into_the_next_turn(no_ll
         first = await graph.ainvoke(_live_state("hi"), config=cfg)
         assert first["trivial_input"] is True
 
-        second = await graph.ainvoke(
-            _live_state("tell me about the scheduler internals"), config=cfg
-        )
+        # Turn 2 must NOT re-supply the flag: only then does the checkpointed
+        # True from turn 1 reach the node, which is the leak being pinned.
+        second_turn = _live_state("tell me about the scheduler internals")
+        second_turn.pop("trivial_input")
+        second = await graph.ainvoke(second_turn, config=cfg)
 
-        assert not second["trivial_input"]
+        assert second["trivial_input"] is False
 
 
 @pytest.mark.asyncio
