@@ -36,7 +36,12 @@ class JarvisState(TypedDict):
     Working Memory tier — exists only per-turn, in-memory.
     """
 
+    # Serializable identity — the checkpointer persists this, never the facade
+    user_id: str
+
     # User Model (lazy facade, loaded once per session)
+    # NOT serializable: dropped by the checkpointer, rehydrated from user_id
+    # by _load_context on resumed turns.
     user_model: Any  # UserModel — Any to avoid circular import
 
     # Current turn

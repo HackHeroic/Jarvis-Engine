@@ -77,6 +77,7 @@ from app.orchestrator.routing import (
 
 def _make_state(**overrides) -> JarvisState:
     base: JarvisState = {
+        "user_id": "test_user",
         "user_model": None,
         "user_message": "test",
         "brain_dump": None,
@@ -185,3 +186,61 @@ async def test_graph_runs_chat_end_to_end(no_llm):
     assert result["response_message"] == CANNED_LLM_REPLY
     assert "conversation_module" in result["modules_invoked"]
     assert result["needs_followup"] is False
+
+
+# ---------------------------------------------------------------------------
+# Serializable state — user_id in state, UserModel hydrated in load_context
+# ---------------------------------------------------------------------------
+
+
+def test_jarvis_state__declares_serializable_user_id():
+    """The checkpointer persists user_id; the UserModel facade is rebuilt per turn."""
+    assert JarvisState.__annotations__.get("user_id") is str
+
+
+@pytest.mark.asyncio
+async def test_load_context__hydrates_user_model_from_user_id():
+    from app.orchestrator.graph import _load_context
+
+    state = _make_state(user_id="u42", user_model=None)
+    result = await _load_context(state)
+
+    assert result["user_model"] is not None
+    assert result["user_model"].user_id == "u42"
+
+
+@pytest.mark.asyncio
+async def test_graph__hydrated_user_model_reaches_final_state(no_llm):
+    """The load_context node's hydration must merge into the state the graph carries."""
+    graph = build_jarvis_graph()
+    result = await graph.ainvoke(_make_state(user_id="u42", user_model=None, user_message="hello"))
+
+    assert result["user_id"] == "u42"
+    assert result["user_model"] is not None
+    assert result["user_model"].user_id == "u42"
+
+
+@pytest.mark.asyncio
+async def test_load_context__keeps_existing_user_model():
+    """Live requests pre-wire the facade with shared db/memory clients — never clobber it."""
+    from app.orchestrator.graph import _load_context
+
+    class Prebuilt:
+        user_id = "u42"
+
+    prebuilt = Prebuilt()
+    state = _make_state(user_id="u42", user_model=prebuilt)
+    result = await _load_context(state)
+
+    assert "user_model" not in result
+
+
+@pytest.mark.asyncio
+async def test_load_context__no_user_id__stays_a_noop():
+    """Without an identity there is nothing to hydrate — behave exactly as before."""
+    from app.orchestrator.graph import _load_context
+
+    state = _make_state(user_model=None)
+    state.pop("user_id", None)
+
+    assert await _load_context(state) == {}

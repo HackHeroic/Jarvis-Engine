@@ -1123,6 +1123,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         progress_queue.put_nowait(json_mod.dumps({"phase": phase, **detail}))
 
     initial_state = {
+        # Serializable identity — survives checkpointing; user_model does not.
+        # The facade is still passed here (shared db_client / memory_store wiring);
+        # _load_context rebuilds it from user_id only on checkpoint-resumed turns.
+        "user_id": request.user_id,
         "user_model": user_model,
         "user_message": request.user_prompt,
         "file_base64": request.file_base64,
