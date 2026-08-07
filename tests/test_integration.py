@@ -8,6 +8,8 @@ import pytest
 from app.orchestrator.graph import build_jarvis_graph
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
 
+from tests.fakes import CANNED_LLM_REPLY
+
 
 def _make_initial_state(message="hello"):
     return {
@@ -35,16 +37,18 @@ def _make_initial_state(message="hello"):
 
 
 @pytest.mark.asyncio
-async def test_chat_flow_end_to_end():
+async def test_chat_flow_end_to_end(no_llm):
     graph = build_jarvis_graph()
     state = _make_initial_state("hello")
     result = await graph.ainvoke(state)
-    assert result.get("response_message") is not None
+    # Assert the mocked reply itself: every module falls back to a generic
+    # string when the LLM raises, so `is not None` would pass on a dead call.
+    assert result.get("response_message") == CANNED_LLM_REPLY
     assert "conversation_module" in result.get("modules_invoked", [])
 
 
 @pytest.mark.asyncio
-async def test_graph_streams_events():
+async def test_graph_streams_events(no_llm):
     graph = build_jarvis_graph()
     state = _make_initial_state("hello")
     config = {"configurable": {"thread_id": "test"}}

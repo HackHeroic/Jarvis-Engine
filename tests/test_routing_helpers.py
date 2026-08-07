@@ -4,6 +4,9 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 MODULE = "app.models.brain.litellm_conf"
+# GEMINI_API_KEY lives in app.core.config; litellm_conf reads it at call time
+# as `_cfg.GEMINI_API_KEY`, so the config module is the only valid patch target.
+CONFIG = "app.core.config"
 
 
 @pytest.fixture
@@ -24,7 +27,7 @@ async def test_gemini_primary__cloud_success(mock_hybrid):
 
     mock_hybrid.return_value = "cloud-result"
 
-    with patch(f"{MODULE}.GEMINI_API_KEY", "fake-key"):
+    with patch(f"{CONFIG}.GEMINI_API_KEY", "fake-key"):
         result = await gemini_primary_route(
             user_prompt="plan my day",
             system_prompt="You are Jarvis.",
@@ -44,7 +47,7 @@ async def test_gemini_primary__cloud_fails__falls_back_to_local(mock_hybrid):
 
     mock_hybrid.side_effect = [RuntimeError("cloud down"), "local-result"]
 
-    with patch(f"{MODULE}.GEMINI_API_KEY", "fake-key"):
+    with patch(f"{CONFIG}.GEMINI_API_KEY", "fake-key"):
         result = await gemini_primary_route(
             user_prompt="plan my day",
             system_prompt="You are Jarvis.",
@@ -65,7 +68,7 @@ async def test_gemini_primary__no_api_key__goes_straight_to_local(mock_hybrid):
 
     mock_hybrid.return_value = "local-result"
 
-    with patch(f"{MODULE}.GEMINI_API_KEY", ""):
+    with patch(f"{CONFIG}.GEMINI_API_KEY", ""):
         result = await gemini_primary_route(
             user_prompt="plan my day",
             system_prompt="You are Jarvis.",
@@ -105,7 +108,7 @@ async def test_local_primary__local_fails__falls_back_to_gemini(mock_hybrid):
 
     mock_hybrid.side_effect = [RuntimeError("local down"), "cloud-result"]
 
-    with patch(f"{MODULE}.GEMINI_API_KEY", "fake-key"):
+    with patch(f"{CONFIG}.GEMINI_API_KEY", "fake-key"):
         result = await local_primary_route(
             user_prompt="classify intent",
             system_prompt="You are Jarvis.",
@@ -124,7 +127,7 @@ async def test_local_primary__local_fails__no_api_key__raises(mock_hybrid):
 
     mock_hybrid.side_effect = RuntimeError("local down")
 
-    with patch(f"{MODULE}.GEMINI_API_KEY", ""):
+    with patch(f"{CONFIG}.GEMINI_API_KEY", ""):
         with pytest.raises(RuntimeError, match="local down"):
             await local_primary_route(
                 user_prompt="classify intent",
