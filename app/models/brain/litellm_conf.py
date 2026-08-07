@@ -110,14 +110,14 @@ async def hybrid_route_query(
             use_cloud = False
             print(f"[LiteLLM Router] Using model_override: {model_override}")
     else:
-        # Gemini-primary routing: use cloud for schema-critical tasks
+        # Gemini-primary routing: no local models loaded → ALL calls go to cloud
+        # (structured AND unstructured — a dead LM Studio must never be targeted)
         if (
             model_override is None
             and _cfg.GEMINI_PRIMARY
             and not prefer_local
             and not force_cloud
             and _cfg.GEMINI_API_KEY
-            and response_schema is not None
         ):
             force_cloud = True
 

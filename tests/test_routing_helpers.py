@@ -147,3 +147,39 @@ async def test_local_primary__custom_model_override(mock_hybrid):
 
     _, kwargs = mock_hybrid.call_args
     assert kwargs["model_override"] == "ollama/custom-model"
+
+
+# ── hybrid_route_query: GEMINI_PRIMARY redirect ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_hybrid_route__gemini_primary_unstructured__routes_to_cloud(monkeypatch):
+    """GEMINI_PRIMARY must redirect even when no response_schema is given."""
+    import app.core.config as cfg
+    from app.models.brain import litellm_conf
+
+    monkeypatch.setattr(cfg, "GEMINI_PRIMARY", True)
+    monkeypatch.setattr(cfg, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cfg, "GEMINI_MODEL", "gemini/gemini-2.5-flash")
+
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Msg:  # minimal LiteLLM response shape
+            content = "ok"
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm_conf.litellm, "acompletion", fake_acompletion)
+    await litellm_conf.hybrid_route_query(
+        system_prompt="s", user_prompt="hello", response_schema=None
+    )
+    assert captured["model"] == "gemini/gemini-2.5-flash"
