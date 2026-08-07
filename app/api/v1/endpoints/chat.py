@@ -1065,6 +1065,7 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
 async def chat_stream_v2(request: ChatRequest, http_request: Request):
     """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
     from app.core.user_model import UserModel
+    from app.orchestrator.checkpoint import make_thread_id
     from app.orchestrator.state import ConversationPhase, NegotiationPhase
     from app.services.chat_history import (
         get_or_create_session,
@@ -1143,8 +1144,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "clarification_request": None,
         "thinking_process": None,
         "response_message": None,
-        "conversation_phase": ConversationPhase.GREETING,
-        "negotiation_state": NegotiationPhase.NONE,
+        # conversation_phase / negotiation_state are deliberately absent: on a
+        # thread that already has a checkpoint they must come from it, or every
+        # turn resets the negotiation to NONE and the negotiation shortcut in
+        # routing.py can never fire. Seeded below only for a brand-new thread.
         "modules_invoked": [],
         "needs_followup": False,
         "needs_consent": None,
@@ -1153,10 +1156,29 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "memory_context": memory_context,
         "progress_callback": progress_cb,
         "progress_queue": progress_queue,
+        # Per-turn flag, cleared explicitly: it is checkpointed now, and the
+        # negotiation shortcut bypasses extract_brain_dump (which otherwise
+        # re-decides it), so a stale True would mute the observation loop.
+        "trivial_input": None,
         # When user picks Gemini in the model selector, force every LLM call
         # in this turn to route to cloud — not local Gemma.
         "force_cloud_request": force_cloud_request,
     }
+
+    # One checkpoint thread per (user, session). The user prefix matters:
+    # _load_context rebuilds the UserModel facade from the checkpointed user_id,
+    # so a session-only key would let a resumed turn rebuild another user's facade.
+    graph_config = {"configurable": {"thread_id": make_thread_id(request.user_id, session_id)}}
+
+    try:
+        _existing = await jarvis_graph.aget_state(graph_config)
+        _resumed = bool(_existing and getattr(_existing, "values", None))
+    except Exception as _e:
+        print(f"[chat/v2] Checkpoint lookup failed ({_e}) — starting a fresh thread")
+        _resumed = False
+    if not _resumed:
+        initial_state["conversation_phase"] = ConversationPhase.GREETING
+        initial_state["negotiation_state"] = NegotiationPhase.NONE
 
     async def event_gen():
         import app.core.config as _cfg
@@ -1171,7 +1193,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
         try:
             final_state = {}
-            async for event in jarvis_graph.astream(initial_state):
+            async for event in jarvis_graph.astream(initial_state, config=graph_config):
                 # Drain progress queue — sub-graph phase events
                 while not progress_queue.empty():
                     try:
