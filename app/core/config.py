@@ -146,6 +146,10 @@ LITELLM_VERBOSE: bool = os.getenv("LITELLM_VERBOSE", "false").lower() in ("1", "
 
 DRAFT_TTL_SECONDS = 1800  # 30 minutes
 
+# LangGraph checkpointer — one SQLite file, one thread per (user, session).
+# Local-first: this is conversation working memory, never leaves the machine.
+CHECKPOINT_DB_PATH: str = os.getenv("JARVIS_CHECKPOINT_DB", "data/checkpoints.sqlite")
+
 # Horizon for scheduling (minutes)
 DEFAULT_HORIZON_MINUTES: int = 2880  # 48 hours
 MAX_HORIZON_MINUTES: int = 43200  # 30 days (per PDF: month-long planning)

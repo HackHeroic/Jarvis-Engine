@@ -97,6 +97,12 @@ async def _load_context(state: JarvisState) -> dict:
     only the serializable ``user_id`` — the facade was never persisted — so
     rebuild it here. Without a user_id there is no identity to rebuild from,
     so leave state untouched.
+
+    The rebuilt facade must be *functional*, not a hollow ``db=None`` shell:
+    it is truthy either way, so every downstream ``if user_model:`` guard
+    would wave the hollow one through and then fail on
+    ``AttributeError: 'NoneType' object has no attribute 'supabase'``. The
+    shared clients come from the registry the lifespan populates.
     """
     if state.get("user_model") is not None:
         return {}
@@ -105,9 +111,14 @@ async def _load_context(state: JarvisState) -> dict:
     if not user_id:
         return {}
 
+    from app.core.runtime import get_db, get_memory_store
     from app.core.user_model import UserModel
 
-    return {"user_model": UserModel(user_id=user_id, db=None)}
+    user_model = UserModel(user_id=user_id, db=get_db())
+    memory_store = get_memory_store()
+    if memory_store is not None:
+        user_model.set_memory_store(memory_store)
+    return {"user_model": user_model}
 
 
 async def _extract_brain_dump(state: JarvisState) -> dict:
@@ -126,8 +137,11 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     if _is_trivial_input(user_msg):
         return {"brain_dump": None, "trivial_input": True}
 
+    # Decided fresh every turn: the checkpointer persists this flag, and a
+    # stale True from an earlier greeting would suppress memory extraction
+    # (observation.py) on a real turn.
     if not user_msg.strip():
-        return {"brain_dump": None}
+        return {"brain_dump": None, "trivial_input": False}
 
     try:
         result = await route_llm_call(
@@ -138,14 +152,17 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
             conversation_history=state.get("conversation_history"),
         )
         if isinstance(result, BrainDumpExtraction):
-            return {"brain_dump": result}
+            return {"brain_dump": result, "trivial_input": False}
         if isinstance(result, dict):
-            return {"brain_dump": BrainDumpExtraction.model_validate(result)}
-        return {"brain_dump": None}
+            return {
+                "brain_dump": BrainDumpExtraction.model_validate(result),
+                "trivial_input": False,
+            }
+        return {"brain_dump": None, "trivial_input": False}
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Brain dump extraction failed: {e}")
-        return {"brain_dump": None}
+        return {"brain_dump": None, "trivial_input": False}
 
 
 async def _classify_intent(state: JarvisState) -> dict:

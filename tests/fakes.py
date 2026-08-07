@@ -114,3 +114,56 @@ class FakeSupabase:
 
     def table(self, name: str) -> _Query:
         return _Query(self.rows.setdefault(name, []), name)
+
+
+class FakeDBClient:
+    """Stand-in for ``DatabaseClient`` — only the ``.supabase`` attribute is read."""
+
+    def __init__(self, supabase: FakeSupabase | None = None):
+        self.supabase = supabase if supabase is not None else FakeSupabase()
+
+    async def check_connection(self) -> bool:
+        return True
+
+
+def make_jarvis_state(**overrides: Any) -> dict:
+    """A complete ``JarvisState`` with sane defaults; override any key.
+
+    Every JarvisState key is present so tests exercise the same shape the
+    endpoint builds (LangGraph only checkpoints channels it has seen).
+    """
+    from app.orchestrator.state import ConversationPhase, NegotiationPhase
+
+    base: dict = {
+        "user_id": "test_user",
+        "user_model": None,
+        "user_message": "test",
+        "file_base64": None,
+        "file_media_type": None,
+        "file_name": None,
+        "brain_dump": None,
+        "intent": "PLAN_DAY",
+        "initiated_by": "user",
+        "execution_graph": None,
+        "schedule": None,
+        "draft_response": None,
+        "research_results": None,
+        "ingestion_result": None,
+        "clarification_request": None,
+        "thinking_process": None,
+        "response_message": None,
+        "conversation_phase": ConversationPhase.CHAT,
+        "negotiation_state": NegotiationPhase.NONE,
+        "modules_invoked": [],
+        "needs_followup": False,
+        "needs_consent": None,
+        "error": None,
+        "conversation_history": [],
+        "memory_context": "",
+        "progress_callback": None,
+        "progress_queue": None,
+        "trivial_input": None,
+        "force_cloud_request": None,
+    }
+    base.update(overrides)
+    return base

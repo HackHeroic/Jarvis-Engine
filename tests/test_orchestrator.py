@@ -5,7 +5,7 @@ from app.orchestrator.state import (
 )
 from app.schemas.context import IntentType
 
-from tests.fakes import CANNED_LLM_REPLY
+from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, make_jarvis_state
 
 
 def test_conversation_phase_values():
@@ -76,31 +76,8 @@ from app.orchestrator.routing import (
 
 
 def _make_state(**overrides) -> JarvisState:
-    base: JarvisState = {
-        "user_id": "test_user",
-        "user_model": None,
-        "user_message": "test",
-        "brain_dump": None,
-        "intent": "PLAN_DAY",
-        "initiated_by": "user",
-        "execution_graph": None,
-        "schedule": None,
-        "draft_response": None,
-        "research_results": None,
-        "ingestion_result": None,
-        "clarification_request": None,
-        "thinking_process": None,
-        "response_message": None,
-        "conversation_phase": ConversationPhase.CHAT,
-        "negotiation_state": NegotiationPhase.NONE,
-        "modules_invoked": [],
-        "needs_followup": False,
-        "needs_consent": None,
-        "error": None,
-        "progress_callback": None,
-    }
-    base.update(overrides)
-    return base
+    """Full-shape JarvisState — shared with tests/test_checkpointer.py."""
+    return make_jarvis_state(**overrides)
 
 
 def test_route_plan_day():
@@ -244,3 +221,61 @@ async def test_load_context__no_user_id__stays_a_noop():
     state.pop("user_id", None)
 
     assert await _load_context(state) == {}
+
+
+# ---------------------------------------------------------------------------
+# Hydration must produce a FUNCTIONAL facade (Task 7)
+#
+# A db=None facade is truthy, so it silently inverts every downstream
+# `if user_model:` guard: a checkpoint-resumed PLAN_DAY turn would reach
+# planning_graph's `get_behavioral_constraints()` and die on
+# `AttributeError: 'NoneType' object has no attribute 'supabase'`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_load_context__hydrated_facade_can_query_the_registered_db():
+    from app.core.runtime import set_shared_clients
+    from app.orchestrator.graph import _load_context
+
+    db = FakeDBClient()
+    set_shared_clients(db=db)
+
+    result = await _load_context(_make_state(user_id="u42", user_model=None))
+    user_model = result["user_model"]
+
+    # The real assertion: this call is what a resumed PLAN_DAY turn makes.
+    # With db=None it raises AttributeError instead of returning rows.
+    assert await user_model.get_behavioral_constraints() == []
+
+
+@pytest.mark.asyncio
+async def test_load_context__hydrated_facade_gets_the_registered_memory_store():
+    from app.core.runtime import set_shared_clients
+    from app.orchestrator.graph import _load_context
+
+    store = object()
+    set_shared_clients(db=FakeDBClient(), memory_store=store)
+
+    result = await _load_context(_make_state(user_id="u42", user_model=None))
+
+    assert await result["user_model"].get_memory_store() is store
+
+
+@pytest.mark.asyncio
+async def test_load_context__before_startup__degrades_to_a_db_less_facade():
+    """No lifespan yet (tests, scripts) — hydrate anyway rather than crash."""
+    from app.orchestrator.graph import _load_context
+
+    result = await _load_context(_make_state(user_id="u42", user_model=None))
+    user_model = result["user_model"]
+
+    assert user_model.user_id == "u42"
+    assert user_model._db is None
+
+
+def test_runtime__accessors_are_none_before_registration():
+    from app.core import runtime
+
+    assert runtime.get_db() is None
+    assert runtime.get_memory_store() is None
