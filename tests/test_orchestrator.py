@@ -5,6 +5,8 @@ from app.orchestrator.state import (
 )
 from app.schemas.context import IntentType
 
+from tests.fakes import CANNED_LLM_REPLY
+
 
 def test_conversation_phase_values():
     assert ConversationPhase.GREETING == "greeting"
@@ -174,10 +176,12 @@ async def test_graph_has_expected_nodes():
 
 
 @pytest.mark.asyncio
-async def test_graph_runs_chat_end_to_end():
+async def test_graph_runs_chat_end_to_end(no_llm):
     graph = build_jarvis_graph()
     initial_state = _make_state(user_message="hello")
     result = await graph.ainvoke(initial_state)
-    assert result["response_message"] is not None
+    # The mocked reply must survive the whole graph; `is not None` would also
+    # be satisfied by the conversation module's LLM-failure fallback string.
+    assert result["response_message"] == CANNED_LLM_REPLY
     assert "conversation_module" in result["modules_invoked"]
     assert result["needs_followup"] is False
