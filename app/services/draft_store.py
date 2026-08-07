@@ -41,11 +41,16 @@ def _get_supabase():
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
+_UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly None"
+
+
 class DraftStore:
     """Persists draft schedules in Supabase draft_schedules table."""
 
-    def __init__(self, supabase_client=None, ttl_seconds=None):
-        self._supabase = supabase_client or _get_supabase()
+    def __init__(self, supabase_client=_UNSET, ttl_seconds=None):
+        # Explicitly-passed None (degraded mode / tests) must NOT silently
+        # build a live client from env — that defeats startup degradation.
+        self._supabase = _get_supabase() if supabase_client is _UNSET else supabase_client
 
     def create_draft(self, user_id: str, tasks: list, horizon_start: str, goal_id: str | None = None) -> dict | None:
         if not self._supabase:
