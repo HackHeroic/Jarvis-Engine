@@ -32,9 +32,10 @@ GEMMA_PRIMARY_MODEL: str = os.getenv("GEMMA_PRIMARY_MODEL", "openai/google/gemma
 GEMMA_FAST_MODEL: str = os.getenv("GEMMA_FAST_MODEL", "openai/google/gemma-4-e4b")
 # An explicitly pinned model name outranks startup detection (design D7): the user
 # chose it deliberately, so detect_loaded_models() must leave that slot alone.
-# Presence in the environment is the pin — captured here, the single env-var reader.
-_PRIMARY_PINNED: bool = os.getenv("GEMMA_PRIMARY_MODEL") is not None
-_FAST_PINNED: bool = os.getenv("GEMMA_FAST_MODEL") is not None
+# A non-empty value is the pin — captured here, the single env-var reader. An empty
+# env var (GEMMA_PRIMARY_MODEL=) reads as unset, so detection still fills the slot.
+_PRIMARY_PINNED: bool = bool(os.getenv("GEMMA_PRIMARY_MODEL"))
+_FAST_PINNED: bool = bool(os.getenv("GEMMA_FAST_MODEL"))
 GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 _raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
@@ -85,11 +86,13 @@ def _resolve_models(primary: str, fast: str) -> tuple[str, str]:
     """Apply env pins over the detected (primary, fast) ids.
 
     Precedence: env pin > detection. Each slot is pinned independently, so pinning
-    only the primary still lets detection choose the fast model.
+    only the primary still lets detection choose the fast model. Pinned values are
+    normalized too — users pin the id LM Studio displays ("google/gemma-4-12b"),
+    which LiteLLM cannot route without the "openai/" prefix.
     """
     return (
-        GEMMA_PRIMARY_MODEL if _PRIMARY_PINNED else _normalize_model_id(primary),
-        GEMMA_FAST_MODEL if _FAST_PINNED else _normalize_model_id(fast),
+        _normalize_model_id(GEMMA_PRIMARY_MODEL if _PRIMARY_PINNED else primary),
+        _normalize_model_id(GEMMA_FAST_MODEL if _FAST_PINNED else fast),
     )
 
 
@@ -115,13 +118,16 @@ def detect_loaded_models() -> dict:
         primary, fast_model = _select_models(ids)
         if primary is None:
             return {"loaded": ids, "warning": "No usable model loaded in LM Studio"}
-        print(f"[Model Detect] primary={primary} fast={fast_model} (from {len(ids)} loaded)")
-        if _PRIMARY_PINNED or _FAST_PINNED:
-            print(f"[Model Detect] env pins kept: primary={_PRIMARY_PINNED} fast={_FAST_PINNED}")
-
         GEMMA_PRIMARY_MODEL, GEMMA_FAST_MODEL = _resolve_models(primary, fast_model)
         SLM_ROUTER_MODEL = GEMMA_FAST_MODEL
         LOCAL_LLM_MODEL = GEMMA_PRIMARY_MODEL
+
+        print(f"[Model Detect] primary={primary} fast={fast_model} (from {len(ids)} loaded)")
+        if _PRIMARY_PINNED or _FAST_PINNED:
+            print(
+                f"[Model Detect] env pins override detection → "
+                f"primary={GEMMA_PRIMARY_MODEL} fast={GEMMA_FAST_MODEL}"
+            )
 
         return {
             "loaded": ids,
