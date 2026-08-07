@@ -9,6 +9,7 @@ memories into the LLM system prompt.
 import math
 from datetime import datetime, timezone
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.utils.embedding import cosine_similarity
 
 # Type-based importance weights (higher = more important to surface)
@@ -128,7 +129,12 @@ def build_memory_context(user_id: str, memory_store) -> str:
     Returns a formatted string to inject into the LLM system prompt.
     Uses importance + confidence + recency scoring (no embeddings — fast path).
     """
-    all_memories = memory_store.get_active_memories(user_id)
+    try:
+        all_memories = memory_store.get_active_memories(user_id)
+    except Exception as e:  # ConnectError, DNS failure, timeouts — degrade, never 500
+        logger.warning(f"build_memory_context degraded (store unavailable): {e}")
+        return ""
+
     if not all_memories:
         return ""
 
