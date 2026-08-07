@@ -26,12 +26,16 @@ def _get_supabase():
 
 MAX_STABILITY = 20.0
 
+_UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly None"
+
 
 class MemoryStore:
     """CRUD for user_memories in Supabase."""
 
-    def __init__(self, supabase_client=None):
-        self._supabase = supabase_client or _get_supabase()
+    def __init__(self, supabase_client=_UNSET):
+        # Explicitly-passed None (degraded mode / tests) must NOT silently
+        # build a live client from env — that defeats startup degradation.
+        self._supabase = _get_supabase() if supabase_client is _UNSET else supabase_client
 
     def store_memory(self, user_id: str, memory: dict) -> dict | None:
         if not self._supabase:
