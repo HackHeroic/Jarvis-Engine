@@ -44,6 +44,9 @@ Thumbs.db
 *.log
 logs/
 
+# Local runtime data (LangGraph SQLite checkpoints)
+data/
+
 # Testing
 .pytest_cache/
 .coverage
