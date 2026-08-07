@@ -184,42 +184,106 @@ async def fuse_tasks(state: PlanningState) -> dict:
     return {"task_chunks": merged, "pending_tasks": pending}
 
 
+def _to_task_chunk(raw: dict, index: int) -> "TaskChunk":
+    """Coerce a PlanningState task_chunks entry into a valid TaskChunk.
+
+    decompose_goal emits fully-formed chunks, but fuse_tasks merges pending
+    Supabase rows that carry no `completion_criteria` (required) and may carry a
+    `duration_minutes` above TaskChunk's 25-minute Pomodoro ceiling. Strict
+    validation would reject those, so fill and clamp before validating.
+    """
+    from app.api.v1.endpoints.reasoning import TaskChunk
+
+    data = dict(raw)
+    data.setdefault("task_id", f"t{index}")
+    data.setdefault("title", data["task_id"])
+    data.setdefault("completion_criteria", f"Finish: {data['title']}")
+
+    raw_duration = data.get("duration_minutes")
+    try:
+        duration = int(raw_duration) if raw_duration else 25
+    except (TypeError, ValueError):
+        duration = 25
+    data["duration_minutes"] = max(1, min(25, duration))
+
+    raw_difficulty = data.get("difficulty_weight")
+    try:
+        difficulty = 0.5 if raw_difficulty is None else float(raw_difficulty)
+    except (TypeError, ValueError):
+        difficulty = 0.5
+    data["difficulty_weight"] = max(0.0, min(1.0, difficulty))
+
+    data["dependencies"] = list(data.get("dependencies") or [])
+    return TaskChunk.model_validate(data)
+
+
 async def solve_schedule(state: PlanningState) -> dict:
-    from app.core.or_tools.solver import JarvisScheduler
+    """Delegate to the reusable run_schedule.
+
+    TMT deadline priority, the adaptive daily cap, hard/soft calendar blocks and
+    the biological sleep fallback all live inside `run_schedule` — per
+    .claude/rules/code-style.md it is imported and called, never reimplemented.
+    """
+    from pydantic import ValidationError
+    from fastapi import HTTPException
+    from app.api.v1.endpoints import schedule as schedule_ep
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
+    from app.schemas.context import TimeSlot
+
     chunks = state.get("task_chunks", [])
     horizon = state.get("horizon_minutes", 2880)
     if not chunks:
         return {"error": "No tasks to schedule", "schedule": None}
-    scheduler = JarvisScheduler(horizon_minutes=horizon)
-    for slot in state.get("time_slots", []):
-        if slot.get("availability") == "blocked":
-            scheduler.add_hard_block(slot["start_min"], slot["end_min"], slot.get("name", "block"))
-        elif slot.get("availability") == "minimal_work":
-            scheduler.add_soft_block(slot["start_min"], slot["end_min"], slot.get("name", "soft"),
-                                     max_task_duration=slot.get("max_task_duration", 15),
-                                     max_difficulty=slot.get("max_difficulty", 0.4))
-    for i, chunk in enumerate(chunks):
-        scheduler.add_task(
-            task_id=chunk.get("task_id", f"t{i}"),
-            duration=chunk.get("duration_minutes", 25),
-            priority_score=len(chunks) - i,
-            dependencies=chunk.get("dependencies", []),
-            difficulty_weight=chunk.get("difficulty_weight", 0.5),
+
+    try:
+        decomposition = [_to_task_chunk(c, i) for i, c in enumerate(chunks)]
+        graph = ExecutionGraph(
+            goal_metadata=GoalMetadata(),
+            decomposition=decomposition,
+            cognitive_load_estimate={"intrinsic_load": 0.5},
         )
-    scheduler.build_dependencies()
-    result, status = scheduler.solve()
-    if status == "INFEASIBLE":
-        return {
-            "schedule": None,
-            "error": "INFEASIBLE",
-            "_tool_detail": {"status": "INFEASIBLE"},
-        }
+    except (ValidationError, TypeError, ValueError, KeyError) as exc:
+        logger.error(f"Could not build ExecutionGraph for scheduling: {exc}")
+        return {"error": f"Invalid tasks for scheduling: {exc}", "schedule": None}
+
+    # Fresh list: run_schedule appends the biological sleep fallback in place,
+    # and PlanningState.time_slots is a reducer-managed list we must not mutate.
+    daily_context: list[TimeSlot] = []
+    for slot in state.get("time_slots", []):
+        try:
+            daily_context.append(
+                slot if isinstance(slot, TimeSlot) else TimeSlot.model_validate(slot)
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            logger.warning(f"Skipping unparseable time slot {slot}: {exc}")
+
+    try:
+        # horizon_start is left to run_schedule (Optional[datetime], never a
+        # str) so its 8 AM-of-plan-date convention stays the single source of
+        # truth; the resolved value comes back on the response.
+        resp = schedule_ep.run_schedule(
+            graph,
+            daily_context,
+            horizon_minutes=horizon,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 422:
+            return {
+                "schedule": None,
+                "error": "INFEASIBLE",
+                "_tool_detail": {"status": "INFEASIBLE", "horizon_h": horizon // 60},
+            }
+        raise
+
+    payload = resp.model_dump(mode="json")
     return {
-        "schedule": result,
+        "schedule": payload,
+        # UI contract: wall time = horizon_start + timedelta(minutes=start_min).
+        "horizon_start": payload.get("horizon_start") if isinstance(payload, dict) else None,
         "error": None,
         "_tool_detail": {
             "status": "OPTIMAL",
-            "task_count": len(chunks),
+            "task_count": len(decomposition),
             "horizon_h": horizon // 60,
             "tmt_applied": True,
             "formula": "canonical_steel_konig",
@@ -227,15 +291,22 @@ async def solve_schedule(state: PlanningState) -> dict:
     }
 
 
+# v1 parity ladder: 3d -> 5d -> 7d -> 14d -> 30d (MAX_HORIZON_MINUTES).
+HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]
+
+
 async def handle_infeasible(state: PlanningState) -> dict:
     retry_count = state.get("retry_count", 0)
-    HORIZON_RETRY_SEQUENCE = [4320, 7200]
     if retry_count < len(HORIZON_RETRY_SEQUENCE):
-        return {"horizon_minutes": HORIZON_RETRY_SEQUENCE[retry_count], "retry_count": retry_count + 1, "error": None}
+        return {
+            "horizon_minutes": HORIZON_RETRY_SEQUENCE[retry_count],
+            "retry_count": retry_count + 1,
+            "error": None,
+        }
     return {
         "error": "INFEASIBLE_EXHAUSTED",
         "clarification_request": (
-            "I couldn't fit everything in even with a 5-day window. "
+            "I couldn't fit everything in even with a 30-day window. "
             "This is a scope problem, not a you problem. "
             "Want to reduce scope or extend the deadline?"
         ),
