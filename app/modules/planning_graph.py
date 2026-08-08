@@ -1,5 +1,6 @@
 """Planning sub-graph — wraps existing pipeline functions as LangGraph nodes."""
 
+import asyncio
 import operator
 from typing import Annotated, Any, Optional, TypedDict
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -335,7 +336,13 @@ async def create_draft(state: PlanningState) -> dict:
         return {"draft_id": None}
 
     try:
-        row = draft_store.create_draft(
+        # DraftStore.create_draft is a sync Supabase HTTP round-trip. Called
+        # bare it would stall the event loop for the whole insert — and
+        # _wrap_step's asyncio.wait_for cannot interrupt a blocking call, so the
+        # step's timeout would be advisory only. Same to_thread pattern as
+        # UserModel.get_behavioral_constraints (user_model.py:48).
+        row = await asyncio.to_thread(
+            draft_store.create_draft,
             user_id=state.get("user_id", "demo"),
             tasks=state.get("task_chunks", []),
             horizon_start=horizon_start,

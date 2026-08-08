@@ -61,18 +61,48 @@ async def test_checkpointer__transient_objects_do_not_break_serialization(no_llm
         assert stored["user_id"] == "u1"
 
 
+def test_scrub_transients__nulls_the_draft_store():
+    """The allowlist itself must cover draft_store, not just the serde fallback.
+
+    Asserting only on what lands in SQLite proves nothing about
+    ``_TRANSIENT_KEYS``: ``_make_serializable`` nulls anything the serde
+    rejects, so the turn-level test passes either way. This pins the fast path
+    directly — remove ``draft_store`` from the tuple and only this fails.
+    """
+    from app.orchestrator.checkpoint import scrub_transients
+    from app.services.draft_store import DraftStore
+
+    store = DraftStore(supabase_client=object())
+
+    assert scrub_transients({"draft_store": store})["draft_store"] is None
+    # Nested one level down, the way LangGraph stores a turn's `__start__` input.
+    nested = scrub_transients({"__start__": {"draft_store": store, "user_id": "u1"}})
+    assert nested["__start__"]["draft_store"] is None
+    assert nested["__start__"]["user_id"] == "u1"
+
+
 @pytest.mark.asyncio
-async def test_checkpointer__draft_store_is_scrubbed_but_draft_id_survives(no_llm, tmp_path):
+async def test_checkpointer__draft_store_is_scrubbed_but_draft_id_survives(
+    no_llm, tmp_path, caplog
+):
     """The live DraftStore holds a Supabase client; only the id may persist.
 
     ``draft_store`` is re-supplied per turn from ``app.state`` (chat.py), so
     checkpointing it buys nothing and costs a
     ``TypeError: Type is not msgpack serializable``. ``draft_id`` is a plain
     string and *must* survive — the accept turn resolves the draft by it.
+
+    The caplog assertion is the load-bearing one: it proves the *allowlist*
+    handled the store. Without it the test passes on the serde fallback alone,
+    which logs a warning and would fire for any unlisted live object.
     """
+    import logging
+
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
     from app.services.draft_store import DraftStore
+
+    caplog.set_level(logging.WARNING, logger="app.orchestrator.checkpoint")
 
     class _LiveClient:  # stands in for the Supabase client: not serializable
         def __init__(self):
@@ -91,6 +121,9 @@ async def test_checkpointer__draft_store_is_scrubbed_but_draft_id_survives(no_ll
         stored = (await graph.aget_state(cfg)).values
         assert stored["draft_store"] is None
         assert stored["draft_id"] == "d-42"
+        # The allowlist handled it, so the serde never saw the store and the
+        # "dropping non-serializable state key" fallback never fired.
+        assert "draft_store" not in caplog.text
 
 
 @pytest.mark.asyncio
