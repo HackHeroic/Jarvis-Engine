@@ -1133,3 +1133,177 @@ def test_render_progress_event__malformed__still_emits_a_phase_frame():
     frame, evt_type, token = render_progress_event("not json at all")
     assert (evt_type, token) == ("phase", "")
     assert frame == "event: phase\ndata: not json at all\n\n"
+
+
+# --- Task 11 review: context and the PII gate on the streaming twin --------
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__conversation_history__reaches_the_model(monkeypatch):
+    """Streamed synthesis was context-blind: the parameter did not exist, so
+    every live SSE turn (which always has a progress_queue) synthesized without
+    the conversation, while the non-streaming twin got it."""
+    import app.models.brain.litellm_conf as _llm
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    seen: dict = {}
+    history = [{"role": "user", "content": "plan my thursday"}]
+
+    async def fake_hybrid(**kwargs):
+        seen.update(kwargs)
+
+        async def _gen():
+            yield ("content", "Done, sir.")
+        return _gen()
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", fake_hybrid)
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
+    )
+
+    _ = [
+        tok
+        async for _evt, tok in synthesize_jarvis_response_stream(
+            {"schedule_generated": True}, conversation_history=history
+        )
+    ]
+    assert seen["conversation_history"] == history
+
+
+@pytest.mark.asyncio
+async def test_synthesis_node__streaming__forwards_conversation_history(monkeypatch):
+    """The call site must pass it, not just the signature accept it."""
+    from app.modules.conversation import voice_of_jarvis_synthesis
+
+    seen: dict = {}
+    history = [{"role": "user", "content": "plan my thursday"}]
+
+    async def fake_stream(execution_summary, conversation_history=None):
+        seen["history"] = conversation_history
+        yield ("message", "Done, sir.")
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response_stream",
+        fake_stream,
+    )
+
+    import asyncio
+
+    await voice_of_jarvis_synthesis({
+        "intent": IntentType.PLAN_DAY,
+        "schedule": {"t1": {}},
+        "user_message": "plan my thursday",
+        "conversation_history": history,
+        "progress_queue": asyncio.Queue(),
+    })
+    assert seen["history"] == history
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
+    """Synthesis calls hybrid_route_query directly, so route_llm_call's
+    PreCloudLLM gate never ran — and under GEMINI_PRIMARY every synthesis is a
+    cloud send."""
+    import app.core.config as _cfg
+    import app.models.brain.litellm_conf as _llm
+    from app.orchestrator.hooks import ActionHooks, register_all_hooks
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    seen: dict = {}
+
+    async def fake_hybrid(**kwargs):
+        seen.update(kwargs)
+
+        async def _gen():
+            yield ("content", "Noted, sir.")
+        return _gen()
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", fake_hybrid)
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
+    )
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", True)
+
+    hooks = ActionHooks()
+    register_all_hooks(hooks)
+    monkeypatch.setattr("app.orchestrator.hooks.get_hooks", lambda: hooks)
+
+    _ = [
+        tok
+        async for _evt, tok in synthesize_jarvis_response_stream({
+            "habits_saved": "reach me on 555-123-4567",
+            "memory_context": "user email is madhav@example.com",
+        })
+    ]
+
+    wire = seen["user_prompt"] + seen["system_prompt"]
+    assert "555-123-4567" not in wire
+    assert "madhav@example.com" not in wire
+    assert "[PHONE]" in wire and "[EMAIL]" in wire
+
+
+@pytest.mark.asyncio
+async def test_voj_nonstream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
+    """Both twins gate symmetrically — fixing only the streaming one would
+    leave the plain /chat path sending the same PII."""
+    import app.core.config as _cfg
+    from app.orchestrator.hooks import ActionHooks, register_all_hooks
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
+
+    seen: dict = {}
+
+    async def fake_hybrid(**kwargs):
+        seen.update(kwargs)
+        return "Noted, sir."
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
+    )
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", True)
+
+    hooks = ActionHooks()
+    register_all_hooks(hooks)
+    monkeypatch.setattr("app.orchestrator.hooks.get_hooks", lambda: hooks)
+
+    await synthesize_jarvis_response({
+        "habits_saved": "reach me on 555-123-4567",
+        "memory_context": "user email is madhav@example.com",
+    })
+
+    wire = seen["user_prompt"] + seen["system_prompt"]
+    assert "555-123-4567" not in wire and "madhav@example.com" not in wire
+    assert "[PHONE]" in wire and "[EMAIL]" in wire
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__local_route__prompt_is_untouched(monkeypatch):
+    """The gate is for cloud sends only — a local Gemma call must not pay for
+    it, and must not see redacted text."""
+    import app.core.config as _cfg
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    seen: dict = {}
+
+    async def fake_hybrid(**kwargs):
+        seen.update(kwargs)
+
+        async def _gen():
+            yield ("content", "Noted, sir.")
+        return _gen()
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
+    )
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", False)
+    monkeypatch.setattr(
+        "app.core.model_router.force_cloud_var",
+        __import__("contextvars").ContextVar("fc_local", default=False),
+    )
+
+    _ = [
+        tok
+        async for _evt, tok in synthesize_jarvis_response_stream(
+            {"habits_saved": "reach me on 555-123-4567"}
+        )
+    ]
+    assert "555-123-4567" in seen["user_prompt"]
