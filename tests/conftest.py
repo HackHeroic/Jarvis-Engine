@@ -58,10 +58,18 @@ def no_llm(monkeypatch):
 
     * ``app.core.model_router.route_llm_call`` — modules import it
       function-locally, so the module attribute is the live target.
+    * ``app.models.brain.litellm_conf.hybrid_route_query`` — the streaming
+      boundary. A turn carrying a ``progress_queue`` streams tokens instead of
+      calling ``route_llm_call``, so patching only the latter leaves a live
+      LM Studio call behind the socket guard's localhost allowance.
     * ``app.services.analytical.voice_of_jarvis.hybrid_route_query`` — bound at
       import time inside that module.
     * ``app.utils.chroma_client.query_knowledge`` — the conversation module's
       RAG lookup, which dials ChromaDB Cloud.
+
+    ``stream=True`` gets an async generator of ``(event_type, token)`` pairs
+    whose content tokens concatenate back to ``CANNED_LLM_REPLY``, so streaming
+    and non-streaming callers can assert against the same constant.
     """
     calls = []
 
@@ -69,8 +77,16 @@ def no_llm(monkeypatch):
         calls.append(("route_llm_call", kwargs.get("task")))
         return CANNED_LLM_REPLY
 
+    async def _canned_token_gen():
+        # Split mid-word on purpose: a chunker that only ever sees whole words
+        # is not being tested.
+        for chunk in (CANNED_LLM_REPLY[:6], CANNED_LLM_REPLY[6:13], CANNED_LLM_REPLY[13:]):
+            yield ("content", chunk)
+
     async def fake_hybrid_route_query(*args, **kwargs):
         calls.append(("hybrid_route_query", kwargs.get("model_override")))
+        if kwargs.get("stream"):
+            return _canned_token_gen()
         return CANNED_LLM_REPLY
 
     def fake_query_knowledge(*args, **kwargs):
@@ -78,6 +94,9 @@ def no_llm(monkeypatch):
         return []
 
     monkeypatch.setattr("app.core.model_router.route_llm_call", fake_route_llm_call)
+    monkeypatch.setattr(
+        "app.models.brain.litellm_conf.hybrid_route_query", fake_hybrid_route_query
+    )
     monkeypatch.setattr(
         "app.services.analytical.voice_of_jarvis.hybrid_route_query",
         fake_hybrid_route_query,
