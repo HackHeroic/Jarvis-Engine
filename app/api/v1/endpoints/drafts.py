@@ -1,8 +1,17 @@
 # app/api/v1/endpoints/drafts.py
-"""Draft review/accept/reject endpoints."""
+"""Draft review/accept/reject endpoints.
+
+Routing and parsing only — the accept two-step (flip the draft's status, then
+persist its tasks) lives in ``app.services.draft_actions`` because the
+orchestrator's ``draft_action`` node performs exactly the same operation on the
+conversational path.
+
+Every handler passes ``user_id`` into ``DraftStore``, which filters on it, so a
+draft belonging to somebody else reads as absent and answers 404 — never 403,
+which would confirm the row exists.
+"""
 
 import asyncio
-from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -12,12 +21,14 @@ from app.schemas.draft import (
     DraftModifyRequest,
     DraftRearrangeRequest,
     DraftRejectRequest,
-    DraftResponse,
-    DraftComponentResponse,
+    DraftStateResponse,
     DraftTaskEdit,
 )
+from app.services.draft_actions import accept_draft_and_persist
 
 router = APIRouter()
+
+_NOT_FOUND = "Draft not found or expired"
 
 
 def _get_draft_store(request: Request):
@@ -27,138 +38,68 @@ def _get_draft_store(request: Request):
     return store
 
 
+async def _load_draft(request: Request, draft_id: str, user_id: str) -> tuple:
+    """Fetch the draft or 404. Returns ``(store, row)``.
+
+    DraftStore is a synchronous Supabase client, so every call goes through
+    ``to_thread`` — a bare call would block the event loop for the whole HTTP
+    round-trip (house rule, same as planning_graph.create_draft).
+    """
+    store = _get_draft_store(request)
+    draft = await asyncio.to_thread(store.get_draft, draft_id, user_id)
+    if draft is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    return store, draft
+
+
+def _supabase_of(request: Request):
+    db_client = getattr(request.app.state, "db_client", None)
+    return getattr(db_client, "supabase", None) if db_client else None
+
+
 @router.get(
     "/{draft_id}",
-    response_model=DraftResponse,
+    response_model=DraftStateResponse,
     summary="Get draft state",
 )
 async def get_draft(draft_id: str, user_id: str, http_request: Request):
-    """Retrieve current state of a draft for user review."""
-    store = _get_draft_store(http_request)
-    draft = store.get(draft_id, user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
-    return DraftResponse(
-        draft_id=draft.draft_id,
-        user_id=draft.user_id,
-        components={
-            k: DraftComponentResponse(
-                component_type=v.component_type,
-                data=v.data,
-                status=v.status,
-            )
-            for k, v in draft.components.items()
-        },
-        metadata=draft.metadata,
+    """Retrieve the current state of a draft for user review."""
+    _, draft = await _load_draft(http_request, draft_id, user_id)
+    return DraftStateResponse(
+        draft_id=draft["id"],
+        user_id=draft["user_id"],
+        goal_id=draft.get("goal_id"),
+        tasks=draft.get("tasks") or [],
+        horizon_start=draft.get("horizon_start"),
+        status=draft.get("status", "pending"),
+        rejection_reason=draft.get("rejection_reason"),
+        created_at=str(draft["created_at"]) if draft.get("created_at") else None,
     )
 
 
-@router.post(
-    "/{draft_id}/accept",
-    summary="Accept draft components",
-)
-async def accept_draft(
-    draft_id: str, request: DraftAcceptRequest, http_request: Request
-):
-    """Accept specific components (or all) and persist to database."""
-    store = _get_draft_store(http_request)
-    draft = store.get(draft_id, request.user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
+@router.post("/{draft_id}/accept", summary="Accept a draft and persist its tasks")
+async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request: Request):
+    """Accept the draft: mark it accepted and write its tasks to ``user_tasks``.
 
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-    components_to_accept = request.components
-    if components_to_accept is None:
-        components_to_accept = [
-            k for k, v in draft.components.items() if v.status == "pending"
-        ]
-
-    accepted = []
-    for key in components_to_accept:
-        if key not in draft.components:
-            continue
-        comp = draft.components[key]
-        if comp.status in ("rejected",):
-            continue
-
-        # Persist based on component type
-        if key == "habits" and supabase:
-            from app.services.extraction.behavioral_store import store_behavioral_constraint
-            for habit in comp.data:
-                if isinstance(habit, dict) and habit.get("raw_text"):
-                    await store_behavioral_constraint(
-                        raw_text=habit["raw_text"],
-                        user_id=request.user_id,
-                        supabase_client=supabase,
-                    )
-
-        elif key == "tasks" and supabase:
-            import asyncio
-            from app.api.v1.endpoints.reasoning import TaskChunk
-            from app.services.analytical.control_policy import _persist_fused_tasks
-            task_chunks = [TaskChunk(**t) for t in comp.data]
-
-            # Extract schedule timing from the "schedule" draft component
-            schedule_map = None
-            horizon_start_iso = None
-            sched_comp = draft.components.get("schedule")
-            if sched_comp and sched_comp.data:
-                sched_data = sched_comp.data
-                if isinstance(sched_data, dict):
-                    schedule_map = sched_data.get("schedule")
-                    horizon_start_iso = sched_data.get("horizon_start")
-
-            # _persist_fused_tasks is sync — offload to thread to avoid blocking event loop
-            await asyncio.to_thread(
-                _persist_fused_tasks,
-                request.user_id,
-                task_chunks,
-                supabase,
-                schedule=schedule_map,
-                horizon_start=horizon_start_iso,
-            )
-
-        elif key == "action_items" and supabase:
-            for item in comp.data:
-                try:
-                    supabase.table("pending_action_items").insert({
-                        "user_id": request.user_id,
-                        "title": item.get("title", ""),
-                        "summary": item.get("summary", ""),
-                        "status": "accepted",
-                    }).execute()
-                except Exception as e:
-                    print(f"[Drafts] Action item persist failed: {e}")
-
-        store.accept_component(draft_id, request.user_id, key)
-        accepted.append(key)
-
-    return {"status": "ok", "accepted": accepted, "draft_id": draft_id}
+    This is the only REST path that commits a proposed schedule — the planning
+    flow deliberately persists nothing until the user says yes.
+    """
+    store, draft = await _load_draft(http_request, draft_id, request.user_id)
+    task_count = await accept_draft_and_persist(
+        store, request.user_id, draft, _supabase_of(http_request)
+    )
+    return {"status": "accepted", "draft_id": draft_id, "task_count": task_count}
 
 
-@router.post(
-    "/{draft_id}/reject",
-    summary="Reject draft components",
-)
-async def reject_draft(
-    draft_id: str, request: DraftRejectRequest, http_request: Request
-):
-    """Reject specific components (they won't be persisted)."""
-    store = _get_draft_store(http_request)
-    draft = store.get(draft_id, request.user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
+@router.post("/{draft_id}/reject", summary="Reject a draft")
+async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request: Request):
+    """Reject the draft. Nothing is persisted to ``user_tasks``."""
+    store, _ = await _load_draft(http_request, draft_id, request.user_id)
+    await asyncio.to_thread(store.reject_draft, draft_id, request.user_id, request.reason)
 
-    rejected = []
-    for key in request.components:
-        if store.reject_component(draft_id, request.user_id, key):
-            rejected.append(key)
-
-    # Store rejection reason as feedback memory for future planning
+    # The reason is behavioural signal — it is why the next plan should differ.
     memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store and hasattr(request, "reason") and request.reason:
+    if memory_store and request.reason:
         asyncio.create_task(
             memory_store.store_memory(
                 user_id=request.user_id,
@@ -168,39 +109,40 @@ async def reject_draft(
             )
         )
 
-    return {"status": "ok", "rejected": rejected, "draft_id": draft_id}
+    return {"status": "rejected", "draft_id": draft_id}
 
 
-@router.post(
-    "/{draft_id}/modify",
-    summary="Modify a draft component",
-)
-async def modify_draft(
-    draft_id: str, request: DraftModifyRequest, http_request: Request
-):
-    """Update a specific component's data (e.g., edit a task, change a habit)."""
-    store = _get_draft_store(http_request)
-    if not store.update_component_data(
-        draft_id, request.user_id, request.component, request.data
-    ):
-        raise HTTPException(status_code=404, detail="Draft or component not found")
+@router.post("/{draft_id}/modify", summary="Replace a draft's task list")
+async def modify_draft(draft_id: str, request: DraftModifyRequest, http_request: Request):
+    """Replace the draft's tasks wholesale.
 
-    return {"status": "modified", "component": request.component, "draft_id": draft_id}
+    Only ``component == "tasks"`` is meaningful: draft_schedules stores a task
+    array, and habits/action_items are no longer part of a draft at all.
+    """
+    if request.component != "tasks":
+        raise HTTPException(
+            status_code=400,
+            detail="Only the 'tasks' component is modifiable on a draft schedule",
+        )
+    if not isinstance(request.data, list):
+        raise HTTPException(status_code=400, detail="'data' must be a list of tasks")
+
+    store, _ = await _load_draft(http_request, draft_id, request.user_id)
+    updated = await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, request.data)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    return {"status": "modified", "component": "tasks", "draft_id": draft_id}
 
 
-@router.delete(
-    "/{draft_id}",
-    summary="Discard a draft",
-)
+@router.delete("/{draft_id}", summary="Discard a draft")
 async def delete_draft(draft_id: str, user_id: str, http_request: Request):
     """Discard an entire draft (user decided not to proceed)."""
-    store = _get_draft_store(http_request)
-    if not store.delete(draft_id, user_id):
-        raise HTTPException(status_code=404, detail="Draft not found")
+    store, _ = await _load_draft(http_request, draft_id, user_id)
+    await asyncio.to_thread(store.delete_draft, draft_id, user_id)
     return {"status": "deleted", "draft_id": draft_id}
 
 
-@router.patch("/{draft_id}/tasks/{task_id}")
+@router.patch("/{draft_id}/tasks/{task_id}", summary="Edit one task in a draft")
 async def edit_draft_task(
     draft_id: str,
     task_id: str,
@@ -209,78 +151,51 @@ async def edit_draft_task(
     request: Request = None,
 ):
     """Edit a single task in a draft."""
-    draft_store = _get_draft_store(request)
-    if not draft_store:
-        raise HTTPException(status_code=503, detail="Draft store unavailable")
+    store = _get_draft_store(request)
 
     edits_dict = edits.model_dump(exclude_none=True)
     if not edits_dict:
         raise HTTPException(status_code=400, detail="No edits provided")
 
-    result = await asyncio.to_thread(draft_store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict)
+    result = await asyncio.to_thread(
+        store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict
+    )
     if result is None:
         raise HTTPException(status_code=404, detail="Draft or task not found")
 
     return {"status": "modified", "draft_id": draft_id, "task_id": task_id, "updated_draft": result}
 
 
-@router.post(
-    "/{draft_id}/rearrange",
-    summary="Rearrange task order in draft",
-)
-async def rearrange_draft(
-    draft_id: str, request: DraftRearrangeRequest, http_request: Request
-):
-    """Reorder tasks within a draft according to user-specified order."""
-    store = _get_draft_store(http_request)
-    draft = store.get(draft_id, request.user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
+@router.post("/{draft_id}/rearrange", summary="Rearrange task order in draft")
+async def rearrange_draft(draft_id: str, request: DraftRearrangeRequest, http_request: Request):
+    """Reorder tasks within a draft according to the user-specified order."""
+    store, draft = await _load_draft(http_request, draft_id, request.user_id)
 
-    # Reorder the tasks component according to the provided task_order
-    tasks_comp = draft.components.get("tasks")
-    if tasks_comp is None:
-        raise HTTPException(status_code=400, detail="Draft has no tasks component")
+    tasks = draft.get("tasks") or []
+    by_id = {t["task_id"]: t for t in tasks if isinstance(t, dict) and t.get("task_id")}
 
-    task_data = tasks_comp.data
-    if not isinstance(task_data, list):
-        raise HTTPException(status_code=400, detail="Tasks data is not a list")
+    # Requested ids first, in order; anything unmentioned keeps its relative
+    # place at the back rather than being silently dropped.
+    reordered = [by_id.pop(tid) for tid in request.task_order if tid in by_id]
+    reordered.extend(by_id.values())
 
-    # Build lookup by task_id
-    task_map = {}
-    for task in task_data:
-        tid = task.get("task_id") if isinstance(task, dict) else getattr(task, "task_id", None)
-        if tid:
-            task_map[tid] = task
+    await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, reordered)
 
-    # Reorder: place requested IDs first in order, then any remaining
-    reordered = []
-    for tid in request.task_order:
-        if tid in task_map:
-            reordered.append(task_map.pop(tid))
-    # Append any tasks not mentioned in task_order
-    reordered.extend(task_map.values())
-
-    store.update_component_data(draft_id, request.user_id, "tasks", reordered)
-
-    # TODO: Trigger OR-Tools re-solve after rearrange to recompute valid start times
-    return {"status": "rearranged", "draft_id": draft_id, "task_count": len(reordered), "needs_resolve": True}
+    # TODO: re-solve with OR-Tools after a rearrange — the stored start times
+    # are the solver's and no longer match the new order.
+    return {
+        "status": "rearranged",
+        "draft_id": draft_id,
+        "task_count": len(reordered),
+        "needs_resolve": True,
+    }
 
 
-@router.post(
-    "/{draft_id}/chat",
-    summary="Modify draft via natural language",
-)
-async def chat_modify_draft(
-    draft_id: str, request: DraftChatRequest, http_request: Request
-):
+@router.post("/{draft_id}/chat", summary="Modify draft via natural language")
+async def chat_modify_draft(draft_id: str, request: DraftChatRequest, http_request: Request):
     """Apply a natural language modification to a draft schedule."""
-    store = _get_draft_store(http_request)
-    draft = store.get(draft_id, request.user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail="Draft not found or expired")
+    await _load_draft(http_request, draft_id, request.user_id)
 
-    # Use schedule modify flow if available, otherwise acknowledge
     schedule_modifier = getattr(http_request.app.state, "schedule_modifier", None)
     if schedule_modifier:
         modified_draft = await schedule_modifier.modify(
