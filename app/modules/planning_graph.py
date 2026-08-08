@@ -5,6 +5,14 @@ import operator
 from typing import Annotated, Any, Optional, TypedDict
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
+# Shared with the orchestrator's draft_action node and the /drafts REST API —
+# the tasks this module hands the solver are the same tasks those two read back
+# off the draft, so the row-shape and coercion rules live in one place.
+from app.services.draft_actions import (
+    draft_id_of as _draft_id_of,
+    to_task_chunk as _to_task_chunk,
+)
+
 
 def _merge_lists(left: list, right: list) -> list:
     """Reducer: merge two lists (used for parallel fan-in on time_slots)."""
@@ -190,39 +198,6 @@ async def fuse_tasks(state: PlanningState) -> dict:
     return {"task_chunks": merged, "pending_tasks": pending}
 
 
-def _to_task_chunk(raw: dict, index: int) -> "TaskChunk":
-    """Coerce a PlanningState task_chunks entry into a valid TaskChunk.
-
-    decompose_goal emits fully-formed chunks, but fuse_tasks merges pending
-    Supabase rows that carry no `completion_criteria` (required) and may carry a
-    `duration_minutes` above TaskChunk's 25-minute Pomodoro ceiling. Strict
-    validation would reject those, so fill and clamp before validating.
-    """
-    from app.api.v1.endpoints.reasoning import TaskChunk
-
-    data = dict(raw)
-    data.setdefault("task_id", f"t{index}")
-    data.setdefault("title", data["task_id"])
-    data.setdefault("completion_criteria", f"Finish: {data['title']}")
-
-    raw_duration = data.get("duration_minutes")
-    try:
-        duration = int(raw_duration) if raw_duration else 25
-    except (TypeError, ValueError):
-        duration = 25
-    data["duration_minutes"] = max(1, min(25, duration))
-
-    raw_difficulty = data.get("difficulty_weight")
-    try:
-        difficulty = 0.5 if raw_difficulty is None else float(raw_difficulty)
-    except (TypeError, ValueError):
-        difficulty = 0.5
-    data["difficulty_weight"] = max(0.0, min(1.0, difficulty))
-
-    data["dependencies"] = list(data.get("dependencies") or [])
-    return TaskChunk.model_validate(data)
-
-
 async def solve_schedule(state: PlanningState) -> dict:
     """Delegate to the reusable run_schedule.
 
@@ -295,20 +270,6 @@ async def solve_schedule(state: PlanningState) -> dict:
             "formula": "canonical_steel_konig",
         },
     }
-
-
-def _draft_id_of(row: dict | None) -> Optional[str]:
-    """Read the draft id out of whatever ``DraftStore.create_draft`` returned.
-
-    The real store returns the inserted Supabase row (draft_store.py:60-64),
-    whose primary key column is ``id`` — the locally generated uuid is *written*
-    as ``id``, never echoed back as ``draft_id``. Accept both so the node works
-    against the live store and against any caller that hands back the friendlier
-    name; ``None`` (degraded / clientless store) falls through to ``None``.
-    """
-    if not isinstance(row, dict):
-        return None
-    return row.get("draft_id") or row.get("id")
 
 
 async def create_draft(state: PlanningState) -> dict:

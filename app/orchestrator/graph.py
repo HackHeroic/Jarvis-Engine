@@ -3,14 +3,16 @@
 Replaces execute_agentic_flow() in control_policy.py.
 """
 
+import asyncio
 import re
 
 from langgraph.graph import END, StateGraph
 
-from app.orchestrator.state import JarvisState
+from app.orchestrator.state import JarvisState, NegotiationPhase
 from app.orchestrator.routing import (
     check_needs_followup,
     check_negotiation_shortcut,
+    route_draft_action,
     route_to_module,
 )
 from app.modules.conversation import run_general_chat, voice_of_jarvis_synthesis
@@ -59,6 +61,65 @@ _PLANNING_VERBS_RE = re.compile(
     r"add\s+a\s+task|remind\s+me|create\s+a\s+task)\b",
     re.IGNORECASE,
 )
+
+
+# --- Draft negotiation verbs -----------------------------------------------
+# Short imperative replies to a proposed schedule ("accept", "scrap that",
+# "move the calculus block"). Rules beat an LLM here: the vocabulary is tiny,
+# the latency budget on a one-word reply is ~0, and a misfire is expensive —
+# ACCEPT_DRAFT is the only intent in v2 that writes to user_tasks.
+#
+# Only consulted while a draft is actually on the table (see _classify_intent /
+# _negotiation_precheck). Outside a negotiation "accept" is just a word.
+_DRAFT_ACCEPT_RE = re.compile(
+    r"\b(accept|approve|confirm|looks good|lgtm|ship it|lock it in|"
+    r"go ahead|do it|yes,?\s*(do|go|lock|please)\b)",
+    re.IGNORECASE,
+)
+_DRAFT_REJECT_RE = re.compile(
+    r"\b(reject|scrap|discard|throw (it|that) out|"
+    r"cancel\s+(the\s+)?(plan|draft|schedule)|start over|no,?\s*redo)",
+    re.IGNORECASE,
+)
+_DRAFT_REARRANGE_RE = re.compile(
+    r"\b(move|shift|push|swap|rearrange|reorder|reschedule|earlier|later)\b",
+    re.IGNORECASE,
+)
+_DRAFT_EDIT_RE = re.compile(
+    r"\b(edit|change|rename|shorten|lengthen|extend|drop|remove|replace|"
+    r"make .*\b(longer|shorter|easier|harder))\b",
+    re.IGNORECASE,
+)
+
+# EDITING is included: a user mid-edit can still accept or scrap the whole thing.
+_NEGOTIATION_ACTIVE = (
+    NegotiationPhase.PROPOSED,
+    NegotiationPhase.REVIEWING,
+    NegotiationPhase.EDITING,
+)
+
+
+def _match_draft_intent(text: str):
+    """Classify a reply aimed at a draft, or ``None`` if it isn't one.
+
+    Order is deliberate: accept and reject are terminal and unambiguous, so they
+    win over the far broader rearrange/edit verb sets ("cancel the plan" must
+    not read as an edit because it contains no edit verb, but "move it and
+    approve" should accept).
+    """
+    from app.schemas.context import IntentType
+
+    if not text or not text.strip():
+        return None
+    if _DRAFT_ACCEPT_RE.search(text):
+        return IntentType.ACCEPT_DRAFT
+    if _DRAFT_REJECT_RE.search(text):
+        return IntentType.REJECT_DRAFT
+    if _DRAFT_REARRANGE_RE.search(text):
+        return IntentType.REARRANGE
+    if _DRAFT_EDIT_RE.search(text):
+        return IntentType.EDIT_TASK
+    return None
 
 
 def _is_trivial_input(text: str) -> bool:
@@ -173,6 +234,14 @@ async def _classify_intent(state: JarvisState) -> dict:
     if state.get("file_base64"):
         return {"intent": IntentType.KNOWLEDGE_INGESTION}
 
+    # Draft verbs, but only while a draft is actually under review. Checked
+    # before the brain-dump rules: "move the calculus block to the evening"
+    # extracts as a planning_goal and would otherwise re-plan from scratch.
+    if state.get("negotiation_state") in _NEGOTIATION_ACTIVE:
+        draft_intent = _match_draft_intent(state.get("user_message") or "")
+        if draft_intent is not None:
+            return {"intent": draft_intent}
+
     bd = state.get("brain_dump")
     if not bd:
         return {"intent": IntentType.CHAT}
@@ -198,6 +267,120 @@ async def _classify_intent(state: JarvisState) -> dict:
     return {"intent": IntentType.CHAT}
 
 
+async def _negotiation_precheck(state: JarvisState) -> dict:
+    """Classify an active-negotiation turn before the planning shortcut takes it.
+
+    ``check_negotiation_shortcut`` used to hand every turn with a live draft
+    straight to planning_module, which bypasses ``_classify_intent`` entirely —
+    so "accept" re-ran the whole planner and proposed *another* draft. This node
+    runs the same cheap regex (no LLM, no brain-dump extraction) and lets
+    ``route_draft_action`` divert only the real draft verbs.
+
+    Anything else falls through as PLAN_DAY, which is what the shortcut always
+    meant: an unrecognised reply mid-review is a re-plan request.
+    """
+    from app.schemas.context import IntentType
+
+    intent = _match_draft_intent(state.get("user_message") or "")
+    return {"intent": intent if intent is not None else IntentType.PLAN_DAY}
+
+
+def _supabase_of(state: JarvisState):
+    """The Supabase client for this turn, or None when running degraded.
+
+    Prefers the facade wired for this request; falls back to the registry the
+    lifespan populates, which is what a checkpoint-resumed turn has. Matches the
+    ``getattr(user_model, "_db", None)`` access observation.py already uses.
+    """
+    user_model = state.get("user_model")
+    db = getattr(user_model, "_db", None) if user_model is not None else None
+    if db is None:
+        from app.core.runtime import get_db
+
+        db = get_db()
+    return getattr(db, "supabase", None)
+
+
+async def handle_draft_action(state: JarvisState) -> dict:
+    """Resolve the draft under review: accept, reject, or keep editing.
+
+    This node is the *exit door* from the negotiation phase. ``planning_state_out``
+    sets ``negotiation_state = REVIEWING`` whenever a draft is created and
+    nothing else ever writes ACCEPTED or NONE — so every branch here, including
+    the degraded ones, must leave a terminal state. A branch that returned
+    REVIEWING on failure would lock the thread into re-planning forever via
+    ``check_negotiation_shortcut``.
+
+    Accept is also the only place v2 writes to ``user_tasks``: the planning
+    sub-graph proposes and persists nothing.
+    """
+    from app.schemas.context import IntentType
+    from app.services.draft_actions import (
+        accept_draft_and_persist,
+        draft_id_of,
+        resolve_draft,
+    )
+
+    user_id = state.get("user_id") or "demo"
+    intent = state.get("intent")
+    intent_value = getattr(intent, "value", intent)
+    draft_store = state.get("draft_store")
+
+    if draft_store is None:
+        return {
+            "response_message": "The draft system is offline at the moment, sir. Nothing to accept.",
+            "negotiation_state": NegotiationPhase.NONE,
+            "draft_id": None,
+        }
+
+    draft = await resolve_draft(draft_store, user_id, state.get("draft_id"))
+    if not draft:
+        return {
+            "response_message": "There's no draft awaiting review, sir. Tell me what to plan.",
+            "negotiation_state": NegotiationPhase.NONE,
+            "draft_id": None,
+        }
+
+    draft_id = draft_id_of(draft)
+
+    if intent_value == IntentType.ACCEPT_DRAFT.value:
+        count = await accept_draft_and_persist(
+            draft_store, user_id, draft, _supabase_of(state)
+        )
+        return {
+            "response_message": (
+                f"Locked in, sir — {count} task{'s' if count != 1 else ''} are on your schedule."
+                if count
+                else "Draft accepted, sir, though it held no tasks to schedule."
+            ),
+            "negotiation_state": NegotiationPhase.ACCEPTED,
+            "draft_id": None,
+        }
+
+    if intent_value == IntentType.REJECT_DRAFT.value:
+        # The rejection message is the reason — worth keeping, it is the signal
+        # PEARL learns "don't propose this again" from.
+        await asyncio.to_thread(
+            draft_store.reject_draft, draft_id, user_id, state.get("user_message")
+        )
+        return {
+            "response_message": "Draft discarded, sir. Tell me what to aim for instead.",
+            "negotiation_state": NegotiationPhase.NONE,
+            "draft_id": None,
+        }
+
+    # EDIT_TASK / REARRANGE — the draft stays live and the negotiation stays
+    # open. Applying a free-text edit to a specific task is Spec 3; until then
+    # the structured route is PATCH /drafts/{id}/tasks/{task_id} from the UI.
+    return {
+        "response_message": (
+            "Which task should I adjust, sir? You can also accept or scrap the draft outright."
+        ),
+        "negotiation_state": NegotiationPhase.EDITING,
+        "draft_id": draft_id,
+    }
+
+
 def build_jarvis_graph(checkpointer=None):
     """Build and compile the Jarvis orchestrator graph."""
     graph = StateGraph(JarvisState)
@@ -206,6 +389,8 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_node("load_context", _load_context)
     graph.add_node("extract_brain_dump", _extract_brain_dump)
     graph.add_node("classify_intent", _classify_intent)
+    graph.add_node("negotiation_precheck", _negotiation_precheck)
+    graph.add_node("draft_action", handle_draft_action)
 
     # Real module nodes (from registry)
     for name in module_registry.registered_names():
@@ -217,10 +402,19 @@ def build_jarvis_graph(checkpointer=None):
 
     graph.set_entry_point("load_context")
 
+    # A live draft short-circuits brain-dump extraction, but not classification:
+    # the pre-check decides between "resolve the draft" and "re-plan" with a
+    # regex, so a one-word "accept" never pays for an LLM call.
     graph.add_conditional_edges(
         "load_context",
         check_negotiation_shortcut,
-        {"negotiation_active": "planning_module", "normal": "extract_brain_dump"},
+        {"negotiation_active": "negotiation_precheck", "normal": "extract_brain_dump"},
+    )
+
+    graph.add_conditional_edges(
+        "negotiation_precheck",
+        route_draft_action,
+        {"draft_action": "draft_action", "planning_module": "planning_module"},
     )
 
     graph.add_edge("extract_brain_dump", "classify_intent")
@@ -234,6 +428,7 @@ def build_jarvis_graph(checkpointer=None):
             "coach_module": "coach_module",
             "knowledge_module": "knowledge_module",
             "conversation_module": "conversation_module",
+            "draft_action": "draft_action",
         },
     )
 
@@ -243,6 +438,11 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_edge("synthesize_response", "observation_loop")
 
     graph.add_edge("conversation_module", "observation_loop")
+
+    # Skips synthesize_response on purpose: the accept/reject confirmations are
+    # deterministic and already in voice, and Voice of Jarvis would overwrite
+    # them with a generic re-synthesis (plus an LLM call the user didn't need).
+    graph.add_edge("draft_action", "observation_loop")
 
     graph.add_conditional_edges(
         "observation_loop",
