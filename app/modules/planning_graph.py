@@ -435,7 +435,22 @@ planning_module = ModuleDefinition(
     state_class=PlanningState,
     state_in=planning_state_in,
     state_out=planning_state_out,
+    entry_step="validate_goal",
     steps=[
+        # The gate runs FIRST, ahead of the fan-out it protects.
+        #
+        # It used to sit alongside translate_habits/memory_to_constraints and
+        # route into decompose_goal, which cannot work: LangGraph's AND-join
+        # (`add_edge([a, b], target)`) waits on node *completion* and ignores
+        # its members' branches, so decompose_goal fired as soon as the two
+        # constraint branches finished — including on the arm where the goal
+        # was too vague to plan and validate_goal had routed to __END__. That
+        # is a wasted 27B decomposition on a turn whose only output is a
+        # clarification question. Gating up front also skips translate_habits,
+        # a second 27B call, for the same reason.
+        ModuleStep(name="validate_goal", handler=validate_goal, read_only=True,
+                   routes_to={is_goal_clear: {True: "fetch_constraints", False: "__END__"}}),
+        # No depends_on: reached only via validate_goal's True branch.
         ModuleStep(name="fetch_constraints", handler=fetch_constraints, concurrent_safe=True),
         ModuleStep(name="translate_habits", handler=translate_habits,
                    depends_on=["fetch_constraints"], timeout_ms=45_000),
@@ -444,11 +459,11 @@ planning_module = ModuleDefinition(
         ModuleStep(name="memory_to_constraints", handler=memory_to_constraints,
                    depends_on=["fetch_constraints"], concurrent_safe=True,
                    feature_flag="ENABLE_PEARL"),
-        ModuleStep(name="validate_goal", handler=validate_goal,
-                   depends_on=["fetch_constraints"], concurrent_safe=True, read_only=True,
-                   routes_to={is_goal_clear: {True: "decompose_goal", False: "__END__"}}),
+        # AND-join over the two constraint branches: both must land before the
+        # decomposition runs, and it must run exactly once (two 27B calls in
+        # one turn is an OOM risk on 24 GB).
         ModuleStep(name="decompose_goal", handler=decompose_goal,
-                   depends_on=["expand_slots", "memory_to_constraints", "validate_goal"],
+                   depends_on=["expand_slots", "memory_to_constraints"],
                    timeout_ms=60_000),
         ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
         ModuleStep(name="solve_schedule", handler=solve_schedule,

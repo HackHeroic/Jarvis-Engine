@@ -486,3 +486,201 @@ async def test_create_module_wrapper__invokes_module():
     assert executed == [True]
     assert result["modules_invoked"] == ["wrapper_test"]
     assert result.get("schedule") == 99
+
+
+# ---------------------------------------------------------------------------
+# Edge-wiring semantics (Task 9.5)
+#
+# `depends_on` is an AND-join. Three rules the builder must honour, each of
+# which was violated by the original `if routes_to: ... elif depends_on and
+# name not in routed_targets` branch:
+#
+#   1. routing OUT and depending IN are independent — a step may do both.
+#   2. a step keeps its dependency edges even when some *other* step routes to
+#      it (retry back-edges must not sever the forward path).
+#   3. >=2 plain dependencies are ONE barrier, not N independent triggers.
+#
+# LangGraph facts these encode (measured, langgraph 1.2.10):
+#   * `add_edge([a, b], c)` registers a `waiting_edge` — c fires once, after
+#     BOTH a and b have completed, even at different depths.
+#   * two separate `add_edge(a, c)` / `add_edge(b, c)` calls at different
+#     depths fire c TWICE.
+#   * a node that is both a conditional source to c and a member of a barrier
+#     into c does NOT gate c — the barrier triggers c regardless of the
+#     branch, which is why the planning module gates upstream of its fan-out.
+# ---------------------------------------------------------------------------
+
+
+def _log_state():
+    """A state class whose `log` key accumulates every node that ran."""
+
+    def _merge(left, right):
+        return left + right
+
+    class LogState(TypedDict):
+        log: Annotated[list, _merge]
+        gate: bool
+        progress_queue: Any
+
+    return LogState
+
+
+def _recorder(name: str):
+    async def handler(state):
+        return {"log": [name]}
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_build_module_graph__step_with_routes_and_depends_on__gets_incoming_edge():
+    """Defect (a): routing OUT must not cancel the dependency edge coming IN."""
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="both",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="a", handler=_recorder("a")),
+            ModuleStep(name="gate", handler=_recorder("gate"), depends_on=["a"],
+                       routes_to={lambda s: "yes": {"yes": "b", "no": "__END__"}}),
+            ModuleStep(name="b", handler=_recorder("b")),
+        ],
+    )
+    result = await build_module_graph(defn).ainvoke(
+        {"log": [], "gate": True, "progress_queue": None}
+    )
+
+    assert result["log"] == ["a", "gate", "b"]
+
+
+@pytest.mark.asyncio
+async def test_build_module_graph__dep_edge_survives_being_another_steps_route_target():
+    """Defect (b): a retry back-edge must not sever the forward dependency.
+
+    `b` is the retry target of `c`, which is exactly the
+    handle_infeasible -> solve_schedule shape. The old `name not in
+    routed_targets` guard dropped `a -> b`, leaving b reachable only from a
+    node that was itself unreachable.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="retry",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="a", handler=_recorder("a")),
+            ModuleStep(name="b", handler=_recorder("b"), depends_on=["a"]),
+            ModuleStep(name="c", handler=_recorder("c"), depends_on=["b"],
+                       routes_to={
+                           lambda s: "again" if len(s["log"]) < 4 else "done":
+                               {"again": "b", "done": "__END__"},
+                       }),
+        ],
+    )
+    result = await build_module_graph(defn).ainvoke(
+        {"log": [], "gate": True, "progress_queue": None}
+    )
+
+    assert result["log"] == ["a", "b", "c", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_build_module_graph__two_plain_deps_at_different_depths__fire_target_once():
+    """`depends_on` is an AND-join, not N independent triggers.
+
+    Wired as two separate edges the target fires twice — once per branch
+    completing — which is how the naive fix produced
+    `InvalidUpdateError: At key 'task_chunks': Can receive only one value per
+    step` and a duplicate 27B decomposition call.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="barrier",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="start", handler=_recorder("start")),
+            ModuleStep(name="deep_1", handler=_recorder("deep_1"), depends_on=["start"]),
+            ModuleStep(name="deep_2", handler=_recorder("deep_2"), depends_on=["deep_1"]),
+            ModuleStep(name="shallow", handler=_recorder("shallow"), depends_on=["start"]),
+            ModuleStep(name="join", handler=_recorder("join"),
+                       depends_on=["deep_2", "shallow"]),
+        ],
+    )
+    result = await build_module_graph(defn).ainvoke(
+        {"log": [], "gate": True, "progress_queue": None}
+    )
+
+    assert result["log"].count("join") == 1
+    assert result["log"][-1] == "join"
+    assert {"deep_2", "shallow"}.issubset(set(result["log"]))
+
+
+@pytest.mark.asyncio
+async def test_build_module_graph__conditional_dep__gate_is_honoured():
+    """A dep that routes to the step contributes its edge CONDITIONALLY only.
+
+    Adding a plain edge as well would let the step run on the branch that was
+    not taken — the measured `decompose_goal ran even when validate_goal
+    routed __END__` bypass.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="gated",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="gate", handler=_recorder("gate"),
+                       routes_to={lambda s: "yes" if s["gate"] else "no":
+                                  {"yes": "work", "no": "__END__"}}),
+            ModuleStep(name="work", handler=_recorder("work"), depends_on=["gate"]),
+        ],
+    )
+    graph = build_module_graph(defn)
+
+    opened = await graph.ainvoke({"log": [], "gate": True, "progress_queue": None})
+    closed = await graph.ainvoke({"log": [], "gate": False, "progress_queue": None})
+
+    assert opened["log"] == ["gate", "work"]
+    assert closed["log"] == ["gate"]
+
+
+@pytest.mark.asyncio
+async def test_build_module_graph__flag_disabled_barrier_member__does_not_deadlock(monkeypatch):
+    """A feature-flagged-off step still COMPLETES (returns {}), so it satisfies
+    an AND-join. Pinned because switching `_wrap_step` to genuinely skip the
+    node would silently deadlock every barrier the step sits in.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    monkeypatch.setenv("JARVIS_ENABLE_BARRIER_TEST", "0")
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="flagged_barrier",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="start", handler=_recorder("start")),
+            ModuleStep(name="deep_1", handler=_recorder("deep_1"), depends_on=["start"]),
+            ModuleStep(name="deep_2", handler=_recorder("deep_2"), depends_on=["deep_1"]),
+            ModuleStep(name="flagged", handler=_recorder("flagged"), depends_on=["start"],
+                       feature_flag="ENABLE_BARRIER_TEST"),
+            ModuleStep(name="join", handler=_recorder("join"),
+                       depends_on=["deep_2", "flagged"]),
+        ],
+    )
+    result = await build_module_graph(defn).ainvoke(
+        {"log": [], "gate": True, "progress_queue": None}
+    )
+
+    assert "flagged" not in result["log"]  # the flag really did skip the body
+    assert result["log"].count("join") == 1  # ...and the barrier still opened

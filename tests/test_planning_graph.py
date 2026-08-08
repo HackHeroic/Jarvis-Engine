@@ -608,27 +608,6 @@ def test_planning_state_out__no_draft__leaves_negotiation_state_alone():
     assert "negotiation_state" not in out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing module-framework wiring bug (flagged in the Task 8 report, "
-        "not introduced here): build_module_graph never gives a step its "
-        "`depends_on` edges in two cases, and the planning module hits both. "
-        "(a) module_framework.py:197-204 uses `if step.routes_to: ... elif "
-        "step.depends_on`, so `validate_goal` — which has both — gets no "
-        "incoming edge and is orphaned. (b) the same branch skips any step "
-        "listed in `routed_targets`, so `solve_schedule` gets no edge from "
-        "`fuse_tasks` and is reachable only via handle_infeasible's retry "
-        "back-edge, which is itself unreachable. Net effect: the compiled "
-        "planning graph is __start__ -> fetch_constraints -> "
-        "{translate_habits -> expand_slots, memory_to_constraints} -> __end__, "
-        "so decompose_goal/fuse_tasks/solve_schedule/create_draft have never "
-        "run in v2. `create_draft` is correct and unit-tested above; it just "
-        "cannot be reached until the framework wires depends_on independently "
-        "of routes_to. Fix belongs in app/core/module_framework.py "
-        "(build_module_graph edge wiring), not in this module."
-    ),
-)
 @pytest.mark.asyncio
 async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm):
     """End-to-end through the compiled graph: the OPTIMAL edge really runs.
@@ -661,3 +640,152 @@ async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm):
     _user_id, tasks, horizon_start, _goal = store.calls[0]
     assert len(tasks) == 6
     assert datetime.fromisoformat(horizon_start).hour == 8
+
+
+# --- invocation counts through the compiled sub-graph ------------------------
+# Edge lists are not the acceptance criterion — *how many times each node runs*
+# is. Two 27B decompositions in one turn is an OOM risk on a 24 GB machine
+# (.claude/CLAUDE.md), and the naive wiring fix fired decompose_goal twice.
+
+
+def _count_invocations(monkeypatch, module, *names) -> dict:
+    """Wrap the named steps' handlers with a counter.
+
+    Counts handler ENTRY, not LLM side effects: entry is what costs a model
+    slot, and a node can be entered without the mocked model recording a call.
+    `_wrap_step` reads `step.handler` at call time, so patching the dataclass
+    instance is enough — and monkeypatch restores the shared module singleton.
+    """
+    counts = {n: 0 for n in names}
+
+    def _wrap(name, inner):
+        async def counting(state):
+            counts[name] += 1
+            return await inner(state)
+        return counting
+
+    for step in module.steps:
+        if step.name in counts:
+            monkeypatch.setattr(step, "handler", _wrap(step.name, step.handler))
+    return counts
+
+
+async def _fake_decompose_llm(*args, **kwargs):
+    """A schema-aware stand-in for the 27B: real ExecutionGraph, no network."""
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+
+    return ExecutionGraph(
+        goal_metadata=GoalMetadata(),
+        decomposition=[TaskChunk.model_validate(_chunk(f"t{i}")) for i in range(6)],
+        cognitive_load_estimate={"intrinsic_load": 0.5},
+    )
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(monkeypatch):
+    """One goal, one decomposition. The fan-in is a barrier, not two triggers.
+
+    Wired as independent edges, `expand_slots` and `memory_to_constraints`
+    complete at different depths and fire `decompose_goal` once each — two
+    concurrent 27B calls and an `InvalidUpdateError` on `task_chunks`.
+    """
+    from app.modules.planning_graph import planning_module, planning_state_in
+
+    counts = _count_invocations(
+        monkeypatch, planning_module,
+        "validate_goal", "fetch_constraints", "decompose_goal", "fuse_tasks",
+        "solve_schedule", "create_draft",
+    )
+    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+
+    module_state = planning_state_in(
+        {"user_model": None, "user_message": "revise for the compilers exam",
+         "draft_store": None}
+    )
+    result = await build_module_graph(planning_module).ainvoke(module_state)
+
+    assert counts == {
+        "validate_goal": 1, "fetch_constraints": 1, "decompose_goal": 1,
+        "fuse_tasks": 1, "solve_schedule": 1, "create_draft": 1,
+    }
+    assert result["schedule"] is not None
+    assert result["draft_id"] is None  # degrades gracefully with no draft_store
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__unclear_goal__decompose_goal_never_runs(monkeypatch):
+    """`validate_goal` is a gate, and a gate that leaks costs a 27B call.
+
+    'hi' is under the 5-character floor, so the module must stop at the
+    clarification — no decomposition, and no habit translation either (that is
+    a 27B call too, and there is nothing to plan).
+    """
+    from app.modules.planning_graph import planning_module, planning_state_in
+
+    counts = _count_invocations(
+        monkeypatch, planning_module,
+        "validate_goal", "decompose_goal", "translate_habits", "solve_schedule",
+        "create_draft",
+    )
+    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+
+    module_state = planning_state_in(
+        {"user_model": None, "user_message": "hi", "draft_store": None}
+    )
+    result = await build_module_graph(planning_module).ainvoke(module_state)
+
+    assert counts == {
+        "validate_goal": 1, "decompose_goal": 0, "translate_habits": 0,
+        "solve_schedule": 0, "create_draft": 0,
+    }
+    assert result["clarification_request"]
+    assert result["schedule"] is None
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypatch):
+    """The retry loop re-enters the solver, never the decomposition.
+
+    `handle_infeasible -> solve_schedule` is a back-edge into the middle of the
+    pipeline; if it re-triggered the fan-in the user would pay for a fresh 27B
+    decomposition on every rung of the horizon ladder.
+    """
+    from fastapi import HTTPException
+    from app.modules.planning_graph import planning_module, planning_state_in
+
+    counts = _count_invocations(
+        monkeypatch, planning_module,
+        "decompose_goal", "fuse_tasks", "solve_schedule", "handle_infeasible",
+        "create_draft",
+    )
+    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+
+    ok = MagicMock()
+    ok.model_dump.return_value = {
+        "status": "OPTIMAL", "schedule": {}, "horizon_start": "2026-08-08T08:00:00+00:00",
+    }
+    attempts = []
+
+    def flaky_run_schedule(*args, **kwargs):
+        attempts.append(kwargs.get("horizon_minutes"))
+        if len(attempts) <= 2:
+            raise HTTPException(status_code=422, detail="INFEASIBLE")
+        return ok
+
+    monkeypatch.setattr(
+        "app.api.v1.endpoints.schedule.run_schedule", flaky_run_schedule
+    )
+
+    module_state = planning_state_in(
+        {"user_model": None, "user_message": "revise for the compilers exam",
+         "draft_store": None}
+    )
+    result = await build_module_graph(planning_module).ainvoke(module_state)
+
+    assert counts == {
+        "decompose_goal": 1, "fuse_tasks": 1, "solve_schedule": 3,
+        "handle_infeasible": 2, "create_draft": 1,
+    }
+    # Each retry widened the horizon along the v1 ladder.
+    assert attempts == [2880, 4320, 7200]
+    assert result["schedule"] is not None

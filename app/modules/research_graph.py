@@ -44,6 +44,17 @@ def needs_more(state: ResearchState) -> bool:
     return len(results) < 3 and iterations < max_iter
 
 
+async def evaluate_results(state: ResearchState) -> dict:
+    """Pure decision point — `needs_more` reads the state, nothing is written.
+
+    Declared as a coroutine, not a `lambda s: {}`: `_wrap_step` awaits whatever
+    the handler returns, so a sync handler raises
+    `TypeError: object dict can't be used in 'await' expression` the first time
+    the node is actually reached.
+    """
+    return {}
+
+
 async def summarize(state: ResearchState) -> dict:
     results = state.get("search_results", [])
     return {"summary": f"Found {len(results)} results for your query."}
@@ -88,7 +99,7 @@ research_module = ModuleDefinition(
         ModuleStep(name="plan_research", handler=plan_research),
         ModuleStep(name="execute_search", handler=execute_search,
                    depends_on=["plan_research"], timeout_ms=30_000),
-        ModuleStep(name="evaluate_results", handler=lambda s: {},
+        ModuleStep(name="evaluate_results", handler=evaluate_results,
                    depends_on=["execute_search"], read_only=True,
                    routes_to={needs_more: {True: "execute_search", False: "summarize"}}),
         ModuleStep(name="summarize", handler=summarize, timeout_ms=45_000),
