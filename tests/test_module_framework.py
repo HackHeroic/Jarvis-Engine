@@ -507,7 +507,7 @@ async def test_create_module_wrapper__invokes_module():
 #     depths fire c TWICE.
 #   * a node that is both a conditional source to c and a member of a barrier
 #     into c does NOT gate c — the barrier triggers c regardless of the
-#     branch, which is why the planning module gates upstream of its fan-out.
+#     branch. Hence rule 4 below: that shape is rejected at build time.
 # ---------------------------------------------------------------------------
 
 
@@ -684,3 +684,75 @@ async def test_build_module_graph__flag_disabled_barrier_member__does_not_deadlo
 
     assert "flagged" not in result["log"]  # the flag really did skip the body
     assert result["log"].count("join") == 1  # ...and the barrier still opened
+
+
+def test_build_module_graph__conditional_dep_mixed_with_plain_deps__is_rejected():
+    """The one shape LangGraph cannot express — rejected loudly, not silently.
+
+    A barrier ignores its members' branches: `add_edge([plain, router], step)`
+    fires `step` even when `router` routed elsewhere (measured). Declaring
+    both a routing dep and a plain dep therefore has no honest wiring, so the
+    builder refuses instead of quietly dropping the gate.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="ambiguous",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="start", handler=_recorder("start")),
+            ModuleStep(name="plain", handler=_recorder("plain"), depends_on=["start"]),
+            ModuleStep(name="gate", handler=_recorder("gate"), depends_on=["start"],
+                       routes_to={lambda s: "yes": {"yes": "work", "no": "__END__"}}),
+            ModuleStep(name="work", handler=_recorder("work"),
+                       depends_on=["plain", "gate"]),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="both a routing dependency"):
+        build_module_graph(defn)
+
+
+def test_build_module_graph__unknown_dependency__is_rejected():
+    """A typo in `depends_on` used to orphan the step in silence."""
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="typo",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="start", handler=_recorder("start")),
+            ModuleStep(name="next", handler=_recorder("next"), depends_on=["strat"]),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="unknown step 'strat'"):
+        build_module_graph(defn)
+
+
+def test_build_module_graph__orphaned_step__is_rejected():
+    """LangGraph compiles an unreachable node in silence — the builder must not.
+
+    Six planning steps (decompose_goal through create_draft) sat dead in the
+    compiled graph for the whole life of the framework because nothing ever
+    said so out loud.
+    """
+    from app.core.module_framework import ModuleStep, ModuleDefinition, build_module_graph
+
+    LogState = _log_state()
+
+    defn = ModuleDefinition(
+        name="orphanage",
+        state_class=LogState,
+        steps=[
+            ModuleStep(name="start", handler=_recorder("start")),
+            ModuleStep(name="stranded", handler=_recorder("stranded")),
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"unreachable from entry 'start'.*stranded"):
+        build_module_graph(defn)

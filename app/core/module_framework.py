@@ -220,8 +220,12 @@ def build_module_graph(definition: ModuleDefinition):
     # keeps its dependency edges even when some other step routes back INTO it
     # (solve_schedule is handle_infeasible's retry target and still needs its
     # forward edge from fuse_tasks).
+    successors: dict[str, set[str]] = {
+        src: set(targets) for src, targets in conditional_reach.items()
+    }
     for step in definition.steps:
         plain_deps: list[str] = []
+        routing_deps: list[str] = []
         for dep_name in step.depends_on:
             if dep_name not in lookup:
                 raise ValueError(
@@ -230,8 +234,23 @@ def build_module_graph(definition: ModuleDefinition):
                 )
             # A dep that branches to this step already reaches it through that
             # branch; a plain edge on top would fire on the arm not taken.
-            if step.name not in conditional_reach.get(dep_name, ()):
+            if step.name in conditional_reach.get(dep_name, ()):
+                routing_deps.append(dep_name)
+            else:
                 plain_deps.append(dep_name)
+
+        if routing_deps and plain_deps:
+            # LangGraph cannot express this: `add_edge([plain, router], step)`
+            # is a barrier over node *completion*, and a barrier ignores its
+            # members' branches — the step would run even on the arm that
+            # routed elsewhere. Declare the gate upstream of the fan-out
+            # instead of inside the join.
+            raise ValueError(
+                f"Module '{definition.name}': step '{step.name}' has both a routing "
+                f"dependency ({routing_deps}) and plain dependencies ({plain_deps}). "
+                "A conditional branch cannot gate an AND-join — move the routing "
+                "step upstream of the fan-out."
+            )
 
         if len(plain_deps) == 1:
             graph.add_edge(plain_deps[0], step.name)
@@ -240,6 +259,28 @@ def build_module_graph(definition: ModuleDefinition):
             # target fires exactly once. Separate add_edge calls would be
             # independent triggers and fire it once per dependency.
             graph.add_edge(plain_deps, step.name)
+
+        for dep_name in plain_deps:
+            successors.setdefault(dep_name, set()).add(step.name)
+
+    # Orphan check. LangGraph compiles an unreachable node without complaint,
+    # which is how six planning steps sat dead in the graph for as long as the
+    # framework existed. A step that cannot be reached from the entry point is
+    # a declaration bug, so say so at build time.
+    reachable: set[str] = set()
+    frontier = [entry]
+    while frontier:
+        current = frontier.pop()
+        if current in reachable:
+            continue
+        reachable.add(current)
+        frontier.extend(successors.get(current, ()))
+    orphans = sorted(s.name for s in definition.steps if s.name not in reachable)
+    if orphans:
+        raise ValueError(
+            f"Module '{definition.name}': steps unreachable from entry '{entry}': "
+            f"{orphans}"
+        )
 
     # Detect terminal steps and wire to END
     depended_on: set[str] = set()
