@@ -160,6 +160,11 @@ async def decompose_goal(state: PlanningState) -> dict:
         )
         if isinstance(result, ExecutionGraph):
             graph = result
+        elif isinstance(result, dict):
+            # route_llm_call normalises this, but a dict must never reach the
+            # str() branch again: `str({...})` is a Python repr with single
+            # quotes and json.loads dies at char 1 (F1, live run 2026-08-08).
+            graph = ExecutionGraph.model_validate(result)
         else:
             import json, re
             clean = re.sub(r"```json|```", "", str(result)).strip()
