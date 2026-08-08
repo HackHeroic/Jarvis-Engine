@@ -79,3 +79,48 @@ class TestTaskComplete:
         )
         result = query.execute()
         assert result.data["status"] == "skipped"
+
+
+# --- actual_duration_minutes reaches the user_tasks UPDATE ------------------
+# F2 (live run 2026-08-08): the field is declared on TaskCompleteRequest and
+# written into the UPDATE payload, but no migration created the column, so
+# PostgREST 500'd with PGRST204 on every request that supplied it. The column
+# now exists (supabase/migrations/20260808000000_user_tasks_actual_duration.sql);
+# this pins the write path that depends on it, so the two can't drift apart
+# again without a test failing.
+
+
+class TestCompletionDurationWrite:
+    def test_update_task_status__extra_fields__merged_into_update_payload(self, mock_supabase):
+        from app.api.v1.endpoints.tasks import _update_task_status_sync
+
+        table = mock_supabase.table.return_value
+        table.execute.return_value.data = [{"task_id": "t1", "user_id": "demo"}]
+
+        _update_task_status_sync(
+            mock_supabase, "t1", "demo", "completed", {"actual_duration_minutes": 18},
+        )
+
+        table.update.assert_called_once_with(
+            {"status": "completed", "actual_duration_minutes": 18}
+        )
+
+    def test_update_task_status__no_extra_fields__status_only(self, mock_supabase):
+        """The optional field must never be written as an explicit NULL."""
+        from app.api.v1.endpoints.tasks import _update_task_status_sync
+
+        table = mock_supabase.table.return_value
+        table.execute.return_value.data = [{"task_id": "t1", "user_id": "demo"}]
+
+        _update_task_status_sync(mock_supabase, "t1", "demo", "completed", None)
+
+        table.update.assert_called_once_with({"status": "completed"})
+
+    def test_task_complete_request__accepts_actual_duration_minutes(self):
+        """The schema advertises the field; the column now backs it."""
+        from app.api.v1.endpoints.tasks import TaskCompleteRequest
+
+        body = TaskCompleteRequest(user_id="demo", quality=4, actual_duration_minutes=18)
+
+        assert body.actual_duration_minutes == 18
+        assert TaskCompleteRequest(user_id="demo").actual_duration_minutes is None
