@@ -8,11 +8,14 @@ def test_planning_module__has_correct_steps():
 
     step_names = [s.name for s in planning_module.steps]
     assert step_names == [
+        # validate_goal leads: it gates every step below it, and a gate cannot
+        # sit inside the fan-in it protects (a LangGraph AND-join ignores its
+        # members' branches, so decompose_goal fired even on the __END__ arm).
+        "validate_goal",
         "fetch_constraints",
         "translate_habits",
         "expand_slots",
         "memory_to_constraints",
-        "validate_goal",
         "decompose_goal",
         "fuse_tasks",
         "solve_schedule",
@@ -30,10 +33,30 @@ def test_planning_module__compiles():
 
 
 def test_planning_module__parallel_fan_out():
+    """fetch_constraints fans out to the two constraint branches...
+
+    ...and `decompose_goal` joins them. The join is what makes the fan-out
+    safe: without it each branch triggers the decomposition independently.
+    """
     from app.modules.planning_graph import planning_module
 
     dependents = [s.name for s in planning_module.steps if "fetch_constraints" in s.depends_on]
-    assert set(dependents) == {"translate_habits", "memory_to_constraints", "validate_goal"}
+    assert set(dependents) == {"translate_habits", "memory_to_constraints"}
+
+    decompose = next(s for s in planning_module.steps if s.name == "decompose_goal")
+    assert set(decompose.depends_on) == {"expand_slots", "memory_to_constraints"}
+
+
+def test_planning_module__validate_goal_gates_the_pipeline():
+    """The gate is the entry point and its True arm opens the fan-out."""
+    from app.modules.planning_graph import planning_module
+
+    assert planning_module.entry_step == "validate_goal"
+    validate = next(s for s in planning_module.steps if s.name == "validate_goal")
+    assert validate.depends_on == []
+    for _cond, dests in validate.routes_to.items():
+        assert dests[True] == "fetch_constraints"
+        assert dests[False] == "__END__"
 
 
 def test_planning_module__retry_loop():

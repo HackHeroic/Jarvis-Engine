@@ -167,14 +167,28 @@ def build_module_graph(definition: ModuleDefinition):
     def _resolve_end(destinations: dict[str, str]) -> dict:
         return {k: END if v == END_SENTINEL else v for k, v in destinations.items()}
 
-    # Collect all steps that are destinations of routes_to
-    routed_targets: set[str] = set()
+    # Which steps does each step reach through a *branch* (routes_to or an
+    # extra_edge)? Everything below is expressed against this map so that
+    # "reaches conditionally" is decided per (source, target) pair rather than
+    # per step — a step that routes somewhere is not thereby excused from its
+    # obligations to every other step.
+    conditional_reach: dict[str, set[str]] = {}
+
+    def _record(source: str, destinations: dict[str, str]) -> None:
+        conditional_reach.setdefault(source, set()).update(
+            t for t in destinations.values() if t != END_SENTINEL
+        )
+
     for s in definition.steps:
         if s.routes_to:
             for _cond, dests in s.routes_to.items():
-                for target in dests.values():
-                    if target != END_SENTINEL:
-                        routed_targets.add(target)
+                _record(s.name, dests)
+    for e in definition.extra_edges:
+        _record(e.from_step, e.destinations)
+
+    routed_targets: set[str] = set()
+    for targets in conditional_reach.values():
+        routed_targets |= targets
 
     # Detect entry point
     if definition.entry_step:
@@ -192,20 +206,40 @@ def build_module_graph(definition: ModuleDefinition):
             )
     graph.set_entry_point(entry)
 
-    # Wire edges
+    # Wire outgoing branches
     for step in definition.steps:
         if step.routes_to:
             for condition_fn, destinations in step.routes_to.items():
                 graph.add_conditional_edges(step.name, condition_fn, _resolve_end(destinations))
-        elif step.depends_on and step.name not in routed_targets:
-            for dep_name in step.depends_on:
-                dep_step = lookup.get(dep_name)
-                if dep_step and not dep_step.routes_to:
-                    graph.add_edge(dep_name, step.name)
 
-    # Wire extra_edges
     for edge in definition.extra_edges:
         graph.add_conditional_edges(edge.from_step, edge.condition, _resolve_end(edge.destinations))
+
+    # Wire incoming dependencies. Independent of the loop above: routing OUT of
+    # a step says nothing about what must complete before it runs, and a step
+    # keeps its dependency edges even when some other step routes back INTO it
+    # (solve_schedule is handle_infeasible's retry target and still needs its
+    # forward edge from fuse_tasks).
+    for step in definition.steps:
+        plain_deps: list[str] = []
+        for dep_name in step.depends_on:
+            if dep_name not in lookup:
+                raise ValueError(
+                    f"Module '{definition.name}': step '{step.name}' depends on "
+                    f"unknown step '{dep_name}'"
+                )
+            # A dep that branches to this step already reaches it through that
+            # branch; a plain edge on top would fire on the arm not taken.
+            if step.name not in conditional_reach.get(dep_name, ()):
+                plain_deps.append(dep_name)
+
+        if len(plain_deps) == 1:
+            graph.add_edge(plain_deps[0], step.name)
+        elif len(plain_deps) > 1:
+            # List form is a `waiting_edge`: ALL of them must complete, and the
+            # target fires exactly once. Separate add_edge calls would be
+            # independent triggers and fire it once per dependency.
+            graph.add_edge(plain_deps, step.name)
 
     # Detect terminal steps and wire to END
     depended_on: set[str] = set()
