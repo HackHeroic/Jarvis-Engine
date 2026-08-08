@@ -49,26 +49,25 @@ async def _stream_chat_reply(
 ) -> tuple[str, str | None]:
     """Stream one CHAT reply through the progress bridge.
 
-    Returns the accumulated (message, thinking). Raises before the first token
-    if the model call never starts, so the caller's fallback still applies; once
-    tokens are on the wire the partial reply is kept — replacing it would erase
-    text the user has already read.
+    Goes through route_llm_call like the non-streaming branch, so streaming
+    keeps the same local-first attempt, cloud fallback and PreCloudLLM (PII)
+    gate. Returns the accumulated (message, thinking). Raises before the first
+    token if the model call never starts, so the caller's fallback still
+    applies; once tokens are on the wire the partial reply is kept — replacing
+    it would erase text the user has already read.
     """
-    from app.core.model_router import MODEL_ROUTING, ModelRole, _get_model_for_role
+    from app.core.model_router import route_llm_call
     from app.orchestrator.graph import make_token_emitter
 
-    import app.models.brain.litellm_conf as _llm
-
     emit = make_token_emitter(progress_queue)
-    model = _get_model_for_role(MODEL_ROUTING.get("voice_of_jarvis", ModelRole.FAST))
 
-    token_gen = await _llm.hybrid_route_query(
-        user_prompt=user_message,
+    token_gen = await route_llm_call(
+        task="voice_of_jarvis",
+        prompt=user_message,
         system_prompt=system_prompt,
         response_schema=None,
-        model_override=model,
-        stream=True,
         conversation_history=conversation_history,
+        stream=True,
     )
 
     message_parts: list[str] = []
