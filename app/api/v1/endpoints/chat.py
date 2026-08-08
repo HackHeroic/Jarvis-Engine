@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.jarvis_logger import log_step
 from app.schemas.context import ChatResponse
 from app.services.analytical.control_policy import execute_agentic_flow
@@ -150,15 +151,22 @@ class ChatRequest(BaseModel):
 @router.post(
     "/",
     response_model=ChatResponse,
-    summary="Unified chat endpoint",
+    deprecated=True,
+    summary="Unified chat endpoint (DEPRECATED — use /api/v1/chat/v2/stream)",
     description=(
+        "DEPRECATED (2026-08-08): superseded by the LangGraph orchestrator at "
+        "/api/v1/chat/v2/stream. Still live for existing callers; do not add features here.\n\n"
         "Single entry point: routes to ingestion or plan-day pipeline via SLM classification. "
         "Returns ChatResponse with intent, message, and pipeline-specific results (schedule, "
         "execution_graph, or ingestion_result)."
     ),
 )
 async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
-    """Execute the agentic flow: classify intent, then run ingestion or plan-day pipeline."""
+    """Execute the agentic flow: classify intent, then run ingestion or plan-day pipeline.
+
+    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
+    """
+    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
     log_step("REQUEST", "Chat received", {"user_id": request.user_id, "prompt_preview": request.user_prompt[:60]})
     db_client = getattr(http_request.app.state, "db_client", None)
     draft_store = getattr(http_request.app.state, "draft_store", None)
@@ -229,15 +237,22 @@ async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
 
 @router.post(
     "/stream",
-    summary="Streaming chat endpoint (SSE)",
+    deprecated=True,
+    summary="Streaming chat endpoint (SSE) (DEPRECATED — use /api/v1/chat/v2/stream)",
     description=(
+        "DEPRECATED (2026-08-08): superseded by the LangGraph orchestrator at "
+        "/api/v1/chat/v2/stream. Still live for existing callers; do not add features here.\n\n"
         "SSE endpoint. Runs the full pipeline then streams Voice of Jarvis output token by token. "
         "Events: step (pipeline done), thinking (think-block tokens), message (response tokens), "
         "complete (full ChatResponse JSON)."
     ),
 )
 async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingResponse:
-    """Run pipeline, then stream Voice of Jarvis as SSE events."""
+    """Run pipeline, then stream Voice of Jarvis as SSE events.
+
+    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
+    """
+    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
     log_step("STREAM_REQUEST", "Stream chat received", {"user_id": request.user_id})
     db_client = getattr(http_request.app.state, "db_client", None)
     draft_store = getattr(http_request.app.state, "draft_store", None)
