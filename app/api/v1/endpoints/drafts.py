@@ -200,18 +200,19 @@ async def rearrange_draft(draft_id: str, request: DraftRearrangeRequest, http_re
     }
 
 
-@router.post("/{draft_id}/chat", summary="Modify draft via natural language")
+@router.post("/{draft_id}/chat", summary="Modify draft via natural language (not implemented)")
 async def chat_modify_draft(draft_id: str, request: DraftChatRequest, http_request: Request):
-    """Apply a natural language modification to a draft schedule."""
-    await _load_draft(http_request, draft_id, request.user_id)
+    """501 — natural-language draft modification has no implementation.
 
-    schedule_modifier = getattr(http_request.app.state, "schedule_modifier", None)
-    if schedule_modifier:
-        modified_draft = await schedule_modifier.modify(
-            draft_id=draft_id,
-            user_id=request.user_id,
-            message=request.message,
-        )
-        return {"status": "modified", "draft_id": draft_id, "result": modified_draft}
+    The handler used to dispatch to ``app.state.schedule_modifier`` and, when
+    that was absent, answer ``{"status": "modified"}`` anyway. Nothing in the
+    codebase ever assigns ``schedule_modifier``, so "modified" was the only
+    reachable reply and it was always false: the draft came back unchanged
+    while the caller was told the edit had landed.
 
-    return {"status": "modified", "draft_id": draft_id}
+    Nothing calls this today (``jarvis-frontend/lib/api.ts`` uses
+    accept/reject/edit/rearrange/delete), so saying so plainly costs no caller.
+    The conversational path to editing a plan is the orchestrator's negotiation
+    flow at /api/v1/chat/v2/stream.
+    """
+    raise HTTPException(status_code=501, detail="draft chat modification not implemented")

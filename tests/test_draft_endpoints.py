@@ -282,6 +282,27 @@ def test_accept__persist_failure__does_not_report_accepted(client, monkeypatch):
     assert _draft_row(client, draft_id)["status"] == "pending"  # retryable
 
 
+def test_chat_modify__is_not_implemented(client):
+    """It used to answer `{"status": "modified"}` having modified nothing.
+
+    The handler branched on `app.state.schedule_modifier`, which is assigned
+    nowhere in the codebase, so the fallback — a bare "modified" — was the only
+    reachable path. No frontend caller exists (jarvis-frontend/lib/api.ts calls
+    accept/reject/edit/delete on drafts, never /chat), so 501 costs nothing and
+    stops the endpoint lying to whoever finds it next.
+    """
+    draft_id = client.app.state._test_draft_id
+    resp = client.post(
+        f"/api/v1/drafts/{draft_id}/chat",
+        json={"user_id": "test_user", "message": "move the second task to tomorrow"},
+    )
+
+    assert resp.status_code == 501
+    assert resp.json()["detail"] == "draft chat modification not implemented"
+    # The draft is untouched — a 501 must not have half-applied anything.
+    assert [t["task_id"] for t in _draft_row(client, draft_id)["tasks"]] == ["t1", "t2"]
+
+
 def test_accept__draft_with_no_tasks__is_not_reported_accepted(client):
     draft_id = client.app.state._test_draft_id
     client.app.state.draft_store.replace_tasks(draft_id, "test_user", [])
