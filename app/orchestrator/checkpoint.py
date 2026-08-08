@@ -10,6 +10,9 @@ nested ``checkpoint_ns`` through this same saver:
 * ``progress_callback`` — a closure over the SSE queue
 * ``progress_queue``  — the ``asyncio.Queue`` itself
 * ``db_client``       — the live ``DatabaseClient`` (KnowledgeState)
+* ``draft_store``     — the live ``DraftStore`` wrapping the Supabase client
+  (JarvisState and PlanningState). Only ``draft_id`` — a plain string — needs
+  to survive the turn; the store itself is re-supplied from ``app.state``.
 * ``file_base64`` / ``file_bytes`` / ``file_name`` — the uploaded document in
   both its encoded and decoded forms, plus its name. Not a serialization
   problem, a privacy one: checkpoint rows are append-only with no pruning, so
@@ -44,6 +47,7 @@ _TRANSIENT_KEYS = (
     "progress_callback",
     "progress_queue",
     "db_client",
+    "draft_store",
     "file_base64",
     "file_bytes",
     "file_name",
