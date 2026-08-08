@@ -16,6 +16,7 @@ def test_planning_module__has_correct_steps():
         "decompose_goal",
         "fuse_tasks",
         "solve_schedule",
+        "create_draft",
         "handle_infeasible",
     ]
 

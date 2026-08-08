@@ -56,6 +56,7 @@ class JarvisState(TypedDict):
     # Module outputs
     execution_graph: Optional[Any]  # ExecutionGraph — Any to avoid cross-layer import
     schedule: Optional[dict]
+    draft_id: Optional[str]
     draft_response: Optional[dict]
     research_results: Optional[list[dict]]
     ingestion_result: Optional[dict]
@@ -80,6 +81,10 @@ class JarvisState(TypedDict):
     # Progress bridge — callable emitting SSE phase events from sub-graphs
     progress_callback: Any
     progress_queue: Any
+
+    # Live Supabase-backed DraftStore from app.state — transient like
+    # user_model, re-supplied per turn by chat.py, never checkpointed.
+    draft_store: Any
 
     # Per-turn flags
     trivial_input: Optional[bool]            # set when greeting/emotional fast-path fires
