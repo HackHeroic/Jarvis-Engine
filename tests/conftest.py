@@ -75,6 +75,8 @@ def no_llm(monkeypatch):
 
     async def fake_route_llm_call(*args, **kwargs):
         calls.append(("route_llm_call", kwargs.get("task")))
+        if kwargs.get("stream"):
+            return _canned_token_gen()
         return CANNED_LLM_REPLY
 
     async def _canned_token_gen():
