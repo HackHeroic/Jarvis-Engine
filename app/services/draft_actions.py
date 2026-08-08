@@ -110,22 +110,26 @@ def _schedule_map_of(draft: dict) -> Optional[dict]:
     return schedule if isinstance(schedule, dict) else None
 
 
-def _count_persisted(supabase: Any, user_id: str, task_ids: set) -> int:
-    """How many of ``task_ids`` are actually sitting in ``user_tasks`` now.
+def _count_persisted(supabase: Any, user_id: str, plan_id: str) -> int:
+    """How many rows carrying *this* ``plan_id`` are in ``user_tasks`` now.
 
-    The only way to know whether the write landed: ``_persist_fused_tasks``
-    catches its own exceptions and returns ``None`` either way
-    (control_policy.py:438-439), so calling it successfully proves nothing.
+    Filtering on plan_id rather than task_id is the whole point. Fused chunk
+    lists deliberately carry pre-existing pending tasks forward (``fuse_tasks``
+    merges them into the draft), and ``_persist_fused_tasks`` builds its rows
+    *before* deleting the old ones — so after a total write failure the stale
+    rows are still there, wearing the same task_ids. Matching on those would
+    read an outage as a success, flip the draft to accepted, and take the retry
+    path away with it. A plan_id is minted per call, so only rows this call
+    wrote can carry it.
     """
     result = (
         supabase.table("user_tasks")
         .select("task_id")
         .eq("user_id", user_id)
-        .eq("status", "pending")
+        .eq("plan_id", plan_id)
         .execute()
     )
-    stored = {row.get("task_id") for row in (result.data or [])}
-    return len(task_ids & stored)
+    return len(result.data or [])
 
 
 async def accept_draft_and_persist(
@@ -146,6 +150,11 @@ async def accept_draft_and_persist(
     the draft, then persist it") means a failed persist leaves an
     accepted-but-empty draft that no retry can ever find again — the user's
     schedule silently evaporates. So: persist, verify, then flip.
+
+    Verification reads back the rows carrying the ``plan_id`` this write minted,
+    never the task_ids: a draft's tasks may already exist as pending rows from
+    an earlier plan (``fuse_tasks`` merges them in), and those survive a failed
+    write, so a task_id match proves nothing at all.
 
     Both writes are offloaded with ``to_thread``; ``DraftStore`` and
     ``_persist_fused_tasks`` are sync Supabase calls that would otherwise stall
@@ -175,7 +184,7 @@ async def accept_draft_and_persist(
         logger.error(f"Draft {draft_id} not accepted: no Supabase client to persist through")
         return None
 
-    await asyncio.to_thread(
+    plan_id = await asyncio.to_thread(
         _persist_fused_tasks,
         user_id,
         chunks,
@@ -183,10 +192,12 @@ async def accept_draft_and_persist(
         schedule=_schedule_map_of(draft),
         horizon_start=draft.get("horizon_start"),
     )
+    if not plan_id:
+        logger.error(f"Draft {draft_id} persist reported nothing written — leaving it pending")
+        return None
 
-    task_ids = {c.task_id for c in chunks}
     try:
-        landed = await asyncio.to_thread(_count_persisted, supabase, user_id, task_ids)
+        landed = await asyncio.to_thread(_count_persisted, supabase, user_id, plan_id)
     except Exception as exc:
         logger.error(f"Could not verify persistence for draft {draft_id}: {exc}")
         return None

@@ -315,7 +315,7 @@ def _persist_fused_tasks(
     supabase_client: Any,
     schedule: dict | None = None,
     horizon_start: str | None = None,
-) -> None:
+) -> str | None:
     """Replace all pending user_tasks with the fused master chunk list.
 
     Deletes existing pending rows, then inserts fresh rows for each chunk.
@@ -328,14 +328,24 @@ def _persist_fused_tasks(
         horizon_start: Optional ISO-8601 datetime string representing minute-0 of
                        the scheduling horizon.
 
+    Returns:
+        The ``plan_id`` stamped on every inserted row when the write completed,
+        else ``None``. Exceptions are still swallowed — this function is called
+        from paths that must not die on a persistence blip — so the return value
+        is the only signal a caller has that anything happened. Callers that need
+        proof (draft acceptance) re-read user_tasks filtered on this plan_id:
+        task_ids alone cannot distinguish rows this call wrote from rows an
+        earlier plan left behind, since fused chunk lists deliberately carry
+        pre-existing pending tasks forward.
+
     Safety: will NOT delete if chunks list is empty (prevents accidental wipe
     when task retrieval fails upstream).
     """
     if not supabase_client or not user_id:
-        return
+        return None
     if not chunks:
         print("[Control Policy] _persist_fused_tasks: empty chunks list, skipping to prevent data loss")
-        return
+        return None
     try:
         plan_id = str(uuid.uuid4())
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -436,8 +446,11 @@ def _persist_fused_tasks(
         if rows:
             supabase_client.table("user_tasks").insert(rows).execute()
             print(f"[Control Policy] Persisted {len(rows)} fused tasks for user {user_id}")
+            return plan_id
+        return None
     except Exception as e:
         print(f"[Control Policy] Persist fused user_tasks failed: {e}")
+        return None
 
 
 INGESTION_MESSAGES = {
