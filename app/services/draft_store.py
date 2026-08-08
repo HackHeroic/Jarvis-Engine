@@ -87,6 +87,20 @@ class DraftStore:
         result = self._supabase.table("draft_schedules").update({"status": "rejected", "rejection_reason": reason}).eq("id", draft_id).eq("user_id", user_id).execute()
         return bool(result.data)
 
+    def replace_tasks(self, draft_id: str, user_id: str, tasks: list) -> dict | None:
+        """Overwrite a draft's whole task list. Returns the updated row, or None.
+
+        The unit of revision for a draft is its task array — reordering
+        (`POST /rearrange`) and per-task edits both end here. Status becomes
+        'modified' so a revised draft is distinguishable from an untouched one.
+        """
+        if not self._supabase:
+            return None
+        if not self.get_draft(draft_id, user_id):
+            return None  # absent, or not this user's — same answer either way
+        self._supabase.table("draft_schedules").update({"tasks": tasks, "status": "modified"}).eq("id", draft_id).eq("user_id", user_id).execute()
+        return self.get_draft(draft_id, user_id)
+
     def edit_task_in_draft(self, draft_id: str, user_id: str, task_id: str, edits: dict) -> dict | None:
         """Edit a single task within a draft by task_id.
 
@@ -109,8 +123,7 @@ class DraftStore:
                 break
         if not updated:
             return None
-        self._supabase.table("draft_schedules").update({"tasks": tasks, "status": "modified"}).eq("id", draft_id).eq("user_id", user_id).execute()
-        return self.get_draft(draft_id, user_id)
+        return self.replace_tasks(draft_id, user_id, tasks)
 
     def delete_draft(self, draft_id: str, user_id: str) -> bool:
         if not self._supabase:
@@ -121,8 +134,10 @@ class DraftStore:
     # ── Backward-compatible aliases ──────────────────────────
     # The old in-memory DraftStore had: create(), get(), delete(), add_component(),
     # accept_component(), reject_component(), accept_all(), cleanup_expired().
-    # These aliases keep existing callers in drafts.py and control_policy.py working
-    # until they are rewritten to use the new API in Phase 1B.
+    # drafts.py no longer calls any of them (Task 10 rewrote it onto the real
+    # API above); control_policy.py's v1 flow still calls add_component(), so
+    # the shims stay until that flow is retired. tests/test_draft_store.py pins
+    # their no-op contract so nobody mistakes them for working code.
 
     def create(self, user_id: str, **kwargs) -> "Draft":
         """Legacy alias. Returns a Draft stub with a generated draft_id."""
@@ -136,23 +151,23 @@ class DraftStore:
         return False  # Fail-safe: refuse to delete without user_id
 
     def get(self, draft_id: str, user_id: str = None, **kwargs):
-        """Legacy alias. Callers: drafts.py:36,63,130 pass (draft_id, user_id)."""
+        """Legacy alias, permanently None. No caller remains — drafts.py now uses get_draft()."""
         return None
 
     def add_component(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
-        """Legacy no-op. Callers: control_policy.py:897,907,1260,1354 pass (draft_id, user_id, key, DraftComponent)."""
+        """Legacy no-op. Still called by control_policy.py:897,907,1260,1354 (v1 flow)."""
         return True
 
     def update_component_data(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
-        """Legacy no-op. Callers: drafts.py:151 pass (draft_id, user_id, component, data)."""
+        """Legacy no-op. No caller remains — drafts.py now uses replace_tasks()."""
         return True
 
     def accept_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
-        """Legacy no-op. Callers: drafts.py:115 pass (draft_id, user_id, key)."""
+        """Legacy no-op. No caller remains — drafts.py now uses accept_draft()."""
         return True
 
     def reject_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
-        """Legacy no-op. Callers: drafts.py:136 pass (draft_id, user_id, key)."""
+        """Legacy no-op. No caller remains — drafts.py now uses reject_draft()."""
         return True
 
     def accept_all(self, draft_id: str, **kwargs) -> bool:
