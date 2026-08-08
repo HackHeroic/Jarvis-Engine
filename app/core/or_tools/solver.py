@@ -182,10 +182,18 @@ class JarvisScheduler:
         makespan + Σ(priority_i × start_i) so high-priority tasks
         are scheduled earlier.
 
+        The search is capped at ``SOLVER_MAX_TIME_SECONDS``; see config for why.
+        An expired cap yields FEASIBLE (best schedule found so far, returned as
+        normal) or UNKNOWN, which joins the INFEASIBLE branch — "I ran out of
+        time" and "no such schedule exists" leave the caller the same two moves,
+        widen the horizon or cut scope, and both are already handled there.
+
         Returns:
             Dict mapping task_id to {"start": start_min, "end": end_min}
             if FEASIBLE or OPTIMAL; otherwise "INFEASIBLE".
         """
+        from app.core.config import SOLVER_MAX_TIME_SECONDS
+
         # Collect all interval variables (Anti-Guilt: user does one thing at a time)
         all_intervals = (
             [t["interval"] for t in self.tasks.values()] + self.hard_blocks
@@ -227,6 +235,7 @@ class JarvisScheduler:
         self.model.minimize(obj_expr)
 
         solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = SOLVER_MAX_TIME_SECONDS
         status = solver.solve(self.model)
 
         if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
@@ -238,4 +247,13 @@ class JarvisScheduler:
                 for tid, t in self.tasks.items()
             }
             return (schedule, "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE")
+
+        if status == cp_model.UNKNOWN:
+            # Distinguishable in the logs even though the return value is not:
+            # a plan that keeps hitting this needs a bigger cap, not less scope.
+            print(
+                f"[Scheduler] CP-SAT returned UNKNOWN after the "
+                f"{SOLVER_MAX_TIME_SECONDS}s cap ({len(self.tasks)} tasks, "
+                f"horizon {self.horizon} min) — reporting INFEASIBLE"
+            )
         return ("INFEASIBLE", "")

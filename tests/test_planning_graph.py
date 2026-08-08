@@ -330,6 +330,44 @@ async def test_solve_schedule__real_solver__applies_biological_sleep_fallback():
         assert slot["tmt_score"] is not None
 
 
+@pytest.mark.asyncio
+async def test_solve_schedule__does_not_block_the_event_loop(monkeypatch):
+    """CP-SAT is a synchronous C++ solve — it must run off-thread.
+
+    Bare, it freezes the whole event loop for the length of the solve. On the
+    streaming path that means every queued SSE frame stops mid-plan: the user
+    watches a dead spinner instead of the progress events already produced. It
+    also makes `_wrap_step`'s `asyncio.wait_for` advisory only, since a blocking
+    call cannot be interrupted by the scheduler.
+    """
+    from app.api.v1.endpoints import schedule as schedule_ep
+    from app.modules.planning_graph import solve_schedule
+
+    idents: list[int] = []
+
+    class _Resp:
+        def model_dump(self, mode="json"):
+            return {"schedule": {}, "horizon_start": "2026-08-08T08:00:00+00:00"}
+
+    def _recording_run_schedule(*a, **k):
+        idents.append(threading.get_ident())
+        return _Resp()
+
+    monkeypatch.setattr(schedule_ep, "run_schedule", _recording_run_schedule)
+
+    result = await solve_schedule(
+        {
+            "task_chunks": [_chunk()],
+            "time_slots": [],
+            "horizon_minutes": 2880,
+            "user_id": "u1",
+        }
+    )
+
+    assert result["error"] is None
+    assert idents and idents[0] != threading.get_ident()
+
+
 # --- horizon ladder ---------------------------------------------------------
 
 
