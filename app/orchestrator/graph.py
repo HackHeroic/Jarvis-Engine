@@ -90,6 +90,13 @@ _DRAFT_EDIT_RE = re.compile(
     r"make .*\b(longer|shorter|easier|harder))\b",
     re.IGNORECASE,
 )
+# "don't do it" contains "do it"; "not yet" follows "looks good" often enough.
+# ACCEPT_DRAFT is the one intent that writes user_tasks, so a negated message
+# is disqualified from accepting and falls through to the safe branches.
+_DRAFT_NEGATION_RE = re.compile(
+    r"\b(don'?t|do\s+not|never|not\s+yet|hold\s+off|no\s+need|wait)\b",
+    re.IGNORECASE,
+)
 
 # EDITING is included: a user mid-edit can still accept or scrap the whole thing.
 _NEGOTIATION_ACTIVE = (
@@ -111,7 +118,7 @@ def _match_draft_intent(text: str):
 
     if not text or not text.strip():
         return None
-    if _DRAFT_ACCEPT_RE.search(text):
+    if _DRAFT_ACCEPT_RE.search(text) and not _DRAFT_NEGATION_RE.search(text):
         return IntentType.ACCEPT_DRAFT
     if _DRAFT_REJECT_RE.search(text):
         return IntentType.REJECT_DRAFT
@@ -314,6 +321,26 @@ async def handle_draft_action(state: JarvisState) -> dict:
     Accept is also the only place v2 writes to ``user_tasks``: the planning
     sub-graph proposes and persists nothing.
     """
+    import logging
+
+    try:
+        return await _apply_draft_action(state)
+    except Exception as exc:
+        logging.getLogger(__name__).error(f"Draft action failed: {exc}")
+        # Deliberately omits negotiation_state: a Supabase blip leaves the draft
+        # exactly where it was, so the phase must stay put too — saying "accept"
+        # again retries instead of starting a second plan from scratch. Claiming
+        # success here would be the one lie this node must never tell.
+        return {
+            "response_message": (
+                "That didn't go through, sir — the draft store refused it. "
+                "Say it again and I'll retry."
+            )
+        }
+
+
+async def _apply_draft_action(state: JarvisState) -> dict:
+    """The body of handle_draft_action; see there for the contract."""
     from app.schemas.context import IntentType
     from app.services.draft_actions import (
         accept_draft_and_persist,
@@ -349,7 +376,9 @@ async def handle_draft_action(state: JarvisState) -> dict:
         )
         return {
             "response_message": (
-                f"Locked in, sir — {count} task{'s' if count != 1 else ''} are on your schedule."
+                f"Locked in, sir — {count} task is on your schedule."
+                if count == 1
+                else f"Locked in, sir — {count} tasks are on your schedule."
                 if count
                 else "Draft accepted, sir, though it held no tasks to schedule."
             ),

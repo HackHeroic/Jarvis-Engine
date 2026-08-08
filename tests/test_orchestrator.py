@@ -576,3 +576,35 @@ async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm, _captu
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] is None
     assert len(_captured_persist) == 1
+
+
+@pytest.mark.asyncio
+async def test_classify__negated_accept_verb__does_not_accept():
+    """"don't do it" contains "do it". ACCEPT_DRAFT is the only intent that
+    writes user_tasks, so a negated match must never reach it."""
+    state = _make_state(
+        user_message="don't do it yet", negotiation_state=NegotiationPhase.REVIEWING
+    )
+    assert await _intent_of(state) != "ACCEPT_DRAFT"
+
+
+@pytest.mark.asyncio
+async def test_draft_action__store_failure__keeps_the_draft_open(_captured_persist):
+    """A Supabase blip must not 500 the turn — nor claim the plan went live."""
+    from app.orchestrator.graph import handle_draft_action
+
+    class _BrokenStore(_FakeDraftStore):
+        def accept_draft(self, draft_id, user_id):
+            raise RuntimeError("supabase unreachable")
+
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=_BrokenStore(), draft_id="d1", user_message="accept",
+    )
+    result = await handle_draft_action(state)
+
+    assert result["response_message"]
+    assert _captured_persist == []
+    # negotiation_state left untouched → still REVIEWING → "accept" retries
+    # instead of the next message starting a whole new plan.
+    assert "negotiation_state" not in result
