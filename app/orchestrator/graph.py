@@ -75,29 +75,16 @@ _PLANNING_VERBS_RE = re.compile(
 # Only consulted while a draft is actually on the table (see _classify_intent /
 # _negotiation_precheck). Outside a negotiation "accept" is just a word.
 
-# Tier 1 — the whole message (minus filler) IS the acceptance. This is the
-# design premise, enforced literally: "accept", "yes, do it", "lock it in".
-_ACCEPT_WHOLE_RE = re.compile(
-    r"^(accept|approved?|confirm(ed)?|lgtm|ship it|do it|go ahead|"
+# One acceptance phrase, with its optional object ("accept" / "accept it" /
+# "accept the draft"). Word-bounded, so "acceptance criteria" is not "accept".
+_ACCEPT_PHRASE_RE = re.compile(
+    r"\b(accept|approved?|confirm(ed)?|lgtm|ship it|do it|go ahead|"
     r"looks good|sounds good|lock it in|locked in|good to go|"
-    r"that works|works for me)"
-    r"( it| that| this| them| all)?"
-    r"( the)?( draft| plan| schedule| tasks)?$",
+    r"that works|works for me)\b"
+    r"(\s+(it|that|this|them|all))?"
+    r"(\s+the)?(\s+(draft|plan|schedule|tasks))?",
     re.IGNORECASE,
 )
-
-# Tier 2 — an unambiguous acceptance token inside a *short* message, so
-# "looks good, lock it in" still lands. Deliberately excludes the weak verbs
-# that only count as a whole message: bare "confirm", "do it" and "go ahead"
-# appear constantly in ordinary planning talk ("do it after the exam",
-# "confirm my exam registration"). "approve" carries a lookahead because
-# "approve of" is the opinion sense, never the imperative.
-_ACCEPT_STRONG_RE = re.compile(
-    r"(\baccept\b|\bapproved?\b(?!\s+of\b)|\blgtm\b|\blooks good\b|"
-    r"\bsounds good\b|\bship it\b|\block it in\b|\bgood to go\b)",
-    re.IGNORECASE,
-)
-_ACCEPT_MAX_WORDS = 6
 
 # Leading/trailing conversational padding, stripped before the whole-message
 # test so "yes, accept it please" reduces to "accept it". Interior words are
@@ -154,20 +141,31 @@ def _normalize_reply(text: str) -> str:
 def _is_acceptance(text: str, normalized: str) -> bool:
     """True only for a message whose whole point is "yes, commit this".
 
-    Three gates, all required: no negation, not a question ("can you confirm
-    what's at 3pm?" is a lookup, not an approval), and either the entire
-    message is an acceptance phrase or a strong token appears in a short one.
+    The rule is *end-to-end coverage*, not presence: every word of the
+    normalized message must be consumed by acceptance phrases. Length alone is
+    not a proxy for intent — "accept my apology", "my calculus grade looks
+    good" and "the professor approved my topic" are all short, and none of them
+    is an instruction. Consuming the whole string separates
+    "looks good, lock it in" (two phrases, nothing left over) from "looks good
+    but move the calculus block later" (leftovers, so not an acceptance).
+
+    Two cheap disqualifiers run first: a negation anywhere, and a question mark
+    — "can you confirm what's at 3pm?" is a lookup, not an approval.
     """
-    if not normalized or _DRAFT_NEGATION_RE.search(text):
+    if not normalized or _DRAFT_NEGATION_RE.search(text) or "?" in text:
         return False
-    if "?" in text:
-        return False
-    if _ACCEPT_WHOLE_RE.match(normalized):
-        return True
-    return (
-        len(normalized.split()) <= _ACCEPT_MAX_WORDS
-        and _ACCEPT_STRONG_RE.search(normalized) is not None
-    )
+
+    position = 0
+    matched = False
+    while position < len(normalized):
+        match = _ACCEPT_PHRASE_RE.match(normalized, position)
+        if match is None or match.end() == position:
+            return False
+        matched = True
+        position = match.end()
+        while position < len(normalized) and normalized[position] == " ":
+            position += 1
+    return matched
 
 
 def _match_draft_intent(text: str):

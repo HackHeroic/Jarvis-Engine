@@ -5,7 +5,7 @@ from app.orchestrator.state import (
 )
 from app.schemas.context import IntentType
 
-from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, make_jarvis_state
+from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, FakeSupabase, make_jarvis_state
 
 
 def test_conversation_phase_values():
@@ -760,14 +760,21 @@ async def test_graph__upload_during_review_reaches_knowledge_module(no_llm, _cap
 
 
 class _VerifyingStore(_FakeDraftStore):
-    """Records the order of status-flip vs. task persistence."""
+    """Observes how many user_tasks rows existed at the moment of the status flip.
 
-    def __init__(self, *args, **kwargs):
+    A plain call-order list would not prove anything — both calls happen either
+    way. Sampling the table at flip time is what actually distinguishes
+    persist-then-flip from flip-then-persist.
+    """
+
+    def __init__(self, *args, supabase=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.order: list[str] = []
+        self._supabase = supabase
+        self.rows_at_flip = None
 
     def accept_draft(self, draft_id, user_id):
-        self.order.append("status_flip")
+        if self._supabase is not None:
+            self.rows_at_flip = len(self._supabase.rows.get("user_tasks", []))
         return super().accept_draft(draft_id, user_id)
 
 
@@ -796,23 +803,23 @@ async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft(mon
 
 
 @pytest.mark.asyncio
-async def test_accept__verified_persist__flips_status_after_the_write():
+async def test_accept__flips_status_only_after_the_tasks_are_in_the_table():
     """Order matters: flipping first leaves an accepted-but-empty draft that
-    get_pending_draft can no longer find."""
+    get_pending_draft can no longer find, so the retry is gone too."""
     from app.orchestrator.graph import handle_draft_action
 
-    store = _VerifyingStore()
     user_model = _user_model_with_db()
+    supabase = user_model._db.supabase
+    store = _VerifyingStore(supabase=supabase)
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
         draft_store=store, draft_id="d1", user_message="accept", user_model=user_model,
     )
     result = await handle_draft_action(state)
 
-    rows = user_model._db.supabase.rows.get("user_tasks", [])
-    assert [r["task_id"] for r in rows] == ["t1"]
+    assert [r["task_id"] for r in supabase.rows["user_tasks"]] == ["t1"]
     assert store.accepted == [("d1", "test_user")]
-    assert store.order == ["status_flip"]  # ran, and only after the insert above
+    assert store.rows_at_flip == 1  # the task was already written when we flipped
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
 
 
@@ -831,4 +838,75 @@ async def test_accept__draft_with_no_tasks__exits_without_claiming_success():
 
     assert store.accepted == []
     assert result["negotiation_state"] == NegotiationPhase.NONE  # exit door
+    assert "locked in" not in result["response_message"].lower()
+
+
+# --- acceptance must be the message's whole point, not a phrase inside it ----
+
+_MUST_NOT_ACCEPT_MENTIONS = [
+    "my calculus grade looks good",
+    "the professor approved my topic",
+    "accept my apology",
+    "the acceptance criteria looks good",
+    "his lgtm came late",
+    "that ship it mentality",
+    "the plan is good to go",
+]
+
+
+@pytest.mark.parametrize("message", _MUST_NOT_ACCEPT_MENTIONS)
+def test_matcher__acceptance_word_inside_a_sentence__never_accepts(message):
+    """Short is not the same as imperative. All seven are <= 6 words."""
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent(message) is not IntentType.ACCEPT_DRAFT
+
+
+class _WriteFailingSupabase(FakeSupabase):
+    """Reads work, every write raises — a Supabase outage mid-accept.
+
+    _persist_fused_tasks catches the exception itself, so the caller sees a
+    perfectly clean return with nothing written.
+    """
+
+    def table(self, name):
+        query = super().table(name)
+        real_execute = query.execute
+
+        def execute():
+            if query._op in ("insert", "update", "delete"):
+                raise RuntimeError("supabase write refused")
+            return real_execute()
+
+        query.execute = execute
+        return query
+
+
+@pytest.mark.asyncio
+async def test_accept__write_failure_over_a_preexisting_row__is_not_read_as_success():
+    """fuse_tasks merges pre-existing pending rows into drafts, so a draft task
+    can already be in user_tasks before accept runs. Verifying by task_id alone
+    would count that stale row as proof the new write landed — and _persist_fused_tasks
+    builds its rows before deleting, so a total failure leaves it sitting there."""
+    from app.core.user_model import UserModel
+    from app.orchestrator.graph import handle_draft_action
+    from tests.fakes import FakeDBClient
+
+    supabase = _WriteFailingSupabase(
+        {"user_tasks": [
+            {"user_id": "test_user", "task_id": "t1", "status": "pending",
+             "plan_id": "plan-from-last-week"},
+        ]}
+    )
+    store = _VerifyingStore(supabase=supabase)
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id="d1", user_message="accept",
+        user_model=UserModel(user_id="test_user", db=FakeDBClient(supabase)),
+    )
+    result = await handle_draft_action(state)
+
+    assert store.accepted == []                 # status NOT flipped
+    assert "negotiation_state" not in result    # still REVIEWING → retryable
     assert "locked in" not in result["response_message"].lower()
