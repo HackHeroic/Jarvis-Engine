@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator
 from typing import Optional
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -776,13 +776,23 @@ class ConfirmScheduleRequest(BaseModel):
 
 @router.post(
     "/confirm-schedule",
-    summary="Schedule user-confirmed tasks (SSE)",
-    description="After user reviews and edits decomposed tasks, run scheduling + Voice of Jarvis.",
+    deprecated=True,
+    summary="Schedule user-confirmed tasks (SSE) (DEPRECATED — use /api/v1/chat/v2/stream)",
+    description=(
+        "DEPRECATED (2026-08-08): v1-adjacent surface, superseded by the "
+        "LangGraph orchestrator at /api/v1/chat/v2/stream, which proposes a "
+        "draft instead. Still live for existing callers; do not add features here.\n\n"
+        "After user reviews and edits decomposed tasks, run scheduling + Voice of Jarvis."
+    ),
 )
 async def confirm_schedule_stream(
     request: ConfirmScheduleRequest, http_request: Request
 ) -> StreamingResponse:
-    """Run Phase 2: scheduling + VoJ on user-confirmed tasks."""
+    """Run Phase 2: scheduling + VoJ on user-confirmed tasks.
+
+    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
+    """
+    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
     from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
     from app.api.v1.endpoints.schedule import run_schedule
     from app.core.config import (
@@ -971,6 +981,18 @@ async def confirm_schedule_stream(
     )
 
 
+def _persist_failed() -> JSONResponse:
+    """503 for "the schedule is not saved" — the honest answer to a failed write.
+
+    503 rather than 500: the write is retryable, nothing about the request was
+    wrong, and the frontend keeps the draft in hand to try again.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"status": "failed", "detail": "schedule could not be persisted"},
+    )
+
+
 class AcceptScheduleRequest(BaseModel):
     """Request to persist a draft schedule."""
 
@@ -983,13 +1005,31 @@ class AcceptScheduleRequest(BaseModel):
 
 @router.post(
     "/accept-schedule",
-    summary="Accept and persist a draft schedule",
-    description="Called when user accepts a draft schedule. Persists tasks to Supabase.",
+    deprecated=True,
+    summary="Accept and persist a draft schedule (DEPRECATED — use /api/v1/drafts/{id}/accept)",
+    description=(
+        "DEPRECATED (2026-08-08): v1-adjacent surface, superseded by "
+        "POST /api/v1/drafts/{draft_id}/accept. Still live as the frontend's "
+        "no-draft fallback; do not add features here.\n\n"
+        "Called when user accepts a draft schedule. Persists tasks to Supabase."
+    ),
 )
 async def accept_schedule(request: AcceptScheduleRequest, http_request: Request):
-    """Persist accepted draft schedule tasks to Supabase."""
+    """Persist accepted draft schedule tasks to Supabase.
+
+    DEPRECATED (2026-08-08): superseded by POST /api/v1/drafts/{draft_id}/accept.
+
+    Answers 503 unless the tasks are verifiably in ``user_tasks``. This route is
+    the only thing between an accepted plan and the database on the no-draft
+    path, and ``_persist_fused_tasks`` swallows its own exceptions — so its
+    return value (a freshly minted plan_id, or None) plus a read-back of the
+    rows carrying that plan_id is the only honest evidence available. Same duty,
+    same verification helper, as ``accept_draft_and_persist``.
+    """
+    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/drafts/{draft_id}/accept")
     from app.api.v1.endpoints.reasoning import TaskChunk
     from app.services.analytical.control_policy import _persist_fused_tasks
+    from app.services.draft_actions import _count_persisted
 
     db_client = getattr(http_request.app.state, "db_client", None)
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -999,11 +1039,26 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
     except Exception as exc:
         return {"status": "error", "message": f"Invalid tasks: {exc}", "task_count": 0}
 
-    _persist_fused_tasks(
+    plan_id = _persist_fused_tasks(
         request.user_id, task_chunks, supabase,
         schedule=request.schedule.get("schedule") if request.schedule else None,
         horizon_start=request.horizon_start,
     )
+    if not plan_id:
+        logger.error(f"accept-schedule persisted nothing for {request.user_id} — reporting failure")
+        return _persist_failed()
+
+    # Read back on plan_id, never task_id: fused lists carry pre-existing
+    # pending rows forward, and those survive a failed write wearing the same
+    # task_ids — matching them would read an outage as a success.
+    try:
+        landed = _count_persisted(supabase, request.user_id, plan_id)
+    except Exception as exc:
+        logger.error(f"accept-schedule could not verify plan {plan_id}: {exc}")
+        return _persist_failed()
+    if landed <= 0:
+        logger.error(f"accept-schedule write for plan {plan_id} did not land")
+        return _persist_failed()
 
     # Fire-and-forget: detect behavioral patterns from task history
     memory_store = getattr(http_request.app.state, "memory_store", None)
