@@ -1,4 +1,8 @@
-"""Control Policy: master orchestrator for the unified /chat endpoint."""
+"""Control Policy: master orchestrator for the unified /chat endpoint.
+
+DEPRECATED (2026-08-08): superseded by app/orchestrator/. Accept-schedule endpoints
+still call into _persist_fused_tasks; do not add features here.
+"""
 
 import asyncio
 import hashlib

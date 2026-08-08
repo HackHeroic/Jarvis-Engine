@@ -12,11 +12,9 @@ class _StubDBClient:
     async def check_connection(self) -> bool:
         return False
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
-from app.models.brain.litellm_conf import hybrid_route_query
 
 
 @asynccontextmanager
@@ -154,29 +152,3 @@ async def health(request: Request):
             status_code=500,
             detail={"status": "unhealthy", "database": "disconnected", "error": str(e)},
         )
-
-
-class ChatRequest(BaseModel):
-    """Request body for test-chat endpoint."""
-
-    prompt: str
-
-
-@app.post("/test-chat")
-async def test_chat(request: ChatRequest):
-    """
-    Temporary endpoint to test the LiteLLM Hybrid Router.
-    - Local Gemma: prompts without cloud keywords (e.g. study schedule)
-    - Cloud Gemini: prompts with keywords like "latest news", "current events"
-    """
-    print(f"📥 Received prompt: {request.prompt}")
-
-    system_prompt = "You are Jarvis, a highly efficient and concise AI assistant."
-
-    response = await hybrid_route_query(
-        user_prompt=request.prompt,
-        system_prompt=system_prompt,
-    )
-
-    return {"status": "success", "response": response}
-
