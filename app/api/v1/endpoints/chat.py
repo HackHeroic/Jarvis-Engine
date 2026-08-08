@@ -1251,6 +1251,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         # draft_id, which the SSE payload below reports to the UI.
         "draft_store": getattr(http_request.app.state, "draft_store", None),
         "draft_id": None,
+        "saved_constraints": None,
         "draft_response": None,
         "research_results": None,
         "ingestion_result": None,
@@ -1579,6 +1580,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 "awaiting_task_confirmation": False,
                 "schedule_status": "draft" if _has_schedule else None,
                 "draft_id": final_state.get("draft_id"),
+                "saved_constraints": final_state.get("saved_constraints"),
                 "conversation_id": session_id,
                 "message_id": _msg_id,
                 "clarification_options": None,

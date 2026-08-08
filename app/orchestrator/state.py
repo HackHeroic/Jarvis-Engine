@@ -65,6 +65,7 @@ class JarvisState(TypedDict):
     # Response
     thinking_process: Optional[str]
     response_message: Optional[str]
+    saved_constraints: Optional[list[str]]  # habits persisted by store_constraint
 
     # Orchestrator control
     conversation_phase: ConversationPhase

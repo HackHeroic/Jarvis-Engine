@@ -1307,3 +1307,90 @@ async def test_voj_stream__local_route__prompt_is_untouched(monkeypatch):
         )
     ]
     assert "555-123-4567" in seen["user_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# store_constraint node — BEHAVIORAL_CONSTRAINT must actually store habits
+# ---------------------------------------------------------------------------
+
+
+def test_routing__behavioral_constraint__goes_to_store_constraint():
+    from app.orchestrator.routing import INTENT_TO_MODULE
+
+    assert INTENT_TO_MODULE["BEHAVIORAL_CONSTRAINT"] == "store_constraint"
+
+
+@pytest.mark.asyncio
+async def test_store_constraint__persists_each_habit_and_confirms(monkeypatch):
+    from app.orchestrator import graph as graph_mod
+    from app.schemas.context import BrainDumpExtraction
+
+    stored = []
+
+    async def fake_store(raw_text, constraint_type="preference", user_id=None,
+                         structured_override=None, supabase_client=None):
+        stored.append((raw_text, constraint_type, user_id))
+        return {"status": "stored", "id": f"c-{len(stored)}"}
+
+    monkeypatch.setattr(
+        "app.services.extraction.behavioral_store.store_behavioral_constraint",
+        fake_store,
+    )
+    state = make_jarvis_state(
+        user_message="I never want to study before 11am",
+        user_id="u1",
+    )
+    state["brain_dump"] = BrainDumpExtraction(
+        inline_habits=["I never want to study before 11am"]
+    )
+    result = await graph_mod.store_constraint(state)
+
+    assert stored == [("I never want to study before 11am", "habit", "u1")]
+    assert result["saved_constraints"] == ["I never want to study before 11am"]
+    assert "11am" in result["response_message"]
+
+
+@pytest.mark.asyncio
+async def test_store_constraint__no_habits__honest_message(monkeypatch):
+    from app.orchestrator import graph as graph_mod
+
+    called = []
+    monkeypatch.setattr(
+        "app.services.extraction.behavioral_store.store_behavioral_constraint",
+        lambda *a, **k: called.append(1),
+    )
+    state = make_jarvis_state(user_message="hmm", user_id="u1")
+    state["brain_dump"] = None
+    result = await graph_mod.store_constraint(state)
+
+    assert called == []
+    assert result["saved_constraints"] == []
+    assert result["response_message"]
+
+
+@pytest.mark.asyncio
+async def test_store_constraint__storage_fails__does_not_claim_success(monkeypatch):
+    from app.orchestrator import graph as graph_mod
+    from app.schemas.context import BrainDumpExtraction
+
+    async def failing_store(*a, **k):
+        return {"status": "error", "error": "db down"}
+
+    monkeypatch.setattr(
+        "app.services.extraction.behavioral_store.store_behavioral_constraint",
+        failing_store,
+    )
+    state = make_jarvis_state(user_message="no meetings on fridays", user_id="u1")
+    state["brain_dump"] = BrainDumpExtraction(inline_habits=["no meetings on fridays"])
+    result = await graph_mod.store_constraint(state)
+
+    assert result["saved_constraints"] == []
+    assert "couldn't" in result["response_message"].lower() or "failed" in result["response_message"].lower()
+
+
+def test_graph__store_constraint_node_is_wired():
+    from app.orchestrator.graph import build_jarvis_graph
+
+    g = build_jarvis_graph()
+    edges = {(e.source, e.target) for e in g.get_graph().edges}
+    assert ("store_constraint", "observation_loop") in edges

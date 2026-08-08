@@ -124,3 +124,51 @@ class TestCompletionDurationWrite:
 
         assert body.actual_duration_minutes == 18
         assert TaskCompleteRequest(user_id="demo").actual_duration_minutes is None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/habits/constraints — behavioral constraints listing
+# ---------------------------------------------------------------------------
+
+
+def test_list_constraints__returns_user_rows_only():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from tests.fakes import FakeSupabase
+
+    fake = FakeSupabase()
+    fake.rows.setdefault("behavioral_constraints", []).extend([
+        {"id": "c1", "user_id": "u1", "raw_text": "no study before 11am",
+         "constraint_type": "habit", "created_at": "2026-08-08T10:00:00+00:00"},
+        {"id": "c2", "user_id": "OTHER", "raw_text": "leak", "constraint_type": "habit",
+         "created_at": "2026-08-08T10:00:00+00:00"},
+    ])
+
+    class _DB:
+        supabase = fake
+
+    original = getattr(app.state, "db_client", None)
+    app.state.db_client = _DB()
+    try:
+        client = TestClient(app)
+        resp = client.get("/api/v1/habits/constraints?user_id=u1")
+        assert resp.status_code == 200
+        rows = resp.json()["constraints"]
+        assert [r["raw_text"] for r in rows] == ["no study before 11am"]
+    finally:
+        app.state.db_client = original
+
+
+def test_list_constraints__degraded_db__empty_list():
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    original = getattr(app.state, "db_client", None)
+    app.state.db_client = None
+    try:
+        client = TestClient(app)
+        resp = client.get("/api/v1/habits/constraints?user_id=u1")
+        assert resp.status_code == 200
+        assert resp.json()["constraints"] == []
+    finally:
+        app.state.db_client = original
