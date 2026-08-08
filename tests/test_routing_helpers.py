@@ -186,3 +186,37 @@ async def test_hybrid_route__gemini_primary_unstructured__routes_to_cloud(monkey
         system_prompt="s", user_prompt="hello", response_schema=None
     )
     assert captured["model"] == "gemini/gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_route__gemini_primary_beats_prefer_local(monkeypatch):
+    """No local model loaded (GEMINI_PRIMARY) must win over prefer_local —
+    background tasks like memory extraction must never dial a dead LM Studio."""
+    import app.core.config as cfg
+    from app.models.brain import litellm_conf
+
+    monkeypatch.setattr(cfg, "GEMINI_PRIMARY", True)
+    monkeypatch.setattr(cfg, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(cfg, "GEMINI_MODEL", "gemini/gemini-2.5-flash")
+
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Msg:
+            content = '{"memories": []}'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm_conf.litellm, "acompletion", fake_acompletion)
+    await litellm_conf.hybrid_route_query(
+        system_prompt="s", user_prompt="extract", prefer_local=True
+    )
+    assert captured["model"] == "gemini/gemini-2.5-flash"

@@ -8,6 +8,8 @@ import json
 import re
 from typing import Any, Callable
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
+
 from langgraph.graph import END, StateGraph
 
 from app.orchestrator.state import JarvisState, NegotiationPhase
@@ -382,6 +384,62 @@ def _supabase_of(state: JarvisState):
     return getattr(db, "supabase", None)
 
 
+async def store_constraint(state: JarvisState) -> dict:
+    """Persist the turn's inline habits as behavioral constraints.
+
+    BEHAVIORAL_CONSTRAINT is classified from ``brain_dump.inline_habits`` —
+    the extraction already carries the verbatim habit phrases. v1 stored them
+    via behavioral_store; v2 routed them into the planning module, which
+    treated the habit as a goal and stored nothing. This node is the v2 home.
+    Deterministic confirmation, no LLM call.
+    """
+    from app.services.extraction import behavioral_store
+
+    bd = state.get("brain_dump")
+    habits = list(getattr(bd, "inline_habits", None) or [])
+    if not habits:
+        return {
+            "saved_constraints": [],
+            "response_message": (
+                "I heard a preference in there, sir, but couldn't pin down the "
+                "rule. Could you phrase it as one habit — e.g. 'no study before 11am'?"
+            ),
+        }
+
+    supabase = _supabase_of(state)
+    saved: list[str] = []
+    for habit in habits:
+        try:
+            result = await behavioral_store.store_behavioral_constraint(
+                habit,
+                constraint_type="habit",
+                user_id=state.get("user_id"),
+                supabase_client=supabase,
+            )
+        except Exception as e:  # storage must never crash the turn
+            logger.warning(f"store_constraint failed for {habit!r}: {e}")
+            result = {"status": "error"}
+        if result.get("status") == "stored":
+            saved.append(habit)
+
+    if not saved:
+        return {
+            "saved_constraints": [],
+            "response_message": (
+                "I couldn't save that constraint just now, sir — the strategy "
+                "hub didn't take the write. Worth trying again in a moment."
+            ),
+        }
+    listed = "; ".join(f"“{h}”" for h in saved)
+    return {
+        "saved_constraints": saved,
+        "response_message": (
+            f"Noted and locked in, sir: {listed}. "
+            "Every schedule I draft from here on will respect it."
+        ),
+    }
+
+
 async def handle_draft_action(state: JarvisState) -> dict:
     """Resolve the draft under review: accept, reject, or keep editing.
 
@@ -531,6 +589,7 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_node("classify_intent", _classify_intent)
     graph.add_node("negotiation_precheck", _negotiation_precheck)
     graph.add_node("draft_action", handle_draft_action)
+    graph.add_node("store_constraint", store_constraint)
 
     # Real module nodes (from registry)
     for name in module_registry.registered_names():
@@ -573,6 +632,7 @@ def build_jarvis_graph(checkpointer=None):
             "knowledge_module": "knowledge_module",
             "conversation_module": "conversation_module",
             "draft_action": "draft_action",
+            "store_constraint": "store_constraint",
         },
     )
 
@@ -587,6 +647,7 @@ def build_jarvis_graph(checkpointer=None):
     # deterministic and already in voice, and Voice of Jarvis would overwrite
     # them with a generic re-synthesis (plus an LLM call the user didn't need).
     graph.add_edge("draft_action", "observation_loop")
+    graph.add_edge("store_constraint", "observation_loop")
 
     graph.add_conditional_edges(
         "observation_loop",
