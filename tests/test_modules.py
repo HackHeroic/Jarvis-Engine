@@ -89,3 +89,47 @@ def test_research_graph_has_expected_nodes():
     node_names = set(graph.nodes.keys())
     expected = {"plan_research", "execute_search", "evaluate_results", "summarize", "link_to_tasks"}
     assert expected.issubset(node_names)
+
+
+@pytest.mark.asyncio
+async def test_research_graph__reaches_search_evaluate_and_summarize(monkeypatch):
+    """The research agent was severed at plan_research -> execute_search.
+
+    `execute_search` is `evaluate_results`' retry target, so the old builder
+    dropped its dependency edge from `plan_research`; `evaluate_results` has
+    both `routes_to` and `depends_on`, so it got no incoming edge either. The
+    compiled graph was literally __start__ -> plan_research -> __end__.
+    """
+    from app.core.module_framework import build_module_graph
+    from app.modules.research_graph import research_module, research_state_in
+
+    counts = {n: 0 for n in
+              ["plan_research", "execute_search", "evaluate_results",
+               "summarize", "link_to_tasks"]}
+
+    def _wrap(name, inner):
+        async def counting(state):
+            counts[name] += 1
+            return await inner(state)
+        return counting
+
+    for step in research_module.steps:
+        monkeypatch.setattr(step, "handler", _wrap(step.name, step.handler))
+
+    async def no_web_search(task_title, learning_style):
+        return []
+
+    monkeypatch.setattr(
+        "app.services.analytical.workspace_builder.perform_learning_style_search",
+        no_web_search,
+    )
+
+    state = research_state_in({"user_model": None, "user_message": "latest on CP-SAT"})
+    await build_module_graph(research_module).ainvoke(state)
+
+    # Empty results keep `needs_more` True until max_iterations is hit, so the
+    # self-loop runs the search three times and then falls through to summarize.
+    assert counts == {
+        "plan_research": 1, "execute_search": 3, "evaluate_results": 3,
+        "summarize": 1, "link_to_tasks": 1,
+    }
