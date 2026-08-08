@@ -173,24 +173,52 @@ stateDiagram-v2
     NONE --> NONE: draft creation failed - key omitted, phase untouched
 
     REVIEWING --> ACCEPTED: ACCEPT_DRAFT - persist verified, n tasks landed
+    REVIEWING --> NONE: ACCEPT_DRAFT - draft held nothing schedulable (count == 0)
     REVIEWING --> NONE: REJECT_DRAFT - reason stored for PEARL
+    REVIEWING --> NONE: draft_store is None - "the draft system is offline"
+    REVIEWING --> NONE: resolve_draft found no draft
     REVIEWING --> EDITING: EDIT_TASK / REARRANGE
-    REVIEWING --> REVIEWING: persist failed or store offline - phase NOT reset, accept retries
+    REVIEWING --> REVIEWING: persist unverified or store raised - phase NOT reset, accept retries
 
     EDITING --> ACCEPTED: ACCEPT_DRAFT
-    EDITING --> NONE: REJECT_DRAFT
+    EDITING --> NONE: REJECT_DRAFT / no draft / store is None
     EDITING --> EDITING: further edits
+    EDITING --> EDITING: persist unverified or store raised
 
     ACCEPTED --> [*]
     NONE --> [*]
 
     note right of REVIEWING
+      EDITING takes the identical branches - both phases
+      route through the same draft_action node.
+
       While REVIEWING or EDITING, check_negotiation_shortcut
       diverts the turn to negotiation_precheck — a one-word
       "accept" never pays for an LLM call. Unrecognised
       replies fall through as PLAN_DAY (re-plan).
     end note
 ```
+
+Only **two** of the eight exits keep the phase, and they keep it by *omitting*
+the `negotiation_state` key rather than writing it — LangGraph merges node output
+by key, so an omitted key leaves the channel untouched:
+
+| Branch in `_apply_draft_action` | Returns | Phase after |
+|---|---|---|
+| `draft_store is None` | message + `NONE` | NONE |
+| `resolve_draft` → no draft | message + `NONE` | NONE |
+| ACCEPT, `count > 0` | message + `ACCEPTED` | ACCEPTED |
+| ACCEPT, `count == 0` (nothing schedulable) | message + `NONE` | NONE |
+| ACCEPT, `count is None` (write did not land) | **message only** | unchanged — retry |
+| `handle_draft_action` outer `except` (store raised) | **message only** | unchanged — retry |
+| REJECT_DRAFT | message + `NONE` | NONE |
+| EDIT_TASK / REARRANGE | message + `EDITING` + `draft_id` | EDITING |
+
+The split is deliberate: a *retryable* failure (the write did not commit, or
+Supabase threw) must leave the draft exactly where it was so "accept" tries
+again, while an *unretryable* one (no store, no draft, empty draft) must clear
+the phase — otherwise `check_negotiation_shortcut` locks the thread into
+re-planning forever.
 
 `NegotiationPhase` also declares `PROPOSED`, and `_NEGOTIATION_ACTIVE` treats it
 as a live phase, but nothing in `app/` ever writes it — drafts go straight to
