@@ -270,6 +270,28 @@ def _infer_goal_id_from_task_id(task_id: str) -> Optional[str]:
     return task_id.split("_", 1)[0]
 
 
+def derive_goal_id(goal_metadata: Any, fallback_objective: str = "") -> str:
+    """The namespace every chunk of one goal is prefixed with.
+
+    Order matters and is the same in both pipelines: the model's own
+    ``goal_metadata.goal_id`` wins, else the objective (or the raw planning goal
+    when the model left it blank) is slugified, else a uuid so two goals can
+    never share a namespace by accident.
+
+    Extracted from ``_run_plan_day_flow`` so the v2 planning sub-graph derives it
+    identically — a second copy would drift and re-open F5, where un-namespaced
+    positional ids let a new plan shadow (and then delete) the previous one's
+    pending rows.
+    """
+    goal_id = getattr(goal_metadata, "goal_id", None) if goal_metadata else None
+    if goal_id:
+        return goal_id
+
+    objective = (getattr(goal_metadata, "objective", "") if goal_metadata else "") or fallback_objective or ""
+    slug = "".join(c if c.isalnum() or c == " " else "" for c in objective)[:30].replace(" ", "_").lower()
+    return slug or f"plan_{uuid.uuid4().hex[:8]}"
+
+
 def _namespace_chunk(chunk: TaskChunk, goal_id: str) -> TaskChunk:
     """Prefix task_id and dependencies with goal_id for multi-goal fusion.
 
@@ -999,11 +1021,7 @@ async def _run_plan_day_flow(
             memories=_get_plan_memories(),
         )
 
-    goal_id = graph.goal_metadata.goal_id if graph.goal_metadata else None
-    if not goal_id:
-        obj = (graph.goal_metadata.objective if graph.goal_metadata else "") or planning_goal
-        slug = "".join(c if c.isalnum() or c == " " else "" for c in obj)[:30].replace(" ", "_").lower()
-        goal_id = slug or f"plan_{uuid.uuid4().hex[:8]}"
+    goal_id = derive_goal_id(graph.goal_metadata, planning_goal)
 
     # Ensure dependencies are prefixed; _namespace_chunk does this
     new_prefixed = [_namespace_chunk(c, goal_id) for c in graph.decomposition]

@@ -632,7 +632,26 @@ async def _fake_decompose_transport(*args, **kwargs):
     ).model_dump()
 
 
-def _patch_decompose_transport(monkeypatch) -> None:
+def _decompose_transport(chunks: list[dict], goal_metadata=None):
+    """A transport returning exactly the chunks (and goal metadata) a test needs.
+
+    Same contract as `_fake_decompose_transport` — a `model_dump()` dict — just
+    parameterised, so the namespacing tests can pin ids and dependencies.
+    """
+
+    async def _transport(*args, **kwargs):
+        from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+
+        return ExecutionGraph(
+            goal_metadata=goal_metadata if goal_metadata is not None else GoalMetadata(),
+            decomposition=[TaskChunk.model_validate(c) for c in chunks],
+            cognitive_load_estimate={"intrinsic_load": 0.5},
+        ).model_dump()
+
+    return _transport
+
+
+def _patch_decompose_transport(monkeypatch, transport=None) -> None:
     """Wire the real router to an in-memory transport — no network, no .env.
 
     The `no_llm` fixture stubs `route_llm_call` itself; restoring the genuine
@@ -644,7 +663,9 @@ def _patch_decompose_transport(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.core.model_router.route_llm_call", _real_route_llm_call
     )
-    monkeypatch.setattr(_llm, "hybrid_route_query", _fake_decompose_transport)
+    monkeypatch.setattr(
+        _llm, "hybrid_route_query", transport or _fake_decompose_transport
+    )
     monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", False)
     monkeypatch.setattr(_cfg, "GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
@@ -838,3 +859,218 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
     # Each retry widened the horizon along the v1 ladder.
     assert attempts == [2880, 4320, 7200]
     assert result["schedule"] is not None
+
+
+# --- F5: goal namespacing keeps a new plan from eating the old one ----------
+# Live run 2026-08-08: the decomposer emits POSITIONAL ids (`task_1…task_N`), so
+# every plan produces the same ids as the last one. `fuse_tasks` deduped by
+# task_id and dropped the pending rows that collided, and accept's
+# delete-then-replace then deleted them from user_tasks for good — six of the
+# demo user's pending tasks vanished on a plain "plan X" → "accept".
+#
+# v1 never had this hole: it namespaces every fresh chunk as `{goal_id}_{task_id}`
+# before fusion (control_policy._run_plan_day_flow), which is the only thing that
+# makes "tasks belonging to THIS goal" decidable. These tests port that rule.
+
+
+class _PendingUserModel:
+    """A UserModel with pending rows and nothing else — no DB, no memory store."""
+
+    def __init__(self, rows: list[dict]):
+        self.user_id = "u1"
+        self._rows = rows
+
+    async def get_pending_tasks(self) -> list[dict]:
+        return list(self._rows)
+
+    async def get_behavioral_constraints(self) -> list[dict]:
+        return []
+
+    async def get_memory_store(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_decompose_goal__namespaces_task_ids_and_dependencies(monkeypatch):
+    """Fresh chunks leave decomposition already namespaced, deps included.
+
+    Dependencies must be re-prefixed in the same pass or the solver's precedence
+    edges point at ids that no longer exist (`_namespace_chunk`'s docstring).
+    """
+    from app.modules.planning_graph import decompose_goal
+
+    _patch_decompose_transport(
+        monkeypatch,
+        _decompose_transport([_chunk("task_1"), _chunk("task_2", dependencies=["task_1"])]),
+    )
+
+    out = await decompose_goal(
+        {"planning_goal": "revise graph algorithms", "user_id": "u1"}
+    )
+
+    assert out.get("error") is None, out.get("error")
+    assert out["goal_id"] == "revise_graph_algorithms"
+    assert [c["task_id"] for c in out["task_chunks"]] == [
+        "revise_graph_algorithms_task_1",
+        "revise_graph_algorithms_task_2",
+    ]
+    assert out["task_chunks"][1]["dependencies"] == ["revise_graph_algorithms_task_1"]
+
+
+@pytest.mark.asyncio
+async def test_decompose_goal__goal_metadata_carries_an_id__it_wins_over_the_slug(monkeypatch):
+    """v1 derivation order: goal_metadata.goal_id → slugified objective → uuid."""
+    from app.api.v1.endpoints.reasoning import GoalMetadata
+    from app.modules.planning_graph import decompose_goal
+
+    _patch_decompose_transport(
+        monkeypatch,
+        _decompose_transport(
+            [_chunk("task_1")],
+            goal_metadata=GoalMetadata(goal_id="thesis", objective="finish the thesis"),
+        ),
+    )
+
+    out = await decompose_goal({"planning_goal": "finish the thesis", "user_id": "u1"})
+
+    assert out["goal_id"] == "thesis"
+    assert [c["task_id"] for c in out["task_chunks"]] == ["thesis_task_1"]
+
+
+@pytest.mark.asyncio
+async def test_fuse_tasks__prior_plans_positional_ids__survive_the_new_decomposition():
+    """v1 parity: keep tasks from OTHER goals, drop tasks from THIS goal.
+
+    The legacy `task_1` row is the F5 collision itself — pre-fix the new chunks
+    carried that same id, so the row was silently dropped from the fusion.
+    """
+    from app.modules.planning_graph import fuse_tasks
+
+    pending = [
+        # An un-namespaced row written by an earlier plan — the actual collision.
+        {"task_id": "task_1", "title": "read chapter 1", "duration_minutes": 25},
+        # Another goal's row: must survive, it is not what this plan replaces.
+        {"task_id": "calculus_task_1", "title": "integrals", "duration_minutes": 20},
+        # THIS goal's leftover from a previous run: replaced by the new decomposition.
+        {"task_id": "revise_graph_algorithms_task_9", "title": "stale", "duration_minutes": 25},
+    ]
+    state = {
+        "user_model": _PendingUserModel(pending),
+        "goal_id": "revise_graph_algorithms",
+        "task_chunks": [
+            _chunk("revise_graph_algorithms_task_1"),
+            _chunk("revise_graph_algorithms_task_2"),
+        ],
+    }
+
+    out = await fuse_tasks(state)
+    ids = [c["task_id"] for c in out["task_chunks"]]
+
+    assert "task_1" in ids
+    assert "calculus_task_1" in ids
+    assert "revise_graph_algorithms_task_9" not in ids
+    assert len(ids) == len(set(ids))  # duplicate ids break the solver's uniqueness
+    assert out["pending_tasks"] == pending
+
+
+@pytest.mark.asyncio
+async def test_fuse_tasks__no_goal_id__falls_back_to_id_dedupe():
+    """Decomposition failed (no goal_id on state): still never emit a duplicate id."""
+    from app.modules.planning_graph import fuse_tasks
+
+    pending = [{"task_id": "task_1", "title": "old", "duration_minutes": 25}]
+    out = await fuse_tasks(
+        {"user_model": _PendingUserModel(pending), "task_chunks": [_chunk("task_1")]}
+    )
+
+    ids = [c["task_id"] for c in out["task_chunks"]]
+    assert ids == ["task_1"]
+    assert out["task_chunks"][0]["title"] == "read chapter 1"  # the new one won
+
+
+@pytest.mark.asyncio
+async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_tasks(monkeypatch):
+    """The whole F5 chain: decompose → fuse → accept must not delete prior work.
+
+    `_persist_fused_tasks` wipes every pending row and re-inserts the fused list,
+    so anything fusion drops is gone from the database permanently. The draft is
+    built here exactly as `create_draft` builds it (`tasks=state["task_chunks"]`);
+    the solver is skipped because scheduling is not what F5 is about.
+    """
+    from app.core.user_model import UserModel
+    from app.modules.planning_graph import decompose_goal, fuse_tasks
+    from app.services.draft_actions import accept_draft_and_persist
+    from tests.fakes import FakeDBClient, FakeSupabase
+
+    supabase = FakeSupabase({"user_tasks": [
+        {"user_id": "u1", "task_id": "task_1", "title": "read chapter 1",
+         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 25},
+        {"user_id": "u1", "task_id": "calculus_task_1", "title": "integrals",
+         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 20},
+    ]})
+    user_model = UserModel(user_id="u1", db=FakeDBClient(supabase))
+
+    _patch_decompose_transport(
+        monkeypatch, _decompose_transport([_chunk("task_1"), _chunk("task_2")])
+    )
+
+    decomposed = await decompose_goal(
+        {"planning_goal": "revise graph algorithms", "user_id": "u1"}
+    )
+    fused = await fuse_tasks({**decomposed, "user_model": user_model})
+
+    draft = {
+        "id": "d1",
+        "tasks": fused["task_chunks"],
+        "horizon_start": "2026-08-08T08:00:00+00:00",
+    }
+    store = _FakeDraftStore()
+    landed = await accept_draft_and_persist(store, "u1", draft, supabase)
+
+    assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == [
+        "calculus_task_1",
+        "revise_graph_algorithms_task_1",
+        "revise_graph_algorithms_task_2",
+        "task_1",
+    ]
+    assert landed == 4
+    assert store.other_calls == ["accept_draft"]
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft(no_llm, monkeypatch):
+    """The longer ids must travel the whole v2 chain unchanged.
+
+    `_to_task_chunk` → `run_schedule` → `create_draft` is newer than v1's path,
+    and the solver keys its output map by task_id — `_persist_fused_tasks` then
+    looks `scheduled_start` up by that key. An id regenerated or truncated
+    anywhere in between would silently drop every wall-clock time, so this drives
+    the compiled sub-graph with the real OR-Tools solver and pins both ends.
+    """
+    from app.modules.planning_graph import planning_state_in
+
+    _patch_decompose_transport(
+        monkeypatch,
+        _decompose_transport([_chunk("task_1"), _chunk("task_2", dependencies=["task_1"])]),
+    )
+
+    store = _FakeDraftStore(row={"id": "row-uuid"})
+    module_state = planning_state_in({
+        "user_model": _PendingUserModel(
+            [{"task_id": "calculus_task_1", "title": "integrals", "duration_minutes": 20}]
+        ),
+        "user_message": "revise graph algorithms",
+        "draft_store": store,
+    })
+
+    result = await build_module_graph(planning_module).ainvoke(module_state)
+
+    _user_id, tasks, _horizon_start, goal = store.calls[0]
+    assert goal == "revise_graph_algorithms"  # the draft row names its own namespace
+    draft_ids = [t["task_id"] for t in tasks]
+    assert draft_ids == [
+        "revise_graph_algorithms_task_1",
+        "revise_graph_algorithms_task_2",
+        "calculus_task_1",  # the other goal's pending row, fused in untouched
+    ]
+    assert set(result["schedule"]["schedule"]) == set(draft_ids)
