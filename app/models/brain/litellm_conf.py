@@ -111,11 +111,13 @@ async def hybrid_route_query(
             print(f"[LiteLLM Router] Using model_override: {model_override}")
     else:
         # Gemini-primary routing: no local models loaded → ALL calls go to cloud
-        # (structured AND unstructured — a dead LM Studio must never be targeted)
+        # (structured AND unstructured — a dead LM Studio must never be targeted).
+        # prefer_local means "prefer local WHEN a local model exists"; with
+        # GEMINI_PRIMARY set there is none, so it must not override the redirect
+        # (background memory extraction was stalling 60-100s dialing LM Studio).
         if (
             model_override is None
             and _cfg.GEMINI_PRIMARY
-            and not prefer_local
             and not force_cloud
             and _cfg.GEMINI_API_KEY
         ):

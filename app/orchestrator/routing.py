@@ -23,7 +23,7 @@ INTENT_TO_MODULE: dict[str, str] = {
     "CHAT": "conversation_module",
     "GREETING": "conversation_module",
     "GENERAL_QA": "conversation_module",
-    "BEHAVIORAL_CONSTRAINT": "planning_module",
+    "BEHAVIORAL_CONSTRAINT": "store_constraint",
     "ACTION_ITEM": "knowledge_module",
 }
 

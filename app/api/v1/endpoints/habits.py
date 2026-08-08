@@ -61,3 +61,36 @@ async def list_due_trackers(
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
     due = await get_due_trackers(user_id=user_id, supabase_client=supabase)
     return {"due_trackers": due}
+
+
+@router.get(
+    "/constraints",
+    summary="List active behavioral constraints",
+    description="Constraints saved from chat (store_constraint) that shape every schedule.",
+)
+async def list_behavioral_constraints(
+    http_request: Request,
+    user_id: str = Query(..., description="User ID"),
+) -> dict:
+    """List the user's behavioral constraints, newest first. Degrades to [] when DB is down."""
+    import asyncio
+
+    db_client = getattr(http_request.app.state, "db_client", None)
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    if supabase is None:
+        return {"constraints": []}
+
+    def _query():
+        return (
+            supabase.table("behavioral_constraints")
+            .select("id,raw_text,constraint_type,created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+    try:
+        result = await asyncio.to_thread(_query)
+        return {"constraints": result.data or []}
+    except Exception:
+        return {"constraints": []}

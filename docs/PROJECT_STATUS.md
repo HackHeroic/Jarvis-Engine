@@ -66,6 +66,7 @@ flowchart TD
         NPC -->|anything else| PM["planning_module"]
 
         CI --> PM
+        CI --> SC["store_constraint<br/>persists inline habits, no LLM"]
         CI --> RA["research_agent"]
         CI --> KM
         CI --> CM["conversation_module"]
@@ -79,6 +80,7 @@ flowchart TD
         SYN --> OL["observation_loop"]
         CM --> OL
         DA --> OL
+        SC --> OL
         OL -->|needs_followup| CI
         OL -->|done| ENDN(["END"])
     end
