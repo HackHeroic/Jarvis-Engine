@@ -284,7 +284,12 @@ async def solve_schedule(state: PlanningState) -> dict:
         # horizon_start is left to run_schedule (Optional[datetime], never a
         # str) so its 8 AM-of-plan-date convention stays the single source of
         # truth; the resolved value comes back on the response.
-        resp = schedule_ep.run_schedule(
+        # Off-thread: run_schedule is a synchronous CP-SAT solve, and a bare
+        # call freezes the event loop for its whole duration — on the streaming
+        # path every queued SSE frame stalls behind it, so the user watches a
+        # dead spinner mid-plan. Same reason create_draft's insert is threaded.
+        resp = await asyncio.to_thread(
+            schedule_ep.run_schedule,
             graph,
             daily_context,
             horizon_minutes=horizon,
