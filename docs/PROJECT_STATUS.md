@@ -16,16 +16,19 @@ which now survives only as a library of helpers the v2 graph calls into
 (`_persist_fused_tasks`, `BRAIN_DUMP_EXTRACTION_PROMPT`).
 
 - **The one entry point:** `POST /api/v1/chat/v2/stream` (SSE).
-- **Deprecated:** `POST /api/v1/chat` and `POST /api/v1/chat/stream` carry
-  `deprecated=True` in their FastAPI route metadata and log a warning per call.
-  The frontend calls `/v2/stream` unconditionally — the `NEXT_PUBLIC_USE_V2`
-  flag was retired.
+- **Deprecated:** `POST /api/v1/chat`, `POST /api/v1/chat/stream`,
+  `POST /api/v1/chat/confirm-schedule` and `POST /api/v1/chat/accept-schedule`
+  carry `deprecated=True` in their FastAPI route metadata and log a warning per
+  call. The frontend calls `/v2/stream` unconditionally — the
+  `NEXT_PUBLIC_USE_V2` flag was retired — but still uses `/accept-schedule` as
+  its no-draft fallback, which is why that route is hardened rather than gone
+  (see the persistence note below).
 - **Conversation state survives the turn:** an async SQLite checkpointer
   (`data/checkpoints.sqlite`) persists graph state per `(user_id, session_id)`
   thread, so a draft proposed on one turn is still under review on the next.
 
-**Test suite: 447 tests collected — 446 passed, 1 xfailed, in ~5 seconds.**
-38 test files. The suite runs fully offline: `tests/conftest.py` installs a
+**Test suite: 473 tests collected — 472 passed, 1 xfailed, in ~5 seconds.**
+39 test files. The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach
 Supabase, Gemini, or ChromaDB. The single `xfail` is `strict=True` and
 documents a real, pre-existing bug (see Known Issues #4).
@@ -131,10 +134,10 @@ flowchart TD
     M2C --> DG
     DG["decompose_goal<br/>AND-join barrier: BOTH arms must land<br/>ChromaDB RAG + socratic_chunker, 60s"]
 
-    DG --> FT["fuse_tasks<br/>merge pending user_tasks"]
-    FT --> SS["solve_schedule<br/>delegates to run_schedule()<br/>TMT · adaptive cap · hard/soft blocks<br/>biological sleep fallback"]
+    DG --> FT["fuse_tasks<br/>merge pending user_tasks<br/>other goals kept by prefix rule"]
+    FT --> SS["solve_schedule<br/>delegates to run_schedule() via to_thread<br/>TMT · adaptive cap · hard/soft blocks<br/>biological sleep fallback"]
 
-    SS -->|OPTIMAL| CD["create_draft<br/>insert into draft_schedules<br/>writes NOTHING to user_tasks"]
+    SS -->|OPTIMAL| CD["create_draft<br/>insert into draft_schedules incl. goal_id<br/>writes NOTHING to user_tasks"]
     SS -->|INFEASIBLE| HI["handle_infeasible"]
     HI -->|retry| SS
     HI -->|exhausted| ENDB(["END → anti-guilt message"])
@@ -150,7 +153,22 @@ flowchart TD
   module with steps unreachable from the entry point.
 - **`solve_schedule` delegates**, it does not reimplement. TMT deadline
   weighting, `compute_adaptive_daily_cap`, hard/soft calendar blocks and the
-  biological sleep fallback all live inside `run_schedule`.
+  biological sleep fallback all live inside `run_schedule`. The call goes
+  through `asyncio.to_thread`: CP-SAT is a synchronous solve, and a bare call
+  freezes the event loop — every queued SSE frame stalls behind it. The solve
+  itself is capped at `SOLVER_MAX_TIME_SECONDS` (30s, `JARVIS_SOLVER_MAX_TIME_SECONDS`
+  overrides); an expired cap returns the best schedule found, or `UNKNOWN`,
+  which takes the INFEASIBLE branch.
+- **One goal, one namespace.** `decompose_goal` derives a `goal_id` via
+  `derive_goal_id` (the model's `goal_metadata.goal_id` → a slug of the
+  objective/planning goal → `plan_{uuid8}`) and prefixes every chunk and every
+  dependency ref as `{goal_id}_{task_id}`. `fuse_tasks` then decides membership
+  by that prefix — pending rows from *other* goals are carried into the plan,
+  rows from *this* goal are replaced by the fresh decomposition. Matching on
+  task_id equality was F5: the decomposer's ids are positional, so a new plan
+  shadowed an unrelated older one and `_persist_fused_tasks`'s
+  delete-then-replace erased it on accept. `create_draft` stores the same
+  `goal_id` on the `draft_schedules` row.
 - **Retry ladder:** `HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]`
   minutes — 3d → 5d → 7d → 14d → 30d. Exhaustion returns an anti-guilt
   clarification ("a scope problem, not a you problem"), never a 500.
@@ -245,6 +263,13 @@ Both the conversational path (`handle_draft_action` in the orchestrator) and the
 REST path (`POST /api/v1/drafts/{id}/accept`) import the same
 `app/services/draft_actions.py`, so they cannot drift.
 
+The deprecated no-draft fallback the frontend still calls,
+`POST /api/v1/chat/accept-schedule`, now reuses the same `_count_persisted`
+read-back: it captures the `plan_id` from `_persist_fused_tasks` and answers
+`503 {"status": "failed"}` unless rows carrying it come back. It used to reply
+`{"status": "accepted"}` unconditionally — including with no Supabase client at
+all.
+
 ---
 
 ## Component Inventory
@@ -307,9 +332,12 @@ Full specifications preserved in [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md
 
 - `app/db/migrations/` — 14 numbered files (`001`–`014`), the historical set,
   hand-run in the Supabase SQL Editor. This is the complete schema.
-- `supabase/migrations/` — 7 timestamped files in Supabase-CLI format,
-  reconciled on 2026-08-08 against the restored project. It mirrors only
-  `009`–`012` plus three later additions. **`001`–`008` have no CLI-format
+- `supabase/migrations/` — 8 timestamped files in Supabase-CLI format,
+  reconciled on 2026-08-08 against the restored project (the newest,
+  `20260808000000_user_tasks_actual_duration.sql`, adds the
+  `user_tasks.actual_duration_minutes` column the task-lifecycle completion
+  path writes). It mirrors only `009`–`012` plus four later additions.
+  **`001`–`008` have no CLI-format
   counterpart**, so `supabase db push` into a clean project would not create
   `behavioral_constraints`, `pending_calendar_updates`, `habit_trackers`,
   `user_tasks`, `task_materials`, `user_calendar_anchors`, `user_plan_updates`
@@ -319,7 +347,7 @@ Tables the code reads or writes:
 
 | Table | Used by | Defined in |
 |---|---|---|
-| `user_tasks` | planning persistence on accept, task lifecycle | `app/db/migrations/004` (+ `006`, `007`, `013`, `014`); CLI: only the `20260401000000` / `20260501000001` ALTERs |
+| `user_tasks` | planning persistence on accept, task lifecycle (incl. `actual_duration_minutes` on completion) | `app/db/migrations/004` (+ `006`, `007`, `013`, `014`); CLI: only the `20260401000000` / `20260501000001` / `20260808000000` ALTERs |
 | `draft_schedules` | `DraftStore`, draft REST API, `create_draft` | `011` · CLI `20260329000002` |
 | `behavioral_constraints` | `UserModel.get_behavioral_constraints`, habit storage | `001` (+ `002`) · **CLI: none** |
 | `user_memories` | 3-tier memory, SM-2 decay | `010` · CLI `20260329000001` |
@@ -400,7 +428,7 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
    arrives.
 
 9. **The two migration sets have diverged.** `supabase/migrations/` (CLI format)
-   mirrors only `009`–`012` of `app/db/migrations/` plus three later additions.
+   mirrors only `009`–`012` of `app/db/migrations/` plus four later additions.
    `001`–`008` were never ported, and `task_workspaces` exists only in the CLI
    set. A `supabase db push` into a clean project therefore produces an
    incomplete schema, and `user_state` has no migration in either set. See the
@@ -409,11 +437,27 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
 10. **`analytical.py` and `telemetry.py` are dead files** — present in
     `app/api/v1/endpoints/` but never included in `app/api/v1/router.py`.
 
+11. **A failed decomposition still produces a schedule.** `fuse_tasks`
+    `depends_on=["decompose_goal"]` with no routing on the error, so when
+    `decompose_goal` returns `{"error": ..., "task_chunks": []}` the graph walks
+    on: `fuse_tasks` merges the user's *pending* rows (nothing was namespaced,
+    so none are replaced), `solve_schedule` schedules those and returns
+    `"error": None`, which overwrites the decomposition failure. The user is
+    shown a plausible plan made entirely of stale tasks and is never told the
+    goal they typed was never decomposed. This is the same class of bug as the
+    two fixed on 2026-08-08 — `/chat/accept-schedule` answering `"accepted"`
+    without writing (now verifies the `plan_id` landed and answers 503
+    otherwise, and is marked deprecated), and `/drafts/{id}/chat` answering
+    `"modified"` with no modifier wired (now 501) — an untruthful success, not a
+    crash, which is why no test caught it. Fix is a routing edge on
+    `decompose_goal`; follow-up task, deliberately not folded into the
+    final-review wave.
+
 ---
 
 ## Test Coverage
 
-**447 collected · 446 passed · 1 xfailed · 38 files · ~5 s · fully offline.**
+**473 collected · 472 passed · 1 xfailed · 39 files · ~5 s · fully offline.**
 
 Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
 form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).
@@ -431,7 +475,8 @@ Areas covered, by file:
 | `test_checkpointer.py` | Transient scrubbing (incl. the uploaded-file keys), serde-failure fallback, user-scoped thread ids |
 | `test_module_framework.py`, `test_module_registration.py`, `test_modules.py` | ModuleStep compilation, AND-join barriers, routing/plain dependency conflict, orphan check |
 | `test_planning_graph.py` | Every planning node, the horizon ladder, `run_schedule` delegation, draft creation |
-| `test_draft_flow.py`, `test_draft_endpoints.py`, `test_draft_integration.py`, `test_draft_store.py` | Accept matcher coverage, plan_id-verified persistence, REST endpoints on the real store |
+| `test_draft_flow.py`, `test_draft_endpoints.py`, `test_draft_integration.py`, `test_draft_store.py` | Accept matcher coverage, plan_id-verified persistence, REST endpoints on the real store, `/drafts/{id}/chat` → 501 |
+| `test_chat_accept_schedule.py` | The no-draft fallback: persists-and-verifies vs. 503 on a swallowed write, no client, or a plan_id with no rows behind it |
 | `test_model_router.py`, `test_model_detection.py` | Role routing, `GEMINI_PRIMARY` behaviour incl. unstructured calls, 12B/14B + qwen detection, env pins |
 | `test_memory_*.py` (6 files), `test_pearl*.py` (2) | 3-tier memory, SM-2 decay, retrieval, extraction, constraint bridge, wiring, PEARL patterns |
 | `test_document_*.py` (3 files) | Document type registry, classification, ingestion end-to-end |
