@@ -9,6 +9,10 @@ import pytest
 from app.modules.planning_graph import planning_module
 from app.core.module_framework import build_module_graph
 
+# Captured at import, before any fixture can swap it out: the decomposition
+# tests below want the REAL router in the loop and fake one layer lower.
+from app.core.model_router import route_llm_call as _real_route_llm_call
+
 
 def _chunk(task_id: str = "t1", **overrides) -> dict:
     """A task_chunks entry shaped like decompose_goal's output."""
@@ -608,31 +612,87 @@ def test_planning_state_out__no_draft__leaves_negotiation_state_alone():
     assert "negotiation_state" not in out
 
 
+# --- the decomposition LLM boundary -----------------------------------------
+# These tests fake `hybrid_route_query` (the transport), NOT `route_llm_call`.
+# Faking the router is what let F1 ship: the old fake handed `decompose_goal` an
+# `ExecutionGraph` instance, a value production never produced, so the whole
+# decomposition path was tested against fiction. `litellm_conf.py:259` returns
+# `parsed.model_dump()` — a plain dict — for every structured call, local and
+# cloud alike. Patching one layer lower keeps the real router in the test.
+
+
+async def _fake_decompose_transport(*args, **kwargs):
+    """Return exactly what `hybrid_route_query` returns: a `model_dump()` dict."""
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+
+    return ExecutionGraph(
+        goal_metadata=GoalMetadata(),
+        decomposition=[TaskChunk.model_validate(_chunk(f"t{i}")) for i in range(6)],
+        cognitive_load_estimate={"intrinsic_load": 0.5},
+    ).model_dump()
+
+
+def _patch_decompose_transport(monkeypatch) -> None:
+    """Wire the real router to an in-memory transport — no network, no .env.
+
+    The `no_llm` fixture stubs `route_llm_call` itself; restoring the genuine
+    function here keeps the normalisation under test even when both are active.
+    """
+    import app.core.config as _cfg
+    import app.models.brain.litellm_conf as _llm
+
+    monkeypatch.setattr(
+        "app.core.model_router.route_llm_call", _real_route_llm_call
+    )
+    monkeypatch.setattr(_llm, "hybrid_route_query", _fake_decompose_transport)
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", False)
+    monkeypatch.setattr(_cfg, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "app.utils.chroma_client.query_knowledge", lambda *a, **k: []
+    )
+
+
 @pytest.mark.asyncio
-async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm):
+async def test_decompose_goal__transport_returns_dict__still_produces_chunks(monkeypatch):
+    """F1 regression: a dict from the transport must not empty the decomposition.
+
+    Live run 2026-08-08: `route_llm_call` normalised only `str`, so the dict fell
+    through, `str(dict)` produced a Python repr, `json.loads` died at char 1 and
+    the `except` returned `{"task_chunks": []}`. `fuse_tasks` then emitted only
+    stale pending rows — the user's goal vanished from a turn that reported
+    success.
+    """
+    from app.modules.planning_graph import decompose_goal
+
+    _patch_decompose_transport(monkeypatch)
+
+    out = await decompose_goal(
+        {"planning_goal": "prepare a 10-minute talk on graph algorithms", "user_id": "u1"}
+    )
+
+    assert out.get("error") is None, out.get("error")
+    assert len(out["task_chunks"]) == 6
+    assert out["_tool_detail"] == {"task_count": 6}
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm, monkeypatch):
     """End-to-end through the compiled graph: the OPTIMAL edge really runs.
 
     Asserting on `planning_module.steps` alone would pass even if the edge were
     never wired, so this drives the compiled sub-graph with the real OR-Tools
-    solver and only the LLM boundary faked.
+    solver and only the LLM transport faked.
     """
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
     from app.modules.planning_graph import planning_state_in
 
-    async def fake_route_llm_call(*args, **kwargs):
-        return ExecutionGraph(
-            goal_metadata=GoalMetadata(),
-            decomposition=[TaskChunk.model_validate(_chunk(f"t{i}")) for i in range(6)],
-            cognitive_load_estimate={"intrinsic_load": 0.5},
-        )
+    _patch_decompose_transport(monkeypatch)
 
     store = _FakeDraftStore(row={"id": "row-uuid"})
     module_state = planning_state_in(
         {"user_model": None, "user_message": "revise for the exam", "draft_store": store}
     )
 
-    with patch("app.core.model_router.route_llm_call", fake_route_llm_call):
-        result = await build_module_graph(planning_module).ainvoke(module_state)
+    result = await build_module_graph(planning_module).ainvoke(module_state)
 
     assert result["schedule"] is not None
     assert result["draft_id"] == "row-uuid"
@@ -670,17 +730,6 @@ def _count_invocations(monkeypatch, module, *names) -> dict:
     return counts
 
 
-async def _fake_decompose_llm(*args, **kwargs):
-    """A schema-aware stand-in for the 27B: real ExecutionGraph, no network."""
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
-
-    return ExecutionGraph(
-        goal_metadata=GoalMetadata(),
-        decomposition=[TaskChunk.model_validate(_chunk(f"t{i}")) for i in range(6)],
-        cognitive_load_estimate={"intrinsic_load": 0.5},
-    )
-
-
 @pytest.mark.asyncio
 async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(monkeypatch):
     """One goal, one decomposition. The fan-in is a barrier, not two triggers.
@@ -696,7 +745,7 @@ async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(m
         "validate_goal", "fetch_constraints", "decompose_goal", "fuse_tasks",
         "solve_schedule", "create_draft",
     )
-    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+    _patch_decompose_transport(monkeypatch)
 
     module_state = planning_state_in(
         {"user_model": None, "user_message": "revise for the compilers exam",
@@ -727,7 +776,7 @@ async def test_planning_subgraph__unclear_goal__decompose_goal_never_runs(monkey
         "validate_goal", "decompose_goal", "translate_habits", "solve_schedule",
         "create_draft",
     )
-    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+    _patch_decompose_transport(monkeypatch)
 
     module_state = planning_state_in(
         {"user_model": None, "user_message": "hi", "draft_store": None}
@@ -758,7 +807,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
         "decompose_goal", "fuse_tasks", "solve_schedule", "handle_infeasible",
         "create_draft",
     )
-    monkeypatch.setattr("app.core.model_router.route_llm_call", _fake_decompose_llm)
+    _patch_decompose_transport(monkeypatch)
 
     ok = MagicMock()
     ok.model_dump.return_value = {

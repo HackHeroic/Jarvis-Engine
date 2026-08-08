@@ -60,6 +60,30 @@ def strip_fences(text: str) -> str:
     return _FENCE_RE.sub("", text).strip()
 
 
+def _coerce_to_schema(result: Any, response_schema: type[BaseModel]) -> Any:
+    """Normalise whatever the transport returned into a schema instance.
+
+    `litellm_conf.hybrid_route_query` returns `parsed.model_dump()` — a plain
+    dict — for every structured call, local and cloud alike, while a fake or a
+    future transport may hand back the model itself or raw JSON text. Callers
+    branch on `isinstance(result, Schema)`, so the router owes them one shape.
+
+    Normalising only `str` is what caused F1: a dict fell through unvalidated,
+    `decompose_goal` did `str(dict)` on a Python repr, `json.loads` failed, and
+    the planning turn silently produced a schedule with none of the user's goal.
+
+    Raises `ValidationError` / `JSONDecodeError` on malformed input, which the
+    local branch treats as a local failure worth retrying against the cloud.
+    """
+    if isinstance(result, response_schema):
+        return result
+    if isinstance(result, str):
+        return response_schema.model_validate_json(strip_fences(result))
+    if isinstance(result, dict):
+        return response_schema.model_validate(result)
+    return result
+
+
 async def route_llm_call(
     task: str,
     prompt: str,
@@ -109,8 +133,8 @@ async def route_llm_call(
                 conversation_history=conversation_history,
                 stream=stream,
             )
-            if response_schema and isinstance(result, str):
-                return response_schema.model_validate_json(strip_fences(result))
+            if response_schema:
+                return _coerce_to_schema(result, response_schema)
             return result
         except (ValidationError, Exception) as e:
             logger.warning(f"Local {model} failed for {task}: {e}")
@@ -132,6 +156,6 @@ async def route_llm_call(
         conversation_history=conversation_history,
         stream=stream,
     )
-    if response_schema and isinstance(result, str):
-        return response_schema.model_validate_json(strip_fences(result))
+    if response_schema:
+        return _coerce_to_schema(result, response_schema)
     return result
