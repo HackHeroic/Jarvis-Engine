@@ -62,6 +62,38 @@ async def test_checkpointer__transient_objects_do_not_break_serialization(no_llm
 
 
 @pytest.mark.asyncio
+async def test_checkpointer__draft_store_is_scrubbed_but_draft_id_survives(no_llm, tmp_path):
+    """The live DraftStore holds a Supabase client; only the id may persist.
+
+    ``draft_store`` is re-supplied per turn from ``app.state`` (chat.py), so
+    checkpointing it buys nothing and costs a
+    ``TypeError: Type is not msgpack serializable``. ``draft_id`` is a plain
+    string and *must* survive — the accept turn resolves the draft by it.
+    """
+    from app.orchestrator.checkpoint import open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+    from app.services.draft_store import DraftStore
+
+    class _LiveClient:  # stands in for the Supabase client: not serializable
+        def __init__(self):
+            self.lock = asyncio.Lock()
+
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        cfg = {"configurable": {"thread_id": "u1:sess-1"}}
+
+        state = _live_state("hi", draft_store=DraftStore(supabase_client=_LiveClient()))
+        result = await graph.ainvoke(state, config=cfg)
+
+        assert result["response_message"] == CANNED_LLM_REPLY
+
+        await graph.aupdate_state(cfg, {"draft_id": "d-42"})
+        stored = (await graph.aget_state(cfg)).values
+        assert stored["draft_store"] is None
+        assert stored["draft_id"] == "d-42"
+
+
+@pytest.mark.asyncio
 async def test_checkpointer__conversation_phase_survives_next_turn(no_llm, tmp_path):
     """Turn 2 omits the phase fields entirely — they must come from the checkpoint."""
     from app.orchestrator.checkpoint import open_checkpointer

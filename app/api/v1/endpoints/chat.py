@@ -1138,6 +1138,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "initiated_by": "user",
         "execution_graph": None,
         "schedule": None,
+        # Live store in, draft id out: planning's create_draft step fills
+        # draft_id, which the SSE payload below reports to the UI.
+        "draft_store": getattr(http_request.app.state, "draft_store", None),
+        "draft_id": None,
         "draft_response": None,
         "research_results": None,
         "ingestion_result": None,

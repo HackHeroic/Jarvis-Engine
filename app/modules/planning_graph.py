@@ -21,12 +21,17 @@ class PlanningState(TypedDict):
     task_chunks: list
     pending_tasks: list
     schedule: Optional[dict]
+    horizon_start: Optional[str]
     horizon_minutes: int
     retry_count: int
     clarification_request: Optional[str]
     error: Optional[str]
     progress_callback: Any
     progress_queue: Any
+    # Live Supabase-backed store, re-supplied per turn from app.state — never
+    # checkpointed (see _TRANSIENT_KEYS in app/orchestrator/checkpoint.py).
+    draft_store: Any
+    draft_id: Optional[str]
 
 
 
@@ -291,6 +296,57 @@ async def solve_schedule(state: PlanningState) -> dict:
     }
 
 
+def _draft_id_of(row: dict | None) -> Optional[str]:
+    """Read the draft id out of whatever ``DraftStore.create_draft`` returned.
+
+    The real store returns the inserted Supabase row (draft_store.py:60-64),
+    whose primary key column is ``id`` — the locally generated uuid is *written*
+    as ``id``, never echoed back as ``draft_id``. Accept both so the node works
+    against the live store and against any caller that hands back the friendlier
+    name; ``None`` (degraded / clientless store) falls through to ``None``.
+    """
+    if not isinstance(row, dict):
+        return None
+    return row.get("draft_id") or row.get("id")
+
+
+async def create_draft(state: PlanningState) -> dict:
+    """v1 parity: a feasible schedule is *proposed* as a draft, not committed.
+
+    Nothing is written to ``user_tasks`` here — ``_persist_fused_tasks`` runs
+    only when the user accepts. Failure is non-fatal by design: a draft id is a
+    convenience for the review turn, and losing it must never cost the user the
+    schedule the solver just spent seconds producing.
+    """
+    draft_store = state.get("draft_store")
+    schedule = state.get("schedule")
+    if not draft_store or not schedule:
+        return {"draft_id": None}
+
+    # draft_schedules.horizon_start is TEXT NOT NULL (20260329000002), so a
+    # None here is a round-trip that can only fail. solve_schedule echoes the
+    # value onto the state, but read it back off the payload too — that is
+    # where it originates, and ScheduleResponse types it as required.
+    horizon_start = state.get("horizon_start")
+    if not horizon_start and isinstance(schedule, dict):
+        horizon_start = schedule.get("horizon_start")
+    if not horizon_start:
+        logger.warning("Skipping draft creation: schedule carries no horizon_start")
+        return {"draft_id": None}
+
+    try:
+        row = draft_store.create_draft(
+            user_id=state.get("user_id", "demo"),
+            tasks=state.get("task_chunks", []),
+            horizon_start=horizon_start,
+        )
+        draft_id = _draft_id_of(row)
+        return {"draft_id": draft_id, "_tool_detail": {"draft_id": draft_id}}
+    except Exception as e:
+        logger.warning(f"Draft creation failed (non-fatal): {e}")
+        return {"draft_id": None}
+
+
 # v1 parity ladder: 3d -> 5d -> 7d -> 14d -> 30d (MAX_HORIZON_MINUTES).
 HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]
 
@@ -346,12 +402,17 @@ def planning_state_in(state) -> dict:
         "task_chunks": [],
         "pending_tasks": [],
         "schedule": None,
+        "horizon_start": None,
         "horizon_minutes": 2880,
         "retry_count": 0,
         "clarification_request": None,
         "error": None,
         "progress_callback": state.get("progress_callback"),
         "progress_queue": state.get("progress_queue"),
+        # Live store handed down from the parent turn (chat.py reads it off
+        # app.state); None in degraded startup and in tests.
+        "draft_store": state.get("draft_store"),
+        "draft_id": None,
     }
 
 
@@ -370,19 +431,35 @@ def planning_state_out(result: dict, module_name: str) -> dict:
             "Could you give me a bit more — the deadline, the subject, or what you're aiming at?"
         )
 
-    return {
+    draft_id = result.get("draft_id")
+
+    out = {
         "schedule": schedule,
         "execution_graph": (
             {"decomposition": task_chunks} if task_chunks else None
         ),
         "clarification_request": clarification,
         "error": error,
+        "draft_id": draft_id,
         # NOTE: anti_guilt_message and missed_deadlines are not yet computed in
         # the v2 sub-graph — placeholder for the upcoming port of
         # detect_and_mark_missed (currently lives in control_policy._run_plan_day_flow).
         "anti_guilt_message": result.get("anti_guilt_message"),
         "missed_deadlines": result.get("missed_deadlines"),
     }
+
+    # A proposed draft is the whole point of the negotiation phase: the next
+    # turn on this thread must take the shortcut in routing.py straight back to
+    # planning instead of being re-classified as a fresh PLAN_DAY. The key is
+    # set *only* when a draft exists — LangGraph merges node output by key, so
+    # unconditionally returning NONE would reset a live review every time a
+    # draft could not be created.
+    if draft_id:
+        from app.orchestrator.state import NegotiationPhase
+
+        out["negotiation_state"] = NegotiationPhase.REVIEWING
+
+    return out
 
 
 planning_module = ModuleDefinition(
@@ -408,7 +485,10 @@ planning_module = ModuleDefinition(
         ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
         ModuleStep(name="solve_schedule", handler=solve_schedule,
                    depends_on=["fuse_tasks"],
-                   routes_to={check_feasibility: {"OPTIMAL": "__END__", "INFEASIBLE": "handle_infeasible"}}),
+                   routes_to={check_feasibility: {"OPTIMAL": "create_draft", "INFEASIBLE": "handle_infeasible"}}),
+        # No depends_on: reached only via solve_schedule's OPTIMAL branch, the
+        # same way handle_infeasible is reached via INFEASIBLE.
+        ModuleStep(name="create_draft", handler=create_draft),
         ModuleStep(name="handle_infeasible", handler=handle_infeasible,
                    routes_to={can_retry: {"retry": "solve_schedule", "exhausted": "__END__"}}),
     ],

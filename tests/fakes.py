@@ -146,6 +146,8 @@ def make_jarvis_state(**overrides: Any) -> dict:
         "initiated_by": "user",
         "execution_graph": None,
         "schedule": None,
+        "draft_store": None,
+        "draft_id": None,
         "draft_response": None,
         "research_results": None,
         "ingestion_result": None,

@@ -31,11 +31,11 @@ def test_planning_graph_compiles():
 
 
 def test_planning_graph_has_expected_steps():
-    """Planning module has all 9 expected steps."""
+    """Planning module has all 10 expected steps."""
     expected = {
         "fetch_constraints", "translate_habits", "expand_slots",
         "memory_to_constraints", "validate_goal", "decompose_goal",
-        "fuse_tasks", "solve_schedule", "handle_infeasible",
+        "fuse_tasks", "solve_schedule", "handle_infeasible", "create_draft",
     }
     actual = {s.name for s in planning_module.steps}
     assert actual == expected
@@ -382,3 +382,263 @@ async def test_solve_schedule__real_solver__single_small_task__is_feasible():
     )
 
     assert result["error"] is None
+
+
+# --- create_draft: a feasible solve becomes a reviewable draft ---------------
+# v1 parity: the schedule is proposed, never silently committed. Persistence
+# (_persist_fused_tasks) happens on accept only — never in this node.
+
+
+class _FakeDraftStore:
+    """Records create_draft calls and returns whatever `row` is set to."""
+
+    def __init__(self, row=None):
+        self.row = row if row is not None else {"draft_id": "d-123"}
+        self.calls = []
+        self.other_calls = []
+
+    def create_draft(self, user_id, tasks, horizon_start, goal_id=None):
+        self.calls.append((user_id, tasks, horizon_start, goal_id))
+        return self.row
+
+    def accept_draft(self, *a, **k):
+        self.other_calls.append("accept_draft")
+        return True
+
+    def delete_draft(self, *a, **k):
+        self.other_calls.append("delete_draft")
+        return True
+
+
+def _solved_state(**overrides) -> dict:
+    base = {
+        "user_id": "u1",
+        "schedule": {"schedule": {"t1": {"start_min": 0}}},
+        "horizon_start": "2026-08-08T08:00:00+00:00",
+        "task_chunks": [_chunk()],
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_create_draft__stores_tasks_and_sets_draft_id():
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    result = await create_draft(_solved_state(draft_store=store))
+
+    assert result["draft_id"] == "d-123"
+    user_id, tasks, horizon_start, _goal = store.calls[0]
+    assert user_id == "u1"
+    assert tasks == [_chunk()]
+    assert horizon_start == "2026-08-08T08:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_create_draft__real_store_row_shape__reads_the_id_column():
+    """DraftStore.create_draft returns the Supabase row — its PK column is `id`.
+
+    draft_store.py:58-64 generates `draft_id` locally but inserts it as `"id"`
+    and returns `result.data[0]`, so a node that only reads `row["draft_id"]`
+    would hand the user a null id against a real (non-fake) store — exactly the
+    bug this task exists to remove.
+    """
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore(row={"id": "row-uuid", "user_id": "u1", "status": "pending"})
+    result = await create_draft(_solved_state(draft_store=store))
+
+    assert result["draft_id"] == "row-uuid"
+
+
+@pytest.mark.asyncio
+async def test_create_draft__never_persists__only_proposes():
+    """Accept (Task 10) commits; this node must not touch the accept path."""
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    await create_draft(_solved_state(draft_store=store))
+
+    assert store.other_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_draft__no_store__returns_none_draft_id():
+    from app.modules.planning_graph import create_draft
+
+    result = await create_draft(
+        {"user_id": "u1", "draft_store": None, "schedule": {"schedule": {}}, "task_chunks": []}
+    )
+
+    assert result["draft_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_draft__degraded_store__returns_none_draft_id():
+    """A clientless DraftStore returns None from every method — never crash."""
+    from app.services.draft_store import DraftStore
+    from app.modules.planning_graph import create_draft
+
+    result = await create_draft(_solved_state(draft_store=DraftStore(supabase_client=None)))
+
+    assert result["draft_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_draft__no_schedule__does_not_call_the_store():
+    """An infeasible/errored solve has nothing to propose."""
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    result = await create_draft(_solved_state(draft_store=store, schedule=None))
+
+    assert result["draft_id"] is None
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_draft__horizon_start_falls_back_to_the_schedule_payload():
+    """solve_schedule sources it from the payload; read it there if the key is lost."""
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    state = _solved_state(draft_store=store)
+    state.pop("horizon_start")
+    state["schedule"] = {"schedule": {}, "horizon_start": "2026-08-08T08:00:00+00:00"}
+
+    result = await create_draft(state)
+
+    assert result["draft_id"] == "d-123"
+    assert store.calls[0][2] == "2026-08-08T08:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_create_draft__no_horizon_start_anywhere__skips_the_insert():
+    """draft_schedules.horizon_start is TEXT NOT NULL — inserting None can only fail."""
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    state = _solved_state(draft_store=store)
+    state.pop("horizon_start")
+
+    result = await create_draft(state)
+
+    assert result["draft_id"] is None
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_draft__store_raises__is_non_fatal():
+    """A Supabase outage must not lose the schedule the solver just produced."""
+    from app.modules.planning_graph import create_draft
+
+    class _Exploding:
+        def create_draft(self, **kwargs):
+            raise RuntimeError("supabase down")
+
+    result = await create_draft(_solved_state(draft_store=_Exploding()))
+
+    assert result["draft_id"] is None
+
+
+def test_planning_graph__optimal_solve_routes_through_create_draft():
+    """The OPTIMAL branch no longer ends at __END__ — it drafts first."""
+    solve = next(s for s in planning_module.steps if s.name == "solve_schedule")
+    destinations = next(iter(solve.routes_to.values()))
+
+    assert destinations["OPTIMAL"] == "create_draft"
+    assert destinations["INFEASIBLE"] == "handle_infeasible"
+
+
+def test_planning_state_in__carries_the_draft_store_into_the_subgraph():
+    from app.modules.planning_graph import planning_state_in
+
+    store = _FakeDraftStore()
+    module_state = planning_state_in({"user_model": None, "draft_store": store})
+
+    assert module_state["draft_store"] is store
+    assert module_state["draft_id"] is None
+
+
+def test_planning_state_out__exposes_draft_id_and_opens_review():
+    """A proposed draft puts the conversation into REVIEWING for the next turn."""
+    from app.orchestrator.state import NegotiationPhase
+    from app.modules.planning_graph import planning_state_out
+
+    out = planning_state_out(
+        {"schedule": {"schedule": {}}, "task_chunks": [_chunk()], "draft_id": "d-9"},
+        "planning_module",
+    )
+
+    assert out["draft_id"] == "d-9"
+    assert out["negotiation_state"] == NegotiationPhase.REVIEWING
+
+
+def test_planning_state_out__no_draft__leaves_negotiation_state_alone():
+    """Omitting the key matters: LangGraph merges by key, so returning NONE
+    would stomp a REVIEWING thread every time a draft could not be created."""
+    from app.modules.planning_graph import planning_state_out
+
+    out = planning_state_out(
+        {"schedule": None, "task_chunks": [], "clarification_request": "more?"},
+        "planning_module",
+    )
+
+    assert out["draft_id"] is None
+    assert "negotiation_state" not in out
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-existing module-framework wiring bug (flagged in the Task 8 report, "
+        "not introduced here): build_module_graph never gives a step its "
+        "`depends_on` edges in two cases, and the planning module hits both. "
+        "(a) module_framework.py:197-204 uses `if step.routes_to: ... elif "
+        "step.depends_on`, so `validate_goal` — which has both — gets no "
+        "incoming edge and is orphaned. (b) the same branch skips any step "
+        "listed in `routed_targets`, so `solve_schedule` gets no edge from "
+        "`fuse_tasks` and is reachable only via handle_infeasible's retry "
+        "back-edge, which is itself unreachable. Net effect: the compiled "
+        "planning graph is __start__ -> fetch_constraints -> "
+        "{translate_habits -> expand_slots, memory_to_constraints} -> __end__, "
+        "so decompose_goal/fuse_tasks/solve_schedule/create_draft have never "
+        "run in v2. `create_draft` is correct and unit-tested above; it just "
+        "cannot be reached until the framework wires depends_on independently "
+        "of routes_to. Fix belongs in app/core/module_framework.py "
+        "(build_module_graph edge wiring), not in this module."
+    ),
+)
+@pytest.mark.asyncio
+async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm):
+    """End-to-end through the compiled graph: the OPTIMAL edge really runs.
+
+    Asserting on `planning_module.steps` alone would pass even if the edge were
+    never wired, so this drives the compiled sub-graph with the real OR-Tools
+    solver and only the LLM boundary faked.
+    """
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.modules.planning_graph import planning_state_in
+
+    async def fake_route_llm_call(*args, **kwargs):
+        return ExecutionGraph(
+            goal_metadata=GoalMetadata(),
+            decomposition=[TaskChunk.model_validate(_chunk(f"t{i}")) for i in range(6)],
+            cognitive_load_estimate={"intrinsic_load": 0.5},
+        )
+
+    store = _FakeDraftStore(row={"id": "row-uuid"})
+    module_state = planning_state_in(
+        {"user_model": None, "user_message": "revise for the exam", "draft_store": store}
+    )
+
+    with patch("app.core.model_router.route_llm_call", fake_route_llm_call):
+        result = await build_module_graph(planning_module).ainvoke(module_state)
+
+    assert result["schedule"] is not None
+    assert result["draft_id"] == "row-uuid"
+    # The draft carries the fused chunks and the solver's own horizon_start.
+    _user_id, tasks, horizon_start, _goal = store.calls[0]
+    assert len(tasks) == 6
+    assert datetime.fromisoformat(horizon_start).hour == 8
