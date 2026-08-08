@@ -66,9 +66,15 @@ def route_draft_action(state: JarvisState) -> str:
     pre-check node classifies the message with a regex first (no LLM); only a
     real draft verb diverts here, everything else keeps the original
     fall-through so "also add chemistry revision" still re-plans.
+
+    A file attached to a review turn is a knowledge event first — the draft can
+    wait, the upload cannot be silently discarded.
     """
-    if _intent_value(state) in DRAFT_ACTION_INTENTS:
+    intent = _intent_value(state)
+    if intent in DRAFT_ACTION_INTENTS:
         return "draft_action"
+    if intent == "KNOWLEDGE_INGESTION":
+        return "knowledge_module"
     return "planning_module"
 
 

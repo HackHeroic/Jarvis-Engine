@@ -88,6 +88,15 @@ async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request:
     task_count = await accept_draft_and_persist(
         store, request.user_id, draft, _supabase_of(http_request)
     )
+    if task_count is None:
+        # The tasks did not land, so the draft is still pending and the client
+        # may retry. Answering 200 "accepted" here is how a user ends up with
+        # an empty schedule and no idea why.
+        raise HTTPException(
+            status_code=500, detail="Schedule could not be committed — draft left pending"
+        )
+    if task_count == 0:
+        return {"status": "empty", "draft_id": draft_id, "task_count": 0}
     return {"status": "accepted", "draft_id": draft_id, "task_count": task_count}
 
 

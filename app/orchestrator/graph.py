@@ -67,15 +67,49 @@ _PLANNING_VERBS_RE = re.compile(
 # Short imperative replies to a proposed schedule ("accept", "scrap that",
 # "move the calculus block"). Rules beat an LLM here: the vocabulary is tiny,
 # the latency budget on a one-word reply is ~0, and a misfire is expensive —
-# ACCEPT_DRAFT is the only intent in v2 that writes to user_tasks.
+# ACCEPT_DRAFT is the only intent in v2 that writes to user_tasks, and
+# _persist_fused_tasks *deletes every pending row* before inserting. A false
+# positive therefore destroys the user's task list; false negatives merely cost
+# a re-plan. The matcher is tuned hard in that direction.
 #
 # Only consulted while a draft is actually on the table (see _classify_intent /
 # _negotiation_precheck). Outside a negotiation "accept" is just a word.
-_DRAFT_ACCEPT_RE = re.compile(
-    r"\b(accept|approve|confirm|looks good|lgtm|ship it|lock it in|"
-    r"go ahead|do it|yes,?\s*(do|go|lock|please)\b)",
+
+# Tier 1 — the whole message (minus filler) IS the acceptance. This is the
+# design premise, enforced literally: "accept", "yes, do it", "lock it in".
+_ACCEPT_WHOLE_RE = re.compile(
+    r"^(accept|approved?|confirm(ed)?|lgtm|ship it|do it|go ahead|"
+    r"looks good|sounds good|lock it in|locked in|good to go|"
+    r"that works|works for me)"
+    r"( it| that| this| them| all)?"
+    r"( the)?( draft| plan| schedule| tasks)?$",
     re.IGNORECASE,
 )
+
+# Tier 2 — an unambiguous acceptance token inside a *short* message, so
+# "looks good, lock it in" still lands. Deliberately excludes the weak verbs
+# that only count as a whole message: bare "confirm", "do it" and "go ahead"
+# appear constantly in ordinary planning talk ("do it after the exam",
+# "confirm my exam registration"). "approve" carries a lookahead because
+# "approve of" is the opinion sense, never the imperative.
+_ACCEPT_STRONG_RE = re.compile(
+    r"(\baccept\b|\bapproved?\b(?!\s+of\b)|\blgtm\b|\blooks good\b|"
+    r"\bsounds good\b|\bship it\b|\block it in\b|\bgood to go\b)",
+    re.IGNORECASE,
+)
+_ACCEPT_MAX_WORDS = 6
+
+# Leading/trailing conversational padding, stripped before the whole-message
+# test so "yes, accept it please" reduces to "accept it". Interior words are
+# left alone — dropping those is how a matcher starts seeing verbs that
+# aren't there.
+_LEAD_FILLER = frozenset(
+    "yes yeah yep yup ok okay sure alright right great perfect cool nice "
+    "and then so well just please".split()
+)
+_TRAIL_FILLER = frozenset("please sir thanks thank you now then".split())
+_PUNCT_RE = re.compile(r"[^\w\s']+")
+
 _DRAFT_REJECT_RE = re.compile(
     r"\b(reject|scrap|discard|throw (it|that) out|"
     r"cancel\s+(the\s+)?(plan|draft|schedule)|start over|no,?\s*redo)",
@@ -90,9 +124,10 @@ _DRAFT_EDIT_RE = re.compile(
     r"make .*\b(longer|shorter|easier|harder))\b",
     re.IGNORECASE,
 )
-# "don't do it" contains "do it"; "not yet" follows "looks good" often enough.
-# ACCEPT_DRAFT is the one intent that writes user_tasks, so a negated message
-# is disqualified from accepting and falls through to the safe branches.
+# "don't do it" contains "do it"; "don't scrap it" contains "scrap". Both
+# ACCEPT and REJECT are destructive — one replaces every pending task, the
+# other throws the draft away — so a negated message is disqualified from both
+# and falls through to the branches that only ever ask a question.
 _DRAFT_NEGATION_RE = re.compile(
     r"\b(don'?t|do\s+not|never|not\s+yet|hold\s+off|no\s+need|wait)\b",
     re.IGNORECASE,
@@ -106,21 +141,52 @@ _NEGOTIATION_ACTIVE = (
 )
 
 
+def _normalize_reply(text: str) -> str:
+    """Lowercase, drop punctuation, strip leading/trailing conversational filler."""
+    words = _PUNCT_RE.sub(" ", text.lower()).split()
+    while words and words[0] in _LEAD_FILLER:
+        words.pop(0)
+    while words and words[-1] in _TRAIL_FILLER:
+        words.pop()
+    return " ".join(words)
+
+
+def _is_acceptance(text: str, normalized: str) -> bool:
+    """True only for a message whose whole point is "yes, commit this".
+
+    Three gates, all required: no negation, not a question ("can you confirm
+    what's at 3pm?" is a lookup, not an approval), and either the entire
+    message is an acceptance phrase or a strong token appears in a short one.
+    """
+    if not normalized or _DRAFT_NEGATION_RE.search(text):
+        return False
+    if "?" in text:
+        return False
+    if _ACCEPT_WHOLE_RE.match(normalized):
+        return True
+    return (
+        len(normalized.split()) <= _ACCEPT_MAX_WORDS
+        and _ACCEPT_STRONG_RE.search(normalized) is not None
+    )
+
+
 def _match_draft_intent(text: str):
     """Classify a reply aimed at a draft, or ``None`` if it isn't one.
 
-    Order is deliberate: accept and reject are terminal and unambiguous, so they
-    win over the far broader rearrange/edit verb sets ("cancel the plan" must
-    not read as an edit because it contains no edit verb, but "move it and
-    approve" should accept).
+    Order is deliberate: accept and reject are terminal, so they are tested
+    first — but both are also destructive, so both are gated on the message
+    being an actual instruction rather than prose that merely contains the
+    verb. Rearrange and edit come last and only ever ask a follow-up question,
+    which is why they can afford far looser patterns.
     """
     from app.schemas.context import IntentType
 
     if not text or not text.strip():
         return None
-    if _DRAFT_ACCEPT_RE.search(text) and not _DRAFT_NEGATION_RE.search(text):
+    normalized = _normalize_reply(text)
+    if _is_acceptance(text, normalized):
         return IntentType.ACCEPT_DRAFT
-    if _DRAFT_REJECT_RE.search(text):
+    if _DRAFT_REJECT_RE.search(text) and not _DRAFT_NEGATION_RE.search(text):
         return IntentType.REJECT_DRAFT
     if _DRAFT_REARRANGE_RE.search(text):
         return IntentType.REARRANGE
@@ -285,8 +351,16 @@ async def _negotiation_precheck(state: JarvisState) -> dict:
 
     Anything else falls through as PLAN_DAY, which is what the shortcut always
     meant: an unrecognised reply mid-review is a re-plan request.
+
+    The file-upload guard is repeated from ``_classify_intent`` rather than
+    inherited, because this node *is* the live path during a negotiation and
+    that function never runs: an upload captioned "confirm this" would
+    otherwise accept the draft and drop the document on the floor.
     """
     from app.schemas.context import IntentType
+
+    if state.get("file_base64"):
+        return {"intent": IntentType.KNOWLEDGE_INGESTION}
 
     intent = _match_draft_intent(state.get("user_message") or "")
     return {"intent": intent if intent is not None else IntentType.PLAN_DAY}
@@ -374,13 +448,31 @@ async def _apply_draft_action(state: JarvisState) -> dict:
         count = await accept_draft_and_persist(
             draft_store, user_id, draft, _supabase_of(state)
         )
+        if count is None:
+            # The write did not land and the draft is still pending. Keep the
+            # phase (omitted, not reset) so "accept" retries — and say what
+            # actually happened, because "Locked in" on an empty schedule is
+            # the failure the user discovers tomorrow morning.
+            return {
+                "response_message": (
+                    "The schedule didn't commit, sir — nothing was written. "
+                    "Say accept again and I'll retry."
+                )
+            }
+        if count == 0:
+            return {
+                "response_message": (
+                    "That draft holds nothing I can schedule, sir. "
+                    "Tell me what to plan and I'll build a fresh one."
+                ),
+                "negotiation_state": NegotiationPhase.NONE,
+                "draft_id": None,
+            }
         return {
             "response_message": (
                 f"Locked in, sir — {count} task is on your schedule."
                 if count == 1
                 else f"Locked in, sir — {count} tasks are on your schedule."
-                if count
-                else "Draft accepted, sir, though it held no tasks to schedule."
             ),
             "negotiation_state": NegotiationPhase.ACCEPTED,
             "draft_id": None,
@@ -443,7 +535,11 @@ def build_jarvis_graph(checkpointer=None):
     graph.add_conditional_edges(
         "negotiation_precheck",
         route_draft_action,
-        {"draft_action": "draft_action", "planning_module": "planning_module"},
+        {
+            "draft_action": "draft_action",
+            "planning_module": "planning_module",
+            "knowledge_module": "knowledge_module",
+        },
     )
 
     graph.add_edge("extract_brain_dump", "classify_intent")
