@@ -6,47 +6,57 @@ from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-class DraftComponentResponse(BaseModel):
-    """A single reviewable component in a draft."""
+class DraftStateResponse(BaseModel):
+    """A ``draft_schedules`` row as the review UI sees it.
 
-    component_type: str = Field(description="habits, tasks, schedule, action_items, materials")
-    data: Any = Field(description="Component-specific data")
-    status: str = Field(description="pending, accepted, rejected, modified")
+    Mirrors the table (migration 20260329000002) rather than the old
+    component-bag shape: a draft is a task list plus a horizon, and it is
+    accepted or rejected whole.
+    """
 
-
-class DraftResponse(BaseModel):
-    """Full draft state returned to frontend."""
-
-    draft_id: str
+    draft_id: str = Field(description="Primary key of the draft (draft_schedules.id)")
     user_id: str
-    components: dict[str, DraftComponentResponse] = Field(default_factory=dict)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    goal_id: Optional[str] = None
+    tasks: List[dict] = Field(default_factory=list, description="TaskChunk dicts under review")
+    horizon_start: Optional[str] = Field(
+        default=None, description="ISO-8601 minute-0 of the scheduling horizon"
+    )
+    status: str = Field(description="pending, accepted, rejected, modified, expired")
+    rejection_reason: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class DraftAcceptRequest(BaseModel):
-    """Accept specific components of a draft."""
+    """Accept a draft."""
 
     user_id: str = Field(..., description="User identifier")
     components: Optional[List[str]] = Field(
         default=None,
-        description="Component keys to accept. None = accept all pending.",
+        description=(
+            "Ignored — kept so existing frontend callers keep validating. A draft "
+            "is accepted whole; there are no per-component statuses any more."
+        ),
     )
 
 
 class DraftRejectRequest(BaseModel):
-    """Reject specific components of a draft."""
+    """Reject a draft."""
 
     user_id: str = Field(..., description="User identifier")
-    components: List[str] = Field(..., description="Component keys to reject")
+    components: Optional[List[str]] = Field(
+        default=None, description="Ignored — a draft is rejected whole (see DraftAcceptRequest)."
+    )
     reason: Optional[str] = Field(default=None, description="Why the user rejected the draft")
 
 
 class DraftModifyRequest(BaseModel):
-    """Modify a specific component's data."""
+    """Replace a draft's task list."""
 
     user_id: str = Field(..., description="User identifier")
-    component: str = Field(..., description="Component key to modify")
-    data: Any = Field(..., description="Updated component data")
+    component: str = Field(
+        ..., description="Only 'tasks' is modifiable — the component model is gone"
+    )
+    data: Any = Field(..., description="Replacement task list")
 
 
 # ── New schemas for draft negotiation ──────────────────────
