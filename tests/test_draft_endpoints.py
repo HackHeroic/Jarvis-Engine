@@ -266,3 +266,28 @@ def test_endpoints_require_a_draft_store(client):
 
     app.state.draft_store = None
     assert client.get("/api/v1/drafts/whatever?user_id=test_user").status_code == 503
+
+
+def test_accept__persist_failure__does_not_report_accepted(client, monkeypatch):
+    """The endpoint shares accept_draft_and_persist with the orchestrator node,
+    so it inherits the same duty: never call an unverified write a success."""
+    monkeypatch.setattr(
+        "app.services.analytical.control_policy._persist_fused_tasks",
+        lambda *a, **k: None,  # what a swallowed exception looks like
+    )
+    draft_id = client.app.state._test_draft_id
+    resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    assert resp.status_code == 500
+    assert _draft_row(client, draft_id)["status"] == "pending"  # retryable
+
+
+def test_accept__draft_with_no_tasks__is_not_reported_accepted(client):
+    draft_id = client.app.state._test_draft_id
+    client.app.state.draft_store.replace_tasks(draft_id, "test_user", [])
+
+    resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] != "accepted"
+    assert resp.json()["task_count"] == 0
