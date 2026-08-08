@@ -25,6 +25,45 @@ from app.models.brain.litellm_conf import hybrid_route_query
 
 router = APIRouter()
 
+# Progress-queue `_event_type` → SSE frame name. Token events land on the same
+# two channels v1 /chat/stream uses, so the frontend needs no new handler:
+# a streamed reply is just many `event: message` frames instead of one.
+_PROGRESS_EVENT_CHANNEL = {
+    "tool_use": "tool_use",
+    "memory_extracted": "memory_extracted",
+    "pattern_detected": "pattern_detected",
+    "token": "message",
+    "thinking_token": "thinking",
+}
+
+
+def render_progress_event(raw) -> tuple[str, str, str]:
+    """Map one progress-queue entry to (sse_frame, event_type, token).
+
+    `token` is "" for anything that is not a token event. Unknown/absent
+    `_event_type` falls through to `event: phase`, re-dumped from the parsed
+    dict — yielding the raw string there would leak the internal `_event_type`
+    key into the phase payload.
+    """
+    try:
+        parsed = json_mod.loads(raw)
+        evt_type = parsed.pop("_event_type", "phase")
+    except (json_mod.JSONDecodeError, TypeError):
+        return f"event: phase\ndata: {raw}\n\n", "phase", ""
+
+    channel = _PROGRESS_EVENT_CHANNEL.get(evt_type)
+    if channel is None:
+        return f"event: phase\ndata: {json_mod.dumps(parsed)}\n\n", "phase", ""
+    if evt_type in ("token", "thinking_token"):
+        token = parsed.get("token", "")
+        return (
+            f"event: {channel}\ndata: {json_mod.dumps({'token': token})}\n\n",
+            evt_type,
+            token,
+        )
+    return f"event: {channel}\ndata: {json_mod.dumps(parsed)}\n\n", evt_type, ""
+
+
 NODE_TO_PHASE = {
     "load_context": "loading_context",
     "extract_brain_dump": "brain_dump_extraction",
@@ -1195,102 +1234,120 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 return intent.value
             return str(intent)
 
+        # Graph node events ride the SAME queue as progress/token events so the
+        # SSE stream keeps true emission order. Draining only between astream()
+        # iterations would leave this coroutine blocked for the whole synthesis
+        # call and deliver every "streamed" token in one burst at the end.
+        _NODE, _ERROR, _DONE = "__node__", "__error__", "__done__"
+
+        async def _pump_graph():
+            try:
+                async for _ev in jarvis_graph.astream(initial_state, config=graph_config):
+                    progress_queue.put_nowait((_NODE, _ev))
+            except Exception as _exc:
+                progress_queue.put_nowait((_ERROR, _exc))
+            finally:
+                progress_queue.put_nowait((_DONE, None))
+
+        # Streaming metrics — filled by the token branch of the loop below.
+        _turn_start = time_mod.monotonic()
+        _gen_start: float | None = None
+        _ttft: float | None = None
+        _token_count = 0
+        thinking_full = ""
+        message_full = ""
+        tokens_streamed = False
+        thinking_streamed = False
+
+        pump_task: asyncio.Task | None = None
         try:
             final_state = {}
-            async for event in jarvis_graph.astream(initial_state, config=graph_config):
-                # Drain progress queue — sub-graph phase events
-                while not progress_queue.empty():
-                    try:
-                        raw = progress_queue.get_nowait()
-                        try:
-                            parsed = json_mod.loads(raw)
-                            evt_type = parsed.pop("_event_type", "phase")
-                        except (json_mod.JSONDecodeError, TypeError):
-                            evt_type = "phase"
-                            parsed = None
-                        if evt_type == "tool_use":
-                            yield f"event: tool_use\ndata: {json_mod.dumps(parsed)}\n\n"
-                        elif evt_type == "memory_extracted":
-                            yield f"event: memory_extracted\ndata: {json_mod.dumps(parsed)}\n\n"
-                        elif evt_type == "pattern_detected":
-                            yield f"event: pattern_detected\ndata: {json_mod.dumps(parsed)}\n\n"
-                        else:
-                            yield f"event: phase\ndata: {raw}\n\n"
-                    except asyncio.QueueEmpty:
+            graph_exc: Exception | None = None
+            pump_task = asyncio.create_task(_pump_graph())
+
+            while True:
+                raw = await progress_queue.get()
+
+                if isinstance(raw, tuple):
+                    kind, payload = raw
+                    if kind == _DONE:
                         break
+                    if kind == _ERROR:
+                        graph_exc = payload
+                        continue
 
-                node_name = list(event.keys())[0]
-                node_state = event[node_name]
-                if not isinstance(node_state, dict):
-                    node_state = {}  # normalize None / non-dict to empty dict
-                final_state.update(node_state)
+                    event = payload
+                    node_name = list(event.keys())[0]
+                    node_state = event[node_name]
+                    if not isinstance(node_state, dict):
+                        node_state = {}  # normalize None / non-dict to empty dict
+                    final_state.update(node_state)
 
-                from app.utils.spinner_verbs import get_spinner_verb
+                    from app.utils.spinner_verbs import get_spinner_verb
 
-                phase = NODE_TO_PHASE.get(node_name)
-                if phase:
-                    phase_detail = {
-                        "phase": phase,
-                        "verb": get_spinner_verb(phase),
-                    }
-                    # Enrich with node-specific detail
-                    # _existing_memories is captured from enclosing scope via closure
-                    # (defined before event_gen — safe)
-                    if node_name == "load_context":
-                        conv_hist = initial_state.get("conversation_history") or []
-                        phase_detail["detail"] = {
-                            "memories_count": len(_existing_memories),
-                            "conversation_turns": len(conv_hist),
+                    phase = NODE_TO_PHASE.get(node_name)
+                    if phase:
+                        phase_detail = {
+                            "phase": phase,
+                            "verb": get_spinner_verb(phase),
                         }
-                    elif node_name == "classify_intent" and node_state.get("intent"):
-                        phase_detail["detail"] = {
-                            "intent": _intent_str(node_state["intent"]),
-                            "method": "rule-based",
-                        }
-                    elif node_name in ("planning_module", "research_agent", "coach_module", "knowledge_module", "conversation_module"):
-                        phase_detail["detail"] = {
-                            "module": node_name,
-                        }
-                    elif node_name == "observation_loop":
-                        phase_detail["detail"] = {
-                            "memories_extracted": node_state.get("memories_extracted_count", 0),
-                            "patterns_detected": node_state.get("patterns_detected_count", 0),
-                        }
-                    yield f"event: phase\ndata: {json_mod.dumps(phase_detail)}\n\n"
+                        # Enrich with node-specific detail
+                        # _existing_memories is captured from enclosing scope via closure
+                        # (defined before event_gen — safe)
+                        if node_name == "load_context":
+                            conv_hist = initial_state.get("conversation_history") or []
+                            phase_detail["detail"] = {
+                                "memories_count": len(_existing_memories),
+                                "conversation_turns": len(conv_hist),
+                            }
+                        elif node_name == "classify_intent" and node_state.get("intent"):
+                            phase_detail["detail"] = {
+                                "intent": _intent_str(node_state["intent"]),
+                                "method": "rule-based",
+                            }
+                        elif node_name in ("planning_module", "research_agent", "coach_module", "knowledge_module", "conversation_module"):
+                            phase_detail["detail"] = {
+                                "module": node_name,
+                            }
+                        elif node_name == "observation_loop":
+                            phase_detail["detail"] = {
+                                "memories_extracted": node_state.get("memories_extracted_count", 0),
+                                "patterns_detected": node_state.get("patterns_detected_count", 0),
+                            }
+                        yield f"event: phase\ndata: {json_mod.dumps(phase_detail)}\n\n"
 
-                if node_name == "classify_intent" and node_state.get("intent"):
-                    yield f"event: step\ndata: {json_mod.dumps({'intent': _intent_str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
+                    if node_name == "classify_intent" and node_state.get("intent"):
+                        yield f"event: step\ndata: {json_mod.dumps({'intent': _intent_str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
 
-                # Emit consent_request if a hook asked for consent
-                if node_state.get("needs_consent"):
-                    yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
+                    # Emit consent_request if a hook asked for consent
+                    if node_state.get("needs_consent"):
+                        yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
 
-                if node_name == "observation_loop":
-                    if node_state.get("memories_extracted"):
-                        yield f"event: memory_extracted\ndata: {json_mod.dumps(node_state['memories_extracted'])}\n\n"
-                    if node_state.get("patterns_detected"):
-                        yield f"event: pattern_detected\ndata: {json_mod.dumps(node_state['patterns_detected'])}\n\n"
+                    if node_name == "observation_loop":
+                        if node_state.get("memories_extracted"):
+                            yield f"event: memory_extracted\ndata: {json_mod.dumps(node_state['memories_extracted'])}\n\n"
+                        if node_state.get("patterns_detected"):
+                            yield f"event: pattern_detected\ndata: {json_mod.dumps(node_state['patterns_detected'])}\n\n"
+                    continue
 
-            # Drain any remaining progress events
-            while not progress_queue.empty():
-                try:
-                    raw = progress_queue.get_nowait()
-                    try:
-                        parsed = json_mod.loads(raw)
-                        evt_type = parsed.pop("_event_type", "phase")
-                    except (json_mod.JSONDecodeError, TypeError):
-                        evt_type = "phase"
-                        parsed = None
-                    if evt_type == "tool_use":
-                        yield f"event: tool_use\ndata: {json_mod.dumps(parsed)}\n\n"
-                    elif evt_type == "memory_extracted":
-                        yield f"event: memory_extracted\ndata: {json_mod.dumps(parsed)}\n\n"
-                    elif evt_type == "pattern_detected":
-                        yield f"event: pattern_detected\ndata: {json_mod.dumps(parsed)}\n\n"
+                # Sub-graph / synthesis bridge event (JSON string)
+                frame, evt_type, _tok = render_progress_event(raw)
+                if evt_type in ("token", "thinking_token"):
+                    if _gen_start is None:
+                        _gen_start = time_mod.monotonic()
+                        _ttft = (_gen_start - _turn_start) * 1000
+                    _token_count += 1
+                    if evt_type == "token":
+                        tokens_streamed = True
+                        message_full += _tok
                     else:
-                        yield f"event: phase\ndata: {raw}\n\n"
-                except asyncio.QueueEmpty:
-                    break
+                        thinking_streamed = True
+                        thinking_full += _tok
+                yield frame
+
+            await pump_task
+            if graph_exc is not None:
+                raise graph_exc
 
             _intent = _intent_str(final_state.get("intent", "CHAT"))
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
@@ -1306,18 +1363,23 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _active_model, 'force_cloud': _force_cloud_now})}\n\n"
 
             # --- Token streaming (matches v1/stream SSE contract) ---
-            _start = time_mod.monotonic()
-            _ttft: float | None = None
-            _token_count = 0
-            thinking_full = ""
-            message_full = ""
             _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else LOCAL_LLM_MODEL
+            if _gen_start is None:
+                # Nothing came through the bridge — this turn falls back to
+                # emitting the assembled message as a single frame. Time the
+                # emission window only, as the pre-streaming code did.
+                _gen_start = time_mod.monotonic()
 
-            if _has_schedule and _intent == "PLAN_DAY":
+            if tokens_streamed:
+                # Synthesis already streamed live through the progress bridge.
+                # Re-emitting the assembled message here would duplicate it.
+                _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else SLM_ROUTER_MODEL
+
+            elif _has_schedule and _intent == "PLAN_DAY":
                 # Schedule responses: emit pre-computed message, no VoJ streaming needed
                 _pre_msg = final_state.get("response_message") or "Here's your schedule."
                 _pre_think = final_state.get("thinking_process")
-                if _pre_think:
+                if _pre_think and not thinking_streamed:
                     yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
                     thinking_full = _pre_think
                 yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
@@ -1332,7 +1394,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
                 if _pre_msg:
                     # Graph already computed the response — stream it word-by-word for UX
-                    if _pre_think:
+                    if _pre_think and not thinking_streamed:
                         yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
                         thinking_full = _pre_think
                     yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
@@ -1364,7 +1426,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
                 if _pre_msg and _pre_msg not in ("", "Standing by, sir."):
                     # VoJ already computed in synthesize_response node — emit it
-                    if _pre_think:
+                    if _pre_think and not thinking_streamed:
                         yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
                         thinking_full = _pre_think
                     # Stream message word-by-word for typing effect
@@ -1381,7 +1443,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         _captured_summary["user_prompt"] = request.user_prompt
                         async for event_type, tok in synthesize_jarvis_response_stream(_captured_summary):
                             if _ttft is None:
-                                _ttft = (time_mod.monotonic() - _start) * 1000
+                                _ttft = (time_mod.monotonic() - _turn_start) * 1000
                             _token_count += 1
                             if event_type == "thinking":
                                 thinking_full += tok
@@ -1396,7 +1458,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         message_full = _fallback
                         _token_count = 1
 
-            _total_s = time_mod.monotonic() - _start
+            # Generation window, not turn duration: tok/sec must describe the
+            # model's output rate, not how long the whole pipeline ran.
+            _total_s = time_mod.monotonic() - (_gen_start or _turn_start)
 
             # Clean up think tags
             message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
@@ -1466,6 +1530,11 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             import traceback
             traceback.print_exc()  # full traceback to server terminal
             yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
+        finally:
+            # The graph no longer runs inline, so a client disconnect (GeneratorExit)
+            # would otherwise leave it churning through LLM calls nobody reads.
+            if pump_task is not None and not pump_task.done():
+                pump_task.cancel()
 
     return StreamingResponse(
         event_gen(),

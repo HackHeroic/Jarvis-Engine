@@ -4,7 +4,9 @@ Replaces execute_agentic_flow() in control_policy.py.
 """
 
 import asyncio
+import json
 import re
+from typing import Any, Callable
 
 from langgraph.graph import END, StateGraph
 
@@ -498,6 +500,25 @@ async def _apply_draft_action(state: JarvisState) -> dict:
         "negotiation_state": NegotiationPhase.EDITING,
         "draft_id": draft_id,
     }
+
+
+def make_token_emitter(progress_queue: Any) -> Callable[..., None]:
+    """Bridge: synthesis streams tokens → SSE via the progress queue.
+
+    The returned callable is a no-op when no queue is wired (plain ``/chat``,
+    unit tests), so nodes can call it unconditionally. ``event_type`` picks the
+    SSE channel the endpoint routes the token to: ``token`` → ``event: message``,
+    ``thinking_token`` → ``event: thinking``.
+    """
+
+    def _emit(token: str, event_type: str = "token") -> None:
+        if progress_queue is None or not token:
+            return
+        progress_queue.put_nowait(
+            json.dumps({"_event_type": event_type, "token": token})
+        )
+
+    return _emit
 
 
 def build_jarvis_graph(checkpointer=None):
