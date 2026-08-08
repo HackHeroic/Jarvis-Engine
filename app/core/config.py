@@ -155,6 +155,15 @@ DEFAULT_HORIZON_MINUTES: int = 2880  # 48 hours
 MAX_HORIZON_MINUTES: int = 43200  # 30 days (per PDF: month-long planning)
 DAY_START_HOUR: int = 8  # Planning day starts at 8 AM (habit translator convention)
 
+# CP-SAT wall-clock cap. An uncapped solve has no upper bound, and it sits on
+# the request path — on the streaming plan flow that is an unbounded stall with
+# every queued SSE frame stuck behind it. Capped, CP-SAT returns the best
+# schedule it found (FEASIBLE) or UNKNOWN, which the caller already treats as
+# INFEASIBLE: widen the horizon, cut scope. 30s is far above a normal solve
+# (a 30-day horizon lands in well under a second) and far below a user's
+# patience limit. Raise it for pathological plans via the env var.
+SOLVER_MAX_TIME_SECONDS: float = float(os.getenv("JARVIS_SOLVER_MAX_TIME_SECONDS", "30"))
+
 # Mental-health safeguard: max scheduled deep-work minutes per day to avoid cramming
 MAX_DEEP_WORK_MINUTES_PER_DAY: int = 360  # 6 hours (legacy; pacing module takes precedence)
 
