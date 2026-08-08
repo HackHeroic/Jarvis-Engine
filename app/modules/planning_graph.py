@@ -29,6 +29,10 @@ class PlanningState(TypedDict):
     constraints: list
     task_chunks: list
     pending_tasks: list
+    # Namespace for this turn's decomposition ({goal_id}_{task_id}). Set by
+    # decompose_goal, read by fuse_tasks to tell THIS goal's stale pending rows
+    # (replaceable) from every other goal's (must survive).
+    goal_id: Optional[str]
     schedule: Optional[dict]
     horizon_start: Optional[str]
     horizon_minutes: int
@@ -170,26 +174,59 @@ async def decompose_goal(state: PlanningState) -> dict:
             clean = re.sub(r"```json|```", "", str(result)).strip()
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
-        chunks = [tc.model_dump() for tc in graph.decomposition]
-        return {"task_chunks": chunks, "_tool_detail": {"task_count": len(chunks)}}
+        # v1 parity (CLAUDE.md → "Namespace goal tasks"): chunks leave
+        # decomposition already prefixed `{goal_id}_{task_id}`, dependencies
+        # included. The decomposer only ever emits POSITIONAL ids (task_1…task_N),
+        # so without this every plan collides with the last one — fuse_tasks
+        # shadowed the older rows and accept's delete-then-replace then deleted
+        # them for good (F5, live run 2026-08-08). Both helpers are imported from
+        # the v1 flow, never re-implemented, so the two pipelines cannot drift.
+        from app.services.analytical.control_policy import (
+            _namespace_chunk,
+            derive_goal_id,
+        )
+
+        goal_id = derive_goal_id(graph.goal_metadata, goal)
+        chunks = [_namespace_chunk(tc, goal_id).model_dump() for tc in graph.decomposition]
+        return {
+            "task_chunks": chunks,
+            "goal_id": goal_id,
+            "_tool_detail": {"task_count": len(chunks)},
+        }
     except Exception as e:
         logger.error(f"Decomposition failed: {e}")
         return {"error": f"Decomposition failed: {e}", "task_chunks": []}
 
 
 async def fuse_tasks(state: PlanningState) -> dict:
+    """Multi-goal fusion, v1 parity: keep tasks from OTHER goals, drop tasks
+    from THIS goal — the fresh decomposition replaces them.
+
+    Membership is decided by the `{goal_id}_` prefix decompose_goal stamps on
+    every new chunk, not by task_id equality. Equality was F5: the decomposer's
+    ids are positional, so "does this pending row share an id with a new chunk?"
+    answered *yes* for unrelated tasks from an earlier plan, dropped them from
+    the fusion, and `_persist_fused_tasks`'s delete-then-replace deleted them
+    from `user_tasks` on accept.
+
+    Without a goal_id (decomposition failed, or a checkpoint written before this
+    key existed) it falls back to the old id-based de-dupe: no namespace to
+    reason with, but still never two chunks wearing one id — the solver and
+    `_validate_master_chunk_dependencies` both require uniqueness.
+    """
     user_model = state.get("user_model")
     pending = []
     if user_model:
         pending = await user_model.get_pending_tasks()
 
-    # Merge: add pending tasks that aren't already in new task_chunks
     new_chunks = state.get("task_chunks", [])
+    goal_id = state.get("goal_id")
+    prefix = f"{goal_id}_" if goal_id else None
     new_ids = {c.get("task_id") for c in new_chunks if c.get("task_id")}
     merged = list(new_chunks)  # start with new tasks
     for p in pending:
         pid = p.get("task_id")
-        if pid and pid not in new_ids:
+        if pid and (not prefix or not pid.startswith(prefix)) and pid not in new_ids:
             # Convert pending task row to TaskChunk-compatible dict
             merged.append({
                 "task_id": pid,
@@ -312,6 +349,10 @@ async def create_draft(state: PlanningState) -> dict:
             user_id=state.get("user_id", "demo"),
             tasks=state.get("task_chunks", []),
             horizon_start=horizon_start,
+            # draft_schedules.goal_id has existed since 20260329000002 and is the
+            # namespace the draft's own task_ids are prefixed with — leaving it
+            # null makes the row unable to say which goal it re-plans.
+            goal_id=state.get("goal_id"),
         )
         draft_id = _draft_id_of(row)
         return {"draft_id": draft_id, "_tool_detail": {"draft_id": draft_id}}
@@ -374,6 +415,7 @@ def planning_state_in(state) -> dict:
         "constraints": [],
         "task_chunks": [],
         "pending_tasks": [],
+        "goal_id": None,
         "schedule": None,
         "horizon_start": None,
         "horizon_minutes": 2880,
