@@ -1441,7 +1441,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         from app.services.analytical.voice_of_jarvis import build_summary_from_state
                         _captured_summary = build_summary_from_state(final_state, _intent)
                         _captured_summary["user_prompt"] = request.user_prompt
-                        async for event_type, tok in synthesize_jarvis_response_stream(_captured_summary):
+                        async for event_type, tok in synthesize_jarvis_response_stream(
+                            _captured_summary,
+                            conversation_history=final_state.get("conversation_history"),
+                        ):
                             if _ttft is None:
                                 _ttft = (time_mod.monotonic() - _turn_start) * 1000
                             _token_count += 1

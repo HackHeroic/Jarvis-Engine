@@ -208,7 +208,8 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
             message_parts: list[str] = []
             thinking_parts: list[str] = []
             async for evt_type, tok in _voj.synthesize_jarvis_response_stream(
-                execution_summary
+                execution_summary,
+                conversation_history=state.get("conversation_history"),
             ):
                 if evt_type == "thinking":
                     thinking_parts.append(tok)
