@@ -1,5 +1,6 @@
 """Tests for the planning module graph topology and its scheduling node."""
 
+import threading
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -396,9 +397,11 @@ class _FakeDraftStore:
         self.row = row if row is not None else {"draft_id": "d-123"}
         self.calls = []
         self.other_calls = []
+        self.thread_idents = []
 
     def create_draft(self, user_id, tasks, horizon_start, goal_id=None):
         self.calls.append((user_id, tasks, horizon_start, goal_id))
+        self.thread_idents.append(threading.get_ident())
         return self.row
 
     def accept_draft(self, *a, **k):
@@ -526,6 +529,22 @@ async def test_create_draft__no_horizon_start_anywhere__skips_the_insert():
 
     assert result["draft_id"] is None
     assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_draft__does_not_block_the_event_loop():
+    """The Supabase insert is a sync HTTP round-trip — it must run off-thread.
+
+    Bare, it stalls every other coroutine for the length of the insert, and
+    `_wrap_step`'s `asyncio.wait_for` cannot interrupt a blocking call, so the
+    step timeout would be advisory only.
+    """
+    from app.modules.planning_graph import create_draft
+
+    store = _FakeDraftStore()
+    await create_draft(_solved_state(draft_store=store))
+
+    assert store.thread_idents[0] != threading.get_ident()
 
 
 @pytest.mark.asyncio
