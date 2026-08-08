@@ -391,6 +391,20 @@ class _FakeDraftStore:
         return True
 
 
+def _user_model_with_db():
+    """A real UserModel over a real FakeSupabase.
+
+    Accept now verifies its own write by re-reading user_tasks, so the fake has
+    to be a working store: a MagicMock would confirm any write, including one
+    that never happened. The facade is the genuine class so the observation
+    loop downstream finds the whole surface it expects.
+    """
+    from app.core.user_model import UserModel
+    from tests.fakes import FakeDBClient, FakeSupabase
+
+    return UserModel(user_id="test_user", db=FakeDBClient(FakeSupabase()))
+
+
 @pytest.mark.asyncio
 async def test_precheck__draft_verb__routes_to_draft_action():
     from app.orchestrator.graph import _negotiation_precheck
@@ -437,24 +451,25 @@ def _captured_persist(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_draft_action__accept__persists_tasks_and_closes_negotiation(_captured_persist):
+async def test_draft_action__accept__persists_tasks_and_closes_negotiation():
+    """Runs the real _persist_fused_tasks against a FakeSupabase — a stubbed
+    persist would satisfy the accept path's verification query with nothing."""
     from app.orchestrator.graph import handle_draft_action
 
     store = _FakeDraftStore()
+    user_model = _user_model_with_db()
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
-        draft_store=store, user_message="accept",
+        draft_store=store, user_message="accept", user_model=user_model,
     )
     result = await handle_draft_action(state)
 
-    assert len(_captured_persist) == 1
-    assert _captured_persist[0]["user_id"] == "test_user"
-    assert len(_captured_persist[0]["chunks"]) == 1
-    assert _captured_persist[0]["horizon_start"] == "2026-08-08T08:00:00Z"
+    rows = user_model._db.supabase.rows.get("user_tasks", [])
+    assert [(r["task_id"], r["user_id"]) for r in rows] == [("t1", "test_user")]
     assert store.accepted == [("d1", "test_user")]
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] is None
-    assert result["response_message"]
+    assert "1 task is" in result["response_message"]
 
 
 @pytest.mark.asyncio
@@ -561,21 +576,22 @@ async def test_graph__has_draft_action_nodes():
 
 
 @pytest.mark.asyncio
-async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm, _captured_persist):
+async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm):
     """A REVIEWING turn saying "accept" must not be swallowed by the planning shortcut."""
     graph = build_jarvis_graph()
     store = _FakeDraftStore()
+    user_model = _user_model_with_db()
     result = await graph.ainvoke(
         _make_state(
             user_message="accept", negotiation_state=NegotiationPhase.REVIEWING,
-            draft_store=store, draft_id="d1",
+            draft_store=store, draft_id="d1", user_model=user_model,
         )
     )
 
     assert store.accepted == [("d1", "test_user")]
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] is None
-    assert len(_captured_persist) == 1
+    assert [r["task_id"] for r in user_model._db.supabase.rows.get("user_tasks", [])] == ["t1"]
 
 
 @pytest.mark.asyncio
@@ -608,3 +624,211 @@ async def test_draft_action__store_failure__keeps_the_draft_open(_captured_persi
     # negotiation_state left untouched → still REVIEWING → "accept" retries
     # instead of the next message starting a whole new plan.
     assert "negotiation_state" not in result
+
+
+# ---------------------------------------------------------------------------
+# Draft-verb matcher precision (Task 10 review)
+#
+# ACCEPT_DRAFT is the only intent in v2 that writes user_tasks, and
+# _persist_fused_tasks deletes every pending row before inserting. So a false
+# positive here does not merely mis-answer — it destroys the user's task list.
+# These utterances are ordinary mid-review conversation and must never match.
+# ---------------------------------------------------------------------------
+
+_MUST_NOT_ACCEPT = [
+    "I need to confirm my exam registration and finish chapter 3",
+    "can you confirm what's at 3pm?",
+    "I'll do it later",
+    "acceptance testing is due friday",
+    "looks good but move the calculus block later",
+    "go ahead and tell me what's on friday",
+    "do it after the exam",
+    "I approve of that approach in general",
+    "confirmation email came through",
+    "don't do it yet",
+]
+
+_MUST_ACCEPT = [
+    "accept",
+    "yes accept it",
+    "approve",
+    "looks good",
+    "lgtm",
+    "lock it in",
+    "accept the draft",
+    "yes, do it",
+    "go ahead",
+    "ship it",
+    "looks good, lock it in",
+    "confirm",
+]
+
+_MUST_NOT_REJECT = [
+    "don't cancel the plan",
+    "don't scrap it, just shorten task 2",
+    "never discard my notes",
+]
+
+_MUST_REJECT = [
+    "reject",
+    "scrap that plan",
+    "no, scrap it",
+    "discard the draft",
+    "cancel the plan",
+    "start over",
+]
+
+
+@pytest.mark.parametrize("message", _MUST_NOT_ACCEPT)
+def test_matcher__conversational_message__never_accepts(message):
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent(message) is not IntentType.ACCEPT_DRAFT
+
+
+@pytest.mark.parametrize("message", _MUST_ACCEPT)
+def test_matcher__imperative_reply__accepts(message):
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent(message) is IntentType.ACCEPT_DRAFT
+
+
+@pytest.mark.parametrize("message", _MUST_NOT_REJECT)
+def test_matcher__negated_reject__never_rejects(message):
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent(message) is not IntentType.REJECT_DRAFT
+
+
+@pytest.mark.parametrize("message", _MUST_REJECT)
+def test_matcher__rejection__rejects(message):
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent(message) is IntentType.REJECT_DRAFT
+
+
+def test_matcher__negated_reject_with_an_edit_verb__edits_instead():
+    """"don't scrap it, just shorten task 2" is an edit, and must read as one."""
+    from app.orchestrator.graph import _match_draft_intent
+    from app.schemas.context import IntentType
+
+    assert _match_draft_intent("don't scrap it, just shorten task 2") is IntentType.EDIT_TASK
+
+
+# --- file uploads must survive an active negotiation ------------------------
+
+
+@pytest.mark.asyncio
+async def test_precheck__file_upload__is_never_a_draft_verb():
+    """The live path is the pre-check, not _classify_intent: an upload captioned
+    "confirm this" must not accept the draft and drop the file on the floor."""
+    from app.orchestrator.graph import _negotiation_precheck
+    from app.orchestrator.routing import route_draft_action
+
+    state = _make_state(
+        user_message="confirm this", negotiation_state=NegotiationPhase.REVIEWING,
+        file_base64="ZmFrZQ==", file_name="syllabus.pdf",
+    )
+    patch = await _negotiation_precheck(state)
+    state.update(patch)
+
+    assert getattr(patch["intent"], "value", patch["intent"]) == "KNOWLEDGE_INGESTION"
+    assert route_draft_action(state) == "knowledge_module"
+
+
+@pytest.mark.asyncio
+async def test_graph__upload_during_review_reaches_knowledge_module(no_llm, _captured_persist):
+    graph = build_jarvis_graph()
+    store = _FakeDraftStore()
+    result = await graph.ainvoke(
+        _make_state(
+            user_message="confirm this", negotiation_state=NegotiationPhase.REVIEWING,
+            draft_store=store, draft_id="d1", file_base64="ZmFrZQ==", file_name="syllabus.pdf",
+        )
+    )
+
+    assert "knowledge_module" in result["modules_invoked"]
+    assert store.accepted == []
+    assert _captured_persist == []
+
+
+# --- accept must not claim success it cannot verify -------------------------
+
+
+class _VerifyingStore(_FakeDraftStore):
+    """Records the order of status-flip vs. task persistence."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order: list[str] = []
+
+    def accept_draft(self, draft_id, user_id):
+        self.order.append("status_flip")
+        return super().accept_draft(draft_id, user_id)
+
+
+@pytest.mark.asyncio
+async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft(monkeypatch):
+    """_persist_fused_tasks swallows its own exceptions, so "it returned" is not
+    evidence anything landed. A silent failure must not answer "Locked in" —
+    and must not flip the draft to accepted, which would hide it from the retry."""
+    from app.orchestrator.graph import handle_draft_action
+
+    monkeypatch.setattr(
+        "app.services.analytical.control_policy._persist_fused_tasks",
+        lambda *a, **k: None,  # exactly what a swallowed failure looks like
+    )
+    store = _VerifyingStore()
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id="d1", user_message="accept",
+        user_model=_user_model_with_db(),
+    )
+    result = await handle_draft_action(state)
+
+    assert store.accepted == []            # status NOT flipped
+    assert "negotiation_state" not in result  # still REVIEWING → "accept" retries
+    assert "locked in" not in result["response_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_accept__verified_persist__flips_status_after_the_write():
+    """Order matters: flipping first leaves an accepted-but-empty draft that
+    get_pending_draft can no longer find."""
+    from app.orchestrator.graph import handle_draft_action
+
+    store = _VerifyingStore()
+    user_model = _user_model_with_db()
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id="d1", user_message="accept", user_model=user_model,
+    )
+    result = await handle_draft_action(state)
+
+    rows = user_model._db.supabase.rows.get("user_tasks", [])
+    assert [r["task_id"] for r in rows] == ["t1"]
+    assert store.accepted == [("d1", "test_user")]
+    assert store.order == ["status_flip"]  # ran, and only after the insert above
+    assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_accept__draft_with_no_tasks__exits_without_claiming_success():
+    from app.orchestrator.graph import handle_draft_action
+
+    store = _VerifyingStore()
+    store.draft["tasks"] = []
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id="d1", user_message="accept",
+        user_model=_user_model_with_db(),
+    )
+    result = await handle_draft_action(state)
+
+    assert store.accepted == []
+    assert result["negotiation_state"] == NegotiationPhase.NONE  # exit door
+    assert "locked in" not in result["response_message"].lower()

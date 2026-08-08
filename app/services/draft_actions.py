@@ -110,23 +110,51 @@ def _schedule_map_of(draft: dict) -> Optional[dict]:
     return schedule if isinstance(schedule, dict) else None
 
 
+def _count_persisted(supabase: Any, user_id: str, task_ids: set) -> int:
+    """How many of ``task_ids`` are actually sitting in ``user_tasks`` now.
+
+    The only way to know whether the write landed: ``_persist_fused_tasks``
+    catches its own exceptions and returns ``None`` either way
+    (control_policy.py:438-439), so calling it successfully proves nothing.
+    """
+    result = (
+        supabase.table("user_tasks")
+        .select("task_id")
+        .eq("user_id", user_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    stored = {row.get("task_id") for row in (result.data or [])}
+    return len(task_ids & stored)
+
+
 async def accept_draft_and_persist(
     draft_store: Any, user_id: str, draft: dict, supabase: Any
-) -> int:
-    """Mark ``draft`` accepted and write its tasks into ``user_tasks``.
+) -> Optional[int]:
+    """Write the draft's tasks to ``user_tasks``, then mark the draft accepted.
 
-    Returns the number of tasks persisted. Both writes are offloaded with
-    ``to_thread``: ``DraftStore`` and ``_persist_fused_tasks`` are sync Supabase
-    calls and would otherwise stall the event loop for the whole round-trip.
+    Returns:
+        ``n > 0`` — that many tasks are verifiably in ``user_tasks`` and the
+        draft's status is now 'accepted'.
+        ``0`` — the draft held nothing schedulable. Nothing was written and the
+        status is untouched; there is nothing here to accept.
+        ``None`` — the write did not land. The status is *deliberately* left
+        'pending' so ``get_pending_draft`` can still find it and the user can
+        retry; the caller must not report success.
 
-    ``_persist_fused_tasks`` is imported inside the function — it lives in
-    control_policy, which pulls in the whole v1 flow at import time.
+    Order matters. Flipping the status first (the obvious reading of "accept
+    the draft, then persist it") means a failed persist leaves an
+    accepted-but-empty draft that no retry can ever find again — the user's
+    schedule silently evaporates. So: persist, verify, then flip.
+
+    Both writes are offloaded with ``to_thread``; ``DraftStore`` and
+    ``_persist_fused_tasks`` are sync Supabase calls that would otherwise stall
+    the event loop. ``_persist_fused_tasks`` is imported inside the function
+    because control_policy pulls in the whole v1 flow at import time.
     """
     from app.services.analytical.control_policy import _persist_fused_tasks
 
     draft_id = draft_id_of(draft)
-    if draft_id:
-        await asyncio.to_thread(draft_store.accept_draft, draft_id, user_id)
 
     chunks = []
     for index, raw in enumerate(draft.get("tasks") or []):
@@ -140,8 +168,12 @@ async def accept_draft_and_persist(
     if not chunks:
         # _persist_fused_tasks refuses empty lists anyway (it would look like a
         # retrieval failure and wipe every pending row); say so plainly here.
-        logger.warning(f"Draft {draft_id} accepted with no persistable tasks")
+        logger.warning(f"Draft {draft_id} holds no persistable tasks — nothing accepted")
         return 0
+
+    if supabase is None:
+        logger.error(f"Draft {draft_id} not accepted: no Supabase client to persist through")
+        return None
 
     await asyncio.to_thread(
         _persist_fused_tasks,
@@ -151,4 +183,18 @@ async def accept_draft_and_persist(
         schedule=_schedule_map_of(draft),
         horizon_start=draft.get("horizon_start"),
     )
-    return len(chunks)
+
+    task_ids = {c.task_id for c in chunks}
+    try:
+        landed = await asyncio.to_thread(_count_persisted, supabase, user_id, task_ids)
+    except Exception as exc:
+        logger.error(f"Could not verify persistence for draft {draft_id}: {exc}")
+        return None
+
+    if landed <= 0:
+        logger.error(f"Draft {draft_id} persist did not land — leaving it pending for retry")
+        return None
+
+    if draft_id:
+        await asyncio.to_thread(draft_store.accept_draft, draft_id, user_id)
+    return landed
