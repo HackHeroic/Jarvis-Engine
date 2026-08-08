@@ -910,3 +910,226 @@ async def test_accept__write_failure_over_a_preexisting_row__is_not_read_as_succ
     assert store.accepted == []                 # status NOT flipped
     assert "negotiation_state" not in result    # still REVIEWING → retryable
     assert "locked in" not in result["response_message"].lower()
+
+
+# --- Task 11: real token streaming through the progress bridge --------------
+
+
+def test_progress_queue__token_events_forwarded():
+    """Synthesis pushes token events through the progress bridge."""
+    import asyncio
+    import json
+
+    from app.orchestrator.graph import make_token_emitter
+
+    q = asyncio.Queue()
+    emit = make_token_emitter(q)
+    emit("Hel")
+    emit("lo")
+
+    first = json.loads(q.get_nowait())
+    assert first == {"_event_type": "token", "token": "Hel"}
+    second = json.loads(q.get_nowait())
+    assert second == {"_event_type": "token", "token": "lo"}
+    assert q.empty()
+
+
+def test_token_emitter__thinking_tokens__carry_their_own_event_type():
+    """Reasoning tokens must not land in the visible message stream."""
+    import asyncio
+    import json
+
+    from app.orchestrator.graph import make_token_emitter
+
+    q = asyncio.Queue()
+    emit = make_token_emitter(q)
+    emit("weighing options", event_type="thinking_token")
+
+    assert json.loads(q.get_nowait()) == {
+        "_event_type": "thinking_token",
+        "token": "weighing options",
+    }
+
+
+def test_token_emitter__no_queue__is_a_no_op():
+    """Non-streaming callers (unit tests, /chat non-stream) pass no queue."""
+    from app.orchestrator.graph import make_token_emitter
+
+    emit = make_token_emitter(None)
+    emit("nothing happens")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_synthesis__with_progress_queue__streams_tokens_not_one_blob(monkeypatch):
+    """voice_of_jarvis_synthesis streams through the bridge when one is wired."""
+    import asyncio
+    import json
+
+    from app.modules.conversation import voice_of_jarvis_synthesis
+
+    async def fake_stream(execution_summary, **kwargs):
+        for tok in ("Your ", "schedule ", "is set, sir."):
+            yield ("message", tok)
+        yield ("thinking", "Ran the solver.")
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response_stream",
+        fake_stream,
+    )
+
+    q = asyncio.Queue()
+    state = {
+        "intent": IntentType.PLAN_DAY,
+        "schedule": {"t1": {"start": 0}},
+        "user_message": "plan my day",
+        "progress_queue": q,
+    }
+    result = await voice_of_jarvis_synthesis(state)
+
+    assert result["response_message"] == "Your schedule is set, sir."
+    assert result["thinking_process"] == "Ran the solver."
+
+    events = []
+    while not q.empty():
+        events.append(json.loads(q.get_nowait()))
+    message_tokens = [e["token"] for e in events if e["_event_type"] == "token"]
+    assert message_tokens == ["Your ", "schedule ", "is set, sir."]
+    assert [e["token"] for e in events if e["_event_type"] == "thinking_token"] == [
+        "Ran the solver."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_synthesis__without_progress_queue__stays_non_streaming(monkeypatch):
+    """The plain /chat path must not be forced through the streaming branch."""
+    from app.modules.conversation import voice_of_jarvis_synthesis
+
+    async def fake_synthesize(execution_summary, conversation_history=None):
+        return ("All sorted, sir.", "did things")
+
+    async def exploding_stream(execution_summary, **kwargs):
+        raise AssertionError("streaming path taken without a progress_queue")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response",
+        fake_synthesize,
+    )
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response_stream",
+        exploding_stream,
+    )
+
+    result = await voice_of_jarvis_synthesis(
+        {"intent": IntentType.PLAN_DAY, "schedule": {"t1": {}}, "user_message": "hi"}
+    )
+    assert result["response_message"] == "All sorted, sir."
+
+
+@pytest.mark.asyncio
+async def test_general_chat__with_progress_queue__streams_and_strips_think(monkeypatch):
+    """CHAT streams live; <think> content is routed to the thinking channel."""
+    import asyncio
+    import json
+
+    from app.modules import conversation
+
+    async def fake_stream(**kwargs):
+        async def _gen():
+            for evt, tok in (
+                ("reasoning", "he said hi"),
+                ("content", "Good evening, "),
+                ("content", "sir."),
+            ):
+                yield (evt, tok)
+        return _gen()
+
+    monkeypatch.setattr(
+        "app.models.brain.litellm_conf.hybrid_route_query", fake_stream
+    )
+    monkeypatch.setattr("app.utils.chroma_client.query_knowledge", lambda *a, **k: [])
+
+    q = asyncio.Queue()
+    result = await conversation.run_general_chat({
+        "user_message": "hi",
+        "progress_queue": q,
+        "trivial_input": True,
+    })
+
+    assert result["response_message"] == "Good evening, sir."
+    assert result["thinking_process"] == "he said hi"
+
+    events = []
+    while not q.empty():
+        events.append(json.loads(q.get_nowait()))
+    assert [e["token"] for e in events if e["_event_type"] == "token"] == [
+        "Good evening, ",
+        "sir.",
+    ]
+
+
+# --- Task 11: progress-queue entry → SSE frame -----------------------------
+
+
+def test_render_progress_event__token__lands_on_the_message_channel():
+    """Streamed content tokens use the same channel v1 /chat/stream uses."""
+    import json
+
+    from app.api.v1.endpoints.chat import render_progress_event
+
+    frame, evt_type, token = render_progress_event(
+        json.dumps({"_event_type": "token", "token": "Hel"})
+    )
+    assert evt_type == "token"
+    assert token == "Hel"
+    assert frame == 'event: message\ndata: {"token": "Hel"}\n\n'
+
+
+def test_render_progress_event__thinking_token__lands_on_the_thinking_channel():
+    import json
+
+    from app.api.v1.endpoints.chat import render_progress_event
+
+    frame, evt_type, token = render_progress_event(
+        json.dumps({"_event_type": "thinking_token", "token": "hmm"})
+    )
+    assert evt_type == "thinking_token"
+    assert token == "hmm"
+    assert frame.startswith("event: thinking\n")
+
+
+def test_render_progress_event__unknown_type__never_leaks_event_type_to_the_ui():
+    """The old drain loop popped _event_type off the parsed dict, then yielded
+    the untouched raw string — so the internal key rode along into the phase payload."""
+    import json
+
+    from app.api.v1.endpoints.chat import render_progress_event
+
+    frame, evt_type, _ = render_progress_event(
+        json.dumps({"_event_type": "something_new", "phase": "planning"})
+    )
+    assert evt_type == "phase"
+    payload = json.loads(frame.split("data: ", 1)[1].strip())
+    assert payload == {"phase": "planning"}
+    assert "_event_type" not in frame
+
+
+def test_render_progress_event__plain_phase__passes_through():
+    import json
+
+    from app.api.v1.endpoints.chat import render_progress_event
+
+    raw = json.dumps({"phase": "decomposing", "detail": {"n": 3}})
+    frame, evt_type, token = render_progress_event(raw)
+    assert (evt_type, token) == ("phase", "")
+    assert json.loads(frame.split("data: ", 1)[1].strip()) == {
+        "phase": "decomposing", "detail": {"n": 3},
+    }
+
+
+def test_render_progress_event__malformed__still_emits_a_phase_frame():
+    from app.api.v1.endpoints.chat import render_progress_event
+
+    frame, evt_type, token = render_progress_event("not json at all")
+    assert (evt_type, token) == ("phase", "")
+    assert frame == "event: phase\ndata: not json at all\n\n"

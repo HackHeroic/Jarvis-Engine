@@ -41,6 +41,56 @@ JARVIS_CHAT_PROMPT = (
 )
 
 
+async def _stream_chat_reply(
+    user_message: str,
+    system_prompt: str,
+    progress_queue,
+    conversation_history: list[dict] | None,
+) -> tuple[str, str | None]:
+    """Stream one CHAT reply through the progress bridge.
+
+    Returns the accumulated (message, thinking). Raises before the first token
+    if the model call never starts, so the caller's fallback still applies; once
+    tokens are on the wire the partial reply is kept — replacing it would erase
+    text the user has already read.
+    """
+    from app.core.model_router import MODEL_ROUTING, ModelRole, _get_model_for_role
+    from app.orchestrator.graph import make_token_emitter
+
+    import app.models.brain.litellm_conf as _llm
+
+    emit = make_token_emitter(progress_queue)
+    model = _get_model_for_role(MODEL_ROUTING.get("voice_of_jarvis", ModelRole.FAST))
+
+    token_gen = await _llm.hybrid_route_query(
+        user_prompt=user_message,
+        system_prompt=system_prompt,
+        response_schema=None,
+        model_override=model,
+        stream=True,
+        conversation_history=conversation_history,
+    )
+
+    message_parts: list[str] = []
+    thinking_parts: list[str] = []
+    try:
+        async for evt_type, tok in token_gen:
+            if evt_type == "reasoning":
+                thinking_parts.append(tok)
+                emit(tok, event_type="thinking_token")
+            else:
+                message_parts.append(tok)
+                emit(tok)
+    except Exception as e:
+        logger.warning(f"CHAT token stream broke mid-reply: {e}")
+        if not message_parts:
+            raise
+
+    message = "".join(message_parts).strip() or "Standing by, sir."
+    thinking = "".join(thinking_parts).strip() or None
+    return message, thinking
+
+
 async def run_general_chat(state: dict) -> dict:
     """Handle CHAT intent — call LLM directly for conversational response."""
     user_message = state.get("user_message", "")
@@ -80,6 +130,22 @@ async def run_general_chat(state: dict) -> dict:
                     system_prompt += "\n\nRelevant knowledge from user's documents:\n" + "\n---\n".join(chunks[:3])
         except Exception:
             pass  # ChromaDB unavailable — proceed without RAG
+
+        progress_queue = state.get("progress_queue")
+        if progress_queue is not None:
+            # Live SSE turn: stream the reply token-by-token through the bridge
+            # instead of making the endpoint re-emit it as one blob.
+            message, thinking = await _stream_chat_reply(
+                user_message,
+                system_prompt,
+                progress_queue,
+                state.get("conversation_history"),
+            )
+            return {
+                "response_message": message,
+                "thinking_process": thinking,
+                "modules_invoked": state.get("modules_invoked", []) + ["conversation_module"],
+            }
 
         result = await route_llm_call(
             task="voice_of_jarvis",
@@ -129,11 +195,34 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
         return {}  # keep coach's response_message as-is
 
     try:
-        from app.services.analytical.voice_of_jarvis import (
-            synthesize_jarvis_response, build_summary_from_state,
-        )
-        execution_summary = build_summary_from_state(state, intent)
-        message, thinking = await synthesize_jarvis_response(
+        import app.services.analytical.voice_of_jarvis as _voj
+
+        execution_summary = _voj.build_summary_from_state(state, intent)
+
+        progress_queue = state.get("progress_queue")
+        if progress_queue is not None:
+            # Live SSE turn: stream synthesis through the bridge so the user
+            # sees the sentence form instead of waiting for the whole blob.
+            from app.orchestrator.graph import make_token_emitter
+
+            emit = make_token_emitter(progress_queue)
+            message_parts: list[str] = []
+            thinking_parts: list[str] = []
+            async for evt_type, tok in _voj.synthesize_jarvis_response_stream(
+                execution_summary
+            ):
+                if evt_type == "thinking":
+                    thinking_parts.append(tok)
+                    emit(tok, event_type="thinking_token")
+                else:
+                    message_parts.append(tok)
+                    emit(tok)
+            return {
+                "response_message": "".join(message_parts).strip() or "Standing by, sir.",
+                "thinking_process": "".join(thinking_parts).strip() or None,
+            }
+
+        message, thinking = await _voj.synthesize_jarvis_response(
             execution_summary,
             conversation_history=state.get("conversation_history"),
         )

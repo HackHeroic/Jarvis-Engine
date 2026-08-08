@@ -291,9 +291,16 @@ async def synthesize_jarvis_response_stream(
 
     summary_text = "\n".join(parts)
     try:
+        # Same memory personalization the non-streaming twin applies — without
+        # this the streamed voice quietly loses what it knows about the user.
+        voj_prompt = VOICE_OF_JARVIS_PROMPT
+        mem_ctx = execution_summary.get("memory_context", "")
+        if mem_ctx:
+            voj_prompt += f"\n\nUser context:\n{mem_ctx}"
+
         token_gen = await hybrid_route_query(
             user_prompt=summary_text,
-            system_prompt=VOICE_OF_JARVIS_PROMPT,
+            system_prompt=voj_prompt,
             response_schema=None,
             model_override=_cfg.SLM_ROUTER_MODEL,
             stream=True,
