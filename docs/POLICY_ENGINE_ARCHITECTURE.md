@@ -1,5 +1,7 @@
 # Policy Engine Architecture
 
+> **NOTE (2026-08-08):** This document describes the v1 pipeline, now deprecated. The live architecture is the LangGraph orchestrator — see PROJECT_STATUS.md and the 2026-04-12 v2 spec.
+
 This document describes the end-to-end request flow of the Jarvis AI Productivity Backend, from user input to final schedule output.
 
 We have scaled the implementation (brain-dump extraction, multi-goal fusion, workspace, ingestion pipeline, multi-day safeguards), but the **Target Architecture** below remains the design vision. DKT, RL, CSP, Calendar, Signals, and L1 Evaluation are what we are building toward.
@@ -743,11 +745,14 @@ The system is designed around a layered model. Implemented layers are in use; pl
 
 ## Routing Behavior (Local-First)
 
-The LiteLLM Hybrid Router adheres to a **Local-First** principle. **Gemini 2.5 Flash** is the primary model for structured tasks (decomposition, habit translation); **Qwen-27B** (via LM Studio) is the local fallback.
+The router adheres to a **Local-First** principle: the **local Gemma model** (auto-detected in LM Studio at startup) is primary for every structured task; **Gemini 2.5 Flash** is the fallback, and only becomes primary when no local model is loaded.
 
-1. **Local by default**: All requests—including goal decomposition, academic topics (e.g., SARIMAX), and structured-output tasks—go to the local Qwen model first (Qwen-27B for heavy lifting). The SLM (Qwen 4B) handles fast intent classification.
-2. **Cloud Gemini (L9 Real-Time Research)**: Reserved for queries containing "latest news", "current events", "search the web", "real-time", or "recent developments". Uses Gemini 2.5 Flash with web_search_options.
-3. **Last-resort fallback**: When the local model fails (e.g., returns fewer than 5 micro-tasks, or Pydantic validation fails), the engine retries once via Cloud Gemini 2.5 Flash. If GEMINI_API_KEY is unset or the retry still fails, a 502 is returned.
+1. **Local by default**: goal decomposition, habit translation, document understanding and research summarization route to the detected PRIMARY local model; intent classification, brain-dump extraction, memory extraction, Voice of Jarvis, calendar parsing and goal validation route to the detected FAST local model. `detect_loaded_models()` probes LM Studio `/v1/models` at startup and picks by capability class (heavy: `27b/26b/22b/14b/12b`; fast: `e4b/e2b/-4b/1b/3b`), preferring Gemma and accepting qwen as a last resort. `GEMMA_PRIMARY_MODEL` / `GEMMA_FAST_MODEL` env pins outrank detection.
+2. **Cloud Gemini (L9 Real-Time Research)**: the `web_search` and `real_time_research` tasks are CLOUD by role and always go to Gemini 2.5 Flash.
+3. **`GEMINI_PRIMARY`**: when LM Studio is unreachable at startup (or the flag is set in the environment), `GEMINI_PRIMARY = True` and **every** call — structured *and* unstructured — skips the local attempt entirely and goes to Gemini. The same happens per-request when the frontend model picker selects Gemini (`force_cloud_var` ContextVar).
+4. **Last-resort fallback**: when the local attempt raises or fails Pydantic validation, the call falls through to Gemini once. The `PreCloudLLM` (PII) hook runs on the prompt immediately before any cloud send. If `GEMINI_API_KEY` is unset, a `RuntimeError` surfaces instead of a silent failure.
+
+Implementation: `app/core/model_router.py` (`route_llm_call`, `MODEL_ROUTING`) and `app/core/config.py` (`detect_loaded_models`, `_select_models`, `_resolve_models`).
 
 ---
 
@@ -1150,11 +1155,3 @@ flowchart TD
 3. **Target Architecture** remains the design vision; **Combined Diagram C** shows what is implemented vs planned.
 4. **Combined Diagram B** shows the Plan Day → Schedule path including Fusion, TMT, and Multi-Day safeguards.
 5. **Combined Diagram D** gives a linear summary for quick reference.
-
-
-
-Architecture verification for Jarvis is required can you add the most recent architecture in mermaid code to
-  @Jarvis-Engine/docs/POLICY_ENGINE_ARCHITECTURE.md  which is being currently used ... when a user prompt comes how does the
-  prompt being decided what action to take care of .. sometimes it can be docs , pdf etc and it should store it in chrome db in
-  thatcase and also decide what to do with it  
-─────────────────────────────────────────────────

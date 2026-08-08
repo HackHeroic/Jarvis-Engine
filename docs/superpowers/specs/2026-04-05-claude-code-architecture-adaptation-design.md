@@ -1,5 +1,7 @@
 # Claude Code Architecture Adaptation — Design Spec
 
+> **SUPERSEDED (2026-08-08):** implemented instead as the smaller ModuleStep framework — see 2026-04-13-module-step-framework-design.md. Kept for historical reference.
+
 **Date:** 2026-04-05
 **Author:** Madhav + Claude
 **Status:** Draft — awaiting review
