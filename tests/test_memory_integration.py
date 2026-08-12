@@ -40,21 +40,24 @@ class TestMemorySchemas:
 
 
 class TestTimeRangeParsing:
+    """Ranges come back in HORIZON minutes (0 = DAY_START_HOUR = 08:00), the
+    frame TimeSlot and OR-Tools use — not wall-clock minutes from midnight."""
+
     def test_24h_format(self):
         result = _parse_time_range("No tasks between 14:00 and 15:00")
-        assert result == (840, 900)
+        assert result == (360, 420)  # 14:00-15:00 is 6-7h after 08:00
 
     def test_12h_format(self):
         result = _parse_time_range("Meeting from 2 PM to 3 PM")
-        assert result == (840, 900)
+        assert result == (360, 420)
 
     def test_after_pattern(self):
         result = _parse_time_range("No work after 6 PM")
-        assert result == (1080, 1440)
+        assert result == (600, 1440)  # 18:00 to the end of the 08:00-anchored day
 
     def test_before_pattern(self):
         result = _parse_time_range("No tasks before 10 AM")
-        assert result == (0, 600)
+        assert result == (0, 120)  # day start to 10:00, not an 8AM-6PM dead zone
 
     def test_no_time_returns_none(self):
         result = _parse_time_range("User prefers quiet study")

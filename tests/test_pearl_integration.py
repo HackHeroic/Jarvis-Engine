@@ -54,8 +54,9 @@ class TestPearlToConstraintBridge:
         slots = memories_to_constraints("u1", mock_bridge_store)
         pattern_slots = [s for s in slots if s.source == "pearl_inferred"]
         assert len(pattern_slots) >= 1
-        assert pattern_slots[0].start_min == 480  # 8 * 60
-        assert pattern_slots[0].end_min == 540    # 9 * 60
+        # Horizon minutes: wall-clock hour 8 is 08:00 = day start.
+        assert pattern_slots[0].start_min == 0
+        assert pattern_slots[0].end_min == 60
         assert pattern_slots[0].availability == "minimal_work"
 
 
