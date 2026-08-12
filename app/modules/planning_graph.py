@@ -393,6 +393,13 @@ async def create_draft(state: PlanningState) -> dict:
             # namespace the draft's own task_ids are prefixed with — leaving it
             # null makes the row unable to say which goal it re-plans.
             goal_id=state.get("goal_id"),
+            # Compact solved map (task_id -> start/end minutes): accept converts
+            # these to wall-clock scheduled_start/end via _persist_fused_tasks.
+            schedule={
+                tid: {"start_min": t.get("start_min"), "end_min": t.get("end_min")}
+                for tid, t in ((state.get("schedule") or {}).get("schedule") or {}).items()
+                if isinstance(t, dict)
+            } or None,
         )
         draft_id = _draft_id_of(row)
         return {"draft_id": draft_id, "_tool_detail": {"draft_id": draft_id}}

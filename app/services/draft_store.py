@@ -52,7 +52,10 @@ class DraftStore:
         # build a live client from env — that defeats startup degradation.
         self._supabase = _get_supabase() if supabase_client is _UNSET else supabase_client
 
-    def create_draft(self, user_id: str, tasks: list, horizon_start: str, goal_id: str | None = None) -> dict | None:
+    def create_draft(
+        self, user_id: str, tasks: list, horizon_start: str,
+        goal_id: str | None = None, schedule: dict | None = None,
+    ) -> dict | None:
         if not self._supabase:
             return None
         draft_id = str(uuid.uuid4())
@@ -60,6 +63,10 @@ class DraftStore:
         result = self._supabase.table("draft_schedules").insert({
             "id": draft_id, "user_id": user_id, "goal_id": goal_id,
             "tasks": tasks_json, "horizon_start": horizon_start, "status": "pending",
+            # Solved task_id -> {start_min, end_min}; accept turns these into
+            # wall-clock scheduled_start/end. Without it tasks persist timeless
+            # and the frontend piles them all at 08:00.
+            "schedule": schedule,
         }).execute()
         return result.data[0] if result.data else None
 
