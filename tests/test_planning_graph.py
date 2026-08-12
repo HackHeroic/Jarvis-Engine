@@ -430,7 +430,7 @@ class _FakeDraftStore:
         self.other_calls = []
         self.thread_idents = []
 
-    def create_draft(self, user_id, tasks, horizon_start, goal_id=None):
+    def create_draft(self, user_id, tasks, horizon_start, goal_id=None, schedule=None):
         self.calls.append((user_id, tasks, horizon_start, goal_id))
         self.thread_idents.append(threading.get_ident())
         return self.row

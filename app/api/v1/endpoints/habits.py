@@ -94,3 +94,38 @@ async def list_behavioral_constraints(
         return {"constraints": result.data or []}
     except Exception:
         return {"constraints": []}
+
+
+@router.delete(
+    "/constraints/{constraint_id}",
+    summary="Delete a behavioral constraint",
+    description="Removes a saved rule; future schedules stop applying it.",
+)
+async def delete_behavioral_constraint(
+    constraint_id: str,
+    http_request: Request,
+    user_id: str = Query(..., description="User ID"),
+) -> dict:
+    """Delete one constraint, user-scoped (IDOR: id alone is not authorization)."""
+    import asyncio
+
+    db_client = getattr(http_request.app.state, "db_client", None)
+    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+
+    def _delete():
+        return (
+            supabase.table("behavioral_constraints")
+            .delete()
+            .eq("id", constraint_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+    result = await asyncio.to_thread(_delete)
+    if not (result.data or []):
+        raise HTTPException(status_code=404, detail="Constraint not found")
+    from app.services.extraction.behavioral_store import invalidate_habit_cache
+    invalidate_habit_cache()
+    return {"status": "deleted", "id": constraint_id}
