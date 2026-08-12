@@ -193,6 +193,15 @@ async def voice_of_jarvis_synthesis(state: dict) -> dict:
     if "CHECK_PROGRESS" in intent and state.get("response_message"):
         return {}  # keep coach's response_message as-is
 
+    # Honesty gate: a clarification with no schedule IS the answer. Re-synthesizing
+    # hands the LLM the decomposed task list and it narrates success ("has been
+    # scheduled, sir") over an INFEASIBLE_EXHAUSTED turn. Verbatim, zero LLM.
+    clarification = state.get("clarification_request")
+    if clarification and not state.get("schedule"):
+        anti_guilt = state.get("anti_guilt_message")
+        message = f"{anti_guilt} {clarification}" if anti_guilt else clarification
+        return {"response_message": message}
+
     try:
         import app.services.analytical.voice_of_jarvis as _voj
 

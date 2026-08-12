@@ -23,6 +23,8 @@ class PlanningState(TypedDict):
     user_id: str
     user_model: Any
     planning_goal: Optional[str]
+    missed_deadlines: Optional[list]
+    anti_guilt_message: Optional[str]
     habits_text: str
     semantic_slots: list
     time_slots: Annotated[list, _merge_lists]  # parallel nodes can both add slots
@@ -46,6 +48,33 @@ class PlanningState(TypedDict):
     draft_store: Any
     draft_id: Optional[str]
 
+
+
+async def mark_missed(state: PlanningState) -> dict:
+    """Mark pending tasks whose deadline has passed as `missed` (v1 parity).
+
+    Anti-Guilt: runs at PLAN_DAY entry so stale tasks stop poisoning TMT
+    weights, and the synthesis layer gets a blame-free framing to surface.
+    Ported from control_policy._run_plan_day_flow — v2 previously never
+    marked anything overdue.
+    """
+    from app.services.analytical import missed_deadlines as md
+
+    user_model = state.get("user_model")
+    db = getattr(user_model, "_db", None) if user_model is not None else None
+    supabase = getattr(db, "supabase", None)
+    try:
+        overdue = await md.detect_and_mark_missed(state.get("user_id", "demo"), supabase)
+    except Exception as e:
+        logger.warning(f"Missed-deadline scan failed (non-fatal): {e}")
+        overdue = []
+    if not overdue:
+        return {"missed_deadlines": [], "anti_guilt_message": None}
+    return {
+        "missed_deadlines": overdue,
+        "anti_guilt_message": md.build_anti_guilt_message(overdue),
+        "_tool_detail": {"missed": len(overdue)},
+    }
 
 
 async def fetch_constraints(state: PlanningState) -> dict:
@@ -83,12 +112,18 @@ async def expand_slots(state: PlanningState) -> dict:
     if not semantic_slots:
         return {"time_slots": []}
     try:
+        from datetime import datetime, timezone
+
         from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
         from app.schemas.context import SemanticTimeSlot
         # Convert dicts back to SemanticTimeSlot objects
         slot_objects = [SemanticTimeSlot.model_validate(s) for s in semantic_slots]
         horizon = state.get("horizon_minutes", 2880)
-        time_slots = expand_semantic_slots_to_time_slots(slot_objects, horizon)
+        # plan_start is REQUIRED (weekday/validity anchoring). Omitting it raised
+        # TypeError into the except below and silently dropped every habit block.
+        time_slots = expand_semantic_slots_to_time_slots(
+            slot_objects, horizon_minutes=horizon, plan_start=datetime.now(timezone.utc)
+        )
         return {"time_slots": [ts.model_dump() if hasattr(ts, 'model_dump') else ts for ts in time_slots]}
     except Exception as e:
         logger.warning(f"Horizon expansion failed: {e}")
@@ -501,9 +536,11 @@ planning_module = ModuleDefinition(
         # clarification question. Gating up front also skips translate_habits,
         # a second 27B call, for the same reason.
         ModuleStep(name="validate_goal", handler=validate_goal, read_only=True,
-                   routes_to={is_goal_clear: {True: "fetch_constraints", False: "__END__"}}),
+                   routes_to={is_goal_clear: {True: "mark_missed", False: "__END__"}}),
         # No depends_on: reached only via validate_goal's True branch.
-        ModuleStep(name="fetch_constraints", handler=fetch_constraints, concurrent_safe=True),
+        ModuleStep(name="mark_missed", handler=mark_missed),
+        ModuleStep(name="fetch_constraints", handler=fetch_constraints,
+                   depends_on=["mark_missed"], concurrent_safe=True),
         ModuleStep(name="translate_habits", handler=translate_habits,
                    depends_on=["fetch_constraints"], timeout_ms=45_000),
         ModuleStep(name="expand_slots", handler=expand_slots,

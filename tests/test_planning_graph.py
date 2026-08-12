@@ -39,7 +39,8 @@ def test_planning_graph_has_expected_steps():
     """Planning module has all 10 expected steps."""
     expected = {
         "fetch_constraints", "translate_habits", "expand_slots",
-        "memory_to_constraints", "validate_goal", "decompose_goal",
+        "memory_to_constraints", "validate_goal",
+        "mark_missed", "decompose_goal",
         "fuse_tasks", "solve_schedule", "handle_infeasible", "create_draft",
     }
     actual = {s.name for s in planning_module.steps}
@@ -399,18 +400,6 @@ async def test_handle_infeasible__exhausted__anti_guilt_message_says_30_days():
     assert "not a you problem" in out["clarification_request"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Pre-existing bug inherited from v1 via run_schedule, not introduced by "
-        "the delegation: compute_adaptive_daily_cap forces target_days >= 2, so a "
-        "one-task plan gets cap = ceil(25/2) = 13 min/day — below the task's own "
-        "25 minutes — and CP-SAT can place it nowhere. Every rung of the horizon "
-        "ladder lowers the cap further, so the user is told 'I couldn't fit "
-        "everything in even with a 30-day window' for a single 25-minute task. "
-        "Fix belongs in app/utils/pacing.py (floor the cap at the longest task)."
-    ),
-)
 @pytest.mark.asyncio
 async def test_solve_schedule__real_solver__single_small_task__is_feasible():
     from app.modules.planning_graph import solve_schedule
@@ -801,7 +790,7 @@ async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(m
 
     counts = _count_invocations(
         monkeypatch, planning_module,
-        "validate_goal", "fetch_constraints", "decompose_goal", "fuse_tasks",
+        "validate_goal", "mark_missed", "fetch_constraints", "decompose_goal", "fuse_tasks",
         "solve_schedule", "create_draft",
     )
     _patch_decompose_transport(monkeypatch)
@@ -813,7 +802,8 @@ async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(m
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
     assert counts == {
-        "validate_goal": 1, "fetch_constraints": 1, "decompose_goal": 1,
+        "validate_goal": 1,
+        "mark_missed": 1, "fetch_constraints": 1, "decompose_goal": 1,
         "fuse_tasks": 1, "solve_schedule": 1, "create_draft": 1,
     }
     assert result["schedule"] is not None
@@ -1112,3 +1102,79 @@ async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft
         "calculus_task_1",  # the other goal's pending row, fused in untouched
     ]
     assert set(result["schedule"]["schedule"]) == set(draft_ids)
+
+
+# ---------------------------------------------------------------------------
+# mark_missed step — overdue tasks marked at PLAN_DAY entry (v1 parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch):
+    from app.modules.planning_graph import mark_missed
+
+    async def fake_detect(user_id, supabase):
+        assert user_id == "u1"
+        return [{"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}]
+
+    monkeypatch.setattr(
+        "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
+    )
+
+    class _DB:
+        supabase = object()
+
+    class _UM:
+        _db = _DB()
+
+    state = {"user_id": "u1", "user_model": _UM()}
+    result = await mark_missed(state)
+    assert result["missed_deadlines"] == [
+        {"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}
+    ]
+    assert result["anti_guilt_message"]
+    assert "fail" not in result["anti_guilt_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
+    from app.modules.planning_graph import mark_missed
+
+    async def fake_detect(user_id, supabase):
+        return []
+
+    monkeypatch.setattr(
+        "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
+    )
+    result = await mark_missed({"user_id": "u1", "user_model": None})
+    assert result == {"missed_deadlines": [], "anti_guilt_message": None}
+
+
+def test_planning_module__mark_missed_wired_after_gate():
+    from app.core.module_framework import build_module_graph
+    from app.modules.planning_graph import planning_module
+
+    g = build_module_graph(planning_module)
+    edges = {(e.source, e.target) for e in g.get_graph().edges}
+    assert ("validate_goal", "mark_missed") in edges or ("mark_missed", "fetch_constraints") in edges
+
+
+@pytest.mark.asyncio
+async def test_expand_slots__daily_blocked_habit__recurs_across_horizon():
+    """v2 called the expander without plan_start — TypeError was swallowed and
+    EVERY habit block silently vanished. Blocks must recur on day 1+."""
+    from app.modules.planning_graph import expand_slots
+
+    state = {
+        "semantic_slots": [{
+            "name": "morning_restriction",
+            "start_min": 0, "end_min": 180,
+            "availability": "blocked", "recurrence": "daily",
+        }],
+        "horizon_minutes": 4320,
+    }
+    result = await expand_slots(state)
+    slots = result["time_slots"]
+    assert len(slots) >= 3, f"expected daily recurrence over 3 days, got {len(slots)}"
+    day_starts = sorted(s["start_min"] for s in slots)
+    assert day_starts[:3] == [0, 1440, 2880]

@@ -12,6 +12,7 @@ def test_planning_module__has_correct_steps():
         # sit inside the fan-in it protects (a LangGraph AND-join ignores its
         # members' branches, so decompose_goal fired even on the __END__ arm).
         "validate_goal",
+        "mark_missed",
         "fetch_constraints",
         "translate_habits",
         "expand_slots",
@@ -55,7 +56,7 @@ def test_planning_module__validate_goal_gates_the_pipeline():
     validate = next(s for s in planning_module.steps if s.name == "validate_goal")
     assert validate.depends_on == []
     for _cond, dests in validate.routes_to.items():
-        assert dests[True] == "fetch_constraints"
+        assert dests[True] == "mark_missed"
         assert dests[False] == "__END__"
 
 
