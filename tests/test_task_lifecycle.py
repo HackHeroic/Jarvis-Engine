@@ -172,3 +172,30 @@ def test_list_constraints__degraded_db__empty_list():
         assert resp.json()["constraints"] == []
     finally:
         app.state.db_client = original
+
+
+def test_delete_constraint__removes_own_row_only():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from tests.fakes import FakeSupabase
+
+    fake = FakeSupabase()
+    fake.rows.setdefault("behavioral_constraints", []).extend([
+        {"id": "c1", "user_id": "u1", "raw_text": "no study before 11am"},
+        {"id": "c2", "user_id": "OTHER", "raw_text": "leak"},
+    ])
+
+    class _DB:
+        supabase = fake
+
+    original = getattr(app.state, "db_client", None)
+    app.state.db_client = _DB()
+    try:
+        client = TestClient(app)
+        assert client.delete("/api/v1/habits/constraints/c1?user_id=u1").status_code == 200
+        assert [r["id"] for r in fake.rows["behavioral_constraints"]] == ["c2"]
+        # wrong user: 404, row untouched
+        assert client.delete("/api/v1/habits/constraints/c2?user_id=u1").status_code == 404
+        assert len(fake.rows["behavioral_constraints"]) == 1
+    finally:
+        app.state.db_client = original

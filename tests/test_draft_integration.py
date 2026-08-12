@@ -130,3 +130,37 @@ def test_clientless_store_returns_empty_defaults_without_network():
     assert store.accept_draft("d1", "user_1") is False
     assert store.reject_draft("d1", "user_1") is False
     assert store.delete_draft("d1", "user_1") is False
+
+
+def test_create_draft__stores_schedule_map(store):
+    row = store.create_draft(
+        user_id="u1",
+        tasks=[{"task_id": "t1", "title": "x"}],
+        horizon_start="2026-08-13T08:00:00+00:00",
+        schedule={"t1": {"start_min": 200, "end_min": 225}},
+    )
+    assert row["schedule"] == {"t1": {"start_min": 200, "end_min": 225}}
+
+
+@pytest.mark.asyncio
+async def test_accept__persists_wall_clock_times(store):
+    """The 8AM pile-up: tasks persisted timeless, so the frontend defaulted
+    them all to 08:00. With the schedule stored on the draft, accept must
+    write scheduled_start/end."""
+    from app.services.draft_actions import accept_draft_and_persist
+
+    fake = store._supabase
+    store.create_draft(
+        user_id="u1",
+        tasks=[{"task_id": "t1", "title": "x", "duration_minutes": 25,
+                "difficulty_weight": 0.5, "dependencies": [],
+                "completion_criteria": "done"}],
+        horizon_start="2026-08-13T08:00:00+00:00",
+        schedule={"t1": {"start_min": 200, "end_min": 225}},
+    )
+    draft = store.get_pending_draft("u1")
+    n = await accept_draft_and_persist(store, "u1", draft, fake)
+    assert n == 1
+    task_rows = fake.rows["user_tasks"]
+    assert task_rows[0].get("scheduled_start"), "scheduled_start missing — 8AM pile-up returns"
+    assert "11:20" in task_rows[0]["scheduled_start"]  # 08:00 + 200 min
