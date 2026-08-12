@@ -1394,3 +1394,58 @@ def test_graph__store_constraint_node_is_wired():
     g = build_jarvis_graph()
     edges = {(e.source, e.target) for e in g.get_graph().edges}
     assert ("store_constraint", "observation_loop") in edges
+
+
+# ---------------------------------------------------------------------------
+# synthesis honesty — clarifications must never be re-synthesized into success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_synthesis__clarification_no_schedule__is_verbatim_no_llm(monkeypatch):
+    """INFEASIBLE_EXHAUSTED produced 'has been scheduled, sir' fiction: the
+    summary carried the decomposed tasks, so the LLM narrated success. A
+    clarification with no schedule must pass through untouched, zero LLM."""
+    from app.modules.conversation import voice_of_jarvis_synthesis
+
+    def tripwire(*a, **k):
+        raise AssertionError("LLM must not be called for a clarification turn")
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response", tripwire
+    )
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response_stream", tripwire
+    )
+    clar = ("I couldn't fit everything in even with a 30-day window. "
+            "This is a scope problem, not a you problem. "
+            "Want to reduce scope or extend the deadline?")
+    state = {
+        "intent": "PLAN_DAY",
+        "schedule": None,
+        "clarification_request": clar,
+        "execution_graph": {"decomposition": [{"task_id": "t1", "title": "x"}]},
+        "progress_queue": None,
+    }
+    result = await voice_of_jarvis_synthesis(state)
+    assert result["response_message"] == clar
+
+
+@pytest.mark.asyncio
+async def test_synthesis__clarification_with_anti_guilt__both_surface(monkeypatch):
+    from app.modules.conversation import voice_of_jarvis_synthesis
+
+    monkeypatch.setattr(
+        "app.services.analytical.voice_of_jarvis.synthesize_jarvis_response",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM")),
+    )
+    state = {
+        "intent": "PLAN_DAY",
+        "schedule": None,
+        "clarification_request": "Want to reduce scope?",
+        "anti_guilt_message": "2 earlier tasks slipped past their dates — rolled forward, no harm done.",
+        "progress_queue": None,
+    }
+    result = await voice_of_jarvis_synthesis(state)
+    assert "rolled forward" in result["response_message"]
+    assert "reduce scope" in result["response_message"]
