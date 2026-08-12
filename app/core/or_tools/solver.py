@@ -17,6 +17,8 @@ from typing import Optional
 
 from ortools.sat.python import cp_model
 
+from app.core.or_tools.constraints import merge_time_windows
+
 MINUTES_PER_DAY = 1440
 
 
@@ -47,26 +49,48 @@ class JarvisScheduler:
         self.max_daily_deep_work_minutes = max_daily_deep_work_minutes
         self.slack_ratio = slack_ratio
         self.tasks: dict[str, dict] = {}
-        self.hard_blocks: list = []
+        # (start_min, end_min, name) windows, NOT intervals — see add_hard_block.
+        self.hard_blocks: list[tuple[int, int, str]] = []
         self.soft_blocks: list[tuple] = []  # (interval_var, max_duration, max_difficulty)
         self._load_d_vars: list = []  # for spread objective
 
     def add_hard_block(self, start_min: int, end_min: int, name: str) -> None:
         """Add a non-negotiable block (e.g., sleep 23:00–07:00).
 
-        Uses model.new_interval_var with integer constants. Do NOT use
-        NewFixedIntervalVar — it does not exist in the Python OR-Tools API.
+        The window is *recorded*, not turned into an interval here: overlapping
+        blocks must be coalesced before they reach ``add_no_overlap`` (see
+        ``_hard_block_intervals``). Degenerate windows block nothing and are
+        dropped rather than becoming a negative-length interval.
 
         Args:
             start_min: Block start time in minutes from horizon zero.
             end_min: Block end time in minutes from horizon zero.
             name: Identifier for the block.
         """
-        duration = end_min - start_min
-        iv = self.model.new_interval_var(
-            start_min, duration, end_min, f"hard_{name}"
-        )
-        self.hard_blocks.append(iv)
+        if end_min <= start_min:
+            return
+        self.hard_blocks.append((start_min, end_min, name))
+
+    def _hard_block_intervals(self) -> list:
+        """Build one fixed interval per *merged* hard-block window.
+
+        Uses model.new_interval_var with integer constants. Do NOT use
+        NewFixedIntervalVar — it does not exist in the Python OR-Tools API.
+
+        Blocks are merged first because ``solve`` drops them into a single
+        ``add_no_overlap`` set: two overlapping *constant* intervals make that
+        constraint unsatisfiable on its own, before a single task is added. Real
+        inputs overlap routinely — an expanded habit block ("no study before
+        10am" -> 0-120) and a memory-bridge constraint (0-600) both start at day
+        zero. Blocked time is a union, not a renewable resource, so the union is
+        what the model gets.
+        """
+        return [
+            self.model.new_interval_var(start, end - start, end, f"hard_block_{i}")
+            for i, (start, end) in enumerate(
+                merge_time_windows((s, e) for s, e, _ in self.hard_blocks)
+            )
+        ]
 
     def add_soft_block(
         self,
@@ -196,7 +220,7 @@ class JarvisScheduler:
 
         # Collect all interval variables (Anti-Guilt: user does one thing at a time)
         all_intervals = (
-            [t["interval"] for t in self.tasks.values()] + self.hard_blocks
+            [t["interval"] for t in self.tasks.values()] + self._hard_block_intervals()
         )
         self.model.add_no_overlap(all_intervals)
 

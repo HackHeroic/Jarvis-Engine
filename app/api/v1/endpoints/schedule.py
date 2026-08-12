@@ -248,6 +248,10 @@ def run_schedule(
         user_override=max_daily_deep_work_minutes,
         min_daily_override=min_daily_deep_work_minutes,
         daily_context=daily_context if horizon_minutes > MINUTES_PER_DAY else None,
+        longest_task_minutes=max(
+            (clamped_durations.get(t.task_id, t.duration_minutes) for t in graph.decomposition),
+            default=None,
+        ),
     )
     scheduler = JarvisScheduler(
         horizon_minutes=horizon_minutes,
