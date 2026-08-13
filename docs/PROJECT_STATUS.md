@@ -27,11 +27,11 @@ which now survives only as a library of helpers the v2 graph calls into
   (`data/checkpoints.sqlite`) persists graph state per `(user_id, session_id)`
   thread, so a draft proposed on one turn is still under review on the next.
 
-**Test suite: 473 tests collected — 472 passed, 1 xfailed, in ~5 seconds.**
+**Test suite: 510 tests collected — 509 passed, zero xfails, in ~6 seconds.**
 39 test files. The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach
-Supabase, Gemini, or ChromaDB. The single `xfail` is `strict=True` and
-documents a real, pre-existing bug (see Known Issues #4).
+Supabase, Gemini, or ChromaDB. (Updated 2026-08-13: the previous strict
+xfail — the single-task pacing bug — is fixed; see Known Issues #4.)
 
 ```bash
 .venv/bin/python -m pytest tests/ -q     # or just: pytest tests/
@@ -400,7 +400,9 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
 3. **DKT / RL / SARIMAX are data-starved**, not merely unimplemented. Building
    them against synthetic data would teach them the wrong things.
 
-4. **`compute_adaptive_daily_cap` breaks single-task plans.** It forces
+4. **FIXED 2026-08-13** — `compute_adaptive_daily_cap` broke single-task plans
+   (cap floored at the longest task and rounded to whole task-atoms; the former
+   strict xfail now passes). Original description: It forces
    `target_days >= 2`, so one 25-minute task gets a 13 min/day cap — below the
    task's own duration — and CP-SAT can place it nowhere. Every rung of the
    horizon ladder lowers the cap further, so the user is told "I couldn't fit
@@ -459,7 +461,7 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
 
 ## Test Coverage
 
-**473 collected · 472 passed · 1 xfailed · 39 files · ~5 s · fully offline.**
+**510 collected · 509 passed · zero xfails · 39 files · ~6 s · fully offline.**
 
 Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
 form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).
