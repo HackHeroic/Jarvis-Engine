@@ -10,7 +10,7 @@ usage metering.
 
 import contextvars
 from collections.abc import AsyncIterator
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 from enum import Enum
 from typing import Any, Optional
 
@@ -19,17 +19,58 @@ from pydantic import BaseModel
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
+from app.domain.events import NullEventBus
 from app.domain.ports import LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
-from app.infrastructure.llm.factory import get_chain
+from app.infrastructure.llm.decorators import redacting_with
+from app.infrastructure.llm.factory import LLMProviderFactory, current_chain, set_chain
 from app.infrastructure.llm.transport import strip_fences  # noqa: F401  (re-export)
-from app.orchestrator.hooks import ActionHooks
+from app.orchestrator.hooks import ActionHooks, HookDecision, get_hooks
 
 # Per-request override: set by chat.py when frontend model picker selects Gemini.
 # ContextVar so concurrent requests don't stomp each other.
 force_cloud_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "force_cloud_var", default=False
 )
+
+
+class PreCloudLLMRedactor:
+    """Adapts the PreCloudLLM hook (L8 PII gate) to the provider chain's ``Redactor`` port.
+
+    Fails closed: a hook that denies the send, or asks first, stops the text from
+    leaving the machine. ``RedactingProvider`` sits outside ``RetryingProvider``, so
+    the refusal is never retried; the chain tries the next cloud provider, whose gate
+    refuses the same way.
+    """
+
+    def __init__(self, hooks: ActionHooks) -> None:
+        self._hooks = hooks
+
+    async def redact(self, text: str) -> tuple[str, int]:
+        result = await self._hooks.execute("PreCloudLLM", prompt=text)
+        if result.decision in (HookDecision.DENY, HookDecision.ASK):
+            raise LLMUnavailableError(
+                "This request cannot be sent to a cloud model.",
+                details={"hook_decision": result.decision.value},
+            )
+        if result.decision != HookDecision.MODIFY or not result.modified_input:
+            return text, 0
+        redacted = result.modified_input.get("prompt", text)
+        # A handler that changed the text but did not count its spans still counts once.
+        return redacted, result.redactions or int(redacted != text)
+
+
+def get_chain() -> FallbackChainProvider:
+    """Return the process-wide provider chain, building the default one on first use.
+
+    The default gates cloud sends with the process-wide hooks and publishes usage
+    nowhere. The composition root (or a test) replaces it with ``set_chain``.
+    """
+    chain = current_chain()
+    if chain is None:
+        chain = LLMProviderFactory.build(_cfg, PreCloudLLMRedactor(get_hooks()), NullEventBus())
+        set_chain(chain)
+    return chain
 
 
 class ModelRole(str, Enum):
@@ -105,9 +146,8 @@ async def route_llm_call(
     cannot be validated). It takes the same route as a plain call — same local-first
     attempt, same cloud fallback, same PreCloudLLM gate.
 
-    ``hooks`` is accepted for compatibility and no longer consulted: the
-    PreCloudLLM gate belongs to the chain's ``RedactingProvider``, which uses the
-    process-wide hooks (``get_hooks()``).
+    ``hooks``, when given, gates this call's cloud sends instead of the chain's own
+    PreCloudLLM gate (the process-wide ``get_hooks()``).
 
     Raises ``RuntimeError`` when every reachable provider failed and no cloud
     provider is configured, and ``LLMUnavailableError`` when cloud ones failed too.
@@ -134,10 +174,12 @@ async def route_llm_call(
     )
 
     chain = get_chain()
+    gate = nullcontext() if hooks is None else redacting_with(PreCloudLLMRedactor(hooks))
     try:
-        if stream:
-            return await _open_stream(chain, req, skip_local)
-        return await chain.complete(req, skip_local=skip_local)
+        with gate:
+            if stream:
+                return await _open_stream(chain, req, skip_local)
+            return await chain.complete(req, skip_local=skip_local)
     except LLMUnavailableError as exc:
         if not chain.has_available(LLMLocation.CLOUD):
             raise RuntimeError(f"Local LLM failed for {task} and no GEMINI_API_KEY set") from exc

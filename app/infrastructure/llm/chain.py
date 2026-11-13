@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import aclosing
 
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMError, LLMUnavailableError
@@ -13,6 +14,22 @@ from app.domain.ports import LLMProvider, LLMRequest
 logger = logging.getLogger(__name__)
 
 _NOTHING_REACHABLE = "No language model is reachable right now."
+_CAUSE_CHARS = 200
+
+
+def _describe_cause(cause: BaseException | None) -> str:
+    """Type and at most 200 characters of the low-level error, for the fall-over log."""
+    if cause is None:
+        return "none"
+    if isinstance(cause, PydanticValidationError):
+        # Its text quotes the model's reply, which may echo the user; where and why suffice.
+        text = "; ".join(
+            f"{'.'.join(map(str, e['loc']))}: {e['type']}"
+            for e in cause.errors(include_input=False)
+        )
+    else:
+        text = str(cause)
+    return f"{type(cause).__name__}: {text[:_CAUSE_CHARS]}"
 
 
 class FallbackChainProvider(LLMProvider):
@@ -57,11 +74,14 @@ class FallbackChainProvider(LLMProvider):
 
     @staticmethod
     def _fall_over(provider: LLMProvider, req: LLMRequest, error: LLMError) -> None:
+        # Never the prompt: the code, the details and the low-level cause say what broke.
         logger.warning(
-            "LLM provider %s failed for %s (%s); trying the next one",
+            "LLM provider %s failed for %s: code=%s details=%s cause=%s; trying the next one",
             provider.name,
             req.task,
             error.code,
+            error.details,
+            _describe_cause(error.__cause__),
         )
 
     async def complete(self, req: LLMRequest, skip_local: bool = False) -> str | BaseModel:
