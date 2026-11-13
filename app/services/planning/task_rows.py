@@ -24,7 +24,8 @@ def to_task_chunk(raw: dict, index: int) -> Any:
 
     Used by the planning sub-graph before scheduling and again when the same
     tasks are read back off a draft being accepted. Raises pydantic's
-    ValidationError (a ValueError) when the dict cannot become a chunk.
+    ValidationError (a ValueError), or OverflowError for an infinite duration,
+    when the dict cannot become a chunk.
     """
     # TaskChunk is defined in the API layer; imported here, lazily, as before.
     from app.api.v1.endpoints.reasoning import TaskChunk
@@ -69,12 +70,17 @@ def _field(chunk: Any, name: str, default: Any = None) -> Any:
     return _from_dict(chunk, name, default) if value is None else value
 
 
+def _minutes(slot: dict, *keys: str) -> Any:
+    """The first of ``keys`` the slot sets. Minute 0 counts: it is the horizon's start."""
+    return next((slot[key] for key in keys if slot.get(key) is not None), None)
+
+
 def _wall_clock(slot: Any, horizon: datetime) -> tuple[str, str] | None:
     """The slot's (start, end) as ISO instants, or None if it has no usable minutes."""
     # Both key spellings occur: start_min/end_min (planner) and start/end (solver).
     if isinstance(slot, dict):
-        start_min = slot.get("start_min") or slot.get("start")
-        end_min = slot.get("end_min") or slot.get("end")
+        start_min = _minutes(slot, "start_min", "start")
+        end_min = _minutes(slot, "end_min", "end")
     elif hasattr(slot, "start_min"):
         start_min, end_min = slot.start_min, slot.end_min
     else:
@@ -112,6 +118,9 @@ def build_task_rows(
 
     rows: list[dict[str, Any]] = []
     for chunk in chunks:
+        # The two reading styles are deliberate legacy semantics. task_id, title and
+        # duration fall back on any falsy attribute (`or`); every other field falls
+        # back only when the attribute is None (`_field`).
         task_id = getattr(chunk, "task_id", None) or _from_dict(chunk, "task_id")
         goal_id = _goal_id_of(task_id) if task_id else None
 

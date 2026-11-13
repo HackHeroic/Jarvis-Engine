@@ -73,7 +73,7 @@ _PLANNING_VERBS_RE = re.compile(
 # "move the calculus block"). Rules beat an LLM here: the vocabulary is tiny,
 # the latency budget on a one-word reply is ~0, and a misfire is expensive —
 # ACCEPT_DRAFT is the only intent in v2 that writes to user_tasks, and
-# _persist_fused_tasks *deletes every pending row* before inserting. A false
+# accepting *replaces every pending row* with the draft's tasks. A false
 # positive therefore destroys the user's task list; false negatives merely cost
 # a re-plan. The matcher is tuned hard in that direction.
 #

@@ -137,6 +137,19 @@ def test_accept_and_reject_draft__closed_draft__are_refused(store):
     assert store.get_draft(rejected["id"], "user_1")["status"] == "rejected"
 
 
+def test_replace_and_edit__closed_draft__refused_and_left_unchanged(store):
+    """An edit must not reopen an accepted draft (accepted -> modified is illegal)."""
+    created = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
+    store.accept_draft(created["id"], "user_1")
+
+    assert store.replace_tasks(created["id"], "user_1", [{"task_id": "x", "title": "x"}]) is None
+    assert store.edit_task_in_draft(created["id"], "user_1", "goal1_task_1", {"title": "x"}) is None
+
+    row = store.get_draft(created["id"], "user_1")
+    assert row["status"] == "accepted"
+    assert row["tasks"] == _tasks()
+
+
 def test_delete_draft_removes_it(store):
     created = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
     draft_id = created["id"]

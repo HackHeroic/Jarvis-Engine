@@ -357,7 +357,11 @@ def test_routing__draft_intents_reach_the_draft_action_node():
 
 
 class _FakeDraftStore:
-    """Minimal DraftStore surface: the four calls the draft_action node makes."""
+    """Minimal DraftStore surface: the three calls the draft_action node makes.
+
+    Accepting goes through ``accept_draft_and_persist`` (one atomic database
+    call), never a DraftStore status flip, so there is no accept_draft here.
+    """
 
     _DEFAULT = object()  # so draft=None can mean "this store is empty"
 
@@ -368,7 +372,6 @@ class _FakeDraftStore:
             "tasks": [{"task_id": "t1", "title": "read", "duration_minutes": 25}],
             "horizon_start": "2026-08-08T08:00:00Z",
         }
-        self.accepted: list[tuple] = []
         self.rejected: list[tuple] = []
         self.get_calls: list[tuple] = []
 
@@ -382,10 +385,6 @@ class _FakeDraftStore:
             return self.draft
         return None
 
-    def accept_draft(self, draft_id, user_id):
-        self.accepted.append((draft_id, user_id))
-        return True
-
     def reject_draft(self, draft_id, user_id, reason=None):
         self.rejected.append((draft_id, user_id, reason))
         return True
@@ -394,10 +393,10 @@ class _FakeDraftStore:
 def _user_model_with_db():
     """A real UserModel over a real FakeSupabase.
 
-    Accept now verifies its own write by re-reading user_tasks, so the fake has
-    to be a working store: a MagicMock would confirm any write, including one
-    that never happened. The facade is the genuine class so the observation
-    loop downstream finds the whole surface it expects.
+    Accept writes through the accept_draft rpc and the tests read user_tasks
+    back, so the fake has to be a working store: a MagicMock would report any
+    write, including one that never happened. The facade is the genuine class
+    so the observation loop downstream finds the whole surface it expects.
     """
     from app.core.user_model import UserModel
     from tests.fakes import FakeDBClient, FakeSupabase
@@ -556,7 +555,6 @@ async def test_draft_action__another_users_draft_is_never_reachable(_captured_pe
     )
     result = await handle_draft_action(state)
 
-    assert store.accepted == []
     assert _captured_persist == []
     assert result["negotiation_state"] == NegotiationPhase.NONE
 
@@ -747,7 +745,6 @@ async def test_graph__upload_during_review_reaches_knowledge_module(no_llm, _cap
     )
 
     assert "knowledge_module" in result["modules_invoked"]
-    assert store.accepted == []
     assert _captured_persist == []
 
 

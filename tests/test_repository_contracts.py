@@ -492,6 +492,22 @@ async def test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds(rep
 
 
 @pytest.mark.asyncio
+async def test_drafts__accept_atomic__concurrent_task_edit__edit_is_not_lost(repos):
+    """An accept marks the draft ACCEPTED; it must not also write back stale tasks."""
+    draft = await _new_draft(repos)
+    edited = [{"task_id": "g1_t9", "title": "Edited while accepting", "duration_minutes": 10}]
+
+    await asyncio.gather(
+        repos.drafts.accept_atomic(U1, draft.id, [_row("x")]),
+        repos.drafts.replace_tasks(U1, draft.id, edited),
+    )
+
+    stored = await repos.drafts.get(U1, draft.id)
+    assert stored.status is DraftStatus.ACCEPTED
+    assert stored.tasks == edited
+
+
+@pytest.mark.asyncio
 async def test_drafts__accept_atomic__expired__raises(repos, expire_draft):
     draft = await _new_draft(repos)
     expire_draft(draft.id)

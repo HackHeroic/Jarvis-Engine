@@ -302,6 +302,67 @@ def test_accept_endpoint__second_call__409_envelope(client):
     assert sorted(r["task_id"] for r in rows) == ["t1", "t2"]
 
 
+_EDITS = {
+    "patch_task": lambda c, d: c.patch(
+        f"/api/v1/drafts/{d}/tasks/t1?user_id=test_user", json={"title": "Read ch1 slowly"}
+    ),
+    "rearrange": lambda c, d: c.post(
+        f"/api/v1/drafts/{d}/rearrange", json={"user_id": "test_user", "task_order": ["t2", "t1"]}
+    ),
+    "modify": lambda c, d: c.post(
+        f"/api/v1/drafts/{d}/modify",
+        json={
+            "user_id": "test_user",
+            "component": "tasks",
+            "data": [{"task_id": "t9", "title": "Only this", "duration_minutes": 10}],
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("edit", sorted(_EDITS))
+def test_edit_routes__accepted_draft__409_and_draft_stays_accepted(client, edit):
+    draft_id = client.app.state._test_draft_id
+    client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+    tasks_before = _draft_row(client, draft_id)["tasks"]
+
+    resp = _EDITS[edit](client, draft_id)
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "invalid_state_transition"
+    row = _draft_row(client, draft_id)
+    assert row["status"] == "accepted"
+    assert row["tasks"] == tasks_before
+
+
+@pytest.mark.parametrize("edit", sorted(_EDITS))
+def test_accept__after_refused_edit__409_and_no_duplicate_rows(client, edit):
+    """An edit used to reopen an accepted draft as "modified". The second accept
+    then succeeded and re-inserted a task the user had finished as a pending twin."""
+    draft_id = client.app.state._test_draft_id
+    client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+    rows = client.app.state._test_supabase.rows["user_tasks"]
+    next(r for r in rows if r["task_id"] == "t1")["status"] = "completed"
+
+    _EDITS[edit](client, draft_id)
+    resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    assert resp.status_code == 409
+    assert sorted((r["task_id"], r["status"]) for r in rows) == [
+        ("t1", "completed"),
+        ("t2", "pending"),
+    ]
+
+
+def test_edit_task__unknown_task_on_open_draft__404(client):
+    """A closed draft is a 409; a task that is not in an open draft stays a 404."""
+    draft_id = client.app.state._test_draft_id
+    resp = client.patch(
+        f"/api/v1/drafts/{draft_id}/tasks/no_such_task?user_id=test_user", json={"title": "x"}
+    )
+    assert resp.status_code == 404
+
+
 def test_reject_endpoint__accepted_draft__409_envelope(client):
     """An accepted draft's tasks are live; rejecting it afterwards cannot undo that."""
     draft_id = client.app.state._test_draft_id

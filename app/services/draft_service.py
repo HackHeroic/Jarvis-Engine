@@ -71,7 +71,8 @@ def _chunks_of(draft: DraftSchedule) -> list:
     for index, raw in enumerate(draft.tasks):
         try:
             chunks.append(to_task_chunk(raw, index))
-        except (TypeError, ValueError):  # ValueError covers pydantic's ValidationError
+        # ValueError covers pydantic's ValidationError; ArithmeticError covers int(inf).
+        except (TypeError, ValueError, ArithmeticError):
             logger.warning(
                 "Draft %s: skipping unparseable task %r", draft.id, raw.get("task_id")
             )

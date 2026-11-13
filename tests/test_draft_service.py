@@ -131,7 +131,11 @@ async def test_accept__other_users_draft__raises_not_found_and_writes_nothing(re
 
 @pytest.mark.asyncio
 async def test_accept__empty_draft__raises_validation_error(repos, service):
-    for tasks in ([], [{"task_id": "x", "title": None}]):  # nothing / nothing parseable
+    unparseable = [
+        {"task_id": "x", "title": None},  # TaskChunk rejects it (a ValueError)
+        {"task_id": "y", "duration_minutes": float("inf")},  # int(inf): an OverflowError
+    ]
+    for tasks in ([], unparseable):
         draft = await _draft(repos, tasks)
 
         with pytest.raises(errors.ValidationError, match="Draft holds nothing schedulable."):
@@ -199,46 +203,81 @@ def test_build_task_rows__schedule_map__sets_wall_clock_times():
     assert {r["goal_id"] for r in rows} == {"g"}
 
 
-def test_build_task_rows__same_output_as_legacy():
-    """The rows a draft accept writes are exactly the rows v1's
-    _persist_fused_tasks writes. plan_id is minted per call and created_at is
-    the clock, so those two are left out of the comparison."""
+def test_build_task_rows__slot_at_minute_zero__gets_wall_clock_times():
+    """Minute 0 is the start of the horizon, not a missing value."""
+    from app.services.planning.task_rows import build_task_rows
+
+    _, rows = build_task_rows(
+        U1,
+        _tasks("g_t1", "g_t2"),
+        schedule={"g_t1": {"start_min": 0, "end_min": 25}, "g_t2": {"start": 0, "end": 25}},
+        horizon_start=HORIZON,
+    )
+
+    for row in rows:
+        assert row["scheduled_start"] == "2026-08-13T08:00:00+00:00"
+        assert row["scheduled_end"] == "2026-08-13T08:25:00+00:00"
+
+
+def test_build_task_rows__representative_chunks__exact_rows():
+    """Pins the exact user_tasks row shape, so any drift in the builder shows here.
+
+    Accept writes these rows through the accept_draft database function, whose
+    column list is built from these keys.
+    """
+    from datetime import datetime
+
     from app.api.v1.endpoints.reasoning import ImplementationIntention, TaskChunk
-    from app.services.analytical.control_policy import _persist_fused_tasks
     from app.services.planning.task_rows import build_task_rows
 
     chunks = [
-        TaskChunk(
+        TaskChunk(  # an object chunk, scheduled with start_min/end_min
             task_id="exam_t1", title="Read ch1", duration_minutes=25, difficulty_weight=0.7,
             completion_criteria="Summarise ch1 from memory", deadline_hint="2026-08-20",
             implementation_intention=ImplementationIntention(
                 obstacle_trigger="phone buzzes", behavioral_response="airplane mode"
             ),
         ),
-        {
+        {  # a dict chunk with a dependency and keywords, scheduled with start/end
             "task_id": "exam_t2", "title": "Problems", "duration_minutes": 20,
             "difficulty_weight": 0.4, "dependencies": ["exam_t1"],
             "completion_criteria": "Solve 3 problems", "topic_keywords": ["calculus"],
         },
-        {"task_id": "loose", "title": "No goal prefix", "duration_minutes": 10},
+        {"task_id": "loose", "title": "No goal prefix", "duration_minutes": 10},  # unscheduled
     ]
-    schedule = {
-        "exam_t1": {"start_min": 60, "end_min": 85},
-        "exam_t2": {"start": 90, "end": 110},  # the other key spelling the legacy path reads
-    }
-    supabase = FakeSupabase()
+    schedule = {"exam_t1": {"start_min": 60, "end_min": 85}, "exam_t2": {"start": 90, "end": 110}}
 
-    legacy_plan_id = _persist_fused_tasks(
-        U1, chunks, supabase, schedule=schedule, horizon_start=HORIZON
-    )
-    _, rows = build_task_rows(U1, chunks, schedule=schedule, horizon_start=HORIZON)
+    plan_id, rows = build_task_rows(U1, chunks, schedule=schedule, horizon_start=HORIZON)
 
-    def comparable(row: dict) -> dict:
-        return {k: v for k, v in row.items() if k not in ("plan_id", "created_at")}
-
-    legacy_rows = supabase.rows["user_tasks"]
-    assert legacy_plan_id and {r["plan_id"] for r in legacy_rows} == {legacy_plan_id}
-    assert [comparable(r) for r in legacy_rows] == [comparable(r) for r in rows]
+    assert {row.pop("plan_id") for row in rows} == {plan_id}
+    created = {row.pop("created_at") for row in rows}
+    assert len(created) == 1 and datetime.fromisoformat(created.pop()).tzinfo is not None
+    assert rows == [
+        {
+            "user_id": U1, "task_id": "exam_t1", "title": "Read ch1", "status": "pending",
+            "duration_minutes": 25, "difficulty_weight": 0.7, "dependencies": [],
+            "deadline_hint": "2026-08-20", "goal_id": "exam",
+            "completion_criteria": "Summarise ch1 from memory",
+            "implementation_intention": {
+                "obstacle_trigger": "phone buzzes", "behavioral_response": "airplane mode",
+            },
+            "scheduled_start": "2026-08-13T09:00:00+00:00",
+            "scheduled_end": "2026-08-13T09:25:00+00:00",
+        },
+        {
+            "user_id": U1, "task_id": "exam_t2", "title": "Problems", "status": "pending",
+            "duration_minutes": 20, "difficulty_weight": 0.4, "dependencies": ["exam_t1"],
+            "deadline_hint": None, "goal_id": "exam", "completion_criteria": "Solve 3 problems",
+            "topic_keywords": ["calculus"],
+            "scheduled_start": "2026-08-13T09:30:00+00:00",
+            "scheduled_end": "2026-08-13T09:50:00+00:00",
+        },
+        {
+            "user_id": U1, "task_id": "loose", "title": "No goal prefix", "status": "pending",
+            "duration_minutes": 10, "difficulty_weight": None, "dependencies": [],
+            "deadline_hint": None,
+        },
+    ]
 
 
 # --- the legacy entry point ---------------------------------------------------
