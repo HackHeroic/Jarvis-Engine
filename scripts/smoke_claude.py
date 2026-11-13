@@ -8,10 +8,9 @@ Both go through ClaudeProvider (cached system block, effort, server-side refusal
 fallback, structured outputs) inside MeteredProvider, so the token usage printed is
 what the usage ledger would record. The credential comes from .env, loaded exactly
 as the app loads it, and is never printed. If the API rejects it as an API key, it
-is tried once more as an auth token (an OAuth bearer token).
+is tried once more as an auth token.
 
-Usage:
-    cd /Users/madhav/Jarvis-cursor/Jarvis-Engine
+Usage, from the Jarvis-Engine directory:
     .venv/bin/python scripts/smoke_claude.py
 
 Exit status: 0 both calls answered; 2 the credential was rejected every way; 1 otherwise.
