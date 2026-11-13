@@ -1255,6 +1255,83 @@ async def test_planning__carried_forward_pending_tasks__keep_their_ids(no_llm, m
     assert {r["goal_id"] for r in new} == {draft.goal_id} == {"revise_graph_algorithms"}
 
 
+# --- goal membership ----------------------------------------------------------
+# Which pending rows does a re-plan of goal X replace? A row's own goal_id
+# decides. The `{X}_` id prefix cannot: goal `learn`'s prefix also matches every
+# task of goal `learn_dsa`. It decides only for rows the old builder wrote, whose
+# goal_id is missing or is just the id's first segment (its guess).
+
+
+@pytest.mark.asyncio
+async def test_planning__replan_learn__leaves_learn_dsa_tasks_untouched(no_llm, monkeypatch):
+    from app.modules.planning_graph import planning_state_in
+
+    learn_dsa = [
+        {"task_id": "learn_dsa_4d5e6f_task_1", "goal_id": "learn_dsa", "title": "arrays",
+         "duration_minutes": 20, "dependencies": []},
+        {"task_id": "learn_dsa_4d5e6f_task_2", "goal_id": "learn_dsa", "title": "heaps",
+         "duration_minutes": 20, "dependencies": ["learn_dsa_4d5e6f_task_1"]},
+    ]
+    stale_learn = {"task_id": "learn_1a2b3c_task_1", "goal_id": "learn", "title": "old",
+                   "duration_minutes": 20, "dependencies": []}
+    _patch_decompose_transport(monkeypatch, _decompose_transport([_chunk("task_1")]))
+    store = _FakeDraftStore(row={"id": "row-uuid"})
+
+    await build_module_graph(planning_module).ainvoke(planning_state_in({
+        "user_model": _PendingUserModel([*learn_dsa, stale_learn]),
+        "user_message": "learn",
+        "draft_store": store,
+    }))
+
+    _user_id, tasks, _horizon_start, goal = store.calls[0]
+    assert goal == "learn"
+    by_id = {t["task_id"]: t for t in tasks}
+    for row in learn_dsa:  # carried forward exactly as they were
+        assert {k: by_id[row["task_id"]][k] for k in row} == row
+    assert stale_learn["task_id"] not in by_id  # this goal's old row is replaced
+    assert len(tasks) == 3
+
+
+@pytest.mark.asyncio
+async def test_fuse_tasks__legacy_row_with_guessed_goal_id__still_replaced():
+    """The old builder filed `revise_graph_algorithms_task_1` under goal `revise`.
+
+    Comparing goal ids alone would keep that stale row next to its replacement,
+    so the plan would hold the same work twice.
+    """
+    from app.modules.planning_graph import fuse_tasks
+
+    legacy = {"task_id": "revise_graph_algorithms_task_1", "goal_id": "revise",
+              "title": "stale", "duration_minutes": 25}
+    out = await fuse_tasks({
+        "user_model": _PendingUserModel([legacy]),
+        "goal_id": "revise_graph_algorithms",
+        "task_chunks": [_chunk("revise_graph_algorithms_ab12cd_task_1")],
+    })
+
+    assert [c["task_id"] for c in out["task_chunks"]] == ["revise_graph_algorithms_ab12cd_task_1"]
+
+
+@pytest.mark.parametrize(
+    ("task_id", "row_goal", "goal", "expected"),
+    [
+        ("learn_dsa_4d5e6f_task_1", "learn_dsa", "learn", False),  # shared leading word
+        ("learn_dsa_4d5e6f_task_1", "learn_dsa", "learn_dsa", True),
+        ("learn_1a2b3c_task_1", "learn", "learn", True),
+        ("learn_1a2b3c_task_1", "learn", "learn_dsa", False),
+        ("revise_graph_task_1", "revise", "revise_graph", True),  # the old builder's guess
+        ("calculus_task_1", None, "calculus", True),  # no goal_id: the prefix decides
+        ("task_1", None, "calculus", False),
+    ],
+)
+def test_belongs_to_goal__own_goal_id_decides__prefix_only_for_legacy_rows(
+    task_id, row_goal, goal, expected
+):
+    from app.services.planning.task_rows import belongs_to_goal
+
+    assert belongs_to_goal(task_id, row_goal, goal) is expected
+
+
 # ---------------------------------------------------------------------------
 # mark_missed step — overdue tasks marked at PLAN_DAY entry (v1 parity)
 # ---------------------------------------------------------------------------

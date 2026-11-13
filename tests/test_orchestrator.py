@@ -811,6 +811,31 @@ async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft():
 
 
 @pytest.mark.asyncio
+async def test_accept__plan_clashes_with_existing_tasks__says_so_and_writes_nothing():
+    """The draft reuses the id of a task the user already finished. A retry can
+    never succeed, so the answer is neither "Locked in" nor "say accept again"."""
+    from app.orchestrator.graph import handle_draft_action
+
+    user_model = _user_model_with_db()
+    supabase = user_model._db.supabase
+    finished = {"user_id": "test_user", "task_id": "t1", "title": "read", "status": "completed"}
+    supabase.rows["user_tasks"] = [dict(finished)]
+    store = _seed_draft(supabase)
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept", user_model=user_model,
+    )
+    result = await handle_draft_action(state)
+
+    assert supabase.rows["user_tasks"] == [finished]
+    assert _draft_status(store) == "pending"
+    assert "clashes" in result["response_message"]
+    assert "accept again" not in result["response_message"]
+    assert result["negotiation_state"] == NegotiationPhase.NONE
+    assert result["draft_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_accept__success__tasks_and_accepted_status_land_in_one_call():
     """No separate status flip: the tasks and the ACCEPTED status commit
     together or not at all, so there is no order between them to get wrong."""

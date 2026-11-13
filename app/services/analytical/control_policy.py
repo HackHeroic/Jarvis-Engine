@@ -44,7 +44,7 @@ from app.schemas.context import (
 )
 from app.services.analytical.habit_translator import translate_habits_to_slots
 from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
-from app.services.analytical.task_retrieval import get_all_pending_tasks
+from app.services.analytical.task_retrieval import get_all_pending_tasks_with_goals
 from app.services.analytical.voice_of_jarvis import (
     _build_thinking_fallback,
     synthesize_jarvis_response,
@@ -54,7 +54,7 @@ from app.services.extraction.behavioral_store import (
 )
 from app.services.extraction.action_item_handler import propose_action_item
 from app.services.extraction.orchestrator import process_ingestion
-from app.services.planning.task_rows import build_task_rows
+from app.services.planning.task_rows import belongs_to_goal, build_task_rows
 from app.utils.deadline_parser import compute_horizon_from_deadlines
 
 # ---------------------------------------------------------------------------
@@ -383,7 +383,11 @@ def _persist_fused_tasks(
         pre-existing pending tasks forward.
 
     Safety: will NOT delete if chunks list is empty (prevents accidental wipe
-    when task retrieval fails upstream).
+    when task retrieval fails upstream). Nor if the insert is bound to fail on
+    user_tasks' UNIQUE (user_id, task_id): an id repeated in ``chunks``, or one a
+    task the user already finished (completed, skipped, missed...) still holds.
+    The delete would land and the insert would not, losing every pending task.
+    Chunks may be dicts carrying their ``goal_id``; ``build_task_rows`` keeps it.
     """
     if not supabase_client or not user_id:
         return None
@@ -394,6 +398,25 @@ def _persist_fused_tasks(
         plan_id, rows = build_task_rows(
             user_id, chunks, schedule=schedule, horizon_start=horizon_start
         )
+
+        task_ids = [row["task_id"] for row in rows]
+        kept = (
+            supabase_client.table("user_tasks")
+            .select("task_id")
+            .eq("user_id", user_id)
+            .neq("status", "pending")
+            .execute()
+        )
+        taken = {r.get("task_id") for r in kept.data or []}
+        clashes = sorted(
+            {t for t in task_ids if t in taken or task_ids.count(t) > 1}, key=str
+        )
+        if clashes:
+            print(
+                f"[Control Policy] _persist_fused_tasks: task ids {clashes} are repeated or "
+                f"already held by finished tasks; nothing deleted or written"
+            )
+            return None
 
         # Delete AFTER building rows — if row construction fails, existing tasks survive
         supabase_client.table("user_tasks").delete().eq(
@@ -957,9 +980,11 @@ async def _run_plan_day_flow(
     # Ensure dependencies are prefixed; _namespace_chunk does this
     run = mint_run_token()
     new_prefixed = [_namespace_chunk(c, goal_id, run) for c in graph.decomposition]
-    all_pending = get_all_pending_tasks(user_id, supabase)
+    all_pending = get_all_pending_tasks_with_goals(user_id, supabase)
     # Keep tasks from OTHER goals, drop tasks from THIS goal (will be replaced by new decomposition)
-    pending_chunks = [c for c in all_pending if not c.task_id.startswith(f"{goal_id}_")]
+    pending_chunks = [
+        c for c, row_goal in all_pending if not belongs_to_goal(c.task_id, row_goal, goal_id)
+    ]
     master_chunk_list = list(pending_chunks) + list(new_prefixed)
     log_step("P5_FUSION", "Multi-goal fusion", {
         "existing_pending": len(all_pending),
@@ -1755,7 +1780,8 @@ async def trigger_replan(
         log_step("REPLAN_SKIP", f"No DB for replan (reason={reason})")
         return None
 
-    pending = get_all_pending_tasks(user_id, supabase)
+    pending_with_goals = get_all_pending_tasks_with_goals(user_id, supabase)
+    pending = [chunk for chunk, _ in pending_with_goals]
     if not pending:
         log_step("REPLAN_SKIP", f"No pending tasks for user {user_id} (reason={reason})")
         return None
@@ -1856,10 +1882,12 @@ async def trigger_replan(
             continue
 
     if schedule_response is not None:
-        # Persist the updated schedule with timing data
+        # Persist the updated schedule with timing data. Each task keeps its
+        # goal_id: TaskChunk has none, and build_task_rows would otherwise read it
+        # off the id prefix and refile `learn_dsa_…` under `learn`.
         _persist_fused_tasks(
             user_id,
-            pending,
+            [{**chunk.model_dump(), "goal_id": goal} for chunk, goal in pending_with_goals],
             supabase,
             schedule=schedule_response.schedule if hasattr(schedule_response, "schedule") else None,
             horizon_start=horizon_start.isoformat() if horizon_start else None,

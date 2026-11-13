@@ -64,6 +64,20 @@ def _goal_id_of(task_id: str) -> str | None:
     return task_id.split("_", 1)[0]
 
 
+def belongs_to_goal(task_id: str, row_goal_id: str | None, goal_id: str) -> bool:
+    """Whether a stored task belongs to ``goal_id``, so a re-plan of that goal replaces it.
+
+    The task's own goal_id decides. The ``{goal_id}_`` id prefix cannot, because it
+    confuses goals that share a leading word: ``learn_`` also matches every task of
+    ``learn_dsa``. The prefix decides only for rows the old builder wrote: those
+    with no goal_id, or whose goal_id is just the id's first segment (its guess,
+    which filed ``revise_graph_task_1`` under ``revise``).
+    """
+    if row_goal_id and row_goal_id != _goal_id_of(task_id):
+        return row_goal_id == goal_id
+    return task_id.startswith(f"{goal_id}_")
+
+
 def _from_dict(chunk: Any, name: str, default: Any = None) -> Any:
     return chunk.get(name, default) if isinstance(chunk, dict) else None
 

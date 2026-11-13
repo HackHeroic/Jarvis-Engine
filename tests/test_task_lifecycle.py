@@ -230,3 +230,31 @@ def test_patch_task__unknown_status__422():
         assert fake.rows["user_tasks"][0]["status"] == "pending"
     finally:
         app.state.db_client = original
+
+
+@pytest.mark.parametrize("status", ["missed", "pacing_pushed"])
+def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status, monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from tests.fakes import FakeSupabase
+
+    async def _no_replan(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr("app.api.v1.endpoints.tasks._try_trigger_replan", _no_replan)
+    fake = FakeSupabase({"user_tasks": [
+        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending"},
+    ]})
+
+    class _DB:
+        supabase = fake
+
+    original = getattr(app.state, "db_client", None)
+    app.state.db_client = _DB()
+    try:
+        resp = TestClient(app).patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": status})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == status
+        assert fake.rows["user_tasks"][0]["status"] == status
+    finally:
+        app.state.db_client = original

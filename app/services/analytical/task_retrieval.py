@@ -24,6 +24,21 @@ def get_all_pending_tasks(
     Returns chunks with prefixed task_ids (goal_id_task_id). Dependencies are
     already prefixed from the last fusion persist. Deduplicates by task_id
     (keeps latest per task_id).
+
+    TaskChunk has no goal_id field, so the goal is lost here. A caller that writes
+    the tasks back, or decides which goal a task belongs to, uses
+    ``get_all_pending_tasks_with_goals``.
+    """
+    return [chunk for chunk, _ in get_all_pending_tasks_with_goals(user_id, supabase_client)]
+
+
+def get_all_pending_tasks_with_goals(
+    user_id: str,
+    supabase_client: Any = None,
+) -> list[tuple[TaskChunk, str | None]]:
+    """``get_all_pending_tasks``, with each chunk paired with its row's goal_id.
+
+    The goal_id is None for a row that has none.
     """
     supabase = _get_supabase(supabase_client)
     if not supabase or not user_id:
@@ -46,7 +61,7 @@ def get_all_pending_tasks(
         return []
 
     seen: set[str] = set()
-    chunks: list[TaskChunk] = []
+    chunks: list[tuple[TaskChunk, str | None]] = []
 
     # Keep latest per task_id (rows ordered by created_at desc)
     for r in rows:
@@ -79,7 +94,7 @@ def get_all_pending_tasks(
                 implementation_intention=None,
                 deadline_hint=r.get("deadline_hint"),
             )
-            chunks.append(chunk)
+            chunks.append((chunk, r.get("goal_id")))
         except Exception as e:
             print(f"[task_retrieval] Skip invalid chunk {task_id}: {e}")
 

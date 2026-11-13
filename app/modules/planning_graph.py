@@ -12,6 +12,7 @@ from app.services.draft_actions import (
     draft_id_of as _draft_id_of,
     to_task_chunk as _to_task_chunk,
 )
+from app.services.planning.task_rows import belongs_to_goal
 
 
 def _merge_lists(left: list, right: list) -> list:
@@ -247,12 +248,14 @@ async def fuse_tasks(state: PlanningState) -> dict:
     """Multi-goal fusion, v1 parity: keep tasks from OTHER goals, drop tasks
     from THIS goal — the fresh decomposition replaces them.
 
-    Membership is decided by the `{goal_id}_` prefix decompose_goal stamps on
-    every new chunk (`{goal_id}_{run}_{task_id}`), not by task_id equality.
-    Equality was F5: the decomposer's ids are positional, so "does this pending
-    row share an id with a new chunk?" answered *yes* for unrelated tasks from an
-    earlier plan, dropped them from the fusion, and `_persist_fused_tasks`'s
-    delete-then-replace deleted them from `user_tasks` on accept.
+    Membership is decided by each row's own goal_id (`belongs_to_goal`; the
+    `{goal_id}_` id prefix only for rows written before goal_id travelled), not
+    by task_id equality. Equality was F5: the decomposer's ids are positional, so
+    "does this pending row share an id with a new chunk?" answered *yes* for
+    unrelated tasks from an earlier plan, dropped them from the fusion, and
+    `_persist_fused_tasks`'s delete-then-replace deleted them from `user_tasks`
+    on accept. The bare prefix was wrong too: goal `learn` claimed every task of
+    goal `learn_dsa`.
 
     Rows carried forward from other goals keep their ids and their own goal_id.
 
@@ -268,23 +271,25 @@ async def fuse_tasks(state: PlanningState) -> dict:
 
     new_chunks = state.get("task_chunks", [])
     goal_id = state.get("goal_id")
-    prefix = f"{goal_id}_" if goal_id else None
     new_ids = {c.get("task_id") for c in new_chunks if c.get("task_id")}
     merged = list(new_chunks)  # start with new tasks
     for p in pending:
         pid = p.get("task_id")
-        if pid and (not prefix or not pid.startswith(prefix)) and pid not in new_ids:
-            # Convert pending task row to TaskChunk-compatible dict
-            merged.append({
-                "task_id": pid,
-                # Its own goal, which is not this plan's: build_task_rows writes it as is.
-                "goal_id": p.get("goal_id"),
-                "title": p.get("title", ""),
-                "duration_minutes": p.get("duration_minutes", 25),
-                "difficulty_weight": p.get("difficulty_weight", 0.5),
-                "dependencies": p.get("dependencies", []),
-                "deadline_hint": p.get("deadline_hint"),
-            })
+        if not pid or pid in new_ids:
+            continue
+        if goal_id and belongs_to_goal(pid, p.get("goal_id"), goal_id):
+            continue  # THIS goal's stale row: the new decomposition replaces it
+        # Convert pending task row to TaskChunk-compatible dict
+        merged.append({
+            "task_id": pid,
+            # Its own goal, which is not this plan's: build_task_rows writes it as is.
+            "goal_id": p.get("goal_id"),
+            "title": p.get("title", ""),
+            "duration_minutes": p.get("duration_minutes", 25),
+            "difficulty_weight": p.get("difficulty_weight", 0.5),
+            "dependencies": p.get("dependencies", []),
+            "deadline_hint": p.get("deadline_hint"),
+        })
 
     return {"task_chunks": merged, "pending_tasks": pending}
 

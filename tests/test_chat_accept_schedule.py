@@ -142,3 +142,46 @@ def test_v1_adjacent_schedule_routes_are_marked_deprecated(client, path):
     so the frontend's generated client warns instead of silently depending."""
     spec = client.get("/openapi.json").json()
     assert spec["paths"][path]["post"]["deprecated"] is True
+
+
+# --- the unique key on user_tasks (user_id, task_id) ---------------------------
+# `_persist_fused_tasks` deletes the user's pending rows and then inserts. If the
+# insert then fails on the unique key, the pending rows are already gone. So it
+# refuses before deleting anything when an incoming id is taken or repeated.
+
+_STILL_PENDING = {
+    "user_id": "test_user", "task_id": "other_goal_task_1", "title": "keep me",
+    "status": "pending", "duration_minutes": 25,
+}
+
+
+def test_accept_schedule__id_held_by_completed_task__refuses_and_deletes_nothing(client):
+    finished = {**_STILL_PENDING, "task_id": "goal_task_1", "status": "completed"}
+    client.app.state._test_supabase.rows["user_tasks"] = [finished, dict(_STILL_PENDING)]
+
+    resp = _post(client)
+
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "failed"
+    assert _rows(client) == [finished, _STILL_PENDING]
+
+
+def test_accept_schedule__duplicate_ids_in_payload__refuses_and_deletes_nothing(client):
+    client.app.state._test_supabase.rows["user_tasks"] = [dict(_STILL_PENDING)]
+
+    resp = _post(client, tasks=[TASKS[0], {**TASKS[1], "task_id": TASKS[0]["task_id"]}])
+
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "failed"
+    assert _rows(client) == [_STILL_PENDING]
+
+
+def test_accept_schedule__client_sends_goal_id__row_keeps_it(client):
+    """A v2 plan accepted through this fallback: `learn_dsa_…` must not be filed under `learn`."""
+    tasks = [{**t, "task_id": f"learn_dsa_ab12cd_task_{n}", "goal_id": "learn_dsa"}
+             for n, t in enumerate(TASKS, start=1)]
+
+    resp = _post(client, tasks=tasks)
+
+    assert resp.status_code == 200
+    assert {r["goal_id"] for r in _rows(client)} == {"learn_dsa"}

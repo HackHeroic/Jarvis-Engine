@@ -9,7 +9,7 @@ import re
 from typing import Any, Callable
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.domain.errors import InvalidStateTransition
+from app.domain.errors import ConflictError, InvalidStateTransition
 
 from langgraph.graph import END, StateGraph
 
@@ -510,6 +510,17 @@ async def _apply_draft_action(state: JarvisState) -> dict:
             )
         except InvalidStateTransition:
             return await _closed_draft_reply(draft_store, user_id, draft_id)
+        except ConflictError:
+            # The draft reuses a task id the user's finished tasks hold. No retry
+            # can write it, so close the negotiation instead of inviting one.
+            return {
+                "response_message": (
+                    "That plan clashes with tasks you already have, sir, so nothing was "
+                    "written. Tell me what to plan and I'll build a fresh one."
+                ),
+                "negotiation_state": NegotiationPhase.NONE,
+                "draft_id": None,
+            }
         if count is None:
             # The write did not land and the draft is still pending. Keep the
             # phase (omitted, not reset) so "accept" retries — and say what

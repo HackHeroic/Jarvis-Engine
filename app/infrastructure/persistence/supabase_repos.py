@@ -53,12 +53,15 @@ from app.infrastructure.persistence._mapping import (
     prepare_new,
     summarize_usage,
     task_from_row,
+    task_id_clash,
     task_status_values,
     to_row,
     utc,
 )
 
 _UNREACHABLE = "Could not reach the database."
+# The name 20261114000001_capstone_lld.sql gives user_tasks' UNIQUE (user_id, task_id).
+_TASK_ID_KEY = "user_tasks_user_id_task_id_key"
 _UNREADABLE = "Stored data is not readable."
 # A lost compare-and-set on a draft's status is retried against the status that won.
 _STATUS_CAS_ATTEMPTS = 3
@@ -286,6 +289,9 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
                 ) from exc
             if "DRAFT_NOT_FOUND" in text:
                 raise not_found("draft", draft_id) from exc
+            # 23505 is unique_violation; the only unique key the insert can hit.
+            if _TASK_ID_KEY in text or getattr(exc, "code", None) == "23505":
+                raise task_id_clash(draft_id) from exc
             raise errors.PersistenceError(_UNREACHABLE) from exc
 
 

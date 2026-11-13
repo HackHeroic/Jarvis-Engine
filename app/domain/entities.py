@@ -108,7 +108,12 @@ class Task(BaseModel):
 
     id: str | None = Field(default=None, description="Storage row id; None until persisted.")
     user_id: str = Field(description="Owner of the task.")
-    task_id: str = Field(description="Task identifier, namespaced by goal ({goal_id}_{task_id}).")
+    task_id: str = Field(
+        description=(
+            "Task identifier, unique per user; new plans write {goal_id}_{run}_{task_id}, "
+            "one run token per planning run. Read the goal from goal_id, never from this."
+        )
+    )
     goal_id: str | None = Field(default=None, description="Goal this task belongs to.")
     plan_id: str | None = Field(
         default=None, description="Plan (accepted draft) that wrote this task."

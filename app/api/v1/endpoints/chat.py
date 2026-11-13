@@ -1039,8 +1039,15 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
     except Exception as exc:
         return {"status": "error", "message": f"Invalid tasks: {exc}", "task_count": 0}
 
+    # A goal_id the client sends (a v2 plan's tasks carry one) rides along:
+    # TaskChunk has no such field, and build_task_rows would otherwise read it off
+    # the id prefix and refile `learn_dsa_…` under `learn`.
+    chunks = [
+        {**chunk.model_dump(), "goal_id": raw.get("goal_id")}
+        for chunk, raw in zip(task_chunks, request.tasks)
+    ]
     plan_id = _persist_fused_tasks(
-        request.user_id, task_chunks, supabase,
+        request.user_id, chunks, supabase,
         schedule=request.schedule.get("schedule") if request.schedule else None,
         horizon_start=request.horizon_start,
     )
