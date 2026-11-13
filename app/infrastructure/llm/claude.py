@@ -8,6 +8,8 @@ Built so the API credits buy answers, not waste:
 * thinking effort follows the role (``CLAUDE_EFFORT_BY_ROLE``);
 * a structured request uses the API's structured outputs, so the reply is
   schema-valid by construction — no fence stripping, no repair loop;
+* every reply the API bills is metered, including one that is then discarded (cut
+  off, refused, or failing its schema);
 * the SDK never retries (``max_retries=0``) because ``RetryingProvider`` owns retries;
   a rejected credential switches the provider off for the rest of the process, and a
   refusal is never asked again;
@@ -18,6 +20,7 @@ Built so the API credits buy answers, not waste:
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from types import ModuleType
 from typing import Any
 
@@ -39,16 +42,18 @@ from app.infrastructure.llm.transport import report_token_usage
 logger = logging.getLogger(__name__)
 
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
-# An auth token is an OAuth bearer token, which the API accepts only with this beta.
-_OAUTH_BETA = "oauth-2025-04-20"
 
 # Thinking counts toward max_tokens. Output is billed as generated, so these are
 # ceilings with room to spare; a reply that reaches one is discarded, never parsed.
-_MAX_TOKENS_FAST_STRUCTURED = 1024
+_MAX_TOKENS_FAST_STRUCTURED = 2048
 _MAX_TOKENS_FAST_TEXT = 4096
 _MAX_TOKENS_DEFAULT = 8000
 
 _shared_client: anthropic.AsyncAnthropic | None = None
+
+# The model that answered the call in progress — not CLAUDE_MODEL when the
+# server-side fallback served it. Per task, so concurrent requests never mix.
+_served_model: ContextVar[str | None] = ContextVar("claude_served_model", default=None)
 
 
 def build_client(cfg: ModuleType) -> anthropic.AsyncAnthropic:
@@ -70,7 +75,7 @@ class ClaudeProvider(LLMProvider):
     """Claude via the Messages API; one model (``CLAUDE_MODEL``) serves every role.
 
     ``cfg`` is the config module, read at call time. ``client`` stands in for the
-    process-wide ``AsyncAnthropic`` (tests pass a fake).
+    process-wide ``AsyncAnthropic`` (tests pass one wired to a mock transport).
     """
 
     name = "claude"
@@ -82,8 +87,12 @@ class ClaudeProvider(LLMProvider):
         self._disabled = False
 
     def model_for_role(self, role: str) -> str:
-        """Return the Claude model; one model serves every role."""
-        return self._cfg.CLAUDE_MODEL
+        """The model to record for the call in this task: the one that answered, if any.
+
+        That is ``CLAUDE_MODEL`` unless the server-side fallback served the reply.
+        ``MeteredProvider`` asks once the call has finished.
+        """
+        return _served_model.get() or self._cfg.CLAUDE_MODEL
 
     def is_available(self) -> bool:
         """Available while a credential is configured and the API has not rejected it."""
@@ -96,25 +105,38 @@ class ClaudeProvider(LLMProvider):
         return _default_client(self._cfg)
 
     async def complete(self, req: LLMRequest) -> str | BaseModel:
+        _served_model.set(None)
         messages_api = self._client().beta.messages
         params = self._params(req)
-        with self._translated_errors():
-            if req.response_schema is None:
-                reply = await messages_api.create(**params)
-            else:
-                reply = await messages_api.parse(**params, output_format=req.response_schema)
-        _report_usage(reply.usage)
-        _check_stop(reply)
         if req.response_schema is None:
+            with self._translated_errors():
+                reply = await messages_api.create(**params)
+            body = reply.to_dict()
+            _meter(body)
+            _check_stop(body)
             return "".join(block.text for block in reply.content if block.type == "text")
-        if not isinstance(reply.parsed_output, req.response_schema):
+
+        # messages.parse validates the reply inside the SDK call, so a cut-off or
+        # malformed reply would raise before its billed usage could be read. The raw
+        # response gives the body first: meter it, check why it stopped, then parse.
+        with self._translated_errors():
+            raw = await messages_api.with_raw_response.parse(
+                **params, output_format=req.response_schema
+            )
+            body = await raw.json()
+        _meter(body)
+        _check_stop(body)
+        with self._translated_errors():
+            parsed = (await raw.parse()).parsed_output
+        if not isinstance(parsed, req.response_schema):
             raise LLMOutputParseError(
                 "The language model's answer could not be understood.",
                 details={"cause": "no_parsed_output"},
             )
-        return reply.parsed_output
+        return parsed
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
+        _served_model.set(None)
         sent_text = False
         with self._translated_errors():
             async with self._client().beta.messages.stream(**self._params(req)) as reply_stream:
@@ -123,12 +145,13 @@ class ClaudeProvider(LLMProvider):
                         sent_text = True
                         yield ("content", text)
                 reply = await reply_stream.get_final_message()
-        _report_usage(reply.usage)
-        if reply.stop_reason == "max_tokens" and sent_text:
+        body = reply.to_dict()
+        _meter(body)
+        if body.get("stop_reason") == "max_tokens" and sent_text:
             # The user has already read the text, and there is nothing to parse.
             logger.warning("Claude reply for %s stopped at max_tokens", req.task)
             return
-        _check_stop(reply)
+        _check_stop(body)
 
     def _params(self, req: LLMRequest) -> dict[str, Any]:
         """Keyword arguments for the SDK call. Never ``thinking``, sampling or ``tool_choice``."""
@@ -138,7 +161,7 @@ class ClaudeProvider(LLMProvider):
             "messages": _messages(req),
             "output_config": {"effort": self._cfg.CLAUDE_EFFORT_BY_ROLE[req.role]},
             "fallbacks": "default",
-            "betas": self._betas(),
+            "betas": [_FALLBACK_BETA],
             "timeout": req.timeout_s,
         }
         if req.system_prompt:
@@ -146,11 +169,6 @@ class ClaudeProvider(LLMProvider):
                 {"type": "text", "text": req.system_prompt, "cache_control": {"type": "ephemeral"}}
             ]
         return params
-
-    def _betas(self) -> list[str]:
-        if self._cfg.ANTHROPIC_API_KEY:
-            return [_FALLBACK_BETA]
-        return [_FALLBACK_BETA, _OAUTH_BETA]
 
     def _max_tokens(self, req: LLMRequest) -> int:
         if req.role != "fast":
@@ -194,7 +212,7 @@ class ClaudeProvider(LLMProvider):
             raise LLMUnavailableError(
                 "The language model could not be reached.", details=_cause(exc)
             ) from exc
-        except PydanticValidationError as exc:  # messages.parse validates the reply it receives
+        except PydanticValidationError as exc:  # the reply's JSON does not fit the schema
             raise LLMOutputParseError(
                 "The language model's answer could not be understood.", details=_cause(exc)
             ) from exc
@@ -225,25 +243,34 @@ def _messages(req: LLMRequest) -> list[dict]:
     return turns
 
 
-def _report_usage(usage: Any) -> None:
-    """Meter the whole prompt as input (uncached + cache write + cache read), and the read."""
-    cache_read = usage.cache_read_input_tokens or 0
-    cache_write = usage.cache_creation_input_tokens or 0
+def _meter(body: dict) -> None:
+    """Record a billed reply's usage, and the model that wrote it, for ``MeteredProvider``.
+
+    ``input_tokens`` is the whole prompt: uncached, written to cache, and read from
+    cache. The tally has no cache-write field, so writes are counted there only;
+    cache reads are also reported on their own.
+    """
+    usage = body.get("usage") or {}
+    cache_read = usage.get("cache_read_input_tokens") or 0
+    cache_write = usage.get("cache_creation_input_tokens") or 0
     report_token_usage(
-        input_tokens=(usage.input_tokens or 0) + cache_write + cache_read,
-        output_tokens=usage.output_tokens or 0,
+        input_tokens=(usage.get("input_tokens") or 0) + cache_write + cache_read,
+        output_tokens=usage.get("output_tokens") or 0,
         cache_read_tokens=cache_read,
     )
+    _served_model.set(body.get("model") or None)
 
 
-def _check_stop(reply: Any) -> None:
+def _check_stop(body: dict) -> None:
     """A refusal (after the server-side fallback) or a cut-off reply is not an answer."""
-    if reply.stop_reason == "refusal":
+    stop_reason = body.get("stop_reason")
+    if stop_reason == "refusal":
+        category = (body.get("stop_details") or {}).get("category")
         raise LLMRefusedError(
             "The language model declined this request.",
-            details={"cause": "refusal", "category": getattr(reply.stop_details, "category", None)},
+            details={"cause": "refusal", "category": category},
         )
-    if reply.stop_reason == "max_tokens":
+    if stop_reason == "max_tokens":
         raise LLMOutputParseError(
             "The language model's answer was cut off.", details={"cause": "max_tokens"}
         )

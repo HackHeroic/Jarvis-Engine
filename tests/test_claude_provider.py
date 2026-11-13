@@ -1,17 +1,20 @@
 """ClaudeProvider: the Anthropic SDK behind the ``LLMProvider`` port.
 
-Every test injects a fake client (``client=``) that records the keyword arguments
-of each SDK call and hands back a scripted response — nothing reaches Anthropic.
+Every test runs the real ``AsyncAnthropic`` against an ``httpx2.MockTransport``
+(``FakeAPI``): the SDK builds, sends, parses, validates and raises exactly as it does
+in production, but each request is answered here and nothing leaves the process.
 """
 
+import json
 from collections.abc import AsyncIterator
-from types import SimpleNamespace
+from dataclasses import dataclass
 from typing import Any
 
 import anthropic
 import httpx2
 import pytest
 from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 import app.core.config as _cfg
 import app.infrastructure.llm.claude as claude_module
@@ -31,111 +34,130 @@ from app.infrastructure.llm.claude import ClaudeProvider, build_client
 from app.infrastructure.llm.decorators import MeteredProvider, RetryingProvider
 from app.infrastructure.llm.factory import LLMProviderFactory
 from app.infrastructure.llm.retry import ExponentialBackoff
+from app.infrastructure.llm.transport import TokenTally, collecting_tokens
 from app.orchestrator.hooks import ActionHooks, register_all_hooks
 
-# --- fakes --------------------------------------------------------------------
+# --- the Messages API, faked at the HTTP layer ------------------------------------
 
 
-def _usage(input_tokens=10, output_tokens=5, cache_read=0, cache_creation=0) -> SimpleNamespace:
-    return SimpleNamespace(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_read_input_tokens=cache_read,
-        cache_creation_input_tokens=cache_creation,
-    )
+def _usage(input_tokens=10, output_tokens=5, cache_read=0, cache_write=0) -> dict:
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+    }
 
 
-def _message(
+def _reply(
     text: str = "ready",
+    *,
     stop_reason: str = "end_turn",
-    parsed: Any = None,
-    usage: SimpleNamespace | None = None,
-) -> SimpleNamespace:
-    """A reply shaped like the SDK's ``ParsedBetaMessage``; an empty thinking block leads."""
-    content = [SimpleNamespace(type="thinking", thinking="")]
+    model: str = "claude-sonnet-5-5",
+    usage: dict | None = None,
+) -> dict:
+    """A Messages API response body; like Sonnet 5.5's, it opens with an empty thinking block."""
+    content: list[dict] = [{"type": "thinking", "thinking": "", "signature": "sig"}]
     if text:
-        content.append(SimpleNamespace(type="text", text=text))
-    return SimpleNamespace(
-        content=content,
-        stop_reason=stop_reason,
-        stop_details=(
-            SimpleNamespace(category="general_harms") if stop_reason == "refusal" else None
+        content.append({"type": "text", "text": text})
+    refused = stop_reason == "refusal"
+    return {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "stop_details": (
+            {"type": "refusal", "category": "general_harms", "explanation": None} if refused else None
         ),
-        parsed_output=parsed,
-        usage=usage or _usage(),
+        "usage": usage or _usage(),
+    }
+
+
+@dataclass
+class _Stream:
+    """A streamed reply: these text deltas, then the final message ``final``."""
+
+    deltas: list[str]
+    final: dict
+
+
+def _sse(stream: _Stream) -> bytes:
+    final = stream.final
+    start = {**final, "content": [], "stop_reason": None, "usage": {**final["usage"], "output_tokens": 1}}
+    events: list[dict] = [{"type": "message_start", "message": start}]
+    if stream.deltas:
+        events.append(
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+        )
+        for delta in stream.deltas:
+            events.append(
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}}
+            )
+        events.append({"type": "content_block_stop", "index": 0})
+    events.append(
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": final["stop_reason"], "stop_sequence": None},
+            "usage": final["usage"],
+        }
+    )
+    events.append({"type": "message_stop"})
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
+
+
+def _api_error(status: int, error_type: str) -> httpx2.Response:
+    return httpx2.Response(
+        status, json={"type": "error", "error": {"type": error_type, "message": "rejected"}}
     )
 
 
-class _FakeStream:
-    def __init__(self, deltas: list[str], final: SimpleNamespace) -> None:
-        self._deltas = deltas
-        self._final = final
+class FakeAPI:
+    """The Messages API behind an ``httpx2.MockTransport``, with a real SDK client on top.
 
-    async def __aenter__(self) -> "_FakeStream":
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        return None
-
-    @property
-    def text_stream(self) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            for delta in self._deltas:
-                yield delta
-
-        return _gen()
-
-    async def get_final_message(self) -> SimpleNamespace:
-        return self._final
-
-
-class FakeClient:
-    """Stands in for ``AsyncAnthropic``: ``client.beta.messages.{create,parse,stream}``.
-
-    Each call consumes the next outcome — a reply to return or an exception to
-    raise. A ``stream`` outcome is ``(deltas, final_message)``.
+    Each request consumes the next outcome: a response body (``dict``), a ``_Stream``,
+    an ``httpx2.Response`` (e.g. an error status), or an ``httpx2`` transport error
+    class to raise. With no outcomes left it answers ``_reply()``.
     """
 
     def __init__(self, outcomes: list | None = None) -> None:
-        self.calls: list[tuple[str, dict]] = []
+        self.requests: list[httpx2.Request] = []
         self._outcomes = list(outcomes or [])
-        self.beta = SimpleNamespace(
-            messages=SimpleNamespace(create=self._create, parse=self._parse, stream=self._stream)
+        transport = httpx2.MockTransport(self._handle)
+        self.client = anthropic.AsyncAnthropic(
+            api_key="test-anthropic-key",
+            max_retries=0,
+            http_client=anthropic.DefaultAsyncHttpxClient(transport=transport),
         )
 
-    def _next(self, default: Any) -> Any:
-        outcome = self._outcomes.pop(0) if self._outcomes else default
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    async def _create(self, **kwargs: Any) -> Any:
-        self.calls.append(("create", kwargs))
-        return self._next(_message())
-
-    async def _parse(self, **kwargs: Any) -> Any:
-        self.calls.append(("parse", kwargs))
-        return self._next(_message())
-
-    def _stream(self, **kwargs: Any) -> _FakeStream:
-        self.calls.append(("stream", kwargs))
-        deltas, final = self._next((["rea", "dy"], _message("ready")))
-        return _FakeStream(deltas, final)
+    def _handle(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        outcome = self._outcomes.pop(0) if self._outcomes else _reply()
+        if isinstance(outcome, type) and issubclass(outcome, httpx2.TransportError):
+            raise outcome("simulated", request=request)
+        if isinstance(outcome, httpx2.Response):
+            return outcome
+        if isinstance(outcome, _Stream):
+            return httpx2.Response(
+                200, content=_sse(outcome), headers={"content-type": "text/event-stream"}
+            )
+        return httpx2.Response(200, json=outcome)
 
     @property
-    def kwargs(self) -> dict:
-        """Keyword arguments of the only call made."""
-        (call,) = self.calls
-        return call[1]
+    def bodies(self) -> list[dict]:
+        """The JSON body of every request sent."""
+        return [json.loads(request.content) for request in self.requests]
+
+    @property
+    def sent(self) -> dict:
+        """The JSON body of the only request sent."""
+        (body,) = self.bodies
+        return body
 
 
-def _status_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
-    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
-    return cls("rejected", response=httpx2.Response(status, request=request), body=None)
-
-
-def _connection_request() -> httpx2.Request:
-    return httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+# --- helpers ---------------------------------------------------------------------
 
 
 class _Tiny(BaseModel):
@@ -150,6 +172,13 @@ class _Recorder(EventListener):
         self.events.append(event)
 
 
+def _recording_bus() -> tuple[EventBus, _Recorder]:
+    bus = EventBus()
+    recorder = _Recorder()
+    bus.subscribe(LLMCallCompleted, recorder)
+    return bus, recorder
+
+
 def _req(**overrides: Any) -> LLMRequest:
     fields: dict[str, Any] = {"task": "voice_of_jarvis", "role": "fast", "prompt": "hello"}
     fields.update(overrides)
@@ -160,10 +189,18 @@ async def _collect(tokens: AsyncIterator[tuple[str, str]]) -> list[tuple[str, st
     return [item async for item in tokens]
 
 
-def _pii_hooks() -> ActionHooks:
+def _counts(tally: TokenTally) -> tuple[int, int, int]:
+    return (tally.input_tokens, tally.output_tokens, tally.cache_read_tokens)
+
+
+def _pii_redactor() -> PreCloudLLMRedactor:
     hooks = ActionHooks()
     register_all_hooks(hooks)
-    return hooks
+    return PreCloudLLMRedactor(hooks)
+
+
+async def _no_sleep(seconds: float) -> None:
+    raise AssertionError(f"retried after {seconds}s; this failure must not be retried")
 
 
 @pytest.fixture
@@ -180,8 +217,8 @@ def claude_cfg(monkeypatch):
     return _cfg
 
 
-def _provider(cfg, client: FakeClient) -> ClaudeProvider:
-    return ClaudeProvider(cfg, client=client)
+def _provider(cfg, api: FakeAPI) -> ClaudeProvider:
+    return ClaudeProvider(cfg, client=api.client)
 
 
 # --- request shape ----------------------------------------------------------------
@@ -189,15 +226,15 @@ def _provider(cfg, client: FakeClient) -> ClaudeProvider:
 
 @pytest.mark.asyncio
 async def test_claude__fast_role__low_effort_and_small_max_tokens(claude_cfg):
-    client = FakeClient([_message(parsed=_Tiny(color="blue")), _message()])
-    provider = _provider(claude_cfg, client)
+    api = FakeAPI([_reply('{"color": "blue"}'), _reply()])
+    provider = _provider(claude_cfg, api)
 
     await provider.complete(_req(response_schema=_Tiny))
     await provider.complete(_req())
 
-    (_, structured), (_, text) = client.calls
-    assert structured["output_config"] == {"effort": "low"}
-    assert structured["max_tokens"] == 1024
+    structured, text = api.bodies
+    assert structured["output_config"]["effort"] == "low"
+    assert structured["max_tokens"] == 2048
     assert text["output_config"] == {"effort": "low"}
     assert text["max_tokens"] == 4096
 
@@ -205,58 +242,58 @@ async def test_claude__fast_role__low_effort_and_small_max_tokens(claude_cfg):
 @pytest.mark.parametrize("role", ["primary", "cloud"])
 @pytest.mark.asyncio
 async def test_claude__primary_and_cloud_roles__medium_effort_and_8000_max_tokens(claude_cfg, role):
-    client = FakeClient()
+    api = FakeAPI()
 
-    await _provider(claude_cfg, client).complete(_req(role=role, task="socratic_chunker"))
+    await _provider(claude_cfg, api).complete(_req(role=role, task="socratic_chunker"))
 
-    assert client.kwargs["output_config"] == {"effort": "medium"}
-    assert client.kwargs["max_tokens"] == 8000
+    assert api.sent["output_config"] == {"effort": "medium"}
+    assert api.sent["max_tokens"] == 8000
 
 
 @pytest.mark.asyncio
 async def test_claude__model_and_timeout__from_config_and_request(claude_cfg, monkeypatch):
     monkeypatch.setattr(_cfg, "CLAUDE_MODEL", "claude-from-config")
-    client = FakeClient()
+    api = FakeAPI()
 
-    await _provider(claude_cfg, client).complete(_req(timeout_s=12.5))
+    await _provider(claude_cfg, api).complete(_req(timeout_s=12.5))
 
-    assert client.kwargs["model"] == "claude-from-config"
-    assert client.kwargs["timeout"] == 12.5
+    assert api.sent["model"] == "claude-from-config"
+    assert api.requests[0].extensions["timeout"]["read"] == 12.5
 
 
 @pytest.mark.asyncio
 async def test_claude__system_prompt__sent_as_cached_block(claude_cfg):
-    client = FakeClient()
+    api = FakeAPI()
 
-    await _provider(claude_cfg, client).complete(_req(system_prompt="You are Jarvis."))
+    await _provider(claude_cfg, api).complete(_req(system_prompt="You are Jarvis."))
 
-    assert client.kwargs["system"] == [
+    assert api.sent["system"] == [
         {"type": "text", "text": "You are Jarvis.", "cache_control": {"type": "ephemeral"}}
     ]
 
 
 @pytest.mark.asyncio
 async def test_claude__empty_system_prompt__no_system_sent(claude_cfg):
-    client = FakeClient()
+    api = FakeAPI()
 
-    await _provider(claude_cfg, client).complete(_req(system_prompt=""))
+    await _provider(claude_cfg, api).complete(_req(system_prompt=""))
 
-    assert "system" not in client.kwargs
+    assert "system" not in api.sent
 
 
 @pytest.mark.asyncio
 async def test_claude__history__mapped_through_and_prompt_is_last_user_turn(claude_cfg):
-    client = FakeClient()
+    api = FakeAPI()
     history = [
         {"role": "user", "content": "plan my week", "created_at": "2026-11-14"},
         {"role": "assistant", "content": "Done, sir."},
     ]
 
-    await _provider(claude_cfg, client).complete(
+    await _provider(claude_cfg, api).complete(
         _req(prompt="and Friday?", conversation_history=history)
     )
 
-    assert client.kwargs["messages"] == [
+    assert api.sent["messages"] == [
         {"role": "user", "content": "plan my week"},
         {"role": "assistant", "content": "Done, sir."},
         {"role": "user", "content": "and Friday?"},
@@ -266,7 +303,7 @@ async def test_claude__history__mapped_through_and_prompt_is_last_user_turn(clau
 @pytest.mark.asyncio
 async def test_claude__history_system_entry__prepended_to_user_message_not_system_block(claude_cfg):
     """A history system entry may change per turn; in the system block it would bust the cache."""
-    client = FakeClient()
+    api = FakeAPI()
     history = [
         {"role": "system", "content": "[Context summary: 3 earlier messages.]"},
         {"role": "assistant", "content": "Morning, sir."},
@@ -274,13 +311,13 @@ async def test_claude__history_system_entry__prepended_to_user_message_not_syste
         {"role": "assistant", "content": "Done, sir."},
     ]
 
-    await _provider(claude_cfg, client).complete(
+    await _provider(claude_cfg, api).complete(
         _req(prompt="and Friday?", system_prompt="You are Jarvis.", conversation_history=history)
     )
 
-    assert client.kwargs["system"][0]["text"] == "You are Jarvis."
+    assert api.sent["system"][0]["text"] == "You are Jarvis."
     # The API needs a user turn first, so the window's leading assistant reply is dropped.
-    assert client.kwargs["messages"] == [
+    assert api.sent["messages"] == [
         {"role": "user", "content": "plan my week"},
         {"role": "assistant", "content": "Done, sir."},
         {"role": "user", "content": "[Context summary: 3 earlier messages.]\n\nand Friday?"},
@@ -289,42 +326,33 @@ async def test_claude__history_system_entry__prepended_to_user_message_not_syste
 
 @pytest.mark.asyncio
 async def test_claude__forbidden_params__never_sent(claude_cfg):
-    client = FakeClient([_message(), _message(parsed=_Tiny(color="blue"))])
-    provider = _provider(claude_cfg, client)
+    api = FakeAPI([_reply(), _reply('{"color": "blue"}'), _Stream(["ready"], _reply())])
+    provider = _provider(claude_cfg, api)
 
     await provider.complete(_req(role="primary"))
     await provider.complete(_req(response_schema=_Tiny))
     await _collect(provider.stream(_req()))
 
     forbidden = {"thinking", "temperature", "top_p", "top_k", "tool_choice", "budget_tokens"}
-    for method, kwargs in client.calls:
-        assert forbidden.isdisjoint(kwargs), method
-        assert forbidden.isdisjoint(kwargs["output_config"]), method
+    assert len(api.bodies) == 3
+    for body in api.bodies:
+        assert forbidden.isdisjoint(body)
+        assert forbidden.isdisjoint(body["output_config"])
 
 
 @pytest.mark.asyncio
 async def test_claude__every_call__opts_into_default_refusal_fallback(claude_cfg):
-    client = FakeClient([_message(), _message(parsed=_Tiny(color="blue"))])
-    provider = _provider(claude_cfg, client)
+    api = FakeAPI([_reply(), _reply('{"color": "blue"}'), _Stream(["ready"], _reply())])
+    provider = _provider(claude_cfg, api)
 
     await provider.complete(_req())
     await provider.complete(_req(response_schema=_Tiny))
     await _collect(provider.stream(_req()))
 
-    for method, kwargs in client.calls:
-        assert kwargs["fallbacks"] == "default", method
-        assert kwargs["betas"] == ["server-side-fallback-2026-07-01"], method
-
-
-@pytest.mark.asyncio
-async def test_claude__auth_token_credential__adds_oauth_beta(claude_cfg, monkeypatch):
-    monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
-    monkeypatch.setattr(_cfg, "ANTHROPIC_AUTH_TOKEN", "test-token")
-    client = FakeClient()
-
-    await _provider(claude_cfg, client).complete(_req())
-
-    assert client.kwargs["betas"] == ["server-side-fallback-2026-07-01", "oauth-2025-04-20"]
+    assert len(api.requests) == 3
+    for request, body in zip(api.requests, api.bodies):
+        assert body["fallbacks"] == "default"
+        assert request.headers["anthropic-beta"] == "server-side-fallback-2026-07-01"
 
 
 # --- answers ----------------------------------------------------------------------
@@ -332,236 +360,85 @@ async def test_claude__auth_token_credential__adds_oauth_beta(claude_cfg, monkey
 
 @pytest.mark.asyncio
 async def test_claude__text_request__returns_text_blocks_only(claude_cfg):
-    client = FakeClient([_message("Good evening, sir.")])
+    api = FakeAPI([_reply("Good evening, sir.")])
 
-    result = await _provider(claude_cfg, client).complete(_req())
+    result = await _provider(claude_cfg, api).complete(_req())
 
     assert result == "Good evening, sir."
-    assert client.calls[0][0] == "create"
 
 
 @pytest.mark.asyncio
 async def test_claude__schema_request__returns_schema_instance(claude_cfg):
-    client = FakeClient([_message('{"color": "blue"}', parsed=_Tiny(color="blue"))])
+    api = FakeAPI([_reply('{"color": "blue"}')])
 
-    result = await _provider(claude_cfg, client).complete(_req(response_schema=_Tiny))
+    result = await _provider(claude_cfg, api).complete(_req(response_schema=_Tiny))
 
     assert result == _Tiny(color="blue")
-    method, kwargs = client.calls[0]
-    assert method == "parse"
-    assert kwargs["output_format"] is _Tiny
-
-
-@pytest.mark.asyncio
-async def test_claude__schema_reply_fails_validation__raises_output_parse_error(claude_cfg):
-    from pydantic import ValidationError
-
-    try:
-        _Tiny.model_validate_json('{"color": ')
-    except ValidationError as exc:
-        invalid = exc
-    client = FakeClient([invalid])
-
-    with pytest.raises(LLMOutputParseError):
-        await _provider(claude_cfg, client).complete(_req(response_schema=_Tiny))
+    output_format = api.sent["output_config"]["format"]
+    assert output_format["type"] == "json_schema"
+    assert output_format["schema"]["properties"]["color"]["type"] == "string"
 
 
 @pytest.mark.parametrize("schema", [_Tiny, None])
 @pytest.mark.asyncio
 async def test_claude__max_tokens_stop__raises_output_parse_error(claude_cfg, schema):
-    client = FakeClient([_message('{"color": "bl', stop_reason="max_tokens", parsed=None)])
+    """The cut-off reply is billed: its usage is recorded, and its JSON is never parsed."""
+    truncated = _reply(
+        '{"color": "bl', stop_reason="max_tokens", usage=_usage(40, 2048, cache_read=300)
+    )
+    api = FakeAPI([truncated])
+    tally = TokenTally()
 
-    with pytest.raises(LLMOutputParseError):
-        await _provider(claude_cfg, client).complete(_req(response_schema=schema))
+    with collecting_tokens(tally):
+        with pytest.raises(LLMOutputParseError) as caught:
+            await _provider(claude_cfg, api).complete(_req(response_schema=schema))
+
+    assert _counts(tally) == (340, 2048, 300)
+    assert caught.value.details == {"cause": "max_tokens"}
+    assert caught.value.__cause__ is None  # stopped on stop_reason, not on a failed parse
 
 
 @pytest.mark.asyncio
-async def test_claude__refusal__raises_refused_and_is_not_retried(claude_cfg):
+async def test_claude__schema_reply_fails_validation__usage_recorded_and_parse_error(claude_cfg):
+    api = FakeAPI([_reply('{"colour": "blue"}', usage=_usage(30, 8))])
+    tally = TokenTally()
+
+    with collecting_tokens(tally):
+        with pytest.raises(LLMOutputParseError) as caught:
+            await _provider(claude_cfg, api).complete(_req(response_schema=_Tiny))
+
+    assert _counts(tally) == (30, 8, 0)
+    assert isinstance(caught.value.__cause__, PydanticValidationError)
+
+
+@pytest.mark.parametrize("schema", [_Tiny, None])
+@pytest.mark.asyncio
+async def test_claude__refusal__usage_recorded_and_refused_without_retry(claude_cfg, schema):
     """After the server-side fallback a refusal is final: Gemini answers, Claude isn't re-asked."""
-    client = FakeClient([_message("", stop_reason="refusal")])
-    provider = _provider(claude_cfg, client)
-    slept: list[float] = []
+    api = FakeAPI([_reply("", stop_reason="refusal", usage=_usage(25, 0))])
+    provider = _provider(claude_cfg, api)
+    tally = TokenTally()
 
-    async def no_sleep(seconds: float) -> None:
-        slept.append(seconds)
+    with collecting_tokens(tally):
+        with pytest.raises(LLMRefusedError) as caught:
+            await RetryingProvider(provider, ExponentialBackoff(), sleep=_no_sleep).complete(
+                _req(response_schema=schema)
+            )
 
-    with pytest.raises(LLMRefusedError) as caught:
-        await RetryingProvider(provider, ExponentialBackoff(), sleep=no_sleep).complete(_req())
-
-    assert isinstance(caught.value, LLMError)
-    assert len(client.calls) == 1
-    assert slept == []
+    assert _counts(tally) == (25, 0, 0)
+    assert caught.value.details == {"cause": "refusal", "category": "general_harms"}
+    assert len(api.requests) == 1
     assert provider.is_available()
 
 
-# --- streaming ----------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_claude__stream__yields_content_events_for_text_deltas(claude_cfg):
-    client = FakeClient([(["Good ", "evening."], _message("Good evening."))])
-
-    items = await _collect(_provider(claude_cfg, client).stream(_req(system_prompt="sys")))
-
-    assert items == [("content", "Good "), ("content", "evening.")]
-    method, kwargs = client.calls[0]
-    assert method == "stream"
-    assert kwargs["system"][0]["cache_control"] == {"type": "ephemeral"}
-
-
-@pytest.mark.asyncio
-async def test_claude__stream_refused_before_any_text__raises_refused(claude_cfg):
-    client = FakeClient([([], _message("", stop_reason="refusal"))])
-
-    with pytest.raises(LLMRefusedError):
-        await _collect(_provider(claude_cfg, client).stream(_req()))
-
-
-@pytest.mark.asyncio
-async def test_claude__stream_cut_off_before_any_text__raises_output_parse_error(claude_cfg):
-    client = FakeClient([([], _message("", stop_reason="max_tokens"))])
-
-    with pytest.raises(LLMOutputParseError):
-        await _collect(_provider(claude_cfg, client).stream(_req()))
-
-
-@pytest.mark.asyncio
-async def test_claude__stream_cut_off_after_text__ends_with_what_was_sent(claude_cfg):
-    client = FakeClient([(["Good "], _message("Good ", stop_reason="max_tokens"))])
-
-    items = await _collect(_provider(claude_cfg, client).stream(_req()))
-
-    assert items == [("content", "Good ")]
-
-
-# --- errors -------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_claude__auth_error__disables_provider_and_raises_unavailable(claude_cfg):
-    """Review Focus 4: an expired key costs one failed call, not one per turn."""
-    client = FakeClient([_status_error(anthropic.AuthenticationError, 401)])
-    provider = _provider(claude_cfg, client)
-    slept: list[float] = []
-
-    async def no_sleep(seconds: float) -> None:
-        slept.append(seconds)
-
-    with pytest.raises(LLMUnavailableError):
-        await RetryingProvider(provider, ExponentialBackoff(), sleep=no_sleep).complete(_req())
-
-    assert provider.is_available() is False
-    assert len(client.calls) == 1
-    assert slept == []
-
-
-@pytest.mark.asyncio
-async def test_claude__permission_denied__disables_provider(claude_cfg):
-    client = FakeClient([_status_error(anthropic.PermissionDeniedError, 403)])
-    provider = _provider(claude_cfg, client)
-
-    with pytest.raises(LLMUnavailableError):
-        await provider.complete(_req())
-
-    assert provider.is_available() is False
-
-
-@pytest.mark.asyncio
-async def test_claude__rate_limit__raises_unavailable_and_stays_enabled(claude_cfg):
-    client = FakeClient([_status_error(anthropic.RateLimitError, 429)])
-    provider = _provider(claude_cfg, client)
-
-    with pytest.raises(LLMUnavailableError):
-        await provider.complete(_req())
-
-    assert provider.is_available() is True
-
-
-@pytest.mark.parametrize("status", [500, 529])
-@pytest.mark.asyncio
-async def test_claude__server_error__raises_unavailable(claude_cfg, status):
-    client = FakeClient([_status_error(anthropic.InternalServerError, status)])
-
-    with pytest.raises(LLMUnavailableError):
-        await _provider(claude_cfg, client).complete(_req())
-
-
-@pytest.mark.asyncio
-async def test_claude__connection_error__raises_unavailable(claude_cfg):
-    client = FakeClient([anthropic.APIConnectionError(request=_connection_request())])
-
-    with pytest.raises(LLMUnavailableError):
-        await _provider(claude_cfg, client).complete(_req())
-
-
-@pytest.mark.asyncio
-async def test_claude__sdk_timeout__raises_llm_timeout(claude_cfg):
-    client = FakeClient([anthropic.APITimeoutError(request=_connection_request())])
-
-    with pytest.raises(LLMTimeoutError):
-        await _provider(claude_cfg, client).complete(_req())
-
-
-@pytest.mark.asyncio
-async def test_claude__bad_request__propagates_as_our_bug(claude_cfg):
-    client = FakeClient([_status_error(anthropic.BadRequestError, 400)])
-
-    with pytest.raises(anthropic.BadRequestError):
-        await _provider(claude_cfg, client).complete(_req())
-
-
-@pytest.mark.asyncio
-async def test_claude__other_client_error__falls_over_without_retry(claude_cfg):
-    client = FakeClient([_status_error(anthropic.NotFoundError, 404)])
-    provider = _provider(claude_cfg, client)
-
-    with pytest.raises(LLMError) as caught:
-        await provider.complete(_req())
-
-    assert not isinstance(caught.value, (LLMUnavailableError, LLMTimeoutError))
-    assert provider.is_available() is True
-
-
-@pytest.mark.asyncio
-async def test_claude__stream_auth_error__disables_provider(claude_cfg):
-    client = FakeClient([_status_error(anthropic.AuthenticationError, 401)])
-    provider = _provider(claude_cfg, client)
-
-    with pytest.raises(LLMUnavailableError):
-        await _collect(provider.stream(_req()))
-
-    assert provider.is_available() is False
-
-
-# --- availability, usage, client ----------------------------------------------------
-
-
-def test_claude__availability__needs_a_credential(claude_cfg, monkeypatch):
-    provider = ClaudeProvider(claude_cfg, client=FakeClient())
-    assert provider.is_available()
-
-    monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
-    assert not provider.is_available()
-
-    monkeypatch.setattr(_cfg, "ANTHROPIC_AUTH_TOKEN", "test-token")
-    assert provider.is_available()
-
-
-def test_claude__identity__cloud_provider_named_claude(claude_cfg):
-    provider = ClaudeProvider(claude_cfg, client=FakeClient())
-
-    assert (provider.name, provider.location) == ("claude", LLMLocation.CLOUD)
-    assert provider.model_for_role("fast") == "claude-sonnet-5-5"
+# --- usage and the model that answered --------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_claude__usage__reports_cache_read_tokens(claude_cfg):
-    usage = _usage(input_tokens=40, output_tokens=7, cache_read=900, cache_creation=60)
-    client = FakeClient([_message(usage=usage)])
-    provider = _provider(claude_cfg, client)
-    bus = EventBus()
-    recorder = _Recorder()
-    bus.subscribe(LLMCallCompleted, recorder)
+    api = FakeAPI([_reply(usage=_usage(40, 7, cache_read=900, cache_write=60))])
+    provider = _provider(claude_cfg, api)
+    bus, recorder = _recording_bus()
 
     await MeteredProvider(provider, bus, provider.model_for_role).complete(_req())
 
@@ -574,29 +451,208 @@ async def test_claude__usage__reports_cache_read_tokens(claude_cfg):
 
 
 @pytest.mark.asyncio
+async def test_claude__fallback_model_answers__usage_records_that_model(claude_cfg):
+    api = FakeAPI([_reply(model="claude-sonnet-5"), _reply(model="claude-sonnet-5-5")])
+    provider = _provider(claude_cfg, api)
+    bus, recorder = _recording_bus()
+    metered = MeteredProvider(provider, bus, provider.model_for_role)
+
+    await metered.complete(_req())
+    await metered.complete(_req())
+
+    assert [e.usage.model for e in recorder.events] == ["claude-sonnet-5", "claude-sonnet-5-5"]
+
+
+@pytest.mark.asyncio
+async def test_claude__call_fails_before_a_reply__model_is_the_configured_one(claude_cfg):
+    api = FakeAPI([_reply(model="claude-sonnet-5"), httpx2.ConnectError])
+    provider = _provider(claude_cfg, api)
+
+    await provider.complete(_req())
+    assert provider.model_for_role("fast") == "claude-sonnet-5"
+    with pytest.raises(LLMUnavailableError):
+        await provider.complete(_req())
+
+    assert provider.model_for_role("fast") == "claude-sonnet-5-5"
+
+
+# --- streaming ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claude__stream__yields_content_events_for_text_deltas(claude_cfg):
+    api = FakeAPI([_Stream(["Good ", "evening."], _reply("Good evening."))])
+
+    items = await _collect(_provider(claude_cfg, api).stream(_req(system_prompt="sys")))
+
+    assert items == [("content", "Good "), ("content", "evening.")]
+    assert api.sent["stream"] is True
+    assert api.sent["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_claude__stream_refused_before_any_text__raises_refused(claude_cfg):
+    api = FakeAPI([_Stream([], _reply("", stop_reason="refusal"))])
+
+    with pytest.raises(LLMRefusedError):
+        await _collect(_provider(claude_cfg, api).stream(_req()))
+
+
+@pytest.mark.asyncio
+async def test_claude__stream_cut_off_before_any_text__raises_output_parse_error(claude_cfg):
+    api = FakeAPI([_Stream([], _reply("", stop_reason="max_tokens"))])
+
+    with pytest.raises(LLMOutputParseError):
+        await _collect(_provider(claude_cfg, api).stream(_req()))
+
+
+@pytest.mark.asyncio
+async def test_claude__stream_cut_off_after_text__ends_with_what_was_sent(claude_cfg):
+    api = FakeAPI([_Stream(["Good "], _reply("Good ", stop_reason="max_tokens"))])
+
+    items = await _collect(_provider(claude_cfg, api).stream(_req()))
+
+    assert items == [("content", "Good ")]
+
+
+@pytest.mark.asyncio
 async def test_claude__stream_usage__reported_once_the_stream_ends(claude_cfg):
-    final = _message("ready", usage=_usage(input_tokens=3, output_tokens=2, cache_read=600))
-    client = FakeClient([(["ready"], final)])
-    provider = _provider(claude_cfg, client)
-    bus = EventBus()
-    recorder = _Recorder()
-    bus.subscribe(LLMCallCompleted, recorder)
+    final = _reply("ready", model="claude-sonnet-5", usage=_usage(3, 2, cache_read=600))
+    api = FakeAPI([_Stream(["ready"], final)])
+    provider = _provider(claude_cfg, api)
+    bus, recorder = _recording_bus()
 
     await _collect(MeteredProvider(provider, bus, provider.model_for_role).stream(_req()))
 
     (event,) = recorder.events
     assert (event.usage.input_tokens, event.usage.output_tokens) == (603, 2)
     assert event.usage.cache_read_tokens == 600
+    assert event.usage.model == "claude-sonnet-5"
 
 
-def test_build_client__sdk_never_retries(claude_cfg):
+# --- errors -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claude__auth_error__disables_provider_and_raises_unavailable(claude_cfg):
+    """Review Focus 4: an expired key costs one failed call, not one per turn."""
+    api = FakeAPI([_api_error(401, "authentication_error")])
+    provider = _provider(claude_cfg, api)
+
+    with pytest.raises(LLMUnavailableError):
+        await RetryingProvider(provider, ExponentialBackoff(), sleep=_no_sleep).complete(_req())
+
+    assert provider.is_available() is False
+    assert len(api.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_claude__permission_denied__disables_provider(claude_cfg):
+    api = FakeAPI([_api_error(403, "permission_error")])
+    provider = _provider(claude_cfg, api)
+
+    with pytest.raises(LLMUnavailableError):
+        await provider.complete(_req(response_schema=_Tiny))
+
+    assert provider.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_claude__rate_limit__raises_unavailable_and_stays_enabled(claude_cfg):
+    api = FakeAPI([_api_error(429, "rate_limit_error")])
+    provider = _provider(claude_cfg, api)
+
+    with pytest.raises(LLMUnavailableError):
+        await provider.complete(_req())
+
+    assert provider.is_available() is True
+
+
+@pytest.mark.parametrize(("status", "error_type"), [(500, "api_error"), (529, "overloaded_error")])
+@pytest.mark.asyncio
+async def test_claude__server_error__raises_unavailable(claude_cfg, status, error_type):
+    api = FakeAPI([_api_error(status, error_type)])
+
+    with pytest.raises(LLMUnavailableError):
+        await _provider(claude_cfg, api).complete(_req())
+
+
+@pytest.mark.asyncio
+async def test_claude__connection_error__raises_unavailable(claude_cfg):
+    api = FakeAPI([httpx2.ConnectError])
+
+    with pytest.raises(LLMUnavailableError):
+        await _provider(claude_cfg, api).complete(_req())
+
+
+@pytest.mark.asyncio
+async def test_claude__sdk_timeout__raises_llm_timeout(claude_cfg):
+    api = FakeAPI([httpx2.ReadTimeout])
+
+    with pytest.raises(LLMTimeoutError):
+        await _provider(claude_cfg, api).complete(_req())
+
+
+@pytest.mark.asyncio
+async def test_claude__bad_request__propagates_as_our_bug(claude_cfg):
+    api = FakeAPI([_api_error(400, "invalid_request_error")])
+
+    with pytest.raises(anthropic.BadRequestError):
+        await _provider(claude_cfg, api).complete(_req())
+
+
+@pytest.mark.asyncio
+async def test_claude__other_client_error__falls_over_without_retry(claude_cfg):
+    api = FakeAPI([_api_error(404, "not_found_error")])
+    provider = _provider(claude_cfg, api)
+
+    with pytest.raises(LLMError) as caught:
+        await provider.complete(_req())
+
+    assert not isinstance(caught.value, (LLMUnavailableError, LLMTimeoutError))
+    assert provider.is_available() is True
+
+
+@pytest.mark.asyncio
+async def test_claude__stream_auth_error__disables_provider(claude_cfg):
+    api = FakeAPI([_api_error(401, "authentication_error")])
+    provider = _provider(claude_cfg, api)
+
+    with pytest.raises(LLMUnavailableError):
+        await _collect(provider.stream(_req()))
+
+    assert provider.is_available() is False
+
+
+# --- availability and the client ----------------------------------------------------
+
+
+def test_claude__availability__needs_a_credential(claude_cfg, monkeypatch):
+    provider = ClaudeProvider(claude_cfg, client=FakeAPI().client)
+    assert provider.is_available()
+
+    monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
+    assert not provider.is_available()
+
+    monkeypatch.setattr(_cfg, "ANTHROPIC_AUTH_TOKEN", "test-token")
+    assert provider.is_available()
+
+
+def test_claude__identity__cloud_provider_named_claude(claude_cfg):
+    provider = ClaudeProvider(claude_cfg, client=FakeAPI().client)
+
+    assert (provider.name, provider.location) == ("claude", LLMLocation.CLOUD)
+    assert provider.model_for_role("fast") == "claude-sonnet-5-5"
+
+
+def test_build_client__any_credential__sdk_retries_disabled(claude_cfg):
     client = build_client(claude_cfg)
 
     assert isinstance(client, anthropic.AsyncAnthropic)
     assert client.max_retries == 0
 
 
-def test_build_client__auth_token_when_no_api_key(claude_cfg, monkeypatch):
+def test_build_client__no_api_key__uses_auth_token(claude_cfg, monkeypatch):
     monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
     monkeypatch.setattr(_cfg, "ANTHROPIC_AUTH_TOKEN", "test-token")
 
@@ -618,7 +674,7 @@ def test_claude__default_client__one_shared_instance(claude_cfg, monkeypatch):
 
 
 def test_factory__with_anthropic_key__order_is_local_claude_gemini(claude_cfg):
-    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), NullEventBus())
+    chain = LLMProviderFactory.build(claude_cfg, _pii_redactor(), NullEventBus())
 
     assert [p.name for p in chain.providers] == ["local", "claude", "gemini"]
     assert [p.location for p in chain.providers] == [
@@ -631,7 +687,7 @@ def test_factory__with_anthropic_key__order_is_local_claude_gemini(claude_cfg):
 def test_factory__without_anthropic_credential__claude_left_out(claude_cfg, monkeypatch):
     monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
 
-    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), NullEventBus())
+    chain = LLMProviderFactory.build(claude_cfg, _pii_redactor(), NullEventBus())
 
     assert [p.name for p in chain.providers] == ["local", "gemini"]
 
@@ -639,21 +695,49 @@ def test_factory__without_anthropic_credential__claude_left_out(claude_cfg, monk
 @pytest.mark.asyncio
 async def test_factory__claude_primary__local_skipped(claude_cfg, monkeypatch):
     monkeypatch.setattr(_cfg, "CLAUDE_PRIMARY", True)
-    client = FakeClient([_message("from claude")])
-    monkeypatch.setattr(claude_module, "_shared_client", client)
+    api = FakeAPI([_reply("from claude")])
+    monkeypatch.setattr(claude_module, "_shared_client", api.client)
 
     async def local_transport(**kwargs):
         raise AssertionError("local must not be tried while CLAUDE_PRIMARY is on")
 
     monkeypatch.setattr(_llm, "hybrid_route_query", local_transport)
-    bus = EventBus()
-    recorder = _Recorder()
-    bus.subscribe(LLMCallCompleted, recorder)
-    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), bus)
+    bus, recorder = _recording_bus()
+    chain = LLMProviderFactory.build(claude_cfg, _pii_redactor(), bus)
 
     result = await chain.complete(_req(prompt="madhav@example.com"))
 
     assert result == "from claude"
-    assert client.kwargs["messages"] == [{"role": "user", "content": "[EMAIL]"}]
+    assert api.sent["messages"] == [{"role": "user", "content": "[EMAIL]"}]
     (event,) = recorder.events
     assert (event.usage.provider, event.usage.pii_redactions) == ("claude", 1)
+
+
+@pytest.mark.asyncio
+async def test_factory__claude_reply_cut_off__billed_usage_and_answering_model_published(
+    claude_cfg, monkeypatch
+):
+    """Through the real wrapping (Timeout inside Metered): the discarded reply is still billed."""
+    truncated = _reply(
+        '{"color": "bl', stop_reason="max_tokens", model="claude-sonnet-5", usage=_usage(50, 2048)
+    )
+    api = FakeAPI([truncated])
+    monkeypatch.setattr(claude_module, "_shared_client", api.client)
+    bus, recorder = _recording_bus()
+    chain = LLMProviderFactory.build(claude_cfg, _pii_redactor(), bus)
+
+    async def gemini_transport(**kwargs):
+        assert kwargs["force_cloud"] is True
+        return {"color": "green"}
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", gemini_transport)
+
+    result = await chain.complete(_req(response_schema=_Tiny), skip_local=True)
+
+    assert result == _Tiny(color="green")
+    assert len(api.requests) == 1  # a cut-off reply is not retried
+    claude_event, gemini_event = recorder.events
+    assert claude_event.usage.provider == "claude"
+    assert claude_event.usage.model == "claude-sonnet-5"
+    assert (claude_event.usage.input_tokens, claude_event.usage.output_tokens) == (50, 2048)
+    assert gemini_event.usage.provider == "gemini"
