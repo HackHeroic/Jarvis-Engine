@@ -1,4 +1,4 @@
-"""Layering rule: the domain layer depends on nothing outside it."""
+"""Layering rules: which layer may import which."""
 
 import ast
 from pathlib import Path
@@ -83,3 +83,45 @@ def test_infrastructure__imports_nothing_from_api_or_orchestrator():
     ]
 
     assert violations == []
+
+
+# --- services and the composition root --------------------------------------------
+
+# Files that must reach infrastructure only through ports. The list grows as more of
+# app/services and app/orchestrator move onto the ports.
+_PORT_ONLY = (
+    _APP_DIR / "services" / "draft_service.py",
+    _APP_DIR / "services" / "usage_ledger.py",
+    *sorted(_DOMAIN_DIR.glob("*.py")),
+)
+
+
+def test_layering__services_and_orchestrator__do_not_import_infrastructure():
+    missing = [str(path.relative_to(_APP_DIR)) for path in _PORT_ONLY if not path.exists()]
+    assert missing == []
+
+    violations = [
+        f"{path.relative_to(_APP_DIR)}: {module}"
+        for path in _PORT_ONLY
+        for module in _resolved_imports(path)
+        if module == "app.infrastructure" or module.startswith("app.infrastructure.")
+    ]
+
+    assert violations == []
+
+
+def test_layering__only_container_builds_repositories():
+    """Dependency inversion, literally: one place chooses the repository family."""
+    defined_in = _INFRASTRUCTURE_DIR / "persistence"
+    allowed = {_APP_DIR / "container.py"}
+
+    referencing = [
+        str(path.relative_to(_APP_DIR))
+        for path in sorted(_APP_DIR.rglob("*.py"))
+        if "RepositoryFactory" in path.read_text()
+        and path not in allowed
+        and defined_in not in path.parents
+    ]
+
+    assert referencing == []
+    assert "RepositoryFactory" in (_APP_DIR / "container.py").read_text()

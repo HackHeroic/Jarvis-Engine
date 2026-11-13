@@ -9,8 +9,9 @@ Two callers act on the same draft rows and must behave identically:
 
 Accepting is the *only* moment v2 writes to ``user_tasks``: the planning
 sub-graph proposes a draft and persists nothing. Accepting is
-``DraftService.accept``, one atomic write; both callers reach it through
-``accept_draft_and_persist`` here.
+``DraftService.accept``, one atomic write, on the composition root's service:
+the REST endpoint takes it from the container, the orchestrator node reaches it
+through ``accept_draft_and_persist`` here.
 
 Every store call takes ``user_id`` — ``DraftStore`` filters on it, so a draft
 belonging to somebody else simply reads as absent (house IDOR rule).
@@ -20,6 +21,7 @@ import asyncio
 from typing import Any, Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.core.runtime import get_container
 from app.domain import errors
 from app.domain.events import NullEventBus
 from app.services.draft_service import DraftService
@@ -115,15 +117,10 @@ async def accept_draft_and_persist(
     finds the draft closed instead of writing every task again. ``draft_store``
     is unused; it stays in the signature for the callers.
     """
-    if supabase is None:
+    service = _draft_service(supabase)
+    if service is None:
         logger.error(f"Draft {draft_id_of(draft)} not accepted: no Supabase client to write through")
         return None
-
-    # Legacy shim: the one place that builds a repository itself, until the
-    # composition root hands DraftService its repository and event bus.
-    from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
-
-    service = DraftService(SupabaseDraftRepository(supabase), NullEventBus())
     try:
         return await service.accept(user_id, draft_id_of(draft))
     except errors.ValidationError:
@@ -132,3 +129,21 @@ async def accept_draft_and_persist(
     except errors.PersistenceError:
         logger.error(f"Draft {draft_id_of(draft)} accept did not land — left open for retry")
         return None
+
+
+def _draft_service(supabase: Any) -> Optional[DraftService]:
+    """The composition root's ``DraftService``, whose bus delivers ``DraftAccepted``.
+
+    With no container registered (tests, scripts) one is built here over
+    ``supabase``, with nobody listening; ``None`` when there is no client either.
+    """
+    container = get_container()
+    if container is not None:
+        return container.draft_service
+    if supabase is None:
+        return None
+    # The no-container fallback: the one place outside the composition root that
+    # builds a repository itself.
+    from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
+
+    return DraftService(SupabaseDraftRepository(supabase), NullEventBus())

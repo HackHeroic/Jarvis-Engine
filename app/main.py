@@ -105,18 +105,33 @@ async def lifespan(app: FastAPI):
         else:
             print(f"    FAST    → {_cfg.GEMMA_FAST_MODEL}")
 
+    # The composition root: repositories, event bus, usage ledger, and the LLM chain
+    # route_llm_call uses (metered onto that bus). With Supabase unreachable it runs
+    # on in-memory repositories and says so; the legacy app.state.db_client above
+    # stays for the routes not yet on the repositories.
+    from app.container import AppContainer
+    from app.core.runtime import set_container
+    from app.orchestrator.hooks import get_hooks
+
+    supabase_client = getattr(app.state.db_client, "supabase", None)
+    container = AppContainer.build(supabase_client=supabase_client, cfg=_cfg, hooks=get_hooks())
+    app.state.container = container
+    set_container(container)
+    if supabase_client is not None:
+        print(" ✅ Repositories: Supabase")
+
     # Which language models will answer, in the order they are tried. CLAUDE_PRIMARY
     # (like GEMINI_PRIMARY) makes the local provider report itself unavailable.
-    from app.core.model_router import get_chain
-
-    live = [p.name for p in get_chain().providers if p.is_available()]
-    if _cfg.CLAUDE_PRIMARY:
-        print(" ☁️  CLAUDE_PRIMARY on — local models skipped")
-        if "claude" not in live:
-            print("   → no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN set; Claude cannot answer")
+    live = [p.name for p in container.llm.providers if p.is_available()]
+    if _cfg.CLAUDE_PRIMARY and "claude" not in live:
+        print("   → no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN set; Claude cannot answer")
     if "claude" in live:
         print(f"    CLAUDE  → {_cfg.CLAUDE_MODEL}")
     print(f" ✅ LLM providers live, in order: {' → '.join(live) or 'none'}")
+    print(
+        f"    CLAUDE_PRIMARY {'on' if _cfg.CLAUDE_PRIMARY else 'off'}, "
+        f"GEMINI_PRIMARY {'on' if _cfg.GEMINI_PRIMARY else 'off'}"
+    )
 
     try:
         yield

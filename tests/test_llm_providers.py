@@ -1033,6 +1033,36 @@ async def test_route_llm_call__stream_with_schema__value_error(offline_cfg):
         await route_llm_call(task="voice_of_jarvis", prompt="hi", stream=True, response_schema=_Tiny)
 
 
+@pytest.mark.asyncio
+async def test_route_llm_call__attributed_context__request_carries_user_and_session(offline_cfg):
+    from app.core.model_router import attribute_llm_calls, route_llm_call
+
+    local = FakeProvider("local", LLMLocation.LOCAL, ["a", "b"])
+    set_chain(FallbackChainProvider([local]))
+
+    await route_llm_call(task="voice_of_jarvis", prompt="unattributed")
+    end_attribution = attribute_llm_calls("u1", "sess-1")
+    try:
+        await route_llm_call(task="voice_of_jarvis", prompt="attributed")
+    finally:
+        end_attribution()
+
+    assert [(r.user_id, r.session_id) for r in local.calls] == [(None, None), ("u1", "sess-1")]
+
+
+def test_attribute_llm_calls__undo__restores_what_was_there():
+    from app.core.model_router import attribute_llm_calls, current_session_var, current_user_var
+
+    end_outer = attribute_llm_calls("u1", "sess-1")
+    end_inner = attribute_llm_calls("u2", "sess-2")
+    assert (current_user_var.get(), current_session_var.get()) == ("u2", "sess-2")
+
+    end_inner()
+    assert (current_user_var.get(), current_session_var.get()) == ("u1", "sess-1")
+    end_outer()
+    assert (current_user_var.get(), current_session_var.get()) == (None, None)
+
+
 # --- fix round 1: Gemini owns no fallback of its own --------------------------
 
 
