@@ -209,12 +209,18 @@ class TimeoutProvider(_ProviderDecorator):
                 yield item
 
 
-class MeteredProvider(_ProviderDecorator):
-    """Times each call that answers and publishes ``LLMCallCompleted``.
+def _billed(tally: TokenTally) -> bool:
+    return bool(tally.input_tokens or tally.output_tokens or tally.cache_read_tokens)
 
-    Token counts are whatever the transport reports through
-    ``transport.report_token_usage`` during the call (zero if it reports none).
-    ``model_for_role`` names the model the wrapped provider uses for a role.
+
+class MeteredProvider(_ProviderDecorator):
+    """Times each call and publishes ``LLMCallCompleted``.
+
+    A call that answers is always published. A call that failed — raised, or a stream
+    that broke or was abandoned — is published only if the transport reported tokens
+    for it: those were billed even though no answer came of them. Token counts are
+    whatever the transport reports through ``transport.report_token_usage`` during the
+    call. ``model_for_role`` names the model the wrapped provider uses for a role.
     """
 
     def __init__(
@@ -247,20 +253,31 @@ class MeteredProvider(_ProviderDecorator):
     async def complete(self, req: LLMRequest) -> str | BaseModel:
         tally = TokenTally()
         started = time.perf_counter()
-        with collecting_tokens(tally):
-            result = await self._inner.complete(req)
+        try:
+            with collecting_tokens(tally):
+                result = await self._inner.complete(req)
+        except Exception:
+            if _billed(tally):
+                await self._publish(req, started, tally)
+            raise
         await self._publish(req, started, tally)
         return result
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
         tally = TokenTally()
         started = time.perf_counter()
-        async with aclosing(self._inner.stream(req)) as tokens:
-            while True:
-                try:
-                    with collecting_tokens(tally):
-                        item = await anext(tokens)
-                except StopAsyncIteration:
-                    break
-                yield item
-        await self._publish(req, started, tally)
+        finished = False
+        try:
+            async with aclosing(self._inner.stream(req)) as tokens:
+                while True:
+                    try:
+                        with collecting_tokens(tally):
+                            item = await anext(tokens)
+                    except StopAsyncIteration:
+                        break
+                    yield item
+            finished = True
+        finally:
+            # Also runs when the consumer closes the stream early (GeneratorExit).
+            if finished or _billed(tally):
+                await self._publish(req, started, tally)
