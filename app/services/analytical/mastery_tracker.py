@@ -132,7 +132,7 @@ def compute_mastery(user_id: str, goal_id: Optional[str], db) -> float:
 def get_mastery_summary(user_id: str, db) -> dict[str, float]:
     """Mastery scores for all active goals. Returns {goal_id: mastery_score}."""
     try:
-        result = db.table("user_tasks").select("goal_id").eq("user_id", user_id).neq("status", "archived").execute()
+        result = db.table("user_tasks").select("goal_id").eq("user_id", user_id).execute()
         tasks = result.data or []
         goal_ids = list({t["goal_id"] for t in tasks if t.get("goal_id")})
         summary = {}

@@ -23,8 +23,9 @@ class DatabaseClient:
         Returns True if successful.
         """
         def _check() -> bool:
-            # Simple query to verify connectivity (user_state from PDF schema)
-            response = self.supabase.table("user_state").select("*").limit(1).execute()
+            # user_tasks is the core table (created by 004, altered by the CLI
+            # migrations); no migration ever created user_state.
+            response = self.supabase.table("user_tasks").select("*").limit(1).execute()
             return response is not None
 
         return await asyncio.to_thread(_check)
