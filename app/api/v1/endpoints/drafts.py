@@ -1,10 +1,14 @@
 # app/api/v1/endpoints/drafts.py
 """Draft review/accept/reject endpoints.
 
-Routing and parsing only — the accept two-step (flip the draft's status, then
-persist its tasks) lives in ``app.services.draft_actions`` because the
+Routing and parsing only — accepting (write the tasks and mark the draft
+accepted, in one transaction) lives in ``app.services.draft_actions`` because the
 orchestrator's ``draft_action`` node performs exactly the same operation on the
 conversational path.
+
+A draft that is no longer open (already accepted, rejected or expired) cannot be
+accepted or rejected: ``InvalidStateTransition`` reaches the global handler,
+which answers 409 in the error envelope.
 
 Every handler passes ``user_id`` into ``DraftStore``, which filters on it, so a
 draft belonging to somebody else reads as absent and answers 404 — never 403,
@@ -15,6 +19,7 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from app.domain.errors import InvalidStateTransition, PersistenceError
 from app.schemas.draft import (
     DraftAcceptRequest,
     DraftChatRequest,
@@ -79,22 +84,21 @@ async def get_draft(draft_id: str, user_id: str, http_request: Request):
 
 @router.post("/{draft_id}/accept", summary="Accept a draft and persist its tasks")
 async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request: Request):
-    """Accept the draft: mark it accepted and write its tasks to ``user_tasks``.
+    """Accept the draft: write its tasks to ``user_tasks`` and mark it accepted.
 
     This is the only REST path that commits a proposed schedule — the planning
-    flow deliberately persists nothing until the user says yes.
+    flow deliberately persists nothing until the user says yes. A second accept
+    answers 409 and writes nothing.
     """
     store, draft = await _load_draft(http_request, draft_id, request.user_id)
     task_count = await accept_draft_and_persist(
         store, request.user_id, draft, _supabase_of(http_request)
     )
     if task_count is None:
-        # The tasks did not land, so the draft is still pending and the client
+        # The tasks did not land, so the draft is still open and the client
         # may retry. Answering 200 "accepted" here is how a user ends up with
         # an empty schedule and no idea why.
-        raise HTTPException(
-            status_code=500, detail="Schedule could not be committed — draft left pending"
-        )
+        raise PersistenceError("The schedule could not be saved. The draft is still open; try again.")
     if task_count == 0:
         return {"status": "empty", "draft_id": draft_id, "task_count": 0}
     return {"status": "accepted", "draft_id": draft_id, "task_count": task_count}
@@ -104,7 +108,14 @@ async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request:
 async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request: Request):
     """Reject the draft. Nothing is persisted to ``user_tasks``."""
     store, _ = await _load_draft(http_request, draft_id, request.user_id)
-    await asyncio.to_thread(store.reject_draft, draft_id, request.user_id, request.reason)
+    rejected = await asyncio.to_thread(
+        store.reject_draft, draft_id, request.user_id, request.reason
+    )
+    if not rejected:  # it exists (we just read it), so it is no longer open
+        raise InvalidStateTransition(
+            "This draft is no longer open, so it cannot be rejected.",
+            details={"draft_id": draft_id, "to": "rejected"},
+        )
 
     # The reason is behavioural signal — it is why the next plan should differ.
     memory_store = getattr(http_request.app.state, "memory_store", None)

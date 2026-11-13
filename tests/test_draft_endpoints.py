@@ -270,16 +270,52 @@ def test_endpoints_require_a_draft_store(client):
 
 def test_accept__persist_failure__does_not_report_accepted(client, monkeypatch):
     """The endpoint shares accept_draft_and_persist with the orchestrator node,
-    so it inherits the same duty: never call an unverified write a success."""
-    monkeypatch.setattr(
-        "app.services.analytical.control_policy._persist_fused_tasks",
-        lambda *a, **k: None,  # what a swallowed exception looks like
-    )
+    so it inherits the same duty: never call a failed write a success."""
+    supabase = client.app.state._test_supabase
+
+    def unreachable(name, params):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(supabase, "rpc", unreachable)  # the one atomic accept call
     draft_id = client.app.state._test_draft_id
     resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
 
-    assert resp.status_code == 500
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "persistence_unavailable"
+    assert "connection refused" not in resp.text
     assert _draft_row(client, draft_id)["status"] == "pending"  # retryable
+    assert supabase.rows.get("user_tasks", []) == []
+
+
+def test_accept_endpoint__second_call__409_envelope(client):
+    """A double-click must not write the tasks twice."""
+    draft_id = client.app.state._test_draft_id
+    first = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+    second = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    error = second.json()["error"]
+    assert error["code"] == "invalid_state_transition"
+    assert error["request_id"] == second.headers["X-Request-ID"]
+    rows = client.app.state._test_supabase.rows["user_tasks"]
+    assert sorted(r["task_id"] for r in rows) == ["t1", "t2"]
+
+
+def test_reject_endpoint__accepted_draft__409_envelope(client):
+    """An accepted draft's tasks are live; rejecting it afterwards cannot undo that."""
+    draft_id = client.app.state._test_draft_id
+    client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    resp = client.post(
+        f"/api/v1/drafts/{draft_id}/reject", json={"user_id": "test_user", "reason": "nah"}
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "invalid_state_transition"
+    row = _draft_row(client, draft_id)
+    assert row["status"] == "accepted"
+    assert row.get("rejection_reason") is None
 
 
 def test_chat_modify__is_not_implemented(client):

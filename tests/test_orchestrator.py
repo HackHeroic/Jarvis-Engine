@@ -435,29 +435,24 @@ async def test_precheck__no_draft_verb__falls_through_to_planning():
 
 @pytest.fixture
 def _captured_persist(monkeypatch):
-    """Record _persist_fused_tasks calls; the node imports it function-locally."""
+    """Record calls to the accept write path; the node imports it function-locally."""
     calls = []
 
-    def fake_persist(user_id, chunks, supabase_client, schedule=None, horizon_start=None):
-        calls.append({
-            "user_id": user_id, "chunks": list(chunks), "supabase": supabase_client,
-            "schedule": schedule, "horizon_start": horizon_start,
-        })
+    async def fake_accept(draft_store, user_id, draft, supabase):
+        calls.append({"user_id": user_id, "draft": draft, "supabase": supabase})
+        return len(draft.get("tasks") or [])
 
-    monkeypatch.setattr(
-        "app.services.analytical.control_policy._persist_fused_tasks", fake_persist
-    )
+    monkeypatch.setattr("app.services.draft_actions.accept_draft_and_persist", fake_accept)
     return calls
 
 
 @pytest.mark.asyncio
 async def test_draft_action__accept__persists_tasks_and_closes_negotiation():
-    """Runs the real _persist_fused_tasks against a FakeSupabase — a stubbed
-    persist would satisfy the accept path's verification query with nothing."""
+    """Runs the real accept against a FakeSupabase: the tasks must actually land."""
     from app.orchestrator.graph import handle_draft_action
 
-    store = _FakeDraftStore()
     user_model = _user_model_with_db()
+    store = _seed_draft(user_model._db.supabase)
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
         draft_store=store, user_message="accept", user_model=user_model,
@@ -466,7 +461,7 @@ async def test_draft_action__accept__persists_tasks_and_closes_negotiation():
 
     rows = user_model._db.supabase.rows.get("user_tasks", [])
     assert [(r["task_id"], r["user_id"]) for r in rows] == [("t1", "test_user")]
-    assert store.accepted == [("d1", "test_user")]
+    assert _draft_status(store) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] is None
     assert "1 task is" in result["response_message"]
@@ -579,16 +574,16 @@ async def test_graph__has_draft_action_nodes():
 async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm):
     """A REVIEWING turn saying "accept" must not be swallowed by the planning shortcut."""
     graph = build_jarvis_graph()
-    store = _FakeDraftStore()
     user_model = _user_model_with_db()
+    store = _seed_draft(user_model._db.supabase)
     result = await graph.ainvoke(
         _make_state(
             user_message="accept", negotiation_state=NegotiationPhase.REVIEWING,
-            draft_store=store, draft_id="d1", user_model=user_model,
+            draft_store=store, draft_id=_DRAFT_ID, user_model=user_model,
         )
     )
 
-    assert store.accepted == [("d1", "test_user")]
+    assert _draft_status(store) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] is None
     assert [r["task_id"] for r in user_model._db.supabase.rows.get("user_tasks", [])] == ["t1"]
@@ -610,7 +605,7 @@ async def test_draft_action__store_failure__keeps_the_draft_open(_captured_persi
     from app.orchestrator.graph import handle_draft_action
 
     class _BrokenStore(_FakeDraftStore):
-        def accept_draft(self, draft_id, user_id):
+        def get_draft(self, draft_id, user_id):
             raise RuntimeError("supabase unreachable")
 
     state = _make_state(
@@ -759,67 +754,85 @@ async def test_graph__upload_during_review_reaches_knowledge_module(no_llm, _cap
 # --- accept must not claim success it cannot verify -------------------------
 
 
-class _VerifyingStore(_FakeDraftStore):
-    """Observes how many user_tasks rows existed at the moment of the status flip.
+_DRAFT_ID = "6f1c2a4e-0d7b-4a51-9a51-3d1f0e9b2c11"  # draft_schedules.id is a uuid
 
-    A plain call-order list would not prove anything — both calls happen either
-    way. Sampling the table at flip time is what actually distinguishes
-    persist-then-flip from flip-then-persist.
+
+def _seed_draft(supabase, tasks=None, **columns):
+    """Put one draft row in ``supabase`` and return a real DraftStore over it.
+
+    Accept is one atomic call against draft_schedules, so the draft has to live
+    in the same database the tasks are written to, as it does in production.
+    The row goes straight into the fake's table, so a fake that refuses every
+    write can still hold a draft.
     """
+    from app.services.draft_store import DraftStore
 
-    def __init__(self, *args, supabase=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._supabase = supabase
-        self.rows_at_flip = None
+    supabase.rows.setdefault("draft_schedules", []).append({
+        "id": _DRAFT_ID,
+        "user_id": "test_user",
+        "status": "pending",
+        "tasks": tasks if tasks is not None else [
+            {"task_id": "t1", "title": "read", "duration_minutes": 25}
+        ],
+        "horizon_start": "2026-08-08T08:00:00Z",
+        **columns,
+    })
+    return DraftStore(supabase_client=supabase)
 
-    def accept_draft(self, draft_id, user_id):
-        if self._supabase is not None:
-            self.rows_at_flip = len(self._supabase.rows.get("user_tasks", []))
-        return super().accept_draft(draft_id, user_id)
+
+def _draft_status(store) -> str:
+    return store.get_draft(_DRAFT_ID, "test_user")["status"]
+
+
+class _RpcFailingSupabase(FakeSupabase):
+    """The database is unreachable for the one atomic accept call."""
+
+    def rpc(self, name, params):
+        raise RuntimeError("supabase unreachable")
 
 
 @pytest.mark.asyncio
-async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft(monkeypatch):
-    """_persist_fused_tasks swallows its own exceptions, so "it returned" is not
-    evidence anything landed. A silent failure must not answer "Locked in" —
-    and must not flip the draft to accepted, which would hide it from the retry."""
+async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft():
+    """A failed write must not answer "Locked in", and must leave the draft
+    open: an accepted-but-empty draft is one no retry can ever find again."""
+    from app.core.user_model import UserModel
     from app.orchestrator.graph import handle_draft_action
 
-    monkeypatch.setattr(
-        "app.services.analytical.control_policy._persist_fused_tasks",
-        lambda *a, **k: None,  # exactly what a swallowed failure looks like
-    )
-    store = _VerifyingStore()
+    supabase = _RpcFailingSupabase()
+    store = _seed_draft(supabase)
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
-        draft_store=store, draft_id="d1", user_message="accept",
-        user_model=_user_model_with_db(),
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept",
+        user_model=UserModel(user_id="test_user", db=FakeDBClient(supabase)),
     )
     result = await handle_draft_action(state)
 
-    assert store.accepted == []            # status NOT flipped
+    assert _draft_status(store) == "pending"     # status NOT flipped
+    assert supabase.rows.get("user_tasks", []) == []
     assert "negotiation_state" not in result  # still REVIEWING → "accept" retries
     assert "locked in" not in result["response_message"].lower()
 
 
 @pytest.mark.asyncio
-async def test_accept__flips_status_only_after_the_tasks_are_in_the_table():
-    """Order matters: flipping first leaves an accepted-but-empty draft that
-    get_pending_draft can no longer find, so the retry is gone too."""
+async def test_accept__success__tasks_and_accepted_status_land_in_one_call():
+    """No separate status flip: the tasks and the ACCEPTED status commit
+    together or not at all, so there is no order between them to get wrong."""
     from app.orchestrator.graph import handle_draft_action
 
     user_model = _user_model_with_db()
     supabase = user_model._db.supabase
-    store = _VerifyingStore(supabase=supabase)
+    store = _seed_draft(supabase)
+    flips = []
+    store.accept_draft = lambda *a: flips.append(a)  # the old two-step's second step
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
-        draft_store=store, draft_id="d1", user_message="accept", user_model=user_model,
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept", user_model=user_model,
     )
     result = await handle_draft_action(state)
 
     assert [r["task_id"] for r in supabase.rows["user_tasks"]] == ["t1"]
-    assert store.accepted == [("d1", "test_user")]
-    assert store.rows_at_flip == 1  # the task was already written when we flipped
+    assert _draft_status(store) == "accepted"
+    assert flips == []
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
 
 
@@ -827,18 +840,62 @@ async def test_accept__flips_status_only_after_the_tasks_are_in_the_table():
 async def test_accept__draft_with_no_tasks__exits_without_claiming_success():
     from app.orchestrator.graph import handle_draft_action
 
-    store = _VerifyingStore()
-    store.draft["tasks"] = []
+    user_model = _user_model_with_db()
+    store = _seed_draft(user_model._db.supabase, tasks=[])
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
-        draft_store=store, draft_id="d1", user_message="accept",
-        user_model=_user_model_with_db(),
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept", user_model=user_model,
     )
     result = await handle_draft_action(state)
 
-    assert store.accepted == []
+    assert _draft_status(store) == "pending"
     assert result["negotiation_state"] == NegotiationPhase.NONE  # exit door
     assert "locked in" not in result["response_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_draft_action__accept_already_accepted_draft__says_locked_in_and_writes_nothing():
+    """REST accept from the review UI, then "looks good" in chat: the second
+    accept must not rewrite the tasks. One of them is already done."""
+    from app.orchestrator.graph import handle_draft_action
+
+    user_model = _user_model_with_db()
+    supabase = user_model._db.supabase
+    store = _seed_draft(supabase, status="accepted")
+    done = {"user_id": "test_user", "task_id": "t1", "status": "completed", "plan_id": "p1"}
+    supabase.rows["user_tasks"] = [dict(done)]
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id=_DRAFT_ID, user_message="looks good", user_model=user_model,
+    )
+    result = await handle_draft_action(state)
+
+    assert "already locked in" in result["response_message"]
+    assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
+    assert result["draft_id"] is None
+    assert supabase.rows["user_tasks"] == [done]
+
+
+@pytest.mark.asyncio
+async def test_draft_action__accept_expired_draft__does_not_claim_locked_in():
+    """An expired draft is closed too, but nothing of it was ever written:
+    "already locked in" would be the lie this node must never tell."""
+    from app.orchestrator.graph import handle_draft_action
+
+    user_model = _user_model_with_db()
+    supabase = user_model._db.supabase
+    store = _seed_draft(supabase, expires_at="2026-08-01T00:00:00+00:00")
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept", user_model=user_model,
+    )
+    result = await handle_draft_action(state)
+
+    assert "locked in" not in result["response_message"].lower()
+    assert result["negotiation_state"] == NegotiationPhase.NONE
+    assert result["draft_id"] is None
+    assert supabase.rows.get("user_tasks", []) == []
+    assert _draft_status(store) == "pending"
 
 
 # --- acceptance must be the message's whole point, not a phrase inside it ----
@@ -864,11 +921,7 @@ def test_matcher__acceptance_word_inside_a_sentence__never_accepts(message):
 
 
 class _WriteFailingSupabase(FakeSupabase):
-    """Reads work, every write raises — a Supabase outage mid-accept.
-
-    _persist_fused_tasks catches the exception itself, so the caller sees a
-    perfectly clean return with nothing written.
-    """
+    """Reads work, every write raises — a Supabase outage mid-accept."""
 
     def table(self, name):
         query = super().table(name)
@@ -882,32 +935,33 @@ class _WriteFailingSupabase(FakeSupabase):
         query.execute = execute
         return query
 
+    def rpc(self, name, params):
+        raise RuntimeError("supabase write refused")
+
 
 @pytest.mark.asyncio
 async def test_accept__write_failure_over_a_preexisting_row__is_not_read_as_success():
     """fuse_tasks merges pre-existing pending rows into drafts, so a draft task
-    can already be in user_tasks before accept runs. Verifying by task_id alone
-    would count that stale row as proof the new write landed — and _persist_fused_tasks
-    builds its rows before deleting, so a total failure leaves it sitting there."""
+    can already be in user_tasks before accept runs. A refused write must not
+    be read as success because that stale row is sitting there, and the stale
+    row must survive: the accept is all or nothing."""
     from app.core.user_model import UserModel
     from app.orchestrator.graph import handle_draft_action
     from tests.fakes import FakeDBClient
 
-    supabase = _WriteFailingSupabase(
-        {"user_tasks": [
-            {"user_id": "test_user", "task_id": "t1", "status": "pending",
-             "plan_id": "plan-from-last-week"},
-        ]}
-    )
-    store = _VerifyingStore(supabase=supabase)
+    stale = {"user_id": "test_user", "task_id": "t1", "status": "pending",
+             "plan_id": "plan-from-last-week"}
+    supabase = _WriteFailingSupabase({"user_tasks": [dict(stale)]})
+    store = _seed_draft(supabase)
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
-        draft_store=store, draft_id="d1", user_message="accept",
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept",
         user_model=UserModel(user_id="test_user", db=FakeDBClient(supabase)),
     )
     result = await handle_draft_action(state)
 
-    assert store.accepted == []                 # status NOT flipped
+    assert _draft_status(store) == "pending"    # status NOT flipped
+    assert supabase.rows["user_tasks"] == [stale]
     assert "negotiation_state" not in result    # still REVIEWING → retryable
     assert "locked in" not in result["response_message"].lower()
 

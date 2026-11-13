@@ -242,6 +242,11 @@ class InMemoryDraftRepository(DraftRepository):
                     "This draft is no longer open, so it cannot be accepted.",
                     details={"draft_id": draft_id, "from": draft.status.value, "to": "accepted"},
                 )
+            # A database answers the status check and the writes in separate round
+            # trips, with other requests running in between. Yield here as it would,
+            # so it is the lock (not the lack of an await) that keeps a concurrent
+            # accept out.
+            await asyncio.sleep(0)
             new_tasks = [task_from_row(row) for row in rows]
             new_tasks = [
                 t if t.id is not None else t.model_copy(update={"id": str(uuid4())})

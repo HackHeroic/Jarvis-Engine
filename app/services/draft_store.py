@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.domain.entities import DraftStatus
 
 
 # ── Legacy stubs (used by control_policy.py pending Task 8 rewrite) ─────────
@@ -42,6 +43,9 @@ def _get_supabase():
 
 
 _UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly None"
+
+# Statuses a draft is still under review in; every other status is final.
+_OPEN_STATUSES = [DraftStatus.PENDING.value, DraftStatus.MODIFIED.value]
 
 
 class DraftStore:
@@ -77,21 +81,24 @@ class DraftStore:
         return result.data[0] if result.data else None
 
     def get_pending_draft(self, user_id: str) -> dict | None:
+        """The user's newest draft still under review (pending, or edited and so modified)."""
         if not self._supabase:
             return None
-        result = self._supabase.table("draft_schedules").select("*").eq("user_id", user_id).eq("status", "pending").order("created_at", desc=True).limit(1).execute()
+        result = self._supabase.table("draft_schedules").select("*").eq("user_id", user_id).in_("status", _OPEN_STATUSES).order("created_at", desc=True).limit(1).execute()
         return result.data[0] if result.data else None
 
     def accept_draft(self, draft_id: str, user_id: str) -> bool:
+        """Mark an open draft accepted. False if absent or already closed."""
         if not self._supabase:
             return False
-        result = self._supabase.table("draft_schedules").update({"status": "accepted"}).eq("id", draft_id).eq("user_id", user_id).execute()
+        result = self._supabase.table("draft_schedules").update({"status": "accepted"}).eq("id", draft_id).eq("user_id", user_id).in_("status", _OPEN_STATUSES).execute()
         return bool(result.data)
 
     def reject_draft(self, draft_id: str, user_id: str, reason: str | None = None) -> bool:
+        """Mark an open draft rejected, keeping the reason. False if absent or already closed."""
         if not self._supabase:
             return False
-        result = self._supabase.table("draft_schedules").update({"status": "rejected", "rejection_reason": reason}).eq("id", draft_id).eq("user_id", user_id).execute()
+        result = self._supabase.table("draft_schedules").update({"status": "rejected", "rejection_reason": reason}).eq("id", draft_id).eq("user_id", user_id).in_("status", _OPEN_STATUSES).execute()
         return bool(result.data)
 
     def replace_tasks(self, draft_id: str, user_id: str, tasks: list) -> dict | None:

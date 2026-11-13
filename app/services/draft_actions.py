@@ -8,9 +8,9 @@ Two callers act on the same draft rows and must behave identically:
   which the frontend calls from the review UI.
 
 Accepting is the *only* moment v2 writes to ``user_tasks``: the planning
-sub-graph proposes a draft and persists nothing. Duplicating that two-step
-(flip ``draft_schedules.status``, then ``_persist_fused_tasks``) invites the two
-paths to drift, so it lives here once and both callers import it.
+sub-graph proposes a draft and persists nothing. Accepting is
+``DraftService.accept``, one atomic write; both callers reach it through
+``accept_draft_and_persist`` here.
 
 Every store call takes ``user_id`` — ``DraftStore`` filters on it, so a draft
 belonging to somebody else simply reads as absent (house IDOR rule).
@@ -20,6 +20,11 @@ import asyncio
 from typing import Any, Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain import errors
+from app.domain.events import NullEventBus
+from app.services.draft_service import DraftService
+# Moved to app.services.planning.task_rows; planning_graph still imports it from here.
+from app.services.planning.task_rows import to_task_chunk  # noqa: F401
 
 
 def draft_id_of(row: Any) -> Optional[str]:
@@ -34,43 +39,6 @@ def draft_id_of(row: Any) -> Optional[str]:
     if not isinstance(row, dict):
         return None
     return row.get("draft_id") or row.get("id")
-
-
-def to_task_chunk(raw: dict, index: int) -> Any:
-    """Coerce a stored draft/planning task dict into a valid ``TaskChunk``.
-
-    Draft tasks come from two places that disagree about completeness:
-    ``decompose_goal`` emits fully-formed chunks, while ``fuse_tasks`` merges
-    pending Supabase rows that carry no ``completion_criteria`` (required) and
-    may carry a ``duration_minutes`` above TaskChunk's 25-minute Pomodoro
-    ceiling. Strict validation would reject those, so fill and clamp first.
-
-    Used by the planning sub-graph before scheduling and again here when the
-    same tasks are read back off an accepted draft.
-    """
-    from app.api.v1.endpoints.reasoning import TaskChunk
-
-    data = dict(raw)
-    data.setdefault("task_id", f"t{index}")
-    data.setdefault("title", data["task_id"])
-    data.setdefault("completion_criteria", f"Finish: {data['title']}")
-
-    raw_duration = data.get("duration_minutes")
-    try:
-        duration = int(raw_duration) if raw_duration else 25
-    except (TypeError, ValueError):
-        duration = 25
-    data["duration_minutes"] = max(1, min(25, duration))
-
-    raw_difficulty = data.get("difficulty_weight")
-    try:
-        difficulty = 0.5 if raw_difficulty is None else float(raw_difficulty)
-    except (TypeError, ValueError):
-        difficulty = 0.5
-    data["difficulty_weight"] = max(0.0, min(1.0, difficulty))
-
-    data["dependencies"] = list(data.get("dependencies") or [])
-    return TaskChunk.model_validate(data)
 
 
 async def resolve_draft(
@@ -95,23 +63,12 @@ async def resolve_draft(
     return await asyncio.to_thread(draft_store.get_pending_draft, user_id)
 
 
-def _schedule_map_of(draft: dict) -> Optional[dict]:
-    """Pull the ``{task_id: {start_min, end_min}}`` map out of a draft row.
-
-    ``draft_schedules`` has no ``schedule`` column today (the solver output is
-    not persisted with the draft), so this is normally ``None`` — accepting then
-    stores tasks without wall-clock times, exactly as before. Handled anyway,
-    and unwrapped one level, because when the column does arrive it will hold a
-    whole ``ScheduleResponse`` payload whose map sits under ``"schedule"``.
-    """
-    schedule = draft.get("schedule")
-    if isinstance(schedule, dict) and "schedule" in schedule:
-        return schedule.get("schedule")
-    return schedule if isinstance(schedule, dict) else None
-
-
 def _count_persisted(supabase: Any, user_id: str, plan_id: str) -> int:
     """How many rows carrying *this* ``plan_id`` are in ``user_tasks`` now.
+
+    Used by the deprecated v1 ``/accept-schedule`` to prove its non-atomic
+    ``_persist_fused_tasks`` write landed. Draft acceptance needs no re-read: its
+    write is one transaction that returns the row count.
 
     Filtering on plan_id rather than task_id is the whole point. Fused chunk
     lists deliberately carry pre-existing pending tasks forward (``fuse_tasks``
@@ -135,77 +92,40 @@ def _count_persisted(supabase: Any, user_id: str, plan_id: str) -> int:
 async def accept_draft_and_persist(
     draft_store: Any, user_id: str, draft: dict, supabase: Any
 ) -> Optional[int]:
-    """Write the draft's tasks to ``user_tasks``, then mark the draft accepted.
+    """Accept the draft: write its tasks to ``user_tasks`` and mark it accepted, atomically.
 
     Returns:
-        ``n > 0`` — that many tasks are verifiably in ``user_tasks`` and the
-        draft's status is now 'accepted'.
+        ``n > 0`` — that many tasks were written and the draft is now 'accepted'.
         ``0`` — the draft held nothing schedulable. Nothing was written and the
         status is untouched; there is nothing here to accept.
-        ``None`` — the write did not land. The status is *deliberately* left
-        'pending' so ``get_pending_draft`` can still find it and the user can
-        retry; the caller must not report success.
+        ``None`` — the write did not land. The draft is still open, so
+        ``get_pending_draft`` can find it and the user can retry; the caller
+        must not report success.
 
-    Order matters. Flipping the status first (the obvious reading of "accept
-    the draft, then persist it") means a failed persist leaves an
-    accepted-but-empty draft that no retry can ever find again — the user's
-    schedule silently evaporates. So: persist, verify, then flip.
+    Raises:
+        InvalidStateTransition: the draft is no longer open (already accepted,
+            rejected or expired). Nothing was written; it must not be re-persisted.
+        NotFoundError: the user has no such draft.
 
-    Verification reads back the rows carrying the ``plan_id`` this write minted,
-    never the task_ids: a draft's tasks may already exist as pending rows from
-    an earlier plan (``fuse_tasks`` merges them in), and those survive a failed
-    write, so a task_id match proves nothing at all.
-
-    Both writes are offloaded with ``to_thread``; ``DraftStore`` and
-    ``_persist_fused_tasks`` are sync Supabase calls that would otherwise stall
-    the event loop. ``_persist_fused_tasks`` is imported inside the function
-    because control_policy pulls in the whole v1 flow at import time.
+    ``DraftService.accept`` writes the tasks and flips the status in one
+    transaction, so they land together or not at all. A second accept therefore
+    finds the draft closed instead of writing every task again. ``draft_store``
+    is unused; it stays in the signature for the callers.
     """
-    from app.services.analytical.control_policy import _persist_fused_tasks
-
-    draft_id = draft_id_of(draft)
-
-    chunks = []
-    for index, raw in enumerate(draft.get("tasks") or []):
-        if not isinstance(raw, dict):
-            continue
-        try:
-            chunks.append(to_task_chunk(raw, index))
-        except Exception as exc:  # pydantic ValidationError and friends
-            logger.warning(f"Skipping unparseable draft task {raw!r}: {exc}")
-
-    if not chunks:
-        # _persist_fused_tasks refuses empty lists anyway (it would look like a
-        # retrieval failure and wipe every pending row); say so plainly here.
-        logger.warning(f"Draft {draft_id} holds no persistable tasks — nothing accepted")
-        return 0
-
     if supabase is None:
-        logger.error(f"Draft {draft_id} not accepted: no Supabase client to persist through")
+        logger.error(f"Draft {draft_id_of(draft)} not accepted: no Supabase client to write through")
         return None
 
-    plan_id = await asyncio.to_thread(
-        _persist_fused_tasks,
-        user_id,
-        chunks,
-        supabase,
-        schedule=_schedule_map_of(draft),
-        horizon_start=draft.get("horizon_start"),
-    )
-    if not plan_id:
-        logger.error(f"Draft {draft_id} persist reported nothing written — leaving it pending")
-        return None
+    # Legacy shim: the one place that builds a repository itself, until the
+    # composition root hands DraftService its repository and event bus.
+    from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
 
+    service = DraftService(SupabaseDraftRepository(supabase), NullEventBus())
     try:
-        landed = await asyncio.to_thread(_count_persisted, supabase, user_id, plan_id)
-    except Exception as exc:
-        logger.error(f"Could not verify persistence for draft {draft_id}: {exc}")
+        return await service.accept(user_id, draft_id_of(draft))
+    except errors.ValidationError:
+        logger.warning(f"Draft {draft_id_of(draft)} holds no persistable tasks — nothing accepted")
+        return 0
+    except errors.PersistenceError:
+        logger.error(f"Draft {draft_id_of(draft)} accept did not land — left open for retry")
         return None
-
-    if landed <= 0:
-        logger.error(f"Draft {draft_id} persist did not land — leaving it pending for retry")
-        return None
-
-    if draft_id:
-        await asyncio.to_thread(draft_store.accept_draft, draft_id, user_id)
-    return landed
