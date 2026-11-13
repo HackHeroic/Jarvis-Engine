@@ -49,6 +49,21 @@ def _no_network():
         socket.socket.connect_ex = real_connect_ex
 
 
+@pytest.fixture(autouse=True)
+def _no_anthropic_credentials(monkeypatch):
+    """Claude is off in every test unless the test turns it on.
+
+    The dev .env carries a real Anthropic key, and with one the default provider
+    chain tries Claude before Gemini — so a test that fakes only the local and
+    Gemini transports would dial Anthropic, and then (blocked by the socket guard)
+    sit through Claude's retries before reaching its fake.
+    """
+    import app.core.config as cfg
+
+    monkeypatch.setattr(cfg, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(cfg, "ANTHROPIC_AUTH_TOKEN", "")
+
+
 @pytest.fixture
 def no_llm(monkeypatch):
     """Replace every outbound model/RAG boundary with canned in-memory results.
