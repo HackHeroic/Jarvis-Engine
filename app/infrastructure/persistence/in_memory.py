@@ -1,0 +1,376 @@
+"""In-memory repository family: the ports over plain Python lists.
+
+Used by tests and anywhere no database is configured. Every repository built over
+the same ``InMemoryStore`` sees the same data, which is what lets draft
+acceptance write tasks. Values are copied in and out, so a caller mutating a
+returned entity cannot change what is stored — just as with a database.
+"""
+
+# Postponed annotations: InMemorySuggestionRepository defines a method named ``list``.
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any
+from uuid import uuid4
+
+from app.domain import errors
+from app.domain.entities import (
+    BehavioralConstraint,
+    DraftSchedule,
+    DraftStatus,
+    LLMUsageEvent,
+    Suggestion,
+    SuggestionStatus,
+    Task,
+    TaskEvent,
+    TaskEventType,
+    TaskStatus,
+    UserProfile,
+)
+from app.domain.ports import (
+    ConstraintRepository,
+    DraftRepository,
+    ProfileRepository,
+    SuggestionRepository,
+    TaskEventRepository,
+    TaskRepository,
+    UsageRepository,
+)
+from app.infrastructure.persistence._mapping import (
+    OPEN_DRAFT_STATUSES,
+    accepted_task_rows,
+    apply_profile_update,
+    day_bounds,
+    new_draft,
+    normalized,
+    not_found,
+    now_utc,
+    prepare_new,
+    summarize_usage,
+    task_from_row,
+    utc,
+)
+
+
+@dataclass
+class InMemoryStore:
+    """The shared tables the in-memory repositories read and write."""
+
+    tasks: list[Task] = field(default_factory=list)
+    task_events: list[TaskEvent] = field(default_factory=list)
+    drafts: list[DraftSchedule] = field(default_factory=list)
+    constraints: list[BehavioralConstraint] = field(default_factory=list)
+    profiles: list[UserProfile] = field(default_factory=list)
+    suggestions: list[Suggestion] = field(default_factory=list)
+    usage: list[LLMUsageEvent] = field(default_factory=list)
+    # Serialises draft status changes, as the row lock does in the database.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class InMemoryTaskRepository(TaskRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _indexes(self, user_id: str, task_id: str) -> list[int]:
+        return [
+            i
+            for i, t in enumerate(self._store.tasks)
+            if t.user_id == user_id and t.task_id == task_id
+        ]
+
+    async def list_pending(self, user_id: str) -> list[Task]:
+        return [
+            t.model_copy(deep=True)
+            for t in self._store.tasks
+            if t.user_id == user_id and t.status == TaskStatus.PENDING
+        ]
+
+    async def get(self, user_id: str, task_id: str) -> Task | None:
+        indexes = self._indexes(user_id, task_id)
+        return self._store.tasks[indexes[0]].model_copy(deep=True) if indexes else None
+
+    async def list_scheduled_between(
+        self, user_id: str, start: datetime, end: datetime
+    ) -> list[Task]:
+        start, end = utc(start), utc(end)
+        found = [
+            t
+            for t in self._store.tasks
+            if t.user_id == user_id
+            and t.scheduled_start is not None
+            and start <= t.scheduled_start < end
+        ]
+        return [t.model_copy(deep=True) for t in sorted(found, key=lambda t: t.scheduled_start)]
+
+    async def update_status(
+        self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
+    ) -> Task:
+        indexes = self._indexes(user_id, task_id)
+        if not indexes:
+            raise not_found("task", task_id)
+        if expected is not None:
+            indexes = [i for i in indexes if self._store.tasks[i].status == expected]
+            if not indexes:
+                raise errors.StaleVersionError(
+                    "That task changed before this update; reload and try again.",
+                    details={"task_id": task_id, "expected": TaskStatus(expected).value},
+                )
+        for i in indexes:
+            self._store.tasks[i] = self._store.tasks[i].model_copy(
+                update={"status": TaskStatus(status)}
+            )
+        return self._store.tasks[indexes[0]].model_copy(deep=True)
+
+    async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:
+        start, end = utc(start), utc(end)
+        if end <= start:
+            raise errors.ValidationError("A task must end after it starts.")
+        indexes = self._indexes(user_id, task_id)
+        if not indexes:
+            raise not_found("task", task_id)
+        for i in indexes:
+            self._store.tasks[i] = self._store.tasks[i].model_copy(
+                update={"scheduled_start": start, "scheduled_end": end}
+            )
+        return self._store.tasks[indexes[0]].model_copy(deep=True)
+
+
+class InMemoryTaskEventRepository(TaskEventRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    async def append(self, user_id: str, event: TaskEvent) -> TaskEvent:
+        stored = prepare_new(user_id, event, "task event")
+        self._store.task_events.append(stored)
+        return stored.model_copy(deep=True)
+
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        since: datetime | None = None,
+        types: set[TaskEventType] | None = None,
+    ) -> list[TaskEvent]:
+        since = utc(since) if since is not None else None
+        found = [
+            e
+            for e in self._store.task_events
+            if e.user_id == user_id
+            and (since is None or e.occurred_at >= since)
+            and (types is None or e.event_type in types)
+        ]
+        return [e.model_copy(deep=True) for e in sorted(found, key=lambda e: e.occurred_at)]
+
+
+class InMemoryDraftRepository(DraftRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, draft_id: str) -> int | None:
+        return next(
+            (
+                i
+                for i, d in enumerate(self._store.drafts)
+                if d.id == draft_id and d.user_id == user_id
+            ),
+            None,
+        )
+
+    async def create(
+        self,
+        user_id: str,
+        *,
+        tasks: list[dict],
+        horizon_start: str | None,
+        goal_id: str | None,
+        schedule: dict | None,
+    ) -> DraftSchedule:
+        draft = new_draft(
+            user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
+        )
+        self._store.drafts.append(draft)
+        return draft.model_copy(deep=True)
+
+    async def get(self, user_id: str, draft_id: str) -> DraftSchedule | None:
+        i = self._index(user_id, draft_id)
+        return self._store.drafts[i].model_copy(deep=True) if i is not None else None
+
+    async def get_open(self, user_id: str) -> DraftSchedule | None:
+        # The store is in creation order, so the last open draft is the newest.
+        return next(
+            (
+                d.model_copy(deep=True)
+                for d in reversed(self._store.drafts)
+                if d.user_id == user_id and d.status in OPEN_DRAFT_STATUSES
+            ),
+            None,
+        )
+
+    async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
+        i = self._index(user_id, draft_id)
+        if i is None:
+            raise not_found("draft", draft_id)
+        self._store.drafts[i] = self._store.drafts[i].model_copy(update={"tasks": tasks}, deep=True)
+        return self._store.drafts[i].model_copy(deep=True)
+
+    async def set_status(
+        self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
+    ) -> DraftSchedule:
+        async with self._store.lock:
+            i = self._index(user_id, draft_id)
+            if i is None:
+                raise not_found("draft", draft_id)
+            moved = self._store.drafts[i].transition(DraftStatus(to))
+            if reason is not None:
+                moved = moved.model_copy(update={"rejection_reason": reason})
+            self._store.drafts[i] = moved
+            return moved.model_copy(deep=True)
+
+    async def accept_atomic(self, user_id: str, draft_id: str, rows: list[dict]) -> int:
+        rows = accepted_task_rows(user_id, rows)
+        async with self._store.lock:
+            i = self._index(user_id, draft_id)
+            if i is None:
+                raise not_found("draft", draft_id)
+            draft = self._store.drafts[i]
+            if draft.status not in OPEN_DRAFT_STATUSES or (
+                draft.expires_at is not None and draft.expires_at < now_utc()
+            ):
+                raise errors.InvalidStateTransition(
+                    "This draft is no longer open, so it cannot be accepted.",
+                    details={"draft_id": draft_id, "from": draft.status.value, "to": "accepted"},
+                )
+            new_tasks = [task_from_row(row) for row in rows]
+            new_tasks = [
+                t if t.id is not None else t.model_copy(update={"id": str(uuid4())})
+                for t in new_tasks
+            ]
+            self._store.tasks[:] = [
+                t
+                for t in self._store.tasks
+                if not (t.user_id == user_id and t.status == TaskStatus.PENDING)
+            ]
+            self._store.tasks.extend(new_tasks)
+            self._store.drafts[i] = draft.model_copy(update={"status": DraftStatus.ACCEPTED})
+            return len(new_tasks)
+
+
+class InMemoryConstraintRepository(ConstraintRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    async def list_active(self, user_id: str) -> list[BehavioralConstraint]:
+        # An entity has no validity window, so every stored constraint applies.
+        return [c.model_copy(deep=True) for c in self._store.constraints if c.user_id == user_id]
+
+    async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
+        stored = prepare_new(user_id, c, "constraint")
+        self._store.constraints.append(stored)
+        return stored.model_copy(deep=True)
+
+    async def delete(self, user_id: str, constraint_id: str) -> bool:
+        before = len(self._store.constraints)
+        self._store.constraints[:] = [
+            c
+            for c in self._store.constraints
+            if not (c.id == constraint_id and c.user_id == user_id)
+        ]
+        return len(self._store.constraints) < before
+
+
+class InMemoryProfileRepository(ProfileRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str) -> int:
+        i = next((i for i, p in enumerate(self._store.profiles) if p.user_id == user_id), None)
+        if i is None:
+            self._store.profiles.append(UserProfile(user_id=user_id))
+            i = len(self._store.profiles) - 1
+        return i
+
+    async def get_or_create(self, user_id: str) -> UserProfile:
+        return self._store.profiles[self._index(user_id)].model_copy(deep=True)
+
+    async def update(self, user_id: str, **fields: Any) -> UserProfile:
+        i = self._index(user_id)
+        self._store.profiles[i] = apply_profile_update(self._store.profiles[i], fields)
+        return self._store.profiles[i].model_copy(deep=True)
+
+    async def list_user_ids(self) -> list[str]:
+        return [p.user_id for p in self._store.profiles]
+
+
+class InMemorySuggestionRepository(SuggestionRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, suggestion_id: str) -> int | None:
+        return next(
+            (
+                i
+                for i, s in enumerate(self._store.suggestions)
+                if s.id == suggestion_id and s.user_id == user_id
+            ),
+            None,
+        )
+
+    async def add(self, user_id: str, s: Suggestion) -> Suggestion:
+        stored = prepare_new(user_id, s, "suggestion")
+        self._store.suggestions.append(stored)
+        return stored.model_copy(deep=True)
+
+    async def list(
+        self, user_id: str, *, status: SuggestionStatus | None = None
+    ) -> list[Suggestion]:
+        """Return the user's suggestions, newest first."""
+        found = [
+            s
+            for s in self._store.suggestions
+            if s.user_id == user_id and (status is None or s.status == status)
+        ]
+        return [
+            s.model_copy(deep=True)
+            for s in sorted(found, key=lambda s: s.created_at, reverse=True)
+        ]
+
+    async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
+        i = self._index(user_id, suggestion_id)
+        return self._store.suggestions[i].model_copy(deep=True) if i is not None else None
+
+    async def set_status(
+        self, user_id: str, suggestion_id: str, to: SuggestionStatus
+    ) -> Suggestion:
+        i = self._index(user_id, suggestion_id)
+        if i is None:
+            raise not_found("suggestion", suggestion_id)
+        self._store.suggestions[i] = self._store.suggestions[i].model_copy(
+            update={"status": SuggestionStatus(to)}
+        )
+        return self._store.suggestions[i].model_copy(deep=True)
+
+    async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
+        """``day`` is a UTC calendar day."""
+        start, end = day_bounds(day)
+        return any(
+            s.user_id == user_id and s.trigger == trigger and start <= s.created_at < end
+            for s in self._store.suggestions
+        )
+
+
+class InMemoryUsageRepository(UsageRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    async def record(self, event: LLMUsageEvent) -> None:
+        self._store.usage.append(normalized(event))
+
+    async def summary(self, user_id: str, *, since: datetime | None = None) -> dict:
+        since = utc(since) if since is not None else None
+        return summarize_usage(
+            e
+            for e in self._store.usage
+            if e.user_id == user_id and (since is None or e.created_at >= since)
+        )

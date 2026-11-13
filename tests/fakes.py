@@ -3,7 +3,9 @@
 `FakeSupabase` implements the slice of the supabase-py chained query builder
 that the stores actually call: ``table(name).insert(row).execute()``,
 ``.select("*").eq(k, v)...execute()``, ``.update(d).eq(...).execute()``,
-``.delete().eq(...).execute()``, plus ``.order()`` / ``.limit()``.
+``.delete().eq(...).execute()``, plus ``.order()`` / ``.limit()``, the
+``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` filters, and
+``rpc("accept_draft", params).execute()``.
 
 It is deliberately a real (if tiny) implementation rather than a MagicMock:
 a MagicMock returns a canned payload regardless of the filters passed, so it
@@ -12,6 +14,10 @@ house security rule ("every Supabase query must filter by user_id") exists to
 prevent. Filtering here is real, so user-isolation assertions have teeth.
 """
 
+import json
+import threading
+import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,8 +31,35 @@ CANNED_LLM_REPLY = "Canned LLM reply, sir."
 class _Result:
     """Mirrors the supabase-py APIResponse surface the stores read."""
 
-    def __init__(self, data: list[dict]):
+    def __init__(self, data: Any):
         self.data = data
+
+
+def _comparable(value: Any) -> Any:
+    """Postgres compares timestamptz by instant, not by text: parse ISO strings.
+
+    A naive timestamp reads as UTC, as it does in a Supabase (UTC) session.
+    Anything that is not a datetime is compared as-is.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _compare(op: Callable[[Any, Any], bool]) -> Callable[[Any, Any], bool]:
+    """A SQL comparison: NULL on either side never matches."""
+
+    def check(cell: Any, value: Any) -> bool:
+        if cell is None or value is None:
+            return False
+        return op(_comparable(cell), _comparable(value))
+
+    return check
 
 
 class _Query:
@@ -36,6 +69,7 @@ class _Query:
         self._op: str | None = None
         self._payload: Any = None
         self._filters: list[tuple[str, Any]] = []
+        self._predicates: list[Callable[[dict], bool]] = []
         self._order: tuple[str, bool] | None = None
         self._limit: int | None = None
 
@@ -60,6 +94,27 @@ class _Query:
         self._filters.append((column, value))
         return self
 
+    def _where(self, column: str, value: Any, check: Callable[[Any, Any], bool]) -> "_Query":
+        self._predicates.append(lambda row: check(row.get(column), value))
+        return self
+
+    def neq(self, column: str, value: Any) -> "_Query":
+        return self._where(column, value, _compare(lambda a, b: a != b))
+
+    def in_(self, column: str, values: list) -> "_Query":
+        return self._where(
+            column, list(values), lambda cell, vals: cell is not None and cell in vals
+        )
+
+    def gte(self, column: str, value: Any) -> "_Query":
+        return self._where(column, value, _compare(lambda a, b: a >= b))
+
+    def lte(self, column: str, value: Any) -> "_Query":
+        return self._where(column, value, _compare(lambda a, b: a <= b))
+
+    def lt(self, column: str, value: Any) -> "_Query":
+        return self._where(column, value, _compare(lambda a, b: a < b))
+
     def order(self, column: str, desc: bool = False) -> "_Query":
         self._order = (column, desc)
         return self
@@ -70,7 +125,9 @@ class _Query:
 
     # ── execution ───────────────────────────────────────────
     def _matches(self, row: dict) -> bool:
-        return all(row.get(col) == val for col, val in self._filters)
+        return all(row.get(col) == val for col, val in self._filters) and all(
+            predicate(row) for predicate in self._predicates
+        )
 
     def execute(self) -> _Result:
         if self._op == "insert":
@@ -104,6 +161,14 @@ class _Query:
         return _Result([dict(r) for r in matched])
 
 
+class _RpcCall:
+    def __init__(self, run: Callable[[], _Result]):
+        self._run = run
+
+    def execute(self) -> _Result:
+        return self._run()
+
+
 class FakeSupabase:
     """Chainable in-memory Supabase stand-in. No network, no MagicMock."""
 
@@ -111,9 +176,52 @@ class FakeSupabase:
         self.rows: dict[str, list[dict]] = {
             name: list(rows) for name, rows in (seed or {}).items()
         }
+        # Stands in for the row lock (`select ... for update`) the real
+        # function takes: repositories run calls on worker threads.
+        self._rpc_lock = threading.Lock()
 
     def table(self, name: str) -> _Query:
         return _Query(self.rows.setdefault(name, []), name)
+
+    def rpc(self, name: str, params: dict) -> _RpcCall:
+        # The real client sends params as JSON; round-trip so a value the
+        # real call could not serialise fails here too.
+        params = json.loads(json.dumps(params))
+        if name == "accept_draft":
+            return _RpcCall(lambda: self._accept_draft(**params))
+        raise NotImplementedError(f"FakeSupabase has no rpc {name!r}")
+
+    def _accept_draft(self, p_draft_id: str, p_user_id: str, p_rows: list[dict]) -> _Result:
+        """Mirror of the accept_draft SQL function: one transaction, all or nothing."""
+        with self._rpc_lock:
+            draft = next(
+                (
+                    r
+                    for r in self.rows.setdefault("draft_schedules", [])
+                    if r.get("id") == p_draft_id and r.get("user_id") == p_user_id
+                ),
+                None,
+            )
+            if draft is None:
+                raise Exception("DRAFT_NOT_FOUND")
+            now = datetime.now(timezone.utc)
+            expires_at = draft.get("expires_at")
+            if draft.get("status") not in ("pending", "modified") or (
+                expires_at is not None and _comparable(expires_at) < now
+            ):
+                raise Exception("DRAFT_NOT_OPEN")
+
+            tasks = self.rows.setdefault("user_tasks", [])
+            tasks[:] = [
+                r
+                for r in tasks
+                if not (r.get("user_id") == p_user_id and r.get("status") == "pending")
+            ]
+            for row in p_rows:
+                # Table defaults the explicit column list leaves to Postgres.
+                tasks.append({"id": str(uuid.uuid4()), "created_at": now.isoformat(), **row})
+            draft["status"] = "accepted"
+            return _Result(len(p_rows))
 
 
 class FakeDBClient:
