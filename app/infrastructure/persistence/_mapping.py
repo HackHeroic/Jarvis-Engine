@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
+from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from app.domain import errors
 from app.domain.entities import (
@@ -120,16 +121,26 @@ def prepare_new(user_id: str, entity: M, what: str) -> M:
 
 
 def accepted_task_rows(user_id: str, rows: list[dict]) -> list[dict]:
-    """Return ``rows`` stamped with ``user_id``, after checking every one is a valid task.
+    """Return ``rows`` stamped with ``user_id`` and made JSON-safe, after checking each one.
 
-    Raises ValidationError, before anything is written, if a row is for another user
-    or would not read back as a Task.
+    Both families receive exactly these values (a datetime becomes its ISO string), as
+    the database function receives them over JSON. Raises ValidationError, before
+    anything is written, if a row is for another user, carries an id a uuid primary
+    key would reject, holds a value JSON cannot carry, or would not read back as a Task.
     """
     checked = []
     for row in rows:
         if row.get("user_id") not in (None, user_id):
             raise errors.ValidationError("A task row belongs to a different user.")
-        row = {**row, "user_id": user_id}
+        if row.get("id") is not None and not is_uuid(row["id"]):
+            raise errors.ValidationError("A task id must be a UUID.", details={"id": row["id"]})
+        try:
+            row = to_jsonable_python({**row, "user_id": user_id})
+        except PydanticSerializationError as exc:
+            raise errors.ValidationError(
+                "A task row holds a value that cannot be stored.",
+                details={"task_id": row.get("task_id")},
+            ) from exc
         try:
             task_from_row(row)
         except PydanticValidationError as exc:

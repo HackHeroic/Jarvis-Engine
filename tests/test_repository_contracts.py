@@ -11,6 +11,7 @@ from datetime import datetime, time, timedelta, timezone
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from app.domain import errors
 from app.domain.entities import (
@@ -272,6 +273,17 @@ async def test_tasks__list_scheduled_between__window_filter(repos):
     assert [t.task_id for t in found] == ["at_start", "inside"]
 
 
+@pytest.mark.asyncio
+async def test_tasks__legacy_pacing_pushed__reads_as_skipped_and_matches_expected(repos):
+    await _seed_tasks(repos, U1, [_row("pushed", status="pacing_pushed")])
+
+    assert (await repos.tasks.get(U1, "pushed")).status is TaskStatus.SKIPPED
+    done = await repos.tasks.update_status(
+        U1, "pushed", TaskStatus.COMPLETED, expected=TaskStatus.SKIPPED
+    )
+    assert done.status is TaskStatus.COMPLETED
+
+
 # --- Task events -------------------------------------------------------------
 
 
@@ -368,6 +380,27 @@ async def test_drafts__replace_tasks__persists(repos):
 
 
 @pytest.mark.asyncio
+async def test_drafts__caller_mutates_tasks_after_write__stored_draft_unchanged(repos):
+    created_tasks = [{"task_id": "g1_t1", "title": "Read chapter 1"}]
+    draft = await repos.drafts.create(
+        U1, tasks=created_tasks, horizon_start=T0.isoformat(), goal_id="g1", schedule=None
+    )
+    created_tasks[0]["title"] = "mutated after create"
+    assert (await repos.drafts.get(U1, draft.id)).tasks == [
+        {"task_id": "g1_t1", "title": "Read chapter 1"}
+    ]
+
+    revised = [{"task_id": "g1_t2", "title": "Practice set"}]
+    await repos.drafts.replace_tasks(U1, draft.id, revised)
+    revised[0]["title"] = "mutated after replace"
+    revised.append({"task_id": "g1_t3", "title": "Sneaked in"})
+
+    assert (await repos.drafts.get(U1, draft.id)).tasks == [
+        {"task_id": "g1_t2", "title": "Practice set"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_drafts__get_open__returns_modified_draft(repos):
     draft = await _new_draft(repos)
     await repos.drafts.set_status(U1, draft.id, DraftStatus.MODIFIED)
@@ -377,6 +410,18 @@ async def test_drafts__get_open__returns_modified_draft(repos):
     assert open_draft is not None
     assert open_draft.id == draft.id and open_draft.status is DraftStatus.MODIFIED
     assert await repos.drafts.get_open(U2) is None
+
+
+@pytest.mark.asyncio
+async def test_drafts__get_open__two_open_drafts__returns_newest(repos):
+    older = await _new_draft(repos)
+    newer = await _new_draft(repos)
+    await repos.drafts.set_status(U1, older.id, DraftStatus.MODIFIED)
+
+    assert (await repos.drafts.get_open(U1)).id == newer.id
+
+    await repos.drafts.set_status(U1, newer.id, DraftStatus.REJECTED)
+    assert (await repos.drafts.get_open(U1)).id == older.id
 
 
 @pytest.mark.asyncio
@@ -467,6 +512,42 @@ async def test_drafts__accept_atomic__missing_or_other_users_draft__raises_not_f
     with pytest.raises(errors.NotFoundError):
         await repos.drafts.accept_atomic(U2, draft.id, [_row("x")])
 
+    assert await repos.tasks.list_pending(U2) == []
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_drafts__accept_atomic__datetime_valued_row__stored_as_its_instant(repos):
+    draft = await _new_draft(repos)
+    row = {
+        **_row("x"),
+        "scheduled_start": T0,
+        "scheduled_end": T0 + timedelta(minutes=25),
+        "created_at": datetime.now(timezone.utc),
+    }
+
+    assert await repos.drafts.accept_atomic(U1, draft.id, [row]) == 1
+
+    task = await repos.tasks.get(U1, "x")
+    assert (task.scheduled_start, task.scheduled_end) == (T0, T0 + timedelta(minutes=25))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_row",
+    [{**_row("x"), "user_id": U2}, {**_row("x"), "id": "not-a-uuid"}],
+    ids=["other_users_row", "non_uuid_id"],
+)
+async def test_drafts__accept_atomic__row_for_other_user_or_bad_id__raises_validation_and_writes_nothing(  # noqa: E501
+    repos, bad_row
+):
+    await _seed_tasks(repos, U1, [_row("existing")])
+    draft = await _new_draft(repos)
+
+    with pytest.raises(errors.ValidationError):
+        await repos.drafts.accept_atomic(U1, draft.id, [_row("y"), bad_row])
+
+    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["existing"]
     assert await repos.tasks.list_pending(U2) == []
     assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
 
@@ -617,3 +698,87 @@ async def test_supabase_repos__transport_error__raises_persistence_error_chained
 
     assert isinstance(info.value.__cause__, ConnectionError)
     assert "secret-host" not in info.value.message
+
+
+class _RacingClient:
+    """A FakeSupabase where another writer moves the draft just before each status write."""
+
+    def __init__(self, inner: FakeSupabase, interfering_statuses: list[str]):
+        self._inner = inner
+        self._interfering = list(interfering_statuses)
+
+    def table(self, name: str):
+        query = self._inner.table(name)
+        original_update = query.update
+
+        def update(payload):
+            if name == "draft_schedules" and self._interfering:
+                for row in self._inner.rows["draft_schedules"]:
+                    row["status"] = self._interfering[0]
+                self._interfering.pop(0)
+            return original_update(payload)
+
+        query.update = update
+        return query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("interfering", "outcome"),
+    [
+        (["modified"], DraftStatus.REJECTED),
+        (["accepted"], errors.InvalidStateTransition),
+        (["modified", "pending", "modified"], errors.InvalidStateTransition),
+    ],
+    ids=["lost_once_then_legal", "lost_to_terminal_state", "lost_every_attempt"],
+)
+async def test_supabase_drafts__set_status__lost_compare_and_set__retries_against_new_status(
+    interfering, outcome
+):
+    fake = FakeSupabase()
+    draft = await _new_draft(RepositoryFactory.supabase(fake))
+    repos = RepositoryFactory.supabase(_RacingClient(fake, interfering))
+
+    if outcome is errors.InvalidStateTransition:
+        with pytest.raises(errors.InvalidStateTransition):
+            await repos.drafts.set_status(U1, draft.id, DraftStatus.REJECTED)
+    else:
+        moved = await repos.drafts.set_status(U1, draft.id, DraftStatus.REJECTED)
+        assert moved.status is outcome
+
+
+class _OddRpcClient(FakeSupabase):
+    """The accept_draft function answers, but with a payload that is not a row count."""
+
+    def rpc(self, name: str, params: dict):
+        class _Call:
+            def execute(self):
+                class _Result:
+                    data = None
+
+                return _Result()
+
+        return _Call()
+
+
+@pytest.mark.asyncio
+async def test_supabase_drafts__accept_atomic__odd_rpc_payload__raises_persistence_error():
+    repos = RepositoryFactory.supabase(_OddRpcClient())
+    draft = await _new_draft(repos)
+
+    with pytest.raises(errors.PersistenceError) as info:
+        await repos.drafts.accept_atomic(U1, draft.id, [_row("x")])
+
+    assert isinstance(info.value.__cause__, TypeError)
+
+
+@pytest.mark.asyncio
+async def test_supabase_repos__unreadable_stored_row__raises_persistence_error(fake_client):
+    fake_client.rows["user_tasks"] = [{**_row("legacy", status="cancelled"), "user_id": U1}]
+    repos = RepositoryFactory.supabase(fake_client)
+
+    with pytest.raises(errors.PersistenceError) as info:
+        await repos.tasks.get(U1, "legacy")
+
+    assert info.value.message == "Stored data is not readable."
+    assert isinstance(info.value.__cause__, PydanticValidationError)

@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import Any
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 from app.domain import errors
 from app.domain.entities import (
@@ -56,6 +59,29 @@ from app.infrastructure.persistence._mapping import (
 )
 
 _UNREACHABLE = "Could not reach the database."
+_UNREADABLE = "Stored data is not readable."
+# A lost compare-and-set on a draft's status is retried against the status that won.
+_STATUS_CAS_ATTEMPTS = 3
+
+M = TypeVar("M", bound=BaseModel)
+
+
+def _read(model: type[M], row: dict) -> M:
+    """Build ``model`` from a stored row.
+
+    A row the entity rejects (legacy data) is a storage fault, not a request fault.
+    """
+    try:
+        return from_row(model, row)
+    except PydanticValidationError as exc:
+        raise errors.PersistenceError(_UNREADABLE) from exc
+
+
+def _read_task(row: dict) -> Task:
+    try:
+        return task_from_row(row)
+    except PydanticValidationError as exc:
+        raise errors.PersistenceError(_UNREADABLE) from exc
 
 
 class _SupabaseRepository:
@@ -87,13 +113,13 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
             .eq("status", TaskStatus.PENDING.value)
             .order("created_at")
         )
-        return [task_from_row(r) for r in rows]
+        return [_read_task(r) for r in rows]
 
     async def get(self, user_id: str, task_id: str) -> Task | None:
         rows = await self._run(
             lambda q: q.select("*").eq("user_id", user_id).eq("task_id", task_id).limit(1)
         )
-        return task_from_row(rows[0]) if rows else None
+        return _read_task(rows[0]) if rows else None
 
     async def list_scheduled_between(
         self, user_id: str, start: datetime, end: datetime
@@ -105,7 +131,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
             .lt("scheduled_start", iso(end))
             .order("scheduled_start")
         )
-        return [task_from_row(r) for r in rows]
+        return [_read_task(r) for r in rows]
 
     async def update_status(
         self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
@@ -120,7 +146,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
         rows = await self._run(build)
         if rows:
-            return task_from_row(rows[0])
+            return _read_task(rows[0])
         if expected is None or await self.get(user_id, task_id) is None:
             raise not_found("task", task_id)
         raise errors.StaleVersionError(
@@ -138,7 +164,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         )
         if not rows:
             raise not_found("task", task_id)
-        return task_from_row(rows[0])
+        return _read_task(rows[0])
 
 
 class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
@@ -147,7 +173,7 @@ class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
     async def append(self, user_id: str, event: TaskEvent) -> TaskEvent:
         stored = prepare_new(user_id, event, "task event")
         rows = await self._run(lambda q: q.insert(to_row(stored)))
-        return from_row(TaskEvent, rows[0]) if rows else stored
+        return _read(TaskEvent, rows[0]) if rows else stored
 
     async def list_for_user(
         self,
@@ -164,7 +190,7 @@ class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
                 q = q.in_("event_type", sorted(TaskEventType(t).value for t in types))
             return q.order("occurred_at")
 
-        return [from_row(TaskEvent, r) for r in await self._run(build)]
+        return [_read(TaskEvent, r) for r in await self._run(build)]
 
 
 class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
@@ -183,7 +209,7 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
         )
         rows = await self._run(lambda q: q.insert(to_row(draft)))
-        return from_row(DraftSchedule, rows[0]) if rows else draft
+        return _read(DraftSchedule, rows[0]) if rows else draft
 
     async def get(self, user_id: str, draft_id: str) -> DraftSchedule | None:
         if not is_uuid(draft_id):  # the id column is a uuid; anything else matches nothing
@@ -191,7 +217,7 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
         rows = await self._run(
             lambda q: q.select("*").eq("id", draft_id).eq("user_id", user_id).limit(1)
         )
-        return from_row(DraftSchedule, rows[0]) if rows else None
+        return _read(DraftSchedule, rows[0]) if rows else None
 
     async def get_open(self, user_id: str) -> DraftSchedule | None:
         rows = await self._run(
@@ -201,7 +227,7 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             .order("created_at", desc=True)
             .limit(1)
         )
-        return from_row(DraftSchedule, rows[0]) if rows else None
+        return _read(DraftSchedule, rows[0]) if rows else None
 
     async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
         if not is_uuid(draft_id):
@@ -211,35 +237,33 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
         )
         if not rows:
             raise not_found("draft", draft_id)
-        return from_row(DraftSchedule, rows[0])
+        return _read(DraftSchedule, rows[0])
 
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
     ) -> DraftSchedule:
         to = DraftStatus(to)
-        current = await self.get(user_id, draft_id)
-        if current is None:
-            raise not_found("draft", draft_id)
-        current.transition(to)  # raises InvalidStateTransition if the move is illegal
         payload: dict[str, Any] = {"status": to.value}
         if reason is not None:
             payload["rejection_reason"] = reason
-        # Compare-and-set on the status we checked, so a concurrent move cannot be overwritten.
-        rows = await self._run(
-            lambda q: q.update(payload)
-            .eq("id", draft_id)
-            .eq("user_id", user_id)
-            .eq("status", current.status.value)
-        )
-        if rows:
-            return from_row(DraftSchedule, rows[0])
-        latest = await self.get(user_id, draft_id)
-        if latest is None:
-            raise not_found("draft", draft_id)
-        latest.transition(to)
-        raise errors.StaleVersionError(
-            "This draft changed while it was being updated; reload and try again.",
-            details={"draft_id": draft_id},
+        for _ in range(_STATUS_CAS_ATTEMPTS):
+            current = await self.get(user_id, draft_id)
+            if current is None:
+                raise not_found("draft", draft_id)
+            current.transition(to)  # raises InvalidStateTransition if the move is illegal
+            # Compare-and-set on the status just checked, so a concurrent move is never
+            # overwritten; if one got in first, check the move again from where it left.
+            rows = await self._run(
+                lambda q, seen=current.status.value: q.update(payload)
+                .eq("id", draft_id)
+                .eq("user_id", user_id)
+                .eq("status", seen)
+            )
+            if rows:
+                return _read(DraftSchedule, rows[0])
+        raise errors.InvalidStateTransition(
+            "This draft kept changing while it was being updated; reload and try again.",
+            details={"draft_id": draft_id, "to": to.value},
         )
 
     async def accept_atomic(self, user_id: str, draft_id: str, rows: list[dict]) -> int:
@@ -252,6 +276,7 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             result = await asyncio.to_thread(
                 lambda: self._client.rpc("accept_draft", params).execute()
             )
+            return int(result.data)
         except Exception as exc:
             text = _error_text(exc)
             if "DRAFT_NOT_OPEN" in text:
@@ -262,7 +287,6 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             if "DRAFT_NOT_FOUND" in text:
                 raise not_found("draft", draft_id) from exc
             raise errors.PersistenceError(_UNREACHABLE) from exc
-        return int(result.data)
 
 
 def _error_text(exc: Exception) -> str:
@@ -279,12 +303,12 @@ class SupabaseConstraintRepository(_SupabaseRepository, ConstraintRepository):
             lambda q: q.select("*").eq("user_id", user_id).order("created_at")
         )
         now = now_utc()
-        return [from_row(BehavioralConstraint, r) for r in rows if _applies_at(r, now)]
+        return [_read(BehavioralConstraint, r) for r in rows if _applies_at(r, now)]
 
     async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
         stored = prepare_new(user_id, c, "constraint")
         rows = await self._run(lambda q: q.insert(to_row(stored)))
-        return from_row(BehavioralConstraint, rows[0]) if rows else stored
+        return _read(BehavioralConstraint, rows[0]) if rows else stored
 
     async def delete(self, user_id: str, constraint_id: str) -> bool:
         if not is_uuid(constraint_id):
@@ -308,7 +332,7 @@ class SupabaseProfileRepository(_SupabaseRepository, ProfileRepository):
 
     async def _find(self, user_id: str) -> UserProfile | None:
         rows = await self._run(lambda q: q.select("*").eq("user_id", user_id).limit(1))
-        return from_row(UserProfile, rows[0]) if rows else None
+        return _read(UserProfile, rows[0]) if rows else None
 
     async def get_or_create(self, user_id: str) -> UserProfile:
         found = await self._find(user_id)
@@ -323,7 +347,7 @@ class SupabaseProfileRepository(_SupabaseRepository, ProfileRepository):
             if found is None:
                 raise
             return found
-        return from_row(UserProfile, rows[0]) if rows else profile
+        return _read(UserProfile, rows[0]) if rows else profile
 
     async def update(self, user_id: str, **fields: Any) -> UserProfile:
         updated = apply_profile_update(await self.get_or_create(user_id), fields)
@@ -331,7 +355,7 @@ class SupabaseProfileRepository(_SupabaseRepository, ProfileRepository):
         rows = await self._run(
             lambda q: q.update({name: row[name] for name in fields}).eq("user_id", user_id)
         )
-        return from_row(UserProfile, rows[0]) if rows else updated
+        return _read(UserProfile, rows[0]) if rows else updated
 
     async def list_user_ids(self) -> list[str]:
         # Deliberately unfiltered: this enumerates users (see ports.py).
@@ -345,7 +369,7 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
     async def add(self, user_id: str, s: Suggestion) -> Suggestion:
         stored = prepare_new(user_id, s, "suggestion")
         rows = await self._run(lambda q: q.insert(to_row(stored)))
-        return from_row(Suggestion, rows[0]) if rows else stored
+        return _read(Suggestion, rows[0]) if rows else stored
 
     async def list(
         self, user_id: str, *, status: SuggestionStatus | None = None
@@ -358,7 +382,7 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
                 q = q.eq("status", SuggestionStatus(status).value)
             return q.order("created_at", desc=True)
 
-        return [from_row(Suggestion, r) for r in await self._run(build)]
+        return [_read(Suggestion, r) for r in await self._run(build)]
 
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
         if not is_uuid(suggestion_id):
@@ -366,7 +390,7 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         rows = await self._run(
             lambda q: q.select("*").eq("id", suggestion_id).eq("user_id", user_id).limit(1)
         )
-        return from_row(Suggestion, rows[0]) if rows else None
+        return _read(Suggestion, rows[0]) if rows else None
 
     async def set_status(
         self, user_id: str, suggestion_id: str, to: SuggestionStatus
@@ -380,7 +404,7 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         )
         if not rows:
             raise not_found("suggestion", suggestion_id)
-        return from_row(Suggestion, rows[0])
+        return _read(Suggestion, rows[0])
 
     async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
         """``day`` is a UTC calendar day."""
@@ -408,4 +432,4 @@ class SupabaseUsageRepository(_SupabaseRepository, UsageRepository):
             q = q.select("*").eq("user_id", user_id)
             return q.gte("created_at", iso(since)) if since is not None else q
 
-        return summarize_usage(from_row(LLMUsageEvent, r) for r in await self._run(build))
+        return summarize_usage(_read(LLMUsageEvent, r) for r in await self._run(build))
