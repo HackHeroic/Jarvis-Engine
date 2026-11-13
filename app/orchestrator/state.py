@@ -61,6 +61,10 @@ class JarvisState(TypedDict):
     research_results: Optional[list[dict]]
     ingestion_result: Optional[dict]
     clarification_request: Optional[str]
+    # Blame-free framing of the tasks planning just marked missed, for synthesis.
+    # Undeclared, LangGraph dropped both on the way out of the planning module.
+    anti_guilt_message: Optional[str]
+    missed_deadlines: Optional[list[dict]]
 
     # Response
     thinking_process: Optional[str]
