@@ -1214,10 +1214,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     session_id = await get_or_create_session(
         request.user_id, request.conversation_id, supabase
     )
-    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+    # History first, then save: the window is the PRIOR context. Saved first, the
+    # message being answered also sat in its own history — the model read it
+    # twice and it took one of the ten slots.
     conversation_history = await build_context_messages(
         session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
     )
+    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
 
     # Inject archival memory
     memory_context = ""
