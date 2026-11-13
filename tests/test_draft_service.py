@@ -280,6 +280,49 @@ def test_build_task_rows__representative_chunks__exact_rows():
     ]
 
 
+def test_build_task_rows__explicit_goal_id__wins_over_id_prefix():
+    from app.services.planning.task_rows import build_task_rows
+
+    chunk = {"task_id": "exam_t1", "goal_id": "thesis", "title": "x", "duration_minutes": 25}
+
+    _, [row] = build_task_rows(U1, [chunk], schedule=None, horizon_start=HORIZON)
+
+    assert row["goal_id"] == "thesis"
+
+
+@pytest.mark.asyncio
+async def test_build_task_rows__multi_word_goal__matches_draft_goal_id(repos, service):
+    """One plan, one goal: `learn_dsa_…` used to be filed under `learn`.
+
+    Through accept, so the goal_id has to survive coercion into a TaskChunk too
+    (TaskChunk has no goal_id field).
+    """
+    tasks = [
+        {"task_id": f"learn_dsa_ab12cd_task_{n}", "goal_id": "learn_dsa", "title": f"step {n}",
+         "duration_minutes": 25}
+        for n in (1, 2)
+    ]
+    draft = await repos.drafts.create(
+        U1, tasks=tasks, horizon_start=HORIZON, goal_id="learn_dsa", schedule=None
+    )
+
+    await service.accept(U1, draft.id)
+
+    assert [t.goal_id for t in await repos.tasks.list_pending(U1)] == [draft.goal_id] * 2
+
+
+def test_build_task_rows__legacy_dict_without_goal_id__falls_back_to_prefix():
+    """A chunk written before goal_id travelled still gets one, read off its id."""
+    from app.services.planning.task_rows import build_task_rows
+
+    _, rows = build_task_rows(
+        U1, _tasks("exam_t1", "loose"), schedule=None, horizon_start=HORIZON
+    )
+
+    assert rows[0]["goal_id"] == "exam"
+    assert "goal_id" not in rows[1]  # no prefix to read: the row names no goal
+
+
 # --- the legacy entry point ---------------------------------------------------
 
 

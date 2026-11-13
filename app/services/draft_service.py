@@ -65,17 +65,25 @@ class DraftService:
         return await self._drafts.set_status(user_id, draft_id, DraftStatus.REJECTED, reason=reason)
 
 
-def _chunks_of(draft: DraftSchedule) -> list:
-    """The draft's tasks as TaskChunks; a task that cannot become one is skipped."""
+def _chunks_of(draft: DraftSchedule) -> list[dict]:
+    """The draft's tasks, validated as TaskChunks; a task that cannot become one is skipped.
+
+    Each keeps the goal_id the planner stamped on it. TaskChunk has no goal_id
+    field, so validation alone would drop it and build_task_rows would have to
+    guess the goal from the task_id.
+    """
     chunks = []
     for index, raw in enumerate(draft.tasks):
         try:
-            chunks.append(to_task_chunk(raw, index))
+            chunk = to_task_chunk(raw, index).model_dump()
         # ValueError covers pydantic's ValidationError; ArithmeticError covers int(inf).
         except (TypeError, ValueError, ArithmeticError):
             logger.warning(
                 "Draft %s: skipping unparseable task %r", draft.id, raw.get("task_id")
             )
+            continue
+        chunk["goal_id"] = raw.get("goal_id")
+        chunks.append(chunk)
     return chunks
 
 

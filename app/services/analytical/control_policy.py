@@ -286,14 +286,33 @@ def derive_goal_id(goal_metadata: Any, fallback_objective: str = "") -> str:
     return slug or f"plan_{uuid.uuid4().hex[:8]}"
 
 
-def _namespace_chunk(chunk: TaskChunk, goal_id: str) -> TaskChunk:
-    """Prefix task_id and dependencies with goal_id for multi-goal fusion.
+def mint_run_token() -> str:
+    """A short token naming one planning run: 6 hex characters of a uuid4.
+
+    The decomposer's ids are positional (task_1…task_N), so ``{goal_id}_{task_id}``
+    alone repeats every time a goal is re-planned. Accepting a plan deletes only
+    the user's pending tasks: one already completed, skipped or missed keeps its id,
+    the re-plan emits that id again, and the unique key on user_tasks
+    (user_id, task_id) refuses the whole accept. Six hex characters, not four,
+    because a token reused by two runs of the same goal causes that failure, and
+    a goal is re-planned many times over its life.
+    """
+    return uuid.uuid4().hex[:6]
+
+
+def _namespace_chunk(chunk: TaskChunk, goal_id: str, run: str) -> TaskChunk:
+    """Prefix task_id and dependencies with ``{goal_id}_{run}_`` for multi-goal fusion.
+
+    ``run`` comes from ``mint_run_token``, once per planning run. The ids stay
+    ``{goal_id}_``-prefixed, which is how fusion tells this goal's pending tasks
+    from every other goal's.
 
     CRITICAL: dependencies must use prefixed refs so the OR-Tools solver's
     build_dependencies() receives consistent IDs for precedence constraints.
     """
-    prefixed_id = f"{goal_id}_{chunk.task_id}"
-    prefixed_deps = [f"{goal_id}_{d}" for d in chunk.dependencies]
+    prefix = f"{goal_id}_{run}_"
+    prefixed_id = f"{prefix}{chunk.task_id}"
+    prefixed_deps = [f"{prefix}{d}" for d in chunk.dependencies]
     return TaskChunk(
         task_id=prefixed_id,
         title=chunk.title,
@@ -936,7 +955,8 @@ async def _run_plan_day_flow(
     goal_id = derive_goal_id(graph.goal_metadata, planning_goal)
 
     # Ensure dependencies are prefixed; _namespace_chunk does this
-    new_prefixed = [_namespace_chunk(c, goal_id) for c in graph.decomposition]
+    run = mint_run_token()
+    new_prefixed = [_namespace_chunk(c, goal_id, run) for c in graph.decomposition]
     all_pending = get_all_pending_tasks(user_id, supabase)
     # Keep tasks from OTHER goals, drop tasks from THIS goal (will be replaced by new decomposition)
     pending_chunks = [c for c in all_pending if not c.task_id.startswith(f"{goal_id}_")]

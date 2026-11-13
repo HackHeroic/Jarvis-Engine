@@ -198,7 +198,13 @@ class FakeSupabase:
         raise NotImplementedError(f"FakeSupabase has no rpc {name!r}")
 
     def _accept_draft(self, p_draft_id: str, p_user_id: str, p_rows: list[dict]) -> _Result:
-        """Mirror of the accept_draft SQL function: one transaction, all or nothing."""
+        """Mirror of the accept_draft SQL function: one transaction, all or nothing.
+
+        Also enforces the migrated table's ``UNIQUE (user_id, task_id)``: a row whose
+        task_id one of the user's surviving (non-pending) rows, or an earlier row of
+        the same call, already holds fails the whole call, as the real insert would.
+        Only this path checks it; ``table().insert`` does not.
+        """
         with self._rpc_lock:
             draft = next(
                 (
@@ -218,11 +224,22 @@ class FakeSupabase:
                 raise Exception("DRAFT_NOT_OPEN")
 
             tasks = self.rows.setdefault("user_tasks", [])
-            tasks[:] = [
+            remaining = [
                 r
                 for r in tasks
                 if not (r.get("user_id") == p_user_id and r.get("status") == "pending")
             ]
+            # Checked before anything is written, so a violation changes nothing.
+            taken = {r.get("task_id") for r in remaining if r.get("user_id") == p_user_id}
+            for row in p_rows:
+                if row.get("task_id") in taken:
+                    # The constraint's name in 20261114000001_capstone_lld.sql.
+                    raise Exception(
+                        'duplicate key value violates unique constraint '
+                        '"user_tasks_user_id_task_id_key"'
+                    )
+                taken.add(row.get("task_id"))
+            tasks[:] = remaining
             for row in p_rows:
                 # Table defaults the explicit column list leaves to Postgres.
                 tasks.append({"id": str(uuid.uuid4()), "created_at": now.isoformat(), **row})

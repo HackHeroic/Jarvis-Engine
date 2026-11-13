@@ -199,3 +199,34 @@ def test_delete_constraint__removes_own_row_only():
         assert len(fake.rows["behavioral_constraints"]) == 1
     finally:
         app.state.db_client = original
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/v1/tasks/{task_id} — status is limited to what user_tasks accepts
+# ---------------------------------------------------------------------------
+
+
+def test_patch_task__unknown_status__422():
+    """`rolled_forward` passed validation and then failed the table's status CHECK."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from tests.fakes import FakeSupabase
+
+    fake = FakeSupabase({"user_tasks": [
+        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending"},
+    ]})
+
+    class _DB:
+        supabase = fake
+
+    original = getattr(app.state, "db_client", None)
+    app.state.db_client = _DB()
+    try:
+        resp = TestClient(app).patch(
+            "/api/v1/tasks/t1", json={"user_id": "u1", "status": "rolled_forward"}
+        )
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "validation_error"
+        assert fake.rows["user_tasks"][0]["status"] == "pending"
+    finally:
+        app.state.db_client = original

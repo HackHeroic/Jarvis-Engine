@@ -31,7 +31,7 @@ class PlanningState(TypedDict):
     constraints: list
     task_chunks: list
     pending_tasks: list
-    # Namespace for this turn's decomposition ({goal_id}_{task_id}). Set by
+    # Namespace for this turn's decomposition ({goal_id}_{run}_{task_id}). Set by
     # decompose_goal, read by fuse_tasks to tell THIS goal's stale pending rows
     # (replaceable) from every other goal's (must survive).
     goal_id: Optional[str]
@@ -210,19 +210,29 @@ async def decompose_goal(state: PlanningState) -> dict:
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
         # v1 parity (CLAUDE.md → "Namespace goal tasks"): chunks leave
-        # decomposition already prefixed `{goal_id}_{task_id}`, dependencies
+        # decomposition already prefixed `{goal_id}_{run}_{task_id}`, dependencies
         # included. The decomposer only ever emits POSITIONAL ids (task_1…task_N),
-        # so without this every plan collides with the last one — fuse_tasks
-        # shadowed the older rows and accept's delete-then-replace then deleted
-        # them for good (F5, live run 2026-08-08). Both helpers are imported from
-        # the v1 flow, never re-implemented, so the two pipelines cannot drift.
+        # so without the goal prefix every plan collides with the last one —
+        # fuse_tasks shadowed the older rows and accept's delete-then-replace then
+        # deleted them for good (F5, live run 2026-08-08). Without the run token a
+        # re-plan of the SAME goal re-emits the ids of tasks the user already
+        # finished, which accept keeps, and the unique key on user_tasks refuses
+        # the plan. The helpers are imported from the v1 flow, never
+        # re-implemented, so the two pipelines cannot drift.
         from app.services.analytical.control_policy import (
             _namespace_chunk,
             derive_goal_id,
+            mint_run_token,
         )
 
         goal_id = derive_goal_id(graph.goal_metadata, goal)
-        chunks = [_namespace_chunk(tc, goal_id).model_dump() for tc in graph.decomposition]
+        run = mint_run_token()
+        # goal_id rides on every chunk, so no reader has to parse it back out of
+        # the id (which reads goal `learn_dsa` as `learn`).
+        chunks = [
+            {**_namespace_chunk(tc, goal_id, run).model_dump(), "goal_id": goal_id}
+            for tc in graph.decomposition
+        ]
         return {
             "task_chunks": chunks,
             "goal_id": goal_id,
@@ -238,11 +248,13 @@ async def fuse_tasks(state: PlanningState) -> dict:
     from THIS goal — the fresh decomposition replaces them.
 
     Membership is decided by the `{goal_id}_` prefix decompose_goal stamps on
-    every new chunk, not by task_id equality. Equality was F5: the decomposer's
-    ids are positional, so "does this pending row share an id with a new chunk?"
-    answered *yes* for unrelated tasks from an earlier plan, dropped them from
-    the fusion, and `_persist_fused_tasks`'s delete-then-replace deleted them
-    from `user_tasks` on accept.
+    every new chunk (`{goal_id}_{run}_{task_id}`), not by task_id equality.
+    Equality was F5: the decomposer's ids are positional, so "does this pending
+    row share an id with a new chunk?" answered *yes* for unrelated tasks from an
+    earlier plan, dropped them from the fusion, and `_persist_fused_tasks`'s
+    delete-then-replace deleted them from `user_tasks` on accept.
+
+    Rows carried forward from other goals keep their ids and their own goal_id.
 
     Without a goal_id (decomposition failed, or a checkpoint written before this
     key existed) it falls back to the old id-based de-dupe: no namespace to
@@ -265,6 +277,8 @@ async def fuse_tasks(state: PlanningState) -> dict:
             # Convert pending task row to TaskChunk-compatible dict
             merged.append({
                 "task_id": pid,
+                # Its own goal, which is not this plan's: build_task_rows writes it as is.
+                "goal_id": p.get("goal_id"),
                 "title": p.get("title", ""),
                 "duration_minutes": p.get("duration_minutes", 25),
                 "difficulty_weight": p.get("difficulty_weight", 0.5),
