@@ -298,7 +298,7 @@ def test_chat_modify__is_not_implemented(client):
     )
 
     assert resp.status_code == 501
-    assert resp.json()["detail"] == "draft chat modification not implemented"
+    assert resp.json()["error"]["message"] == "draft chat modification not implemented"
     # The draft is untouched — a 501 must not have half-applied anything.
     assert [t["task_id"] for t in _draft_row(client, draft_id)["tasks"]] == ["t1", "t2"]
 

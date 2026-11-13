@@ -3,7 +3,7 @@
 from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 
 # Stub used when Supabase fails at startup so the app can still run
 class _StubDBClient:
@@ -13,8 +13,10 @@ class _StubDBClient:
         return False
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.error_handlers import RequestIdMiddleware, register_error_handlers
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
+from app.domain.errors import PersistenceError
 
 
 @asynccontextmanager
@@ -125,6 +127,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestIdMiddleware)
+register_error_handlers(app)
 
 app.include_router(api_router, prefix="/api/v1")
 
@@ -139,16 +143,15 @@ def root():
 async def health(request: Request):
     """
     Health check endpoint. Uses pre-initialized database connection from startup.
-    Returns 200 if healthy, 500 if database connection failed at startup.
+    Returns 200 if healthy; 503 `persistence_unavailable` if the database is unreachable.
     """
     db_client: DatabaseClient = request.app.state.db_client
     try:
         connected = await db_client.check_connection()
-        if connected:
-            return {"status": "healthy", "database": "connected"}
-        raise HTTPException(status_code=500, detail="Database check returned false")
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"status": "unhealthy", "database": "disconnected", "error": str(e)},
-        )
+    except Exception as exc:
+        raise PersistenceError(
+            "Database is unreachable.", details={"database": "disconnected"}
+        ) from exc
+    if not connected:
+        raise PersistenceError("Database is unreachable.", details={"database": "disconnected"})
+    return {"status": "healthy", "database": "connected"}
