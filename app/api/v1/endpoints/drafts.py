@@ -1,10 +1,10 @@
 # app/api/v1/endpoints/drafts.py
 """Draft review/accept/reject endpoints.
 
-Routing and parsing only — accepting (write the tasks and mark the draft
-accepted, in one transaction) lives in ``app.services.draft_actions`` because the
-orchestrator's ``draft_action`` node performs exactly the same operation on the
-conversational path.
+Routing and parsing only. Accepting (write the tasks and mark the draft accepted,
+in one transaction) and rejecting are ``DraftService`` moves, taken from the
+composition root (``get_container``) — the same service the orchestrator's
+``draft_action`` node reaches through ``app.services.draft_actions``.
 
 A draft that is no longer open (already accepted, rejected or expired) cannot be
 accepted, rejected or edited: ``InvalidStateTransition`` reaches the global
@@ -19,7 +19,8 @@ import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from app.domain.errors import InvalidStateTransition, PersistenceError
+from app.api.deps import get_container
+from app.domain import errors
 from app.schemas.draft import (
     DraftAcceptRequest,
     DraftChatRequest,
@@ -29,7 +30,6 @@ from app.schemas.draft import (
     DraftStateResponse,
     DraftTaskEdit,
 )
-from app.services.draft_actions import accept_draft_and_persist
 from app.services.draft_store import is_open_draft
 
 router = APIRouter()
@@ -66,16 +66,11 @@ async def _refused_edit(store, draft_id: str, user_id: str, not_found: str) -> E
     """
     draft = await asyncio.to_thread(store.get_draft, draft_id, user_id)
     if draft is not None and not is_open_draft(draft):
-        return InvalidStateTransition(
+        return errors.InvalidStateTransition(
             "This draft is no longer open, so it cannot be changed.",
             details={"draft_id": draft_id, "from": draft.get("status"), "to": "modified"},
         )
     return HTTPException(status_code=404, detail=not_found)
-
-
-def _supabase_of(request: Request):
-    db_client = getattr(request.app.state, "db_client", None)
-    return getattr(db_client, "supabase", None) if db_client else None
 
 
 @router.get(
@@ -106,32 +101,33 @@ async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request:
     flow deliberately persists nothing until the user says yes. A second accept
     answers 409 and writes nothing.
     """
-    store, draft = await _load_draft(http_request, draft_id, request.user_id)
-    task_count = await accept_draft_and_persist(
-        store, request.user_id, draft, _supabase_of(http_request)
-    )
-    if task_count is None:
+    await _load_draft(http_request, draft_id, request.user_id)
+    drafts = get_container(http_request).draft_service
+    try:
+        task_count = await drafts.accept(request.user_id, draft_id)
+    except errors.ValidationError:
+        # Nothing in the draft can be scheduled; nothing was written.
+        return {"status": "empty", "draft_id": draft_id, "task_count": 0}
+    except errors.PersistenceError as exc:
         # The tasks did not land, so the draft is still open and the client
         # may retry. Answering 200 "accepted" here is how a user ends up with
         # an empty schedule and no idea why.
-        raise PersistenceError("The schedule could not be saved. The draft is still open; try again.")
-    if task_count == 0:
-        return {"status": "empty", "draft_id": draft_id, "task_count": 0}
+        raise errors.PersistenceError(
+            "The schedule could not be saved. The draft is still open; try again."
+        ) from exc
     return {"status": "accepted", "draft_id": draft_id, "task_count": task_count}
 
 
 @router.post("/{draft_id}/reject", summary="Reject a draft")
 async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request: Request):
-    """Reject the draft. Nothing is persisted to ``user_tasks``."""
-    store, _ = await _load_draft(http_request, draft_id, request.user_id)
-    rejected = await asyncio.to_thread(
-        store.reject_draft, draft_id, request.user_id, request.reason
+    """Reject the draft. Nothing is persisted to ``user_tasks``.
+
+    A draft that is no longer open raises ``InvalidStateTransition`` (409).
+    """
+    await _load_draft(http_request, draft_id, request.user_id)
+    await get_container(http_request).draft_service.reject(
+        request.user_id, draft_id, request.reason
     )
-    if not rejected:  # it exists (we just read it), so it is no longer open
-        raise InvalidStateTransition(
-            "This draft is no longer open, so it cannot be rejected.",
-            details={"draft_id": draft_id, "to": "rejected"},
-        )
 
     # The reason is behavioural signal — it is why the next plan should differ.
     memory_store = getattr(http_request.app.state, "memory_store", None)

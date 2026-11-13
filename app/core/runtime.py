@@ -8,14 +8,20 @@ at all — it is truthy, so it passes every ``if user_model:`` guard and then
 raises ``AttributeError`` deep inside a module.
 
 So the lifespan registers the same singletons here once at startup, and
-``_load_context`` reads them back. Accessors return ``None`` before startup
-(tests, scripts) — callers degrade rather than crash.
+``_load_context`` reads them back. The ``AppContainer`` is registered the same
+way, for code that reaches services without a request (the orchestrator's
+draft accept). Accessors return ``None`` before startup (tests, scripts) —
+callers degrade rather than crash.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.container import AppContainer
 
 _db: Any = None
 _memory_store: Any = None
+_container: "AppContainer | None" = None
 
 
 def set_shared_clients(db: Any = None, memory_store: Any = None) -> None:
@@ -41,8 +47,20 @@ def get_memory_store() -> Any:
     return _memory_store
 
 
+def set_container(container: "AppContainer") -> None:
+    """Register the composition root. Called once, from the FastAPI lifespan."""
+    global _container
+    _container = container
+
+
+def get_container() -> "AppContainer | None":
+    """The ``AppContainer`` the lifespan built, or ``None`` before startup (tests, scripts)."""
+    return _container
+
+
 def reset_shared_clients() -> None:
-    """Drop both registrations. Test hygiene only — never call from app code."""
-    global _db, _memory_store
+    """Drop every registration. Test hygiene only — never call from app code."""
+    global _db, _memory_store, _container
     _db = None
     _memory_store = None
+    _container = None

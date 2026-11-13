@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.jarvis_logger import log_step
@@ -1180,6 +1181,7 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
 @router.post("/v2/stream")
 async def chat_stream_v2(request: ChatRequest, http_request: Request):
     """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
+    from app.core.model_router import attribute_llm_calls
     from app.core.user_model import UserModel
     from app.orchestrator.checkpoint import make_thread_id
     from app.orchestrator.state import ConversationPhase, NegotiationPhase
@@ -1189,6 +1191,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         save_assistant_message,
         build_context_messages,
     )
+    from app.services.turn_locks import thread_lock
 
     jarvis_graph = http_request.app.state.jarvis_graph
     db_client = getattr(http_request.app.state, "db_client", None)
@@ -1289,17 +1292,19 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     # One checkpoint thread per (user, session). The user prefix matters:
     # _load_context rebuilds the UserModel facade from the checkpointed user_id,
     # so a session-only key would let a resumed turn rebuild another user's facade.
-    graph_config = {"configurable": {"thread_id": make_thread_id(request.user_id, session_id)}}
+    thread_id = make_thread_id(request.user_id, session_id)
+    graph_config = {"configurable": {"thread_id": thread_id}}
 
-    try:
-        _existing = await jarvis_graph.aget_state(graph_config)
-        _resumed = bool(_existing and getattr(_existing, "values", None))
-    except Exception as _e:
-        print(f"[chat/v2] Checkpoint lookup failed ({_e}) — starting a fresh thread")
-        _resumed = False
-    if not _resumed:
-        initial_state["conversation_phase"] = ConversationPhase.GREETING
-        initial_state["negotiation_state"] = NegotiationPhase.NONE
+    async def _seed_if_fresh_thread() -> None:
+        try:
+            _existing = await jarvis_graph.aget_state(graph_config)
+            _resumed = bool(_existing and getattr(_existing, "values", None))
+        except Exception as _e:
+            print(f"[chat/v2] Checkpoint lookup failed ({_e}) — starting a fresh thread")
+            _resumed = False
+        if not _resumed:
+            initial_state["conversation_phase"] = ConversationPhase.GREETING
+            initial_state["negotiation_state"] = NegotiationPhase.NONE
 
     async def event_gen():
         import app.core.config as _cfg
@@ -1320,8 +1325,14 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
         async def _pump_graph():
             try:
-                async for _ev in jarvis_graph.astream(initial_state, config=graph_config):
-                    progress_queue.put_nowait((_NODE, _ev))
+                # One turn at a time per conversation: a second tab's turn on this
+                # thread queues here until this graph run is over (finished, failed,
+                # or cancelled by a disconnect). The checkpoint is read under the
+                # lock too, so a queued turn sees what the turn before it left.
+                async with thread_lock(thread_id):
+                    await _seed_if_fresh_thread()
+                    async for _ev in jarvis_graph.astream(initial_state, config=graph_config):
+                        progress_queue.put_nowait((_NODE, _ev))
             except Exception as _exc:
                 progress_queue.put_nowait((_ERROR, _exc))
             finally:
@@ -1618,8 +1629,21 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             if pump_task is not None and not pump_task.done():
                 pump_task.cancel()
 
+    # Usage attribution, like force_cloud_var: every LLM call of this turn — the
+    # graph pump and every task it starts copy this context — is metered to this
+    # user and session. The stream is consumed after this handler returns, so the
+    # attribution ends in the response's background task, which Starlette runs in
+    # this same context once the last frame is sent or the client has gone.
+    end_attribution = attribute_llm_calls(request.user_id, session_id)
+
+    async def _end_attribution() -> None:
+        # async on purpose: a sync background task runs on a worker thread, in a
+        # copy of this context, where the ContextVar reset would raise.
+        end_attribution()
+
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        background=BackgroundTask(_end_attribution),
     )

@@ -155,6 +155,20 @@ def _clean_runtime_registry():
     runtime.reset_shared_clients()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_llm_chain():
+    """Keep the process-wide LLM chain from leaking between tests.
+
+    ``AppContainer.build`` installs its chain (metered onto that container's bus)
+    as the one ``route_llm_call`` uses; the next test must get the lazy default.
+    """
+    from app.infrastructure.llm.factory import reset_chain
+
+    reset_chain()
+    yield
+    reset_chain()
+
+
 @pytest.fixture
 def mock_supabase():
     """Mock Supabase client that returns empty results by default."""

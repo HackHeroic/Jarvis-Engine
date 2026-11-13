@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, Query, Request
 
+from app.container import AppContainer
 from app.domain import errors
 
 
@@ -34,3 +35,11 @@ def require_supabase(request: Request) -> Any:
     if supabase is None:
         raise errors.PersistenceError("Could not reach the database.")
     return supabase
+
+
+def get_container(request: Request) -> AppContainer:
+    """The composition root the lifespan built (``app.state.container``)."""
+    container = getattr(request.app.state, "container", None)
+    if container is None:
+        raise RuntimeError("No AppContainer on app.state; the lifespan builds it at startup.")
+    return container

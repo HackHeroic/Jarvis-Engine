@@ -24,11 +24,15 @@ HORIZON = "2026-08-08T08:00:00Z"
 
 @pytest.fixture
 def client():
+    import app.core.config as cfg
+    from app.container import AppContainer
     from app.main import app
+    from app.orchestrator.hooks import ActionHooks
     from app.services.draft_store import DraftStore
 
     original_store = getattr(app.state, "draft_store", _UNSET)
     original_db = getattr(app.state, "db_client", _UNSET)
+    original_container = getattr(app.state, "container", _UNSET)
 
     # One FakeSupabase behind both the draft store and the db client, so an
     # accept can be observed writing user_tasks in the same place it reads
@@ -45,12 +49,20 @@ def client():
     )
     app.state.draft_store = store
     app.state.db_client = FakeDBClient(supabase)
+    # The composition root the lifespan builds, over the same client.
+    app.state.container = AppContainer.build(
+        supabase_client=supabase, cfg=cfg, hooks=ActionHooks()
+    )
     app.state._test_draft_id = draft["id"]
     app.state._test_supabase = supabase
 
     yield TestClient(app)
 
-    for name, original in (("draft_store", original_store), ("db_client", original_db)):
+    for name, original in (
+        ("draft_store", original_store),
+        ("db_client", original_db),
+        ("container", original_container),
+    ):
         if original is _UNSET:
             delattr(app.state, name)
         else:
@@ -125,6 +137,26 @@ def test_accept__persists_the_tasks(client):
     # completion_criteria is required on TaskChunk but absent from stored draft
     # tasks — the shared coercer has to fill it or validation would drop them.
     assert all(r["completion_criteria"] for r in rows)
+
+
+def test_accept__publishes_draft_accepted_on_the_container_bus(client):
+    from app.domain.events import DomainEvent, DraftAccepted, EventListener
+
+    class _Recorder(EventListener):
+        def __init__(self) -> None:
+            self.events: list[DomainEvent] = []
+
+        async def handle(self, event: DomainEvent) -> None:
+            self.events.append(event)
+
+    recorder = _Recorder()
+    client.app.state.container.events.subscribe(DraftAccepted, recorder)
+    draft_id = client.app.state._test_draft_id
+
+    client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    (event,) = recorder.events
+    assert (event.user_id, event.draft_id, event.task_count) == ("test_user", draft_id, 2)
 
 
 def test_accept_wrong_user(client):

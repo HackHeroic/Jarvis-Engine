@@ -9,9 +9,10 @@ usage metering.
 """
 
 import contextvars
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, nullcontext
 from enum import Enum
+from types import ModuleType
 from typing import Any, Optional
 
 from pydantic import BaseModel
@@ -19,7 +20,7 @@ from pydantic import BaseModel
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
-from app.domain.events import NullEventBus
+from app.domain.events import EventBus, NullEventBus
 from app.domain.ports import LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.decorators import redacting_with
@@ -32,6 +33,32 @@ from app.orchestrator.hooks import ActionHooks, HookDecision, get_hooks
 force_cloud_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "force_cloud_var", default=False
 )
+
+# Who the LLM calls made in this context are for, stamped on every LLMRequest so the
+# usage ledger can attribute them. Set per turn by chat.py via attribute_llm_calls.
+current_user_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_current_user", default=None
+)
+current_session_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_current_session", default=None
+)
+
+
+def attribute_llm_calls(user_id: str | None, session_id: str | None) -> Callable[[], None]:
+    """Attribute every LLM call made from the current context to this user and session.
+
+    Tasks started from the context afterwards copy the attribution. Returns the undo,
+    which restores what was there and must be called once, from this same context
+    (a ``ContextVar`` reset raises anywhere else).
+    """
+    user_token = current_user_var.set(user_id)
+    session_token = current_session_var.set(session_id)
+
+    def undo() -> None:
+        current_session_var.reset(session_token)
+        current_user_var.reset(user_token)
+
+    return undo
 
 
 class PreCloudLLMRedactor:
@@ -60,15 +87,25 @@ class PreCloudLLMRedactor:
         return redacted, result.redactions or int(redacted != text)
 
 
+def build_chain(cfg: ModuleType, hooks: ActionHooks, bus: EventBus) -> FallbackChainProvider:
+    """Build the provider chain: cloud sends gated by ``hooks``' PreCloudLLM, usage published on ``bus``.
+
+    The one recipe for the chain. The composition root (``AppContainer.build``) and
+    ``get_chain``'s lazy default both use it, so they cannot drift apart.
+    """
+    return LLMProviderFactory.build(cfg, PreCloudLLMRedactor(hooks), bus)
+
+
 def get_chain() -> FallbackChainProvider:
     """Return the process-wide provider chain, building the default one on first use.
 
-    The default gates cloud sends with the process-wide hooks and publishes usage
-    nowhere. The composition root (or a test) replaces it with ``set_chain``.
+    The lazy default (no container: tests, scripts) gates cloud sends with the
+    process-wide hooks and publishes usage nowhere. At startup the composition root
+    installs its own chain, metered onto its event bus, with ``set_chain``.
     """
     chain = current_chain()
     if chain is None:
-        chain = LLMProviderFactory.build(_cfg, PreCloudLLMRedactor(get_hooks()), NullEventBus())
+        chain = build_chain(_cfg, get_hooks(), NullEventBus())
         set_chain(chain)
     return chain
 
@@ -149,6 +186,9 @@ async def route_llm_call(
     ``hooks``, when given, gates this call's cloud sends instead of the chain's own
     PreCloudLLM gate (the process-wide ``get_hooks()``).
 
+    The request carries the user and session ``attribute_llm_calls`` set for this
+    context, so the usage ledger knows whom the call was for.
+
     Raises ``RuntimeError`` when every reachable provider failed and no cloud
     provider is configured, and ``LLMUnavailableError`` when cloud ones failed too.
     """
@@ -171,6 +211,8 @@ async def route_llm_call(
         conversation_history=conversation_history,
         response_schema=response_schema,
         timeout_s=_cfg.LLM_STREAM_TIMEOUT_SECONDS if stream else _cfg.LLM_TIMEOUT_SECONDS,
+        user_id=current_user_var.get(),
+        session_id=current_session_var.get(),
     )
 
     chain = get_chain()
