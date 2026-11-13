@@ -10,6 +10,7 @@ import inspect
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any, Optional
 
 import pytest
@@ -89,6 +90,8 @@ class FakeProvider(LLMProvider):
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
         self.calls.append(req)
+        if self._tokens:
+            report_token_usage(*self._tokens)
         for item in self._next([("content", f"{self.name}-token")]):
             if isinstance(item, BaseException):
                 raise item
@@ -1331,3 +1334,73 @@ async def test_chain__fall_over_on_schema_error__log_omits_the_model_reply(caplo
     text = caplog.records[-1].getMessage()
     assert "ValidationError: color: missing" in text
     assert "madhav@example.com" not in text
+
+
+# --- fix round 1: billed-but-failed calls reach the ledger --------------------
+
+
+@pytest.mark.asyncio
+async def test_metered__billed_call_then_error__published_and_error_raised():
+    """A reply cut off at max_tokens is paid for even though it is not an answer."""
+    inner = FakeProvider(
+        "claude", LLMLocation.CLOUD, [LLMOutputParseError("cut off")], tokens=(500, 8000, 120)
+    )
+    bus, recorder = _recording_bus()
+
+    with pytest.raises(LLMOutputParseError):
+        await MeteredProvider(inner, bus, lambda role: "m").complete(_req())
+
+    (event,) = recorder.events
+    usage = event.usage
+    assert (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens) == (500, 8000, 120)
+    assert usage.provider == "claude"
+
+
+@pytest.mark.asyncio
+async def test_metered__stream_abandoned_after_two_tokens__billed_usage_published():
+    inner = FakeProvider(
+        "claude",
+        LLMLocation.CLOUD,
+        [[("content", "a"), ("content", "b"), ("content", "c")]],
+        tokens=(40, 3, 0),
+    )
+    bus, recorder = _recording_bus()
+    received: list[tuple[str, str]] = []
+
+    async with aclosing(MeteredProvider(inner, bus, lambda role: "m").stream(_req())) as tokens:
+        async for item in tokens:
+            received.append(item)
+            if len(received) == 2:
+                break
+
+    assert received == [("content", "a"), ("content", "b")]
+    (event,) = recorder.events
+    assert (event.usage.input_tokens, event.usage.output_tokens) == (40, 3)
+
+
+@pytest.mark.asyncio
+async def test_metered__stream_fails_midway_after_billing__published_and_error_raised():
+    inner = FakeProvider(
+        "claude",
+        LLMLocation.CLOUD,
+        [[("content", "half"), LLMUnavailableError("dropped")]],
+        tokens=(10, 2, 0),
+    )
+    bus, recorder = _recording_bus()
+
+    with pytest.raises(LLMUnavailableError, match="dropped"):
+        await _collect(MeteredProvider(inner, bus, lambda role: "m").stream(_req()))
+
+    (event,) = recorder.events
+    assert (event.usage.input_tokens, event.usage.output_tokens) == (10, 2)
+
+
+@pytest.mark.asyncio
+async def test_metered__stream_fails_without_tokens__publishes_nothing():
+    inner = FakeProvider(outcomes=[[("content", "half"), LLMUnavailableError("dropped")]])
+    bus, recorder = _recording_bus()
+
+    with pytest.raises(LLMUnavailableError):
+        await _collect(MeteredProvider(inner, bus, lambda role: "m").stream(_req()))
+
+    assert recorder.events == []
