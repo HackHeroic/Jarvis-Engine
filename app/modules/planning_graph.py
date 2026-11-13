@@ -3,7 +3,7 @@
 import asyncio
 import operator
 from typing import Annotated, Any, Optional, TypedDict
-from app.core.config import SOLVER_MAX_TIME_SECONDS
+from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
 # Shared with the orchestrator's draft_action node and the /drafts REST API —
@@ -135,6 +135,29 @@ async def expand_slots(state: PlanningState) -> dict:
         return {"time_slots": []}
 
 
+def _on_every_day(slots: list[dict]) -> list[dict]:
+    """Repeat each standing rule's one-day window on every day a plan can cover.
+
+    The bridge emits each rule once, in day 0's minutes, marked ``recurring`` — but
+    nothing downstream expands it, so "no study before 11 AM" held on the first day
+    only and day two started at 08:00. Repeated out to MAX_HORIZON_MINUTES, not the
+    first attempt's horizon: the INFEASIBLE ladder can stretch a plan to 30 days and
+    these slots are not rebuilt per attempt. Copies past an attempt's horizon
+    constrain nothing.
+    """
+    days = MAX_HORIZON_MINUTES // 1440
+    return [
+        {
+            **slot,
+            "name": f"{slot['name']}_d{day}",
+            "start_min": slot["start_min"] + day * 1440,
+            "end_min": slot["end_min"] + day * 1440,
+        }
+        for slot in slots
+        for day in range(days)
+    ]
+
+
 async def memory_to_constraints(state: PlanningState) -> dict:
     """Convert PEARL behavioral patterns into time slot constraints for OR-Tools."""
     user_model = state.get("user_model")
@@ -150,7 +173,9 @@ async def memory_to_constraints(state: PlanningState) -> dict:
         slots = await asyncio.to_thread(memories_to_constraints, user_id, memory_store)
         if not slots:
             return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
-        extra = [s.model_dump() if hasattr(s, 'model_dump') else s for s in slots]
+        extra = _on_every_day(
+            [s.model_dump() if hasattr(s, 'model_dump') else s for s in slots]
+        )
         # Reducer _merge_lists handles combining with expand_slots output
         return {
             "time_slots": extra,
