@@ -3,6 +3,8 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.api.deps import CurrentUser, require_supabase
+from app.domain import errors
 from app.services.analytical.sm2_engine import get_due_trackers, record_completion
 
 router = APIRouter()
@@ -23,24 +25,20 @@ async def complete_tracker(
     tracker_id: str,
     body: TrackerCompleteRequest,
     http_request: Request,
-    user_id: str = Query(None, description="User ID (optional, for multi-tenant IDOR protection)"),
+    user: CurrentUser,
 ) -> dict:
-    """Record completion and update SM-2 state."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    """Record completion and update SM-2 state on one of the caller's trackers."""
+    supabase = require_supabase(http_request)
     result = await record_completion(
         tracker_id=tracker_id,
         quality=body.quality,
-        user_id=user_id,
+        user_id=user,
         supabase_client=supabase,
     )
     if result.get("status") == "error":
-        reason = result.get("reason", "")
-        if "not found" in reason.lower():
-            raise HTTPException(status_code=404, detail="Tracker not found")
-        if "forbidden" in reason.lower():
-            raise HTTPException(status_code=403, detail="Forbidden")
-        raise HTTPException(status_code=500, detail=reason or "Completion failed")
+        if result.get("reason") == "not found":
+            raise errors.NotFoundError("Tracker not found.")
+        raise errors.PersistenceError("Could not reach the database.")
     return {
         "next_review_date": result.get("next_review_date"),
         "next_interval_days": result.get("next_interval_days"),

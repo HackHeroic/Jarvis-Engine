@@ -1,12 +1,14 @@
 """Semantic Router endpoint for intent classification and autonomous extraction pipeline."""
 
 import base64
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 import app.core.config as _cfg
+from app.api.deps import CurrentUser, require_supabase
+from app.domain import errors
 from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
 from app.services.extraction.behavioral_store import delete_behavioral_constraint
@@ -156,23 +158,43 @@ async def process_full_pipeline(
     "/pending-calendar",
     summary="List pending calendar updates",
 )
-async def list_pending_calendar(
-    http_request: Request,
-    user_id: Optional[str] = None,
-) -> dict:
-    """List pending calendar updates for approval."""
-    db_client = getattr(http_request.app.state, "db_client", None) if http_request else None
-    if not db_client or not hasattr(db_client, "supabase"):
-        return {"pending": []}
-    supabase = db_client.supabase
+async def list_pending_calendar(http_request: Request, user: CurrentUser) -> dict:
+    """List the caller's pending calendar updates awaiting approval."""
+    supabase = require_supabase(http_request)
     try:
-        query = supabase.table("pending_calendar_updates").select("*").eq("status", "pending")
-        if user_id:
-            query = query.eq("user_id", user_id)
-        result = query.execute()
-        return {"pending": result.data or []}
-    except Exception:
-        return {"pending": []}
+        result = (
+            supabase.table("pending_calendar_updates")
+            .select("*")
+            .eq("user_id", user)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as exc:
+        raise errors.PersistenceError("Could not reach the database.") from exc
+    return {"pending": result.data or []}
+
+
+def _resolve_pending_calendar(
+    supabase: Any, pending_id: str, user: str, status: str
+) -> dict:
+    """Flip one of the caller's pending rows to ``status``; NotFoundError if none matched.
+
+    Another user's row matches nothing, so it is indistinguishable from a missing one.
+    """
+    try:
+        result = (
+            supabase.table("pending_calendar_updates")
+            .update({"status": status})
+            .eq("id", pending_id)
+            .eq("user_id", user)
+            .eq("status", "pending")
+            .execute()
+        )
+    except Exception as exc:
+        raise errors.PersistenceError("Could not reach the database.") from exc
+    if not result.data:
+        raise errors.NotFoundError("Pending update not found or already processed.")
+    return result.data[0]
 
 
 @router.post(
@@ -182,34 +204,17 @@ async def list_pending_calendar(
 async def approve_pending_calendar(
     pending_id: str,
     http_request: Request,
+    user: CurrentUser,
 ) -> dict:
-    """Approve a pending calendar update. Returns daily_context for schedule."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    if not db_client or not hasattr(db_client, "supabase"):
-        raise HTTPException(status_code=503, detail="Database not available")
-    supabase = db_client.supabase
-    try:
-        result = (
-            supabase.table("pending_calendar_updates")
-            .update({"status": "approved"})
-            .eq("id", pending_id)
-            .eq("status", "pending")
-            .select("*")
-            .execute()
-        )
-        if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=404, detail="Pending update not found or already processed")
-        row = result.data[0]
-        slots = row.get("extracted_slots", [])
-        daily_context = [TimeSlot.model_validate(s) for s in slots]
-        return {
-            "status": "approved",
-            "daily_context": [s.model_dump() for s in daily_context],
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    """Approve one of the caller's pending calendar updates. Returns daily_context for schedule."""
+    supabase = require_supabase(http_request)
+    row = _resolve_pending_calendar(supabase, pending_id, user, "approved")
+    slots = row.get("extracted_slots") or []
+    daily_context = [TimeSlot.model_validate(s) for s in slots]
+    return {
+        "status": "approved",
+        "daily_context": [s.model_dump() for s in daily_context],
+    }
 
 
 @router.post(
@@ -219,28 +224,12 @@ async def approve_pending_calendar(
 async def reject_pending_calendar(
     pending_id: str,
     http_request: Request,
+    user: CurrentUser,
 ) -> dict:
-    """Reject a pending calendar update."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    if not db_client or not hasattr(db_client, "supabase"):
-        raise HTTPException(status_code=503, detail="Database not available")
-    supabase = db_client.supabase
-    try:
-        result = (
-            supabase.table("pending_calendar_updates")
-            .update({"status": "rejected"})
-            .eq("id", pending_id)
-            .eq("status", "pending")
-            .select("*")
-            .execute()
-        )
-        if not result.data or len(result.data) == 0:
-            raise HTTPException(status_code=404, detail="Pending update not found or already processed")
-        return {"status": "rejected"}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    """Reject one of the caller's pending calendar updates."""
+    supabase = require_supabase(http_request)
+    _resolve_pending_calendar(supabase, pending_id, user, "rejected")
+    return {"status": "rejected"}
 
 
 @router.delete(
