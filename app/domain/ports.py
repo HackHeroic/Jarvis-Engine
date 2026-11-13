@@ -1,0 +1,252 @@
+"""Abstract ports the domain depends on; infrastructure provides the implementations.
+
+Every per-user repository method takes ``user_id`` first and only ever sees that user's
+rows. The two exceptions are ``ProfileRepository.list_user_ids`` (enumerates users) and
+``UsageRepository.record`` (the event carries its own, possibly absent, ``user_id``).
+"""
+
+# Postponed annotations: SuggestionRepository defines a method named ``list``, which
+# would otherwise shadow the builtin in annotations evaluated later in that class body.
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from datetime import date, datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.domain.entities import (
+    BehavioralConstraint,
+    DraftSchedule,
+    DraftStatus,
+    LLMLocation,
+    LLMUsageEvent,
+    Suggestion,
+    SuggestionStatus,
+    Task,
+    TaskEvent,
+    TaskEventType,
+    TaskStatus,
+    UserProfile,
+)
+
+# --- Repositories -----------------------------------------------------------
+
+
+class TaskRepository(ABC):
+    """Storage for the user's committed tasks."""
+
+    @abstractmethod
+    async def list_pending(self, user_id: str) -> list[Task]:
+        """Return the user's tasks whose status is PENDING."""
+
+    @abstractmethod
+    async def get(self, user_id: str, task_id: str) -> Task | None:
+        """Return the user's task with this task_id, or None."""
+
+    @abstractmethod
+    async def list_scheduled_between(
+        self, user_id: str, start: datetime, end: datetime
+    ) -> list[Task]:
+        """Return the user's tasks scheduled within [start, end)."""
+
+    @abstractmethod
+    async def update_status(
+        self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
+    ) -> Task:
+        """Set the status if it is ``expected`` (when given); NotFoundError / StaleVersionError."""
+
+    @abstractmethod
+    async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:
+        """Move the task to a new [start, end) slot and return it; raise NotFoundError if absent."""
+
+
+class TaskEventRepository(ABC):
+    """Append-only log of what happened to the user's tasks."""
+
+    @abstractmethod
+    async def append(self, user_id: str, event: TaskEvent) -> TaskEvent:
+        """Store the event and return it as persisted (with its id)."""
+
+    @abstractmethod
+    async def list_for_user(
+        self,
+        user_id: str,
+        *,
+        since: datetime | None = None,
+        types: set[TaskEventType] | None = None,
+    ) -> list[TaskEvent]:
+        """Return the user's events oldest first, optionally filtered by ``since`` and ``types``."""
+
+
+class DraftRepository(ABC):
+    """Storage for draft schedules under review."""
+
+    @abstractmethod
+    async def create(
+        self,
+        user_id: str,
+        *,
+        tasks: list[dict],
+        horizon_start: str | None,
+        goal_id: str | None,
+        schedule: dict | None,
+    ) -> DraftSchedule:
+        """Store a new PENDING draft and return it."""
+
+    @abstractmethod
+    async def get(self, user_id: str, draft_id: str) -> DraftSchedule | None:
+        """Return the user's draft with this id, or None."""
+
+    @abstractmethod
+    async def get_open(self, user_id: str) -> DraftSchedule | None:
+        """Return the user's newest PENDING or MODIFIED draft, or None."""
+
+    @abstractmethod
+    async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
+        """Replace the draft's tasks and return the updated draft."""
+
+    @abstractmethod
+    async def set_status(
+        self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
+    ) -> DraftSchedule:
+        """Move the draft to ``to`` if DRAFT_TRANSITIONS allows it; else InvalidStateTransition."""
+
+    @abstractmethod
+    async def accept_atomic(self, user_id: str, draft_id: str, rows: list[dict]) -> int:
+        """Atomically write ``rows`` and mark the draft ACCEPTED; return rows written.
+
+        Raises InvalidStateTransition if the draft is not open or has expired.
+        """
+
+
+class ConstraintRepository(ABC):
+    """Storage for the user's behavioural constraints."""
+
+    @abstractmethod
+    async def list_active(self, user_id: str) -> list[BehavioralConstraint]:
+        """Return the user's constraints that currently apply."""
+
+    @abstractmethod
+    async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
+        """Store a constraint and return it as persisted."""
+
+    @abstractmethod
+    async def delete(self, user_id: str, constraint_id: str) -> bool:
+        """Delete the user's constraint; return whether one was deleted."""
+
+
+class ProfileRepository(ABC):
+    """Storage for user profiles."""
+
+    @abstractmethod
+    async def get_or_create(self, user_id: str) -> UserProfile:
+        """Return the user's profile, creating it with defaults if absent."""
+
+    @abstractmethod
+    async def update(self, user_id: str, **fields: Any) -> UserProfile:
+        """Update the given profile fields and return the profile."""
+
+    @abstractmethod
+    async def list_user_ids(self) -> list[str]:
+        """Return the ids of every user with a profile."""
+
+
+class SuggestionRepository(ABC):
+    """Storage for proactive suggestions."""
+
+    @abstractmethod
+    async def add(self, user_id: str, s: Suggestion) -> Suggestion:
+        """Store a suggestion and return it as persisted (with its id)."""
+
+    @abstractmethod
+    async def list(
+        self, user_id: str, *, status: SuggestionStatus | None = None
+    ) -> list[Suggestion]:
+        """Return the user's suggestions, optionally only those with ``status``."""
+
+    @abstractmethod
+    async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
+        """Return the user's suggestion with this id, or None."""
+
+    @abstractmethod
+    async def set_status(
+        self, user_id: str, suggestion_id: str, to: SuggestionStatus
+    ) -> Suggestion:
+        """Set the suggestion's status and return it; raise NotFoundError if absent."""
+
+    @abstractmethod
+    async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
+        """Return whether ``trigger`` already produced a suggestion for the user on ``day``."""
+
+
+class UsageRepository(ABC):
+    """Ledger of language-model calls."""
+
+    @abstractmethod
+    async def record(self, event: LLMUsageEvent) -> None:
+        """Store one usage event."""
+
+    @abstractmethod
+    async def summary(self, user_id: str, *, since: datetime | None = None) -> dict:
+        """Return local_calls, cloud_calls, input_tokens, output_tokens, pii_redactions totals."""
+
+
+# --- Language models --------------------------------------------------------
+
+
+class LLMRequest(BaseModel):
+    """One request to a language model, independent of which provider serves it."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    task: str = Field(description="Routing task name (e.g. socratic_chunker).")
+    role: Literal["primary", "fast", "cloud"] = Field(description="Model role the task maps to.")
+    prompt: str = Field(description="The user-turn prompt.")
+    system_prompt: str = Field(default="", description="System instructions for the model.")
+    conversation_history: list[dict] | None = Field(
+        default=None, description="Prior chat messages ({role, content}) to send before the prompt."
+    )
+    response_schema: type[BaseModel] | None = Field(
+        default=None,
+        description="Pydantic model class the answer must parse into; None for free text.",
+    )
+    timeout_s: float = Field(default=60.0, description="Seconds before the call is abandoned.")
+    user_id: str | None = Field(
+        default=None, description="User the call is made for, for usage accounting."
+    )
+    session_id: str | None = Field(
+        default=None, description="Chat session the call belongs to, for usage accounting."
+    )
+
+
+class LLMProvider(ABC):
+    """A source of language-model completions (Strategy)."""
+
+    name: str
+    location: LLMLocation
+
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Return cheaply, without I/O, whether this provider can be tried right now."""
+
+    @abstractmethod
+    async def complete(self, req: LLMRequest) -> str | BaseModel:
+        """Return the completion: an instance of req.response_schema when set, else text."""
+
+    @abstractmethod
+    def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
+        """Yield (event_type, token) pairs as they arrive; req.response_schema must be None."""
+
+
+class RetryPolicy(ABC):
+    """Decides whether and when a failed call is retried (Strategy)."""
+
+    @abstractmethod
+    def should_retry(self, error: Exception, attempt: int) -> bool:
+        """Return whether to try again after ``error`` on attempt number ``attempt``."""
+
+    @abstractmethod
+    def delay(self, attempt: int) -> float:
+        """Return seconds to wait before retry number ``attempt``."""
