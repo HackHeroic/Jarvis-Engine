@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
 
     def _force_gemini_only(reason: str) -> None:
         _cfg.GEMINI_PRIMARY = True
-        print(f" ⚠️  {reason} — all LLM calls will use Gemini cloud")
+        print(f" ⚠️  {reason} — all LLM calls will use the cloud providers")
 
     detect_result = _cfg.detect_loaded_models()
     if detect_result.get("error") or detect_result.get("warning"):
@@ -104,6 +104,19 @@ async def lifespan(app: FastAPI):
             print(f"    FAST    → {_cfg.GEMMA_FAST_MODEL}  (single-model fallback; same as primary)")
         else:
             print(f"    FAST    → {_cfg.GEMMA_FAST_MODEL}")
+
+    # Which language models will answer, in the order they are tried. CLAUDE_PRIMARY
+    # (like GEMINI_PRIMARY) makes the local provider report itself unavailable.
+    from app.infrastructure.llm.factory import get_chain
+
+    live = [p.name for p in get_chain().providers if p.is_available()]
+    if _cfg.CLAUDE_PRIMARY:
+        print(" ☁️  CLAUDE_PRIMARY on — local models skipped")
+        if "claude" not in live:
+            print("   → no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN set; Claude cannot answer")
+    if "claude" in live:
+        print(f"    CLAUDE  → {_cfg.CLAUDE_MODEL}")
+    print(f" ✅ LLM providers live, in order: {' → '.join(live) or 'none'}")
 
     try:
         yield

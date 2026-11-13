@@ -83,3 +83,9 @@ class LLMUnavailableError(LLMError):
 
 class LLMOutputParseError(LLMError):
     code = "llm_output_parse"
+
+
+class LLMRefusedError(LLMError):
+    """The model declined the request. Another provider may answer; asking this one again won't."""
+
+    code = "llm_refused"

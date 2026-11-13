@@ -5,6 +5,7 @@ from types import ModuleType
 from app.domain.events import EventBus, NullEventBus
 from app.domain.ports import LLMProvider
 from app.infrastructure.llm.chain import FallbackChainProvider
+from app.infrastructure.llm.claude import ClaudeProvider
 from app.infrastructure.llm.decorators import (
     MeteredProvider,
     RedactingProvider,
@@ -36,9 +37,10 @@ class LLMProviderFactory:
         bus: EventBus,
         extra_cloud: list[LLMProvider] | None = None,
     ) -> FallbackChainProvider:
-        """Return ``[local, *extra_cloud, gemini]``, each wrapped for its location.
+        """Return ``[local, claude, *extra_cloud, gemini]``, each wrapped for its location.
 
-        Cloud providers: Redacting → Retrying → Timeout → Metered. Local: Timeout →
+        Claude is left out when no Anthropic credential is configured. Cloud
+        providers: Redacting → Retrying → Timeout → Metered. Local: Timeout →
         Metered (no redaction — the prompt never leaves the machine — and no retry —
         a dead LM Studio should hand over to the cloud at once).
         """
@@ -46,7 +48,9 @@ class LLMProviderFactory:
         providers: list[LLMProvider] = [
             TimeoutProvider(MeteredProvider(local, bus, local.model_for_role))
         ]
-        for cloud in [*(extra_cloud or []), GeminiProvider(cfg)]:
+        claude = ClaudeProvider(cfg)
+        first_cloud = [claude] if claude.is_available() else []
+        for cloud in [*first_cloud, *(extra_cloud or []), GeminiProvider(cfg)]:
             providers.append(_wrap_cloud(cloud, hooks, bus))
         return FallbackChainProvider(providers)
 

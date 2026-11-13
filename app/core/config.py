@@ -41,12 +41,17 @@ _raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
 GEMINI_PRIMARY: bool = os.getenv("GEMINI_PRIMARY", "false").lower() == "true"
 
-# Claude cloud tier. The provider itself arrives with the Claude task; these are read
-# now so the provider chain can honour CLAUDE_PRIMARY (skip local) from the start.
-ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_AUTH_TOKEN: str = os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+# Claude cloud tier (app/infrastructure/llm/claude.py), tried before Gemini whenever a
+# credential is set. An API key wins over an auth token when both are set.
+# CLAUDE_PRIMARY skips the local model on every call, as GEMINI_PRIMARY does.
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_AUTH_TOKEN: str = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
 CLAUDE_PRIMARY: bool = os.getenv("CLAUDE_PRIMARY", "false").lower() == "true"
+# The one place the Claude model id is named.
 CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+# Thinking effort per model role. Effort is the main lever on Claude's token spend:
+# low for classification and short replies, medium for decomposition and research.
+CLAUDE_EFFORT_BY_ROLE: dict[str, str] = {"fast": "low", "primary": "medium", "cloud": "medium"}
 
 # Seconds before a language-model call is abandoned. Applied twice on purpose: as the
 # transport's own timeout, and as a hard ceiling around the provider call. For a
