@@ -491,8 +491,8 @@ def _record_completion_signal(
 ) -> None:
     """Record a task completion signal for future DKT/RL input.
 
-    Stores in a lightweight signals table. If the table doesn't exist yet,
-    silently skip (the signal collection is forward-looking).
+    Writes only the columns ``task_completion_signals`` has; the actual duration
+    rides in ``metadata``. A failed write is logged and never fails the completion.
     """
     if not supabase:
         return
@@ -500,13 +500,13 @@ def _record_completion_signal(
         supabase.table("task_completion_signals").insert({
             "user_id": user_id,
             "task_id": task_id,
+            "signal_type": "completed",
             "quality": quality,
-            "actual_duration_minutes": actual_duration_minutes,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {"actual_duration_minutes": actual_duration_minutes},
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
-    except Exception:
-        # Table may not exist yet; silently skip
-        pass
+    except Exception as exc:
+        logger.warning(f"Failed to record completion signal for task {task_id}: {exc}")
 
 
 async def _try_trigger_replan(
