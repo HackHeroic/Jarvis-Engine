@@ -442,3 +442,20 @@ Also in this task — **one turn at a time per conversation** (spec §10b): `app
 - [ ] Migration applied (Task 7 Step 6) and `scripts/smoke_claude.py` passes.
 - [ ] One live turn through `/api/v1/chat/v2/stream` with `CLAUDE_PRIMARY=true`: brain dump → draft → accept → second accept returns 409 → `llm_usage_events` has rows with `provider = 'claude'` and non-zero `cache_read_tokens` on the second turn.
 - [ ] Update `docs/PROJECT_STATUS.md` (test count, provider chain, new layers) and commit.
+
+### Task 12: Behaviour test suites (Madhav's request, 2026-11-14)
+
+**Files:**
+- Create: `tests/behaviour/__init__.py`, `tests/behaviour/test_chat_turns.py`, `tests/behaviour/test_short_term_memory.py`, `tests/behaviour/test_long_term_memory.py`, `tests/behaviour/test_psychology.py`, `tests/behaviour/test_learning.py`, `scripts/live_e2e.py`
+- Modify: only if a test exposes a real defect — fix it in the owning module and say so in the report.
+
+All offline (FakeSupabase / InMemory repos, scripted fake LLM chain via `set_chain`), real CP-SAT solver, real Pydantic parsing. Each test asserts observable behaviour. First read the existing tests for the same areas (`test_memory_*.py`, `test_pearl*.py`, `test_planning_graph.py`, `test_orchestrator.py`, `test_checkpointer.py`) and do not duplicate what they already pin — add what is missing from the list below and name, in the report, which existing test covers any item you skip.
+
+- **Chat turns:** brain dump → planning module → draft proposed (nothing in `user_tasks`); "looks good" → accepted and persisted; second "looks good" → "already locked in" and no duplicate rows; greeting takes the no-LLM fast path (fake chain call count 0); a resumed turn on the same thread id sees the draft from the previous turn (checkpointer); two different users never see each other's draft.
+- **Short-term (working) memory:** `build_context_messages` returns the last 10 messages in order; older messages are summarised by the placeholder, not silently dropped mid-list; a new session starts with no carry-over; uploaded file bytes are scrubbed from checkpoints.
+- **Long-term memory:** a fact extracted in session A appears in `build_memory_context` for session B; a contradicting fact supersedes the old one (`superseded_by` set, old one excluded from context); forget removes it from context; dismiss vs confirm change `confidence`; strength decays with time since last use (SM-2) and a memory below the retention floor is dropped from context; another user's memories are never returned.
+- **Psychology:** TMT — of two equal tasks the earlier deadline is scheduled first; CLT — daily minutes never exceed `compute_adaptive_daily_cap`, and high intrinsic load lowers the cap by ×0.8; every decomposed `TaskChunk` has a non-empty `implementation_intention` (WOOP if-then); tasks are ≤ 25 minutes; missed-task and INFEASIBLE messages contain none of a blame-word list (`failed`, `you didn't`, `you missed`, `behind`, `lazy`, `should have`); the coach reply for a progress check references mastery/progress terms and never a peer comparison; nothing is scheduled between 00:00 and 08:00 without a sleep habit.
+- **Learning:** PEARL detects a time-window avoidance pattern from ≥ 3 skip observations at ≥ 0.7 rate and not from 2; a stored constraint from the memory → constraint bridge moves the next schedule out of the blocked window.
+- **`scripts/live_e2e.py`** (not run by pytest; network): against the real backend on localhost with real Supabase and the real LLM chain, runs brain dump → draft → accept → double accept (expects 409) → teach rule → re-plan (schedule moved) → memory recalled in a new session → forget → usage receipt shows cloud calls; prints a pass/fail table and exits non-zero on any fail. Uses a dedicated user id `e2e-<date>` and deletes its rows at the end.
+
+- [ ] Write the tests (RED where the behaviour is missing, otherwise confirm GREEN and note it), fix real defects found, full suite green, commit `test: behaviour suites for chat, memory, psychology and learning`.
