@@ -1258,9 +1258,11 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "execution_graph": None,
         "schedule": None,
         # Live store in, draft id out: planning's create_draft step fills
-        # draft_id, which the SSE payload below reports to the UI.
+        # draft_id, which the SSE payload below reports to the UI. draft_id is
+        # deliberately absent, like the phase fields below: a resumed thread's
+        # "looks good" must resolve the draft that thread proposed, and a None
+        # here would overwrite it (accepting the user's newest draft instead).
         "draft_store": getattr(http_request.app.state, "draft_store", None),
-        "draft_id": None,
         "saved_constraints": None,
         "draft_response": None,
         "research_results": None,
@@ -1305,6 +1307,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         if not _resumed:
             initial_state["conversation_phase"] = ConversationPhase.GREETING
             initial_state["negotiation_state"] = NegotiationPhase.NONE
+            initial_state["draft_id"] = None
 
     async def event_gen():
         import app.core.config as _cfg
@@ -1576,13 +1579,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 supabase,
             )
 
-            # Fire-and-forget memory extraction
-            if memory_store:
-                from app.services.memory.extractor import safe_extract_memories
-                asyncio.create_task(safe_extract_memories(
-                    request.user_id, request.user_prompt, _assistant_msg, memory_store,
-                    db_client=supabase,
-                ))
+            # Memory extraction and PEARL already ran in the graph's observation
+            # loop, which skips greetings. A second extraction here cost an extra
+            # model call on every turn, mined "hi" for memories, and could store a
+            # contradicted fact's replacement twice.
 
             # --- Build full ChatResponse payload ---
             complete_payload = {

@@ -4,7 +4,8 @@
 that the stores actually call: ``table(name).insert(row).execute()``,
 ``.select("*").eq(k, v)...execute()``, ``.update(d).eq(...).execute()``,
 ``.delete().eq(...).execute()``, plus ``.order()`` / ``.limit()``, the
-``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` filters, and
+``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` / ``.gt()`` filters,
+``.is_(column, "null")``, and
 ``rpc("accept_draft", params).execute()``.
 
 It is deliberately a real (if tiny) implementation rather than a MagicMock:
@@ -115,6 +116,15 @@ class _Query:
 
     def lt(self, column: str, value: Any) -> "_Query":
         return self._where(column, value, _compare(lambda a, b: a < b))
+
+    def gt(self, column: str, value: Any) -> "_Query":
+        return self._where(column, value, _compare(lambda a, b: a > b))
+
+    def is_(self, column: str, value: Any) -> "_Query":
+        """PostgREST ``is``: only the SQL NULL test is modelled."""
+        if value not in ("null", None):
+            raise NotImplementedError(f"FakeSupabase models is_(..., 'null') only, not {value!r}")
+        return self._where(column, None, lambda cell, _value: cell is None)
 
     def order(self, column: str, desc: bool = False) -> "_Query":
         self._order = (column, desc)
