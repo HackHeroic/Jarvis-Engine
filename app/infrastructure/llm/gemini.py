@@ -12,10 +12,14 @@ from app.infrastructure.llm.transport import coerce_to_schema, translated_errors
 
 
 class GeminiProvider(LLMProvider):
-    """Gemini via ``litellm_conf.gemini_primary_route`` — the route ``route_llm_call`` used.
+    """Gemini via ``litellm_conf.hybrid_route_query(force_cloud=True)``.
 
-    ``cfg`` is the config module, read at call time. The route is looked up on its
-    module at call time so tests that patch ``litellm_conf`` functions reach it.
+    Not ``gemini_primary_route``: that retries a failed cloud call on the local model
+    inside itself, which hid the real error from the chain, swallowed code bugs, and
+    dialled LM Studio even when the call had to skip it. Fallback belongs to the chain.
+
+    ``cfg`` is the config module, read at call time. The transport is looked up on its
+    module at call time so tests that patch ``litellm_conf.hybrid_route_query`` reach it.
     """
 
     name = "gemini"
@@ -36,10 +40,11 @@ class GeminiProvider(LLMProvider):
         import app.models.brain.litellm_conf as _llm
 
         with translated_errors(parse_errors=(_llm.EmptyLLMResponseError,)):
-            result = await _llm.gemini_primary_route(
+            result = await _llm.hybrid_route_query(
                 user_prompt=req.prompt,
                 system_prompt=req.system_prompt,
                 response_schema=req.response_schema,
+                force_cloud=True,
                 conversation_history=req.conversation_history,
             )
             if req.response_schema is None:
@@ -50,10 +55,11 @@ class GeminiProvider(LLMProvider):
         import app.models.brain.litellm_conf as _llm
 
         with translated_errors():
-            tokens = await _llm.gemini_primary_route(
+            tokens = await _llm.hybrid_route_query(
                 user_prompt=req.prompt,
                 system_prompt=req.system_prompt,
                 response_schema=None,
+                force_cloud=True,
                 conversation_history=req.conversation_history,
                 stream=True,
             )

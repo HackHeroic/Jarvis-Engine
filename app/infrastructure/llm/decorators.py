@@ -1,16 +1,20 @@
 """Decorators that add one concern each around any ``LLMProvider``.
 
 The factory composes them per provider, outermost first:
-cloud ``Redacting → Retrying → Timeout → Metered → adapter``; local
-``Timeout → Metered → adapter``. So redaction happens once before any attempt,
-each retry attempt gets its own timeout, and every attempt that answers is metered.
+cloud ``Redacting → Retrying → Metered → Timeout → adapter``; local
+``Metered → Timeout → adapter``. So redaction happens once before any attempt, each
+retry attempt gets its own timeout, every attempt that answers is metered, and the
+usage event is published after the timed call returned — a slow listener can delay
+the answer but never turn it into a timeout and a second, paid attempt.
 """
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import aclosing
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import aclosing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +23,6 @@ from app.domain.errors import LLMTimeoutError
 from app.domain.events import EventBus, LLMCallCompleted
 from app.domain.ports import LLMProvider, LLMRequest, RetryPolicy
 from app.infrastructure.llm.transport import TokenTally, collecting_tokens
-from app.orchestrator.hooks import ActionHooks, HookDecision
 
 
 class _ProviderDecorator(LLMProvider):
@@ -40,6 +43,33 @@ class _ProviderDecorator(LLMProvider):
         return self._inner.is_available()
 
 
+class Redactor(Protocol):
+    """Removes PII from text bound for a cloud model (the redaction port).
+
+    Returns the text to send and how many spans were redacted. Raises an ``LLMError``
+    when the text must not leave the machine at all.
+    """
+
+    async def redact(self, text: str) -> tuple[str, int]: ...
+
+
+_REDACTOR_OVERRIDE: ContextVar[Redactor | None] = ContextVar("llm_redactor_override", default=None)
+
+
+@contextmanager
+def redacting_with(redactor: Redactor) -> Iterator[None]:
+    """Make every ``RedactingProvider`` use ``redactor`` for calls made inside the block.
+
+    Lets one call bring its own gate without rebuilding the chain. Redaction runs
+    before a provider's first token, so a stream must be started inside the block.
+    """
+    reset = _REDACTOR_OVERRIDE.set(redactor)
+    try:
+        yield
+    finally:
+        _REDACTOR_OVERRIDE.reset(reset)
+
+
 class RedactedLLMRequest(LLMRequest):
     """A request after the PreCloudLLM gate, carrying how many spans it redacted."""
 
@@ -47,28 +77,24 @@ class RedactedLLMRequest(LLMRequest):
 
 
 class RedactingProvider(_ProviderDecorator):
-    """Runs the PreCloudLLM hook over everything sent to a cloud model.
+    """Runs a ``Redactor`` over everything sent to a cloud model.
 
     Covers the prompt, the system prompt and every string ``content`` in the
     conversation history, and builds a new request — the caller's is never mutated.
     Only cloud providers are wrapped: a local model must see the user's own words.
     """
 
-    def __init__(self, inner: LLMProvider, hooks: ActionHooks) -> None:
+    def __init__(self, inner: LLMProvider, redactor: Redactor) -> None:
         if inner.location != LLMLocation.CLOUD:
             raise ValueError(f"RedactingProvider wraps cloud providers only, not {inner.name!r}")
         super().__init__(inner)
-        self._hooks = hooks
+        self._redactor = redactor
 
     async def _redact(self, text: str) -> tuple[str, int]:
         if not text:
             return text, 0
-        result = await self._hooks.execute("PreCloudLLM", prompt=text)
-        if result.decision != HookDecision.MODIFY or not result.modified_input:
-            return text, 0
-        redacted = result.modified_input.get("prompt", text)
-        # A handler that changed the text but did not count its spans still counts once.
-        return redacted, result.redactions or int(redacted != text)
+        redactor = _REDACTOR_OVERRIDE.get() or self._redactor
+        return await redactor.redact(text)
 
     async def _redacted(self, req: LLMRequest) -> RedactedLLMRequest:
         prompt, count = await self._redact(req.prompt)

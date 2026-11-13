@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
 
     # Which language models will answer, in the order they are tried. CLAUDE_PRIMARY
     # (like GEMINI_PRIMARY) makes the local provider report itself unavailable.
-    from app.infrastructure.llm.factory import get_chain
+    from app.core.model_router import get_chain
 
     live = [p.name for p in get_chain().providers if p.is_available()]
     if _cfg.CLAUDE_PRIMARY:

@@ -7,6 +7,7 @@ nothing reaches LiteLLM, LM Studio or a cloud API.
 import asyncio
 import contextvars
 import inspect
+import logging
 import time
 from collections.abc import AsyncIterator
 from typing import Any, Optional
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 import app.core.config as _cfg
 import app.models.brain.litellm_conf as _llm
 from app.domain.entities import LLMLocation
+from app.core.model_router import PreCloudLLMRedactor, get_chain
 from app.domain.errors import (
     LLMError,
     LLMOutputParseError,
@@ -32,17 +34,12 @@ from app.infrastructure.llm.decorators import (
     RetryingProvider,
     TimeoutProvider,
 )
-from app.infrastructure.llm.factory import (
-    LLMProviderFactory,
-    get_chain,
-    reset_chain,
-    set_chain,
-)
+from app.infrastructure.llm.factory import LLMProviderFactory, reset_chain, set_chain
 from app.infrastructure.llm.gemini import GeminiProvider
 from app.infrastructure.llm.local import LocalLMStudioProvider
 from app.infrastructure.llm.retry import ExponentialBackoff, NoRetry
 from app.infrastructure.llm.transport import report_token_usage
-from app.orchestrator.hooks import ActionHooks, register_all_hooks
+from app.orchestrator.hooks import ActionHooks, HookDecision, HookResult, register_all_hooks
 
 # --- fakes --------------------------------------------------------------------
 
@@ -141,6 +138,10 @@ def _pii_hooks() -> ActionHooks:
     hooks = ActionHooks()
     register_all_hooks(hooks)
     return hooks
+
+
+def _pii_redactor() -> PreCloudLLMRedactor:
+    return PreCloudLLMRedactor(_pii_hooks())
 
 
 class _Tiny(BaseModel):
@@ -453,7 +454,7 @@ async def test_redacting__email_in_history_and_system_prompt__redacted():
         conversation_history=history,
     )
 
-    await RedactingProvider(inner, _pii_hooks()).complete(req)
+    await RedactingProvider(inner, _pii_redactor()).complete(req)
 
     sent = inner.calls[0]
     wire = sent.prompt + sent.system_prompt + "".join(m["content"] for m in sent.conversation_history)
@@ -474,7 +475,7 @@ async def test_redacting__counts_redactions():
     inner = FakeProvider(location=LLMLocation.CLOUD)
     bus, recorder = _recording_bus()
     provider = RedactingProvider(
-        MeteredProvider(inner, bus, lambda role: "gemini/gemini-2.5-flash"), _pii_hooks()
+        MeteredProvider(inner, bus, lambda role: "gemini/gemini-2.5-flash"), _pii_redactor()
     )
 
     await provider.complete(
@@ -494,7 +495,7 @@ async def test_redacting__stream__redacted_before_the_send():
     inner = FakeProvider(location=LLMLocation.CLOUD, outcomes=[[("content", "ok")]])
 
     tokens = await _collect(
-        RedactingProvider(inner, _pii_hooks()).stream(_req(prompt="madhav@example.com"))
+        RedactingProvider(inner, _pii_redactor()).stream(_req(prompt="madhav@example.com"))
     )
 
     assert tokens == [("content", "ok")]
@@ -503,7 +504,7 @@ async def test_redacting__stream__redacted_before_the_send():
 
 def test_redacting__local_provider__refused():
     with pytest.raises(ValueError):
-        RedactingProvider(FakeProvider(location=LLMLocation.LOCAL), _pii_hooks())
+        RedactingProvider(FakeProvider(location=LLMLocation.LOCAL), _pii_redactor())
 
 
 # --- metering -------------------------------------------------------------------
@@ -748,20 +749,22 @@ async def test_gemini__no_api_key__unavailable(monkeypatch, offline_cfg):
 
 
 @pytest.mark.asyncio
-async def test_gemini__complete__goes_through_gemini_primary_route(monkeypatch, offline_cfg):
+async def test_gemini__complete__forces_cloud_on_the_transport(monkeypatch, offline_cfg):
     seen: dict = {}
 
-    async def fake_route(**kwargs):
+    async def transport(**kwargs):
         seen.update(kwargs)
         return '```json\n{"color": "red"}\n```'
 
-    monkeypatch.setattr(_llm, "gemini_primary_route", fake_route)
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
 
     result = await GeminiProvider(offline_cfg).complete(
         _req(prompt="p", response_schema=_Tiny, conversation_history=[{"role": "user", "content": "x"}])
     )
 
     assert result == _Tiny(color="red")
+    assert seen["force_cloud"] is True
+    assert seen.get("model_override") is None
     assert seen["user_prompt"] == "p"
     assert seen["conversation_history"] == [{"role": "user", "content": "x"}]
 
@@ -853,7 +856,7 @@ async def test_hybrid_route__usage_on_response__reaches_the_meter(monkeypatch, o
 async def test_factory__order_is_local_extra_cloud_gemini(offline_cfg):
     extra = FakeProvider("claude", LLMLocation.CLOUD)
 
-    chain = LLMProviderFactory.build(offline_cfg, _pii_hooks(), NullEventBus(), extra_cloud=[extra])
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), NullEventBus(), extra_cloud=[extra])
 
     assert [p.name for p in chain.providers] == ["local", "claude", "gemini"]
     assert [p.location for p in chain.providers] == [
@@ -867,7 +870,7 @@ async def test_factory__order_is_local_extra_cloud_gemini(offline_cfg):
 async def test_factory__cloud_provider__redacted_and_metered(offline_cfg):
     extra = FakeProvider("claude", LLMLocation.CLOUD, ["from claude"])
     bus, recorder = _recording_bus()
-    chain = LLMProviderFactory.build(offline_cfg, _pii_hooks(), bus, extra_cloud=[extra])
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), bus, extra_cloud=[extra])
 
     result = await chain.complete(_req(prompt="madhav@example.com"), skip_local=True)
 
@@ -887,7 +890,7 @@ async def test_factory__local_provider__not_redacted(monkeypatch, offline_cfg):
         return "local answer"
 
     monkeypatch.setattr(_llm, "hybrid_route_query", transport)
-    chain = LLMProviderFactory.build(offline_cfg, _pii_hooks(), NullEventBus())
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), NullEventBus())
 
     assert await chain.complete(_req(prompt="madhav@example.com")) == "local answer"
     assert seen["user_prompt"] == "madhav@example.com"
@@ -1025,3 +1028,306 @@ async def test_route_llm_call__stream_with_schema__value_error(offline_cfg):
 
     with pytest.raises(ValueError):
         await route_llm_call(task="voice_of_jarvis", prompt="hi", stream=True, response_schema=_Tiny)
+
+
+# --- fix round 1: Gemini owns no fallback of its own --------------------------
+
+
+def _split_transport(monkeypatch, cloud_outcome: Any) -> dict[str, int]:
+    """Patch the transport: cloud calls (``force_cloud=True``) get ``cloud_outcome``,
+    local calls answer. Returns live call counts per side."""
+    calls = {"local": 0, "cloud": 0}
+
+    async def transport(**kwargs):
+        if kwargs.get("force_cloud"):
+            calls["cloud"] += 1
+            if isinstance(cloud_outcome, BaseException):
+                raise cloud_outcome
+            return cloud_outcome
+        calls["local"] += 1
+        return "local answer"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_gemini__rate_limited__retried_with_backoff_then_answers(monkeypatch, offline_cfg):
+    import litellm
+
+    calls: list[dict] = []
+
+    async def transport(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise litellm.exceptions.RateLimitError(message="429", llm_provider="gemini", model="m")
+        return "from gemini"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    result = await RetryingProvider(
+        GeminiProvider(offline_cfg), ExponentialBackoff(), sleep=fake_sleep
+    ).complete(_req())
+
+    assert result == "from gemini"
+    assert [c["force_cloud"] for c in calls] == [True, True]
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 0.5 * 1.25
+
+
+@pytest.mark.asyncio
+async def test_gemini__failure__one_transport_call_and_no_local_call(monkeypatch, offline_cfg):
+    """gemini_primary_route retried a failed cloud call on the local model inside the adapter."""
+    import litellm
+
+    calls = _split_transport(
+        monkeypatch,
+        litellm.exceptions.ServiceUnavailableError(message="503", llm_provider="gemini", model="m"),
+    )
+
+    with pytest.raises(LLMUnavailableError):
+        await GeminiProvider(offline_cfg).complete(_req())
+
+    assert calls == {"local": 0, "cloud": 1}
+
+
+@pytest.mark.asyncio
+async def test_gemini__programming_error__propagates_and_local_not_called(monkeypatch, offline_cfg):
+    calls = _split_transport(monkeypatch, TypeError("bug in our code"))
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), NullEventBus())
+
+    with pytest.raises(TypeError, match="bug in our code"):
+        await chain.complete(_req(), skip_local=True)
+
+    assert calls == {"local": 0, "cloud": 1}
+
+
+@pytest.mark.asyncio
+async def test_chain__skip_local_and_gemini_fails__local_never_dialled(monkeypatch, offline_cfg):
+    import litellm
+
+    calls = _split_transport(
+        monkeypatch,
+        litellm.exceptions.BadRequestError(message="bad", model="m", llm_provider="gemini"),
+    )
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), NullEventBus())
+
+    with pytest.raises(LLMUnavailableError):
+        await chain.complete(_req(), skip_local=True)
+
+    assert calls == {"local": 0, "cloud": 1}
+
+
+# --- fix round 1: the PII gate fails closed -----------------------------------
+
+
+@pytest.mark.parametrize("decision", [HookDecision.DENY, HookDecision.ASK])
+@pytest.mark.asyncio
+async def test_redactor__hook_denies_or_asks__fails_closed_and_nothing_is_sent(decision):
+    hooks = ActionHooks()
+
+    async def gate(**context):
+        return HookResult(decision=decision, reason="not for the cloud")
+
+    hooks.register("PreCloudLLM", gate)
+    inner = FakeProvider(location=LLMLocation.CLOUD)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    provider = RedactingProvider(
+        RetryingProvider(inner, ExponentialBackoff(), sleep=fake_sleep), PreCloudLLMRedactor(hooks)
+    )
+
+    with pytest.raises(LLMUnavailableError) as info:
+        await provider.complete(_req())
+    assert info.value.message == "This request cannot be sent to a cloud model."
+
+    with pytest.raises(LLMUnavailableError):
+        await _collect(provider.stream(_req()))
+
+    assert inner.calls == []
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__hooks_deny__nothing_reaches_the_cloud(monkeypatch, offline_cfg):
+    from app.core.model_router import route_llm_call
+
+    calls = _split_transport(monkeypatch, "from gemini")
+    hooks = ActionHooks()
+
+    async def deny(**context):
+        return HookResult(decision=HookDecision.DENY)
+
+    hooks.register("PreCloudLLM", deny)
+
+    with pytest.raises(LLMUnavailableError):
+        await route_llm_call(task="voice_of_jarvis", prompt="p", hooks=hooks, force_cloud=True)
+
+    assert calls == {"local": 0, "cloud": 0}
+
+
+# --- fix round 1: metering stays out of the timed region ----------------------
+
+
+class _SlowListener(EventListener):
+    async def handle(self, event: DomainEvent) -> None:
+        await asyncio.sleep(0.1)  # twice the calls' timeout_s
+
+
+@pytest.mark.asyncio
+async def test_metered__slow_listener__does_not_turn_an_answer_into_a_timeout(
+    monkeypatch, offline_cfg
+):
+    """A slow ledger write after an answer must not cost a timeout, a retry and a second paid call."""
+
+    async def transport(**kwargs):
+        if kwargs.get("force_cloud"):
+            raise AssertionError("Gemini must not be reached")
+        return "local answer"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    bus = EventBus()
+    bus.subscribe(LLMCallCompleted, _SlowListener())
+    extra = FakeProvider("claude", LLMLocation.CLOUD, ["answer", "a second paid call"])
+    chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), bus, extra_cloud=[extra])
+
+    assert await chain.complete(_req(timeout_s=0.05), skip_local=True) == "answer"
+    assert len(extra.calls) == 1
+    assert await chain.complete(_req(timeout_s=0.05)) == "local answer"
+
+
+# --- fix round 1: a fall-over says why ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain__fall_over__logs_code_details_and_truncated_cause(caplog):
+    error = LLMUnavailableError("down", details={"status": 503})
+    error.__cause__ = RuntimeError("upstream said: " + "x" * 300 + "TAIL")
+    first = FakeProvider("local", LLMLocation.LOCAL, [error])
+    second = FakeProvider("gemini", LLMLocation.CLOUD, ["ok"])
+
+    with caplog.at_level(logging.WARNING, logger="app.infrastructure.llm.chain"):
+        await FallbackChainProvider([first, second]).complete(_req(prompt="secret prompt text"))
+
+    (record,) = [r for r in caplog.records if r.name == "app.infrastructure.llm.chain"]
+    text = record.getMessage()
+    assert record.levelno == logging.WARNING
+    assert "llm_unavailable" in text
+    assert "'status': 503" in text
+    assert "RuntimeError: upstream said: xxx" in text
+    assert "TAIL" not in text
+    assert "secret prompt text" not in text
+
+
+# --- fix round 1: route_llm_call(hooks=...) gates that call ------------------
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__explicit_hooks__gate_this_call_only(offline_cfg):
+    from app.core.model_router import route_llm_call
+
+    hooks = ActionHooks()
+
+    async def custom(prompt: str, **context):
+        return HookResult(
+            decision=HookDecision.MODIFY, modified_input={"prompt": "custom-redacted"}, redactions=1
+        )
+
+    hooks.register("PreCloudLLM", custom)
+    cloud = FakeProvider("gemini", LLMLocation.CLOUD, ["a", [("content", "b")], "c"])
+    set_chain(FallbackChainProvider([RedactingProvider(cloud, _pii_redactor())]))
+
+    await route_llm_call(task="voice_of_jarvis", prompt="madhav@example.com", hooks=hooks)
+    tokens = await route_llm_call(
+        task="voice_of_jarvis", prompt="madhav@example.com", hooks=hooks, stream=True
+    )
+    await _collect(tokens)
+    await route_llm_call(task="voice_of_jarvis", prompt="madhav@example.com")
+
+    assert [c.prompt for c in cloud.calls] == ["custom-redacted", "custom-redacted", "[EMAIL]"]
+
+
+# --- fix round 1: more coverage -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chain__stream_programming_error__propagates_and_cloud_stream_not_opened():
+    local = FakeProvider("local", LLMLocation.LOCAL, [[TypeError("bug in our code")]])
+    cloud = FakeProvider("gemini", LLMLocation.CLOUD, [[("content", "cloud")]])
+
+    with pytest.raises(TypeError, match="bug in our code"):
+        await _collect(FallbackChainProvider([local, cloud]).stream(_req()))
+
+    assert cloud.calls == []
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__local_fails__cloud_receives_redacted_prompt_system_and_history(
+    monkeypatch, offline_cfg
+):
+    """Through the real factory, adapters and PreCloudLLM hook — only the transport is faked."""
+    import litellm
+
+    from app.core.model_router import route_llm_call
+
+    sent: list[dict] = []
+
+    async def transport(**kwargs):
+        sent.append(kwargs)
+        if not kwargs.get("force_cloud"):
+            raise litellm.exceptions.APIConnectionError(
+                message="connection refused", llm_provider="openai", model="m"
+            )
+        return "from gemini"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    history = [
+        {"role": "user", "content": "reach me at madhav@example.com"},
+        {"role": "assistant", "content": "Noted, sir."},
+    ]
+
+    result = await route_llm_call(
+        task="voice_of_jarvis",
+        prompt="call 555-123-4567",
+        system_prompt="The user's email is madhav@example.com",
+        conversation_history=history,
+    )
+
+    assert result == "from gemini"
+    local, cloud = sent
+    assert local["user_prompt"] == "call 555-123-4567"  # local sees the user's own words
+    assert cloud["force_cloud"] is True
+    assert cloud["user_prompt"] == "call [PHONE]"
+    assert cloud["system_prompt"] == "The user's email is [EMAIL]"
+    assert cloud["conversation_history"] == [
+        {"role": "user", "content": "reach me at [EMAIL]"},
+        {"role": "assistant", "content": "Noted, sir."},
+    ]
+    assert history[0]["content"] == "reach me at madhav@example.com"
+
+
+@pytest.mark.asyncio
+async def test_chain__fall_over_on_schema_error__log_omits_the_model_reply(caplog):
+    """A Pydantic error's text quotes the reply, which can echo the user's own data."""
+    from pydantic import ValidationError as PydanticValidationError
+
+    try:
+        _Tiny.model_validate({"colour": "madhav@example.com"})
+    except PydanticValidationError as cause:
+        error = LLMOutputParseError("bad json")
+        error.__cause__ = cause
+    first = FakeProvider("local", LLMLocation.LOCAL, [error])
+    second = FakeProvider("gemini", LLMLocation.CLOUD, ["ok"])
+
+    with caplog.at_level(logging.WARNING, logger="app.infrastructure.llm.chain"):
+        await FallbackChainProvider([first, second]).complete(_req())
+
+    text = caplog.records[-1].getMessage()
+    assert "ValidationError: color: missing" in text
+    assert "madhav@example.com" not in text

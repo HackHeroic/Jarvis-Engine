@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import app.core.config as _cfg
 import app.infrastructure.llm.claude as claude_module
 import app.models.brain.litellm_conf as _llm
+from app.core.model_router import PreCloudLLMRedactor
 from app.domain.entities import LLMLocation
 from app.domain.errors import (
     LLMError,
@@ -617,7 +618,7 @@ def test_claude__default_client__one_shared_instance(claude_cfg, monkeypatch):
 
 
 def test_factory__with_anthropic_key__order_is_local_claude_gemini(claude_cfg):
-    chain = LLMProviderFactory.build(claude_cfg, _pii_hooks(), NullEventBus())
+    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), NullEventBus())
 
     assert [p.name for p in chain.providers] == ["local", "claude", "gemini"]
     assert [p.location for p in chain.providers] == [
@@ -630,7 +631,7 @@ def test_factory__with_anthropic_key__order_is_local_claude_gemini(claude_cfg):
 def test_factory__without_anthropic_credential__claude_left_out(claude_cfg, monkeypatch):
     monkeypatch.setattr(_cfg, "ANTHROPIC_API_KEY", "")
 
-    chain = LLMProviderFactory.build(claude_cfg, _pii_hooks(), NullEventBus())
+    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), NullEventBus())
 
     assert [p.name for p in chain.providers] == ["local", "gemini"]
 
@@ -648,7 +649,7 @@ async def test_factory__claude_primary__local_skipped(claude_cfg, monkeypatch):
     bus = EventBus()
     recorder = _Recorder()
     bus.subscribe(LLMCallCompleted, recorder)
-    chain = LLMProviderFactory.build(claude_cfg, _pii_hooks(), bus)
+    chain = LLMProviderFactory.build(claude_cfg, PreCloudLLMRedactor(_pii_hooks()), bus)
 
     result = await chain.complete(_req(prompt="madhav@example.com"))
 
