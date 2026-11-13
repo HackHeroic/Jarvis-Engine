@@ -37,6 +37,31 @@ _FENCE_RE = re.compile(
 )
 
 
+class EmptyLLMResponseError(ValueError):
+    """The model returned no content where a structured answer was required.
+
+    A ``ValueError`` so existing ``except ValueError`` callers keep working; the
+    provider adapters read it as unparseable output, which falls over to the next
+    provider instead of propagating as a code bug.
+    """
+
+
+def _report_usage(response: object) -> None:
+    """Hand a completion's token counts to the metering decorator, if one is listening."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    from app.infrastructure.llm.transport import report_token_usage
+
+    try:
+        report_token_usage(
+            input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+            output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+        )
+    except (TypeError, ValueError):
+        logger.debug("Unreadable usage on LLM response; not metered")
+
+
 def _sanitize_llm_json(raw: str) -> str:
     """Strip markdown code fences that local models wrap around JSON."""
     stripped = raw.strip()
@@ -143,6 +168,7 @@ async def hybrid_route_query(
         "model": target_model,
         "messages": messages,
         "temperature": 0.1,
+        "timeout": _cfg.LLM_TIMEOUT_SECONDS,
     }
     if response_schema is not None:
         completion_kwargs["response_format"] = response_schema
@@ -165,6 +191,7 @@ async def hybrid_route_query(
     # Yields (event_type, token) tuples where event_type is "reasoning" or "content"
     if stream and response_schema is None:
         completion_kwargs["stream"] = True
+        completion_kwargs["timeout"] = _cfg.LLM_STREAM_TIMEOUT_SECONDS
         stream_response = await litellm.acompletion(**completion_kwargs)
 
         async def _token_gen() -> AsyncGenerator[tuple[str, str], None]:
@@ -240,6 +267,7 @@ async def hybrid_route_query(
         return _token_gen()
 
     response = await litellm.acompletion(**completion_kwargs)
+    _report_usage(response)
     content = response.choices[0].message.content
 
     # Guard: empty LLM response when structured output expected
@@ -253,7 +281,7 @@ async def hybrid_route_query(
                 force_cloud=True,
                 lenient_validation=lenient_validation,
             )
-        raise ValueError(f"LLM returned empty response for {response_schema.__name__}")
+        raise EmptyLLMResponseError(f"LLM returned empty response for {response_schema.__name__}")
 
     if response_schema is not None and content:
         try:
@@ -397,6 +425,7 @@ async def gemini_web_search(
             "api_key": _cfg.GEMINI_API_KEY,
             "temperature": 0.1,
             "web_search_options": {"search_context_size": "medium"},
+            "timeout": _cfg.LLM_TIMEOUT_SECONDS,
         }
         response = await litellm.acompletion(**completion_kwargs)
         content = response.choices[0].message.content

@@ -1,20 +1,29 @@
-"""Task-based model routing. Replaces hybrid_route_query().
+"""Task-based model routing: task → role → the provider chain.
 
-Local-first by default. Gemini fallback for web research, validation failure,
-OR when the current request explicitly opted into cloud (model picker).
-PII filter hook runs exactly once before any cloud call.
+``route_llm_call`` is the single call site for language models. It maps the task to a
+role, decides whether this call may use the on-device model, and hands an
+``LLMRequest`` to the process-wide ``FallbackChainProvider``
+(``app/infrastructure/llm``). The chain owns the rest: local first, cloud fallback by
+error type, timeouts, retries, the PreCloudLLM (PII) gate on every cloud send, and
+usage metering.
 """
 
 import contextvars
-import re
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 import app.core.config as _cfg
-from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.orchestrator.hooks import ActionHooks, HookDecision
+from app.domain.entities import LLMLocation
+from app.domain.errors import LLMUnavailableError
+from app.domain.ports import LLMRequest
+from app.infrastructure.llm.chain import FallbackChainProvider
+from app.infrastructure.llm.factory import get_chain
+from app.infrastructure.llm.transport import strip_fences  # noqa: F401  (re-export)
+from app.orchestrator.hooks import ActionHooks
 
 # Per-request override: set by chat.py when frontend model picker selects Gemini.
 # ContextVar so concurrent requests don't stomp each other.
@@ -45,43 +54,31 @@ MODEL_ROUTING: dict[str, ModelRole] = {
 }
 
 
-def _get_model_for_role(role: ModelRole) -> str:
-    """Read config at call time so startup detection is respected."""
-    if role == ModelRole.PRIMARY:
-        return _cfg.GEMMA_PRIMARY_MODEL
-    if role == ModelRole.FAST:
-        return _cfg.GEMMA_FAST_MODEL
-    return _cfg.GEMINI_MODEL
-
-_FENCE_RE = re.compile(r"```json|```")
-
-
-def strip_fences(text: str) -> str:
-    return _FENCE_RE.sub("", text).strip()
+async def _replay(
+    head: tuple[tuple[str, str], ...], rest: AsyncIterator[tuple[str, str]]
+) -> AsyncIterator[tuple[str, str]]:
+    async with aclosing(rest):
+        for item in head:
+            yield item
+        async for item in rest:
+            yield item
 
 
-def _coerce_to_schema(result: Any, response_schema: type[BaseModel]) -> Any:
-    """Normalise whatever the transport returned into a schema instance.
+async def _open_stream(
+    chain: FallbackChainProvider, req: LLMRequest, skip_local: bool
+) -> AsyncIterator[tuple[str, str]]:
+    """Start the chain's stream and wait for its first token.
 
-    `litellm_conf.hybrid_route_query` returns `parsed.model_dump()` — a plain
-    dict — for every structured call, local and cloud alike, while a fake or a
-    future transport may hand back the model itself or raw JSON text. Callers
-    branch on `isinstance(result, Schema)`, so the router owes them one shape.
-
-    Normalising only `str` is what caused F1: a dict fell through unvalidated,
-    `decompose_goal` did `str(dict)` on a Python repr, `json.loads` failed, and
-    the planning turn silently produced a schedule with none of the user's goal.
-
-    Raises `ValidationError` / `JSONDecodeError` on malformed input, which the
-    local branch treats as a local failure worth retrying against the cloud.
+    A stream that cannot start raises here, at the caller's ``await`` — where
+    ``hybrid_route_query(stream=True)`` raised when the model call never began — so
+    callers' "failed before any text" handling still applies.
     """
-    if isinstance(result, response_schema):
-        return result
-    if isinstance(result, str):
-        return response_schema.model_validate_json(strip_fences(result))
-    if isinstance(result, dict):
-        return response_schema.model_validate(result)
-    return result
+    tokens = chain.stream(req, skip_local=skip_local)
+    try:
+        first = await anext(tokens)
+    except StopAsyncIteration:
+        return _replay((), tokens)
+    return _replay((first,), tokens)
 
 
 async def route_llm_call(
@@ -94,68 +91,54 @@ async def route_llm_call(
     force_cloud: Optional[bool] = None,
     stream: bool = False,
 ) -> str | BaseModel | Any:
-    """Route LLM call with fallback chain.
+    """Route one LLM call through the provider chain.
 
-    Priority for cloud routing:
-      1. explicit force_cloud=True kwarg
-      2. force_cloud_var ContextVar (set by chat endpoint when user picks Gemini)
-      3. _cfg.GEMINI_PRIMARY (no local models loaded)
+    The on-device model is skipped for this call when any of these hold:
+      1. explicit ``force_cloud=True`` kwarg
+      2. ``force_cloud_var`` ContextVar (set by chat endpoint when user picks Gemini)
+      3. ``_cfg.GEMINI_PRIMARY`` or ``_cfg.CLAUDE_PRIMARY``
+      4. the task's role is CLOUD
 
+    Structured calls (``response_schema``) return an instance of the schema.
     ``stream=True`` returns an async generator of ``(event_type, token)`` pairs
-    instead of a string, and is incompatible with ``response_schema`` (partial
-    JSON cannot be validated). It takes the same route as a plain call — same
-    local-first attempt, same cloud fallback, same PreCloudLLM gate — so a
-    streamed reply can never be the one path that skips the PII filter.
-    """
-    import app.models.brain.litellm_conf as _llm
+    instead of a string, and is incompatible with ``response_schema`` (partial JSON
+    cannot be validated). It takes the same route as a plain call — same local-first
+    attempt, same cloud fallback, same PreCloudLLM gate.
 
+    ``hooks`` is accepted for compatibility and no longer consulted: the
+    PreCloudLLM gate belongs to the chain's ``RedactingProvider``, which uses the
+    process-wide hooks (``get_hooks()``).
+
+    Raises ``RuntimeError`` when every reachable provider failed and no cloud
+    provider is configured, and ``LLMUnavailableError`` when cloud ones failed too.
+    """
     if stream and response_schema is not None:
         raise ValueError("route_llm_call: stream=True cannot be combined with response_schema")
 
-    if hooks is None:
-        from app.orchestrator.hooks import get_hooks
-        hooks = get_hooks()
-
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
-    model = _get_model_for_role(role)
-
-    # Resolve the cloud preference for THIS call
-    use_cloud = bool(force_cloud) or force_cloud_var.get() or _cfg.GEMINI_PRIMARY
-
-    # Skip local attempt if cloud is requested for this turn
-    if role in (ModelRole.PRIMARY, ModelRole.FAST) and not use_cloud:
-        try:
-            result = await _llm.hybrid_route_query(
-                user_prompt=prompt,
-                system_prompt=system_prompt,
-                response_schema=response_schema,
-                model_override=model,
-                conversation_history=conversation_history,
-                stream=stream,
-            )
-            if response_schema:
-                return _coerce_to_schema(result, response_schema)
-            return result
-        except (ValidationError, Exception) as e:
-            logger.warning(f"Local {model} failed for {task}: {e}")
-
-    if hooks:
-        pii_result = await hooks.execute("PreCloudLLM", prompt=prompt)
-        if pii_result.decision == HookDecision.MODIFY:
-            prompt = pii_result.modified_input["prompt"]
-
-    if not _cfg.GEMINI_API_KEY:
-        raise RuntimeError(f"Local LLM failed for {task} and no GEMINI_API_KEY set")
-
-    from app.models.brain.litellm_conf import gemini_primary_route
-
-    result = await gemini_primary_route(
-        user_prompt=prompt,
-        system_prompt=system_prompt,
-        response_schema=response_schema,
-        conversation_history=conversation_history,
-        stream=stream,
+    skip_local = (
+        role == ModelRole.CLOUD
+        or bool(force_cloud)
+        or force_cloud_var.get()
+        or _cfg.GEMINI_PRIMARY
+        or _cfg.CLAUDE_PRIMARY
     )
-    if response_schema:
-        return _coerce_to_schema(result, response_schema)
-    return result
+    req = LLMRequest(
+        task=task,
+        role=role.value,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        conversation_history=conversation_history,
+        response_schema=response_schema,
+        timeout_s=_cfg.LLM_STREAM_TIMEOUT_SECONDS if stream else _cfg.LLM_TIMEOUT_SECONDS,
+    )
+
+    chain = get_chain()
+    try:
+        if stream:
+            return await _open_stream(chain, req, skip_local)
+        return await chain.complete(req, skip_local=skip_local)
+    except LLMUnavailableError as exc:
+        if not chain.has_available(LLMLocation.CLOUD):
+            raise RuntimeError(f"Local LLM failed for {task} and no GEMINI_API_KEY set") from exc
+        raise
