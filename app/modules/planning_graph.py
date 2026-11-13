@@ -3,6 +3,7 @@
 import asyncio
 import operator
 from typing import Annotated, Any, Optional, TypedDict
+from app.core.config import SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 
 # Shared with the orchestrator's draft_action node and the /drafts REST API —
@@ -36,6 +37,9 @@ class PlanningState(TypedDict):
     # decompose_goal, read by fuse_tasks to tell THIS goal's stale pending rows
     # (replaceable) from every other goal's (must survive).
     goal_id: Optional[str]
+    # The decomposer's intrinsic-load estimate for this goal (CLT): >= 0.8 cuts the
+    # daily cap by a fifth inside run_schedule. None when no decomposition ran.
+    intrinsic_load: Optional[float]
     schedule: Optional[dict]
     horizon_start: Optional[str]
     horizon_minutes: int
@@ -237,6 +241,7 @@ async def decompose_goal(state: PlanningState) -> dict:
         return {
             "task_chunks": chunks,
             "goal_id": goal_id,
+            "intrinsic_load": graph.cognitive_load_estimate.get("intrinsic_load"),
             "_tool_detail": {"task_count": len(chunks)},
         }
     except Exception as e:
@@ -317,7 +322,13 @@ async def solve_schedule(state: PlanningState) -> dict:
         graph = ExecutionGraph(
             goal_metadata=GoalMetadata(),
             decomposition=decomposition,
-            cognitive_load_estimate={"intrinsic_load": 0.5},
+            # The goal's own estimate, so a hard goal gets a lighter day; it used to
+            # be a constant 0.5, which left the cap's cognitive-safety cut dead.
+            cognitive_load_estimate={
+                "intrinsic_load": 0.5
+                if state.get("intrinsic_load") is None
+                else state["intrinsic_load"]
+            },
         )
     except (ValidationError, TypeError, ValueError, KeyError) as exc:
         logger.error(f"Could not build ExecutionGraph for scheduling: {exc}")
@@ -427,6 +438,12 @@ async def create_draft(state: PlanningState) -> dict:
         return {"draft_id": None}
 
 
+# The solve step must outlive CP-SAT's own wall-clock cap: when the cap expires the
+# solver returns the best schedule it found, and a step timeout equal to the cap
+# (the framework default, 30 s) threw that schedule away and left the turn
+# reporting a plan it did not have. The margin covers model building.
+SOLVE_STEP_TIMEOUT_MS = int(SOLVER_MAX_TIME_SECONDS * 1000) + 15_000
+
 # v1 parity ladder: 3d -> 5d -> 7d -> 14d -> 30d (MAX_HORIZON_MINUTES).
 HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]
 
@@ -482,6 +499,7 @@ def planning_state_in(state) -> dict:
         "task_chunks": [],
         "pending_tasks": [],
         "goal_id": None,
+        "intrinsic_load": None,
         "schedule": None,
         "horizon_start": None,
         "horizon_minutes": 2880,
@@ -582,7 +600,7 @@ planning_module = ModuleDefinition(
                    timeout_ms=60_000),
         ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
         ModuleStep(name="solve_schedule", handler=solve_schedule,
-                   depends_on=["fuse_tasks"],
+                   depends_on=["fuse_tasks"], timeout_ms=SOLVE_STEP_TIMEOUT_MS,
                    routes_to={check_feasibility: {"OPTIMAL": "create_draft", "INFEASIBLE": "handle_infeasible"}}),
         # No depends_on: reached only via solve_schedule's OPTIMAL branch, the
         # same way handle_infeasible is reached via INFEASIBLE.

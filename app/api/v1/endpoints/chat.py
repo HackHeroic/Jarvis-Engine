@@ -1271,6 +1271,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "research_results": None,
         "ingestion_result": None,
         "clarification_request": None,
+        # Per turn: a checkpointed framing would re-announce last turn's missed tasks.
+        "anti_guilt_message": None,
+        "missed_deadlines": None,
         "thinking_process": None,
         "response_message": None,
         # conversation_phase / negotiation_state are deliberately absent: on a

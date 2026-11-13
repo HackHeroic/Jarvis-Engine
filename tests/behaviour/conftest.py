@@ -136,7 +136,13 @@ def bag_of_words_embedding(text: str, dims: int = 128) -> list[float]:
 
 
 @pytest.fixture
-def llm(monkeypatch) -> ScriptedLLM:
+def embeddings(monkeypatch) -> None:
+    """Memory similarity uses the deterministic bag-of-words embedder."""
+    monkeypatch.setattr("app.services.memory.store.embed_text", bag_of_words_embedding)
+
+
+@pytest.fixture
+def llm(monkeypatch, embeddings) -> ScriptedLLM:
     """The only language model the test can reach. Fails the test on any unscripted call."""
     scripted = ScriptedLLM()
     set_chain(FallbackChainProvider([scripted]))  # conftest's _fresh_llm_chain resets it
@@ -169,7 +175,6 @@ def llm(monkeypatch) -> ScriptedLLM:
     )
     monkeypatch.setattr("app.services.memory.extractor.hybrid_route_query", extraction_transport)
     monkeypatch.setattr("app.utils.chroma_client.query_knowledge", lambda *a, **k: [])
-    monkeypatch.setattr("app.services.memory.store.embed_text", bag_of_words_embedding)
 
     yield scripted
 
@@ -189,15 +194,19 @@ def decomposition(
     *,
     duration: int = 25,
     difficulty: float = 0.5,
-    deadline: str | None = None,
+    deadline: str | list[str | None] | None = None,
     intrinsic_load: float = 0.5,
     with_intentions: bool = True,
     chained: bool = False,
     objective: str = "",
 ) -> str:
-    """An ``ExecutionGraph`` as the socratic chunker returns it, positional ids and all."""
+    """An ``ExecutionGraph`` as the socratic chunker returns it, positional ids and all.
+
+    ``deadline`` is one deadline hint for every task, or a list with one per task.
+    """
+    deadlines = deadline if isinstance(deadline, list) else [deadline] * len(titles)
     tasks = []
-    for i, title in enumerate(titles, start=1):
+    for i, (title, task_deadline) in enumerate(zip(titles, deadlines, strict=True), start=1):
         task: dict[str, Any] = {
             "task_id": f"task_{i}",
             "title": title,
@@ -205,7 +214,7 @@ def decomposition(
             "difficulty_weight": difficulty,
             "dependencies": [f"task_{i - 1}"] if chained and i > 1 else [],
             "completion_criteria": f"Explain {title.lower()} from memory in two minutes",
-            "deadline_hint": deadline,
+            "deadline_hint": task_deadline,
         }
         if with_intentions:
             task["implementation_intention"] = {
@@ -330,7 +339,10 @@ async def jarvis(tmp_path) -> Jarvis:
     from app.core.runtime import set_shared_clients
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
+    from app.services.memory.pearl import pearl_registry, register_default_patterns
 
+    if not pearl_registry.registered_names():  # the lifespan's job in the app
+        register_default_patterns()
     supabase = FakeSupabase()
     async with open_checkpointer(str(tmp_path / "checkpoints.sqlite")) as saver:
         app = Jarvis(build_jarvis_graph(checkpointer=saver), supabase)

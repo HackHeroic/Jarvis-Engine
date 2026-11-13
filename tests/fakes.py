@@ -293,6 +293,8 @@ def make_jarvis_state(**overrides: Any) -> dict:
         "research_results": None,
         "ingestion_result": None,
         "clarification_request": None,
+        "anti_guilt_message": None,
+        "missed_deadlines": None,
         "thinking_process": None,
         "response_message": None,
         "conversation_phase": ConversationPhase.CHAT,
