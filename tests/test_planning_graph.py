@@ -1047,13 +1047,17 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
     )
     fused = await fuse_tasks({**decomposed, "user_model": user_model})
 
+    # Accept is one atomic call against draft_schedules, so the draft lives in
+    # the same database as the tasks, as it does in production.
     draft = {
-        "id": "d1",
+        "id": "5b0d8f3e-7c2a-4e1b-9f6d-2a8c4e0b1d37",
+        "user_id": "u1",
+        "status": "pending",
         "tasks": fused["task_chunks"],
         "horizon_start": "2026-08-08T08:00:00+00:00",
     }
-    store = _FakeDraftStore()
-    landed = await accept_draft_and_persist(store, "u1", draft, supabase)
+    supabase.rows["draft_schedules"] = [draft]
+    landed = await accept_draft_and_persist(_FakeDraftStore(), "u1", draft, supabase)
 
     assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == [
         "calculus_task_1",
@@ -1062,7 +1066,7 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
         "task_1",
     ]
     assert landed == 4
-    assert store.other_calls == ["accept_draft"]
+    assert draft["status"] == "accepted"
 
 
 @pytest.mark.asyncio

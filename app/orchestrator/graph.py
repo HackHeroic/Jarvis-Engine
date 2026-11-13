@@ -9,6 +9,7 @@ import re
 from typing import Any, Callable
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.errors import InvalidStateTransition
 
 from langgraph.graph import END, StateGraph
 
@@ -503,9 +504,12 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     draft_id = draft_id_of(draft)
 
     if intent_value == IntentType.ACCEPT_DRAFT.value:
-        count = await accept_draft_and_persist(
-            draft_store, user_id, draft, _supabase_of(state)
-        )
+        try:
+            count = await accept_draft_and_persist(
+                draft_store, user_id, draft, _supabase_of(state)
+            )
+        except InvalidStateTransition:
+            return await _closed_draft_reply(draft_store, user_id, draft_id)
         if count is None:
             # The write did not land and the draft is still pending. Keep the
             # phase (omitted, not reset) so "accept" retries — and say what
@@ -557,6 +561,32 @@ async def _apply_draft_action(state: JarvisState) -> dict:
         ),
         "negotiation_state": NegotiationPhase.EDITING,
         "draft_id": draft_id,
+    }
+
+
+async def _closed_draft_reply(draft_store: Any, user_id: str, draft_id: str | None) -> dict:
+    """Answer an accept that found the draft closed. Nothing was written this turn.
+
+    Usually it was accepted already: from the review UI, or by a double-click.
+    It may instead have expired or been rejected, and then none of its tasks
+    were ever written, so "locked in" would be false. Re-read the draft rather
+    than trust the copy from before the accept: a concurrent accept may have
+    closed it since.
+    """
+    current = await asyncio.to_thread(draft_store.get_draft, draft_id, user_id) if draft_id else None
+    if current and current.get("status") == "accepted":
+        return {
+            "response_message": "That plan is already locked in, sir.",
+            "negotiation_state": NegotiationPhase.ACCEPTED,
+            "draft_id": None,
+        }
+    return {
+        "response_message": (
+            "That draft has closed, sir, so I didn't apply it. "
+            "Tell me what to plan and I'll build a fresh one."
+        ),
+        "negotiation_state": NegotiationPhase.NONE,
+        "draft_id": None,
     }
 
 

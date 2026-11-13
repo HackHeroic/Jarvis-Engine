@@ -112,6 +112,31 @@ def test_get_pending_draft_ignores_resolved_drafts(store):
     assert store.get_pending_draft("user_1") is None
 
 
+def test_get_pending_draft__modified_draft__still_awaits_review(store):
+    """An edited draft is still under review; "accept" in chat must find it."""
+    created = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
+    store.edit_task_in_draft(created["id"], "user_1", "goal1_task_1", {"duration_minutes": 15})
+
+    pending = store.get_pending_draft("user_1")
+
+    assert pending["id"] == created["id"]
+    assert pending["status"] == "modified"
+
+
+def test_accept_and_reject_draft__closed_draft__are_refused(store):
+    """Only an open draft (pending or modified) may change status."""
+    accepted = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
+    store.accept_draft(accepted["id"], "user_1")
+    rejected = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
+    store.reject_draft(rejected["id"], "user_1", reason="too cramped")
+
+    assert store.reject_draft(accepted["id"], "user_1", reason="late") is False
+    assert store.accept_draft(rejected["id"], "user_1") is False
+    assert store.get_draft(accepted["id"], "user_1")["status"] == "accepted"
+    assert store.get_draft(accepted["id"], "user_1").get("rejection_reason") is None
+    assert store.get_draft(rejected["id"], "user_1")["status"] == "rejected"
+
+
 def test_delete_draft_removes_it(store):
     created = store.create_draft(user_id="user_1", tasks=_tasks(), horizon_start=HORIZON)
     draft_id = created["id"]

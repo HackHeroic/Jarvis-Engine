@@ -54,6 +54,7 @@ from app.services.extraction.behavioral_store import (
 )
 from app.services.extraction.action_item_handler import propose_action_item
 from app.services.extraction.orchestrator import process_ingestion
+from app.services.planning.task_rows import build_task_rows
 from app.utils.deadline_parser import compute_horizon_from_deadlines
 
 # ---------------------------------------------------------------------------
@@ -263,13 +264,6 @@ def _get_plan_deadlines_from_db(
         return []
 
 
-def _infer_goal_id_from_task_id(task_id: str) -> Optional[str]:
-    """Extract goal_id from prefixed task_id (e.g. thesis_task_1 -> thesis)."""
-    if not task_id or "_" not in task_id:
-        return None
-    return task_id.split("_", 1)[0]
-
-
 def derive_goal_id(goal_metadata: Any, fallback_objective: str = "") -> str:
     """The namespace every chunk of one goal is prefixed with.
 
@@ -344,9 +338,14 @@ def _persist_fused_tasks(
 ) -> str | None:
     """Replace all pending user_tasks with the fused master chunk list.
 
-    Deletes existing pending rows, then inserts fresh rows for each chunk.
+    Deletes existing pending rows, then inserts fresh rows for each chunk. The
+    rows come from ``build_task_rows``, the same builder draft acceptance uses.
     Chunks must have prefixed task_ids (goal_id_orig_id). Full TaskChunk fields
     are persisted for retrieval by get_all_pending_tasks.
+
+    The delete and the insert are two calls, not one transaction. Draft
+    acceptance does not come through here: it uses ``DraftService.accept``,
+    which is atomic. Only the deprecated v1 ``/accept-schedule`` still does.
 
     Args:
         schedule: Optional dict mapping task_id -> {"start_min": int, "end_min": int}
@@ -359,7 +358,7 @@ def _persist_fused_tasks(
         else ``None``. Exceptions are still swallowed — this function is called
         from paths that must not die on a persistence blip — so the return value
         is the only signal a caller has that anything happened. Callers that need
-        proof (draft acceptance) re-read user_tasks filtered on this plan_id:
+        proof (v1 ``/accept-schedule``) re-read user_tasks filtered on this plan_id:
         task_ids alone cannot distinguish rows this call wrote from rows an
         earlier plan left behind, since fused chunk lists deliberately carry
         pre-existing pending tasks forward.
@@ -373,96 +372,9 @@ def _persist_fused_tasks(
         print("[Control Policy] _persist_fused_tasks: empty chunks list, skipping to prevent data loss")
         return None
     try:
-        plan_id = str(uuid.uuid4())
-        now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Parse horizon_start for wall-clock computation
-        horizon_dt: datetime | None = None
-        if horizon_start:
-            try:
-                horizon_dt = datetime.fromisoformat(horizon_start)
-            except (ValueError, TypeError):
-                print(f"[Control Policy] Could not parse horizon_start: {horizon_start}")
-
-        rows: list[dict[str, Any]] = []
-
-        for chunk in chunks:
-            # Support both Pydantic TaskChunk objects and plain dicts
-            task_id = getattr(chunk, "task_id", None) or (chunk.get("task_id") if isinstance(chunk, dict) else None)
-            title = getattr(chunk, "title", None) or (chunk.get("title") if isinstance(chunk, dict) else None)
-            duration = getattr(chunk, "duration_minutes", None) or (chunk.get("duration_minutes") if isinstance(chunk, dict) else None)
-            difficulty = getattr(chunk, "difficulty_weight", None)
-            if difficulty is None and isinstance(chunk, dict):
-                difficulty = chunk.get("difficulty_weight")
-            deps = getattr(chunk, "dependencies", None)
-            if deps is None and isinstance(chunk, dict):
-                deps = chunk.get("dependencies", [])
-            deadline = getattr(chunk, "deadline_hint", None)
-            if deadline is None and isinstance(chunk, dict):
-                deadline = chunk.get("deadline_hint")
-
-            goal_id = _infer_goal_id_from_task_id(task_id) if task_id else None
-
-            row = {
-                "user_id": user_id,
-                "plan_id": plan_id,
-                "task_id": task_id,
-                "title": title,
-                "status": "pending",
-                "duration_minutes": duration,
-                "difficulty_weight": difficulty,
-                "dependencies": deps,
-                "deadline_hint": deadline,
-                "created_at": now_iso,
-            }
-            if goal_id:
-                row["goal_id"] = goal_id
-
-            # --- Completion criteria ---
-            cc = getattr(chunk, "completion_criteria", None)
-            if cc is None and isinstance(chunk, dict):
-                cc = chunk.get("completion_criteria")
-            if cc:
-                row["completion_criteria"] = cc
-
-            # --- Implementation intention (WOOP) ---
-            ii = getattr(chunk, "implementation_intention", None)
-            if ii is None and isinstance(chunk, dict):
-                ii = chunk.get("implementation_intention")
-            if ii is not None:
-                # Convert Pydantic model to dict if needed
-                if hasattr(ii, "model_dump"):
-                    ii = ii.model_dump()
-                elif hasattr(ii, "dict"):
-                    ii = ii.dict()
-                row["implementation_intention"] = ii
-
-            # --- Topic keywords ---
-            tk = getattr(chunk, "topic_keywords", None)
-            if tk is None and isinstance(chunk, dict):
-                tk = chunk.get("topic_keywords")
-            if tk:
-                row["topic_keywords"] = tk
-
-            # --- Scheduled start/end from OR-Tools schedule ---
-            if schedule and task_id and task_id in schedule and horizon_dt:
-                slot = schedule[task_id]
-                # Support both "start"/"end" and "start_min"/"end_min" keys
-                if isinstance(slot, dict):
-                    start_min = slot.get("start_min") or slot.get("start")
-                    end_min = slot.get("end_min") or slot.get("end")
-                elif hasattr(slot, "start_min"):
-                    start_min = slot.start_min
-                    end_min = slot.end_min
-                else:
-                    start_min = None
-                    end_min = None
-
-                if start_min is not None and end_min is not None:
-                    row["scheduled_start"] = (horizon_dt + timedelta(minutes=int(start_min))).isoformat()
-                    row["scheduled_end"] = (horizon_dt + timedelta(minutes=int(end_min))).isoformat()
-
-            rows.append(row)
+        plan_id, rows = build_task_rows(
+            user_id, chunks, schedule=schedule, horizon_start=horizon_start
+        )
 
         # Delete AFTER building rows — if row construction fails, existing tasks survive
         supabase_client.table("user_tasks").delete().eq(
