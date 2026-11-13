@@ -14,6 +14,7 @@ house security rule ("every Supabase query must filter by user_id") exists to
 prevent. Filtering here is real, so user-isolation assertions have teeth.
 """
 
+import copy
 import json
 import threading
 import uuid
@@ -137,16 +138,21 @@ class _Query:
             inserted = []
             for row in incoming:
                 # The real table defaults created_at; emulate so .order() works.
-                stored = {"created_at": datetime.now(timezone.utc).isoformat(), **row}
+                # Deep copies: a real client serialises the payload, so a caller
+                # mutating its dict afterwards cannot reach the stored row.
+                stored = {
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    **copy.deepcopy(row),
+                }
                 self._rows.append(stored)
-                inserted.append(dict(stored))
+                inserted.append(copy.deepcopy(stored))
             return _Result(inserted)
 
         matched = [r for r in self._rows if self._matches(r)]
 
         if self._op == "update":
             for row in matched:
-                row.update(self._payload)
+                row.update(copy.deepcopy(self._payload))
         elif self._op == "delete":
             for row in matched:
                 self._rows.remove(row)
@@ -158,7 +164,7 @@ class _Query:
             matched = matched[: self._limit]
 
         # Return copies so callers mutating results can't corrupt the store.
-        return _Result([dict(r) for r in matched])
+        return _Result([copy.deepcopy(r) for r in matched])
 
 
 class _RpcCall:

@@ -10,6 +10,7 @@ returned entity cannot change what is stored — just as with a database.
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -212,7 +213,10 @@ class InMemoryDraftRepository(DraftRepository):
         i = self._index(user_id, draft_id)
         if i is None:
             raise not_found("draft", draft_id)
-        self._store.drafts[i] = self._store.drafts[i].model_copy(update={"tasks": tasks}, deep=True)
+        # model_copy assigns update values by reference: copy, or the caller keeps a handle.
+        self._store.drafts[i] = self._store.drafts[i].model_copy(
+            update={"tasks": copy.deepcopy(tasks)}
+        )
         return self._store.drafts[i].model_copy(deep=True)
 
     async def set_status(
