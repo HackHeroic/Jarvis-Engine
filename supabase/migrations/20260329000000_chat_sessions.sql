@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE INDEX idx_chat_sessions_user_id ON chat_sessions (user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions (user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS chat_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -24,5 +24,5 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_chat_messages_session ON chat_messages (session_id, created_at ASC);
-CREATE INDEX idx_chat_messages_user ON chat_messages (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages (session_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_user ON chat_messages (user_id, created_at DESC);

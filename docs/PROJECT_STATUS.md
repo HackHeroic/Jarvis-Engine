@@ -330,45 +330,54 @@ Full specifications preserved in [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md
 
 ### Supabase (relational)
 
-**Two migration sets exist**, and they are not equivalent:
+**`supabase/migrations/` is the schema.** Applied in filename order, it builds the
+whole database on a fresh project (verified 2026-11-14 against a local
+PostgreSQL 18, twice in a row: every file is idempotent).
 
-- `app/db/migrations/` — 14 numbered files (`001`–`014`), the historical set,
-  hand-run in the Supabase SQL Editor. This is the complete schema.
-- `supabase/migrations/` — 8 timestamped files in Supabase-CLI format,
-  reconciled on 2026-08-08 against the restored project (the newest,
-  `20260808000000_user_tasks_actual_duration.sql`, adds the
-  `user_tasks.actual_duration_minutes` column the task-lifecycle completion
-  path writes). It mirrors only `009`–`012` plus four later additions.
-  **`001`–`008` have no CLI-format
-  counterpart**, so `supabase db push` into a clean project would not create
-  `behavioral_constraints`, `pending_calendar_updates`, `habit_trackers`,
-  `user_tasks`, `task_materials`, `user_calendar_anchors`, `user_plan_updates`
-  or `ingested_documents`.
+- `20260101000000_baseline_legacy_tables.sql` ports the hand-run
+  `app/db/migrations/001`–`004` and `006`–`008`, plus the `014` columns, into the
+  CLI set. It sorts first because later CLI files `ALTER user_tasks`.
+- `20261114000001_capstone_lld.sql` does the capstone work:
+  - adds the user root `user_profiles` and the domain tables `goals`,
+    `task_events`, `proactive_suggestions` and `llm_usage_events`;
+  - gives every user table a cascading FK to `user_profiles`, plus the CHECKs the
+    entities enforce;
+  - drops six dead tables;
+  - enables RLS everywhere;
+  - adds `accept_draft()`, the one-transaction draft accept.
+  - Its first application **wipes all user tables** (owner decision: test data).
+- `app/db/migrations/` (`001`–`014`) is historical only.
 
-Tables the code reads or writes:
+Keys, relationships, triggers, the table → entity map and the reasoning are in
+[`docs/capstone/_schema_notes.md`](capstone/_schema_notes.md). **Before applying,
+the backend must use the project's secret key.** RLS is on, and a publishable
+(anon) key sees no rows.
 
-| Table | Used by | Defined in |
+| Table | Used by | Entity |
 |---|---|---|
-| `user_tasks` | planning persistence on accept, task lifecycle (incl. `actual_duration_minutes` on completion) | `app/db/migrations/004` (+ `006`, `007`, `013`, `014`); CLI: only the `20260401000000` / `20260501000001` / `20260808000000` ALTERs |
-| `draft_schedules` | `DraftStore`, draft REST API, `create_draft` | `011` · CLI `20260329000002` |
-| `behavioral_constraints` | `UserModel.get_behavioral_constraints`, habit storage | `001` (+ `002`) · **CLI: none** |
-| `user_memories` | 3-tier memory, SM-2 decay | `010` · CLI `20260329000001` |
-| `chat_sessions`, `chat_messages` | session + history service | `009` (+ `012`) · CLI `20260329000000`, `20260331000000` |
-| `user_preferences` | learning style for workspace | `011` · CLI `20260329000002` |
-| `pending_action_items` | action proposals | `011` · CLI `20260329000002` |
-| `task_completion_signals` | completion telemetry | `011` · CLI `20260329000002` |
-| `task_workspaces` | proactive workspace cache | **CLI `20260501000002` only** — no numbered counterpart |
-| `habit_trackers` | SM-2 spaced repetition | `003` · **CLI: none** |
-| `task_materials` | document ↔ task RAG bridge | `004` · **CLI: none** |
-| `ingested_documents` | ingestion provenance | `008` · **CLI: none** |
-| `pending_calendar_updates` | timetable approval flow | `001` (+ `002`) · **CLI: none** |
-| `user_plan_updates` | goal-level deadlines | `006` · **CLI: none** |
-| `user_state` | startup health probe only (`DatabaseClient.check_connection`) | **no migration anywhere** |
+| `user_profiles` | profile repository; created on demand by the `ensure_user_profile` trigger | `UserProfile` |
+| `goals` | created by the `ensure_goal` trigger when a `goal_id` first appears | `Goal` |
+| `user_tasks` | `accept_draft()` (the write path), task lifecycle | `Task` |
+| `task_events` | task event repository | `TaskEvent` |
+| `draft_schedules` | `DraftStore`, draft repository, draft REST API | `DraftSchedule` |
+| `behavioral_constraints` | constraint repository, habit storage | `BehavioralConstraint` |
+| `proactive_suggestions` | suggestion repository | `Suggestion` |
+| `llm_usage_events` | usage repository | `LLMUsageEvent` |
+| `user_memories` | 3-tier memory, SM-2 decay, PEARL | — |
+| `chat_sessions`, `chat_messages` | session + history service | — |
+| `habit_trackers` | SM-2 spaced repetition | — |
+| `task_materials` | document ↔ task RAG bridge | — |
+| `ingested_documents` | ingestion provenance (incl. `s3_key`) | — |
+| `pending_calendar_updates` | timetable approval flow | — |
+| `user_plan_updates` | goal-level deadlines | — |
+| `user_preferences` | learning style for workspace | — |
+| `task_workspaces` | proactive workspace cache | — |
+| `task_completion_signals` | completion telemetry | — |
 
-Created by migrations but with no live call site: `user_calendar_anchors`
-(`005` — the placeholder-resolution feature was never built),
-`conversation_sessions` / `conversation_messages` (`010`), `extracted_problems`
-and `task_completion_criteria` (`011`).
+Dropped as dead (no call site in `app/`): `pending_action_items`,
+`extracted_problems`, `task_completion_criteria`, `user_calendar_anchors`,
+`conversation_sessions` and `conversation_messages`. The startup probe
+(`DatabaseClient.check_connection`) reads `user_tasks`.
 
 ### Local SQLite
 
@@ -426,17 +435,19 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
    `len(goal.strip()) < 5`, so "DSA" or "gym" is treated as too vague and
    returns a clarification instead of planning.
 
-8. **`draft_schedules` has no `schedule` column.** The solver's output map is
-   not persisted with the draft, so accepted tasks land in `user_tasks` without
-   wall-clock times. `_schedule_map_of` already handles the column for when it
-   arrives.
+8. **FIXED** — `draft_schedules` had no `schedule` column. CLI migration
+   `20260813000001` added it. Draft acceptance (`DraftService` →
+   `build_task_rows` → `accept_draft()`) now turns the solver's slot map into
+   wall-clock `scheduled_start`/`scheduled_end`. Original description: the
+   solver's output map was not persisted with the draft, so accepted tasks
+   landed in `user_tasks` without wall-clock times.
 
-9. **The two migration sets have diverged.** `supabase/migrations/` (CLI format)
-   mirrors only `009`–`012` of `app/db/migrations/` plus four later additions.
-   `001`–`008` were never ported, and `task_workspaces` exists only in the CLI
-   set. A `supabase db push` into a clean project therefore produces an
-   incomplete schema, and `user_state` has no migration in either set. See the
-   Storage Map above for the per-table breakdown.
+9. **FIXED 2026-11-14** — the two migration sets had diverged. The CLI set now
+   carries the legacy tables (`20260101000000_baseline_legacy_tables.sql`) and
+   builds the full schema on a fresh project. `user_state` is no longer probed.
+   Original description: `supabase/migrations/` mirrored only `009`–`012` plus
+   four later additions, so a `supabase db push` into a clean project produced
+   an incomplete schema.
 
 10. **`analytical.py` and `telemetry.py` are dead files** — present in
     `app/api/v1/endpoints/` but never included in `app/api/v1/router.py`.
