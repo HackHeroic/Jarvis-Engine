@@ -51,6 +51,7 @@ from app.infrastructure.persistence._mapping import (
     prepare_new,
     summarize_usage,
     task_from_row,
+    task_id_clash,
     utc,
 )
 
@@ -258,11 +259,18 @@ class InMemoryDraftRepository(DraftRepository):
                 t if t.id is not None else t.model_copy(update={"id": str(uuid4())})
                 for t in new_tasks
             ]
-            self._store.tasks[:] = [
+            remaining = [
                 t
                 for t in self._store.tasks
                 if not (t.user_id == user_id and t.status == TaskStatus.PENDING)
             ]
+            # user_tasks is UNIQUE (user_id, task_id); checked before any write.
+            taken = {t.task_id for t in remaining if t.user_id == user_id}
+            for task in new_tasks:
+                if task.task_id in taken:
+                    raise task_id_clash(draft_id)
+                taken.add(task.task_id)
+            self._store.tasks[:] = remaining
             self._store.tasks.extend(new_tasks)
             # Re-read rather than write back the copy from before the yield: only
             # the status is this call's to change.

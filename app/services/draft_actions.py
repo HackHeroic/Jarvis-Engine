@@ -106,6 +106,9 @@ async def accept_draft_and_persist(
         InvalidStateTransition: the draft is no longer open (already accepted,
             rejected or expired). Nothing was written; it must not be re-persisted.
         NotFoundError: the user has no such draft.
+        ConflictError: a task id in the draft is already held by one of the
+            user's finished tasks, or repeated. Nothing was written, and a retry
+            cannot succeed.
 
     ``DraftService.accept`` writes the tasks and flips the status in one
     transaction, so they land together or not at all. A second accept therefore

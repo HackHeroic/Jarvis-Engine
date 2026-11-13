@@ -71,6 +71,17 @@ def not_found(what: str, entity_id: str) -> errors.NotFoundError:
     return errors.NotFoundError(f"That {what} does not exist.", details={f"{what}_id": entity_id})
 
 
+def task_id_clash(draft_id: str) -> errors.ConflictError:
+    """Accepting the draft would break user_tasks' UNIQUE (user_id, task_id).
+
+    A task the user already finished keeps its id, since accept replaces only
+    pending tasks. A plan that reuses that id, or repeats one, can never be written.
+    """
+    return errors.ConflictError(
+        "That plan clashes with tasks you already have.", details={"draft_id": draft_id}
+    )
+
+
 def normalized(entity: M) -> M:
     """Return a deep copy of ``entity`` with every datetime field in UTC."""
     updates = {name: utc(value) for name, value in entity if isinstance(value, datetime)}

@@ -431,7 +431,7 @@ async def list_tasks(
     user_id: str = Query(..., description="User ID"),
     status: Optional[str] = Query(
         default=None,
-        description="Filter by status: pending, completed, skipped, rolled_forward",
+        description="Filter by status: pending, completed, skipped, missed, pacing_pushed",
     ),
     request: Request = None,
 ) -> dict:

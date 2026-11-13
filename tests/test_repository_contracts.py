@@ -568,6 +568,33 @@ async def test_drafts__accept_atomic__row_for_other_user_or_bad_id__raises_valid
     assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rows",
+    [[_row("y"), _row("done")], [_row("y"), _row("y")]],
+    ids=["id_a_finished_task_holds", "id_twice_in_one_plan"],
+)
+async def test_drafts__accept_atomic__task_id_already_taken__raises_conflict_and_writes_nothing(
+    repos, rows
+):
+    """user_tasks is UNIQUE (user_id, task_id), and accept deletes only pending rows.
+
+    A finished task keeps its id, so a plan that reuses it, or repeats an id, can
+    never be written. That is a conflict with the user's tasks, not an outage.
+    """
+    await _seed_tasks(repos, U1, [_row("done", status="completed"), _row("open")])
+    draft = await _new_draft(repos)
+
+    with pytest.raises(errors.ConflictError) as raised:
+        await repos.drafts.accept_atomic(U1, draft.id, rows)
+
+    assert type(raised.value) is errors.ConflictError  # not InvalidStateTransition
+    assert raised.value.message == "That plan clashes with tasks you already have."
+    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["open"]
+    assert (await repos.tasks.get(U1, "done")).status is TaskStatus.COMPLETED
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
+
+
 # --- Constraints -------------------------------------------------------------
 
 

@@ -302,6 +302,23 @@ def test_accept_endpoint__second_call__409_envelope(client):
     assert sorted(r["task_id"] for r in rows) == ["t1", "t2"]
 
 
+def test_accept_endpoint__plan_clashes_with_existing_tasks__409_conflict(client):
+    """t1 is a task the user already finished; the unique key refuses the plan."""
+    supabase = client.app.state._test_supabase
+    finished = {"user_id": "test_user", "task_id": "t1", "title": "Read ch1", "status": "completed"}
+    supabase.rows["user_tasks"] = [dict(finished)]
+    draft_id = client.app.state._test_draft_id
+
+    resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
+
+    assert resp.status_code == 409
+    error = resp.json()["error"]
+    assert error["code"] == "conflict"
+    assert error["message"] == "That plan clashes with tasks you already have."
+    assert supabase.rows["user_tasks"] == [finished]
+    assert _draft_row(client, draft_id)["status"] == "pending"
+
+
 _EDITS = {
     "patch_task": lambda c, d: c.patch(
         f"/api/v1/drafts/{d}/tasks/t1?user_id=test_user", json={"title": "Read ch1 slowly"}
