@@ -77,7 +77,14 @@ async def test_route_llm_call__stream__still_runs_the_pii_gate_before_cloud(monk
 
 @pytest.mark.asyncio
 async def test_route_llm_call__stream__local_failure_falls_back_to_cloud(monkeypatch):
-    """Streaming lost route_llm_call's retry when it called litellm directly."""
+    """Streaming lost route_llm_call's retry when it called litellm directly.
+
+    The local failure is the error LiteLLM raises when LM Studio rejects the call.
+    A bare RuntimeError would now propagate: only model failures fall over to the
+    cloud, a code bug does not (tests/test_llm_providers.py).
+    """
+    import litellm
+
     import app.core.config as _cfg
     import app.models.brain.litellm_conf as _llm
     from app.core.model_router import route_llm_call
@@ -87,7 +94,9 @@ async def test_route_llm_call__stream__local_failure_falls_back_to_cloud(monkeyp
     async def flaky_hybrid(**kwargs):
         attempts.append(bool(kwargs.get("force_cloud")))
         if not kwargs.get("force_cloud"):
-            raise RuntimeError("LM Studio: no models loaded")
+            raise litellm.exceptions.BadRequestError(
+                message="LM Studio: no models loaded", model="gemma", llm_provider="openai"
+            )
 
         async def _gen():
             yield ("content", "cloud reply")

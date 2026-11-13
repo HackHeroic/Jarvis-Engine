@@ -41,6 +41,19 @@ _raw_gemini = os.getenv("GEMINI_MODEL", "gemini/gemini-2.5-flash")
 GEMINI_MODEL: str = _raw_gemini if _raw_gemini.startswith("gemini/") else f"gemini/{_raw_gemini}"
 GEMINI_PRIMARY: bool = os.getenv("GEMINI_PRIMARY", "false").lower() == "true"
 
+# Claude cloud tier. The provider itself arrives with the Claude task; these are read
+# now so the provider chain can honour CLAUDE_PRIMARY (skip local) from the start.
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_AUTH_TOKEN: str = os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+CLAUDE_PRIMARY: bool = os.getenv("CLAUDE_PRIMARY", "false").lower() == "true"
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+
+# Seconds before a language-model call is abandoned. Applied twice on purpose: as the
+# transport's own timeout, and as a hard ceiling around the provider call. For a
+# stream the ceiling bounds each wait for the next token, not the whole reply.
+LLM_TIMEOUT_SECONDS: float = 60
+LLM_STREAM_TIMEOUT_SECONDS: float = 120
+
 # SLM for Semantic Router (Level 2 - fast intent detection)
 # Uses Gemma fast model when available; falls back to primary at startup probe.
 SLM_ROUTER_MODEL: str = os.getenv("SLM_ROUTER_MODEL", GEMMA_FAST_MODEL)

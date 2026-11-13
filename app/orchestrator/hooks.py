@@ -22,6 +22,8 @@ class HookResult:
     decision: HookDecision
     modified_input: Optional[dict] = None
     reason: Optional[str] = None
+    # PII spans a MODIFY handler replaced — the usage ledger reports this count.
+    redactions: int = 0
 
 
 HookHandler = Callable[..., Awaitable[HookResult]]
@@ -80,6 +82,7 @@ async def pii_filter_hook(prompt: str, **kwargs: Any) -> HookResult:
             decision=HookDecision.MODIFY,
             modified_input={"prompt": filtered},
             reason=f"Stripped {len(email_matches)} emails, {len(phone_matches)} phones",
+            redactions=len(email_matches) + len(phone_matches),
         )
     return HookResult(decision=HookDecision.ALLOW)
 
