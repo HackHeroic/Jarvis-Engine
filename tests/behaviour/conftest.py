@@ -21,6 +21,7 @@ PEARL, the constraint bridge and the draft service.
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -154,6 +155,9 @@ def llm(monkeypatch) -> ScriptedLLM:
     async def extraction_transport(
         user_prompt, system_prompt="", response_schema=None, **_kwargs
     ):
+        # A model takes time to answer. Without this, background extractions could
+        # never overlap in a test the way they do live.
+        await asyncio.sleep(0.05)
         req = LLMRequest(
             task="memory_extraction", role="fast", prompt=user_prompt,
             system_prompt=system_prompt, response_schema=response_schema,
@@ -309,8 +313,9 @@ class Jarvis:
         return Turn(reply=payload["message"], payload=payload, events=events)
 
     def rows(self, table: str, **where: Any) -> list[dict]:
+        """Copies of the matching rows: a snapshot, not a live view of the table."""
         return [
-            r for r in self.db.rows.get(table, [])
+            copy.deepcopy(r) for r in self.db.rows.get(table, [])
             if all(r.get(k) == v for k, v in where.items())
         ]
 
