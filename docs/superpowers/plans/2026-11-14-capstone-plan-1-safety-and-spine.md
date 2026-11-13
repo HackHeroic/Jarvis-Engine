@@ -20,7 +20,7 @@
 - No `str(exc)` in any HTTP response. One error envelope: `{"error": {"code", "message", "details", "request_id"}}`.
 - Never copy code from `claude-code-src-code-main`.
 - Never run two PRIMARY-role LLM calls concurrently (existing project rule).
-- Claude calls: official `anthropic` SDK (`AsyncAnthropic`), model `claude-opus-5-5`, never via LiteLLM. Before writing any Claude code, invoke the `claude-api` skill and read `python/claude-api/README.md`, `python/claude-api/tool-use.md` (structured outputs), `shared/prompt-caching.md`. Never guess SDK names.
+- Claude calls: official `anthropic` SDK (`AsyncAnthropic`), model `claude-sonnet-5-5`, never via LiteLLM. Before writing any Claude code, invoke the `claude-api` skill and read `python/claude-api/README.md`, `python/claude-api/tool-use.md` (structured outputs), `shared/prompt-caching.md`. Never guess SDK names.
 - Test names follow `test_{thing}__{condition}__{expected}`.
 - Keep old import paths working with re-exports where existing tests patch them.
 
@@ -373,14 +373,14 @@ Error translation inside the adapters: `asyncio.TimeoutError`/litellm timeout �
 
 **Files:**
 - Create: `app/infrastructure/llm/claude.py`
-- Modify: `app/core/config.py` (`ANTHROPIC_API_KEY`, `CLAUDE_MODEL = "claude-opus-5-5"`, `CLAUDE_PRIMARY` bool env, `CLAUDE_EFFORT_BY_ROLE = {"fast": "low", "primary": "medium", "cloud": "medium"}`), `app/infrastructure/llm/factory.py` (insert Claude between local and Gemini when the key is set), `app/main.py` (startup log line: which providers are live; `CLAUDE_PRIMARY` honoured), `requirements.txt` + `pyproject.toml` (`anthropic>=1.0`), `.env.example` if present
+- Modify: `app/core/config.py` (`ANTHROPIC_API_KEY`, `CLAUDE_MODEL` (env, default `"claude-sonnet-5-5"` — Madhav chose Sonnet 2026-11-14; the model id is never hardcoded outside config), `CLAUDE_PRIMARY` bool env, `CLAUDE_EFFORT_BY_ROLE = {"fast": "low", "primary": "medium", "cloud": "medium"}`), `app/infrastructure/llm/factory.py` (insert Claude between local and Gemini when the key is set), `app/main.py` (startup log line: which providers are live; `CLAUDE_PRIMARY` honoured), `requirements.txt` + `pyproject.toml` (`anthropic>=1.0`), `.env.example` if present
 - Test: `tests/test_claude_provider.py`, `scripts/smoke_claude.py`
 
 **First step for the implementer:** invoke the `claude-api` skill; read `python/claude-api/README.md`, `python/claude-api/tool-use.md` (structured outputs section), `python/claude-api/streaming.md`, `shared/prompt-caching.md`, `shared/error-codes.md`. Use only names documented there.
 
 **Decisions (token efficiency is a hard requirement from Madhav):**
 - One module-level `AsyncAnthropic` client (`max_retries=0` — our `RetryingProvider` owns retries so calls are never double-retried; `timeout=req.timeout_s`).
-- `model="claude-opus-5-5"`; `output_config={"effort": CLAUDE_EFFORT_BY_ROLE[req.role]}`; do not send `thinking`, `temperature`, `top_p`, `budget_tokens`, or forced `tool_choice` (all 400 on this model).
+- `model="claude-sonnet-5-5"`; `output_config={"effort": CLAUDE_EFFORT_BY_ROLE[req.role]}`; do not send `thinking`, `temperature`, `top_p`, `budget_tokens`, or forced `tool_choice` (all rejected on this model). Read `shared/model-migration.md` → "Migrating to Claude Sonnet 5.5" in the claude-api skill before coding: effort levels are recalibrated (use `low` for the fast role, `medium` for primary/cloud), and the refusal fallback must use the `"default"` form.
 - `max_tokens`: 1024 for role `fast` with a schema, 4096 for role `fast` without, 8000 for `primary`/`cloud`. On `stop_reason == "max_tokens"` raise `LLMOutputParseError` (truncated JSON must not be parsed).
 - **Prompt caching:** `system` is sent as a single text block with `cache_control: {"type": "ephemeral"}`; the system prompt must be byte-stable — nothing volatile (dates, user names, memory context) goes in it; volatile context goes in the user message. Add `usage.cache_read_input_tokens` to `LLMUsageEvent.cache_read_tokens`.
 - **Structured output:** when `req.response_schema` is set, use the SDK's documented structured-output path (`output_config.format` / `messages.parse`) so the reply is schema-valid by construction; return the schema instance. No fence-stripping, no repair loop.

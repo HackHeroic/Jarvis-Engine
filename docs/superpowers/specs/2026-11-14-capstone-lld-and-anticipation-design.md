@@ -94,11 +94,11 @@ So this work has two jobs that pull in the same direction:
   - **Claude (Anthropic API, paid from Madhav's existing Console credits) replaces Gemini as the cloud tier.** Gemini stays only as a last resort, so the fallback order is Local → Claude → Gemini.
   - A `CLAUDE_PRIMARY` switch makes Claude first for the demo. It works like today's `GEMINI_PRIMARY`.
   - Claude is called through the official `anthropic` Python SDK (`AsyncAnthropic`), not through LiteLLM.
-  - Model `claude-opus-5-5` for every role, using effort to separate the roles: `low` for FAST-role tasks, `medium`/`high` for PRIMARY-role tasks.
+  - Model `claude-sonnet-5-5` for every cloud call (Madhav's choice, 2026-11-14: Opus is more than this project needs; set by `CLAUDE_MODEL` in config so it can change in one place), using effort to separate the roles: `low` for FAST-role tasks, `medium`/`high` for PRIMARY-role tasks.
   - Structured outputs via `output_config.format` / `messages.parse()` for every schema'd call.
   - Prompt caching on the stable system prompts.
   - Server-side refusal fallback on by default (`fallbacks: "default"`, beta `server-side-fallback-2026-07-01`).
-  - Estimated spend: about $0.10–0.20 per turn, and $10–30 for all development and demo use.
+  - Estimated spend: roughly half of the Opus estimate: about $0.05–0.10 per turn, and $5–15 for all development and demo use.
 - **Supabase is currently paused.** Madhav must restore it from the dashboard. Code work continues offline because tests never touch the network.
 - Tests must stay offline (the conftest socket guard).
 - Docs use Mermaid plus ADR-style decision logs (Madhav's standing preference).
