@@ -238,7 +238,12 @@ async def get_recent_messages(
     limit: int = 20,
     supabase: Any = None,
 ) -> list[dict]:
-    """Fetch the last ``limit`` messages ordered by ``created_at`` ASC."""
+    """Fetch the last ``limit`` messages, returned oldest first (``created_at`` ASC).
+
+    The query sorts newest first so ``limit`` keeps the most recent messages; sorted
+    ascending, it kept the *oldest* ones, freezing a long conversation's context at
+    its opening turns.
+    """
     if supabase is None:
         return []
 
@@ -249,11 +254,11 @@ async def get_recent_messages(
                 .select("id, session_id, role, content, intent, metadata, created_at")
                 .eq("session_id", session_id)
                 .eq("user_id", user_id)
-                .order("created_at", desc=False)
+                .order("created_at", desc=True)
                 .limit(limit)
                 .execute()
             )
-            return resp.data or []
+            return list(reversed(resp.data or []))
 
         return await asyncio.to_thread(_fetch)
     except Exception:
@@ -273,7 +278,7 @@ async def build_context_messages(
     Returns a list of ``{"role": "user"|"assistant", "content": "..."}`` dicts.
 
     If there are more messages in the DB than ``max_messages``, a system
-    message summarising the older turns is prepended to the window.
+    note that older turns were left out is prepended to the window.
 
     The **current** user message is NOT included — this list is the prior context
     that is injected before the new turn.
@@ -292,13 +297,13 @@ async def build_context_messages(
     cleaned = _truncate_messages(window, max_chars=max_chars_per_message)
 
     if overflow:
-        older_count = len(all_recent) - max_messages
+        # Only one message past the window is fetched, so how many were left out
+        # is unknown here; stating a number would understate it.
         summary_msg = {
             "role": "system",
             "content": (
-                f"[Context summary: there are {older_count} earlier message(s) in this "
-                "conversation that are not shown here. The messages below represent the "
-                "most recent context.]"
+                "[Context summary: earlier messages in this conversation are not "
+                "shown here. The messages below represent the most recent context.]"
             ),
         }
         return [summary_msg] + cleaned
