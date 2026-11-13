@@ -534,6 +534,12 @@ do $$ begin
     end if;
 end $$;
 
+-- SupabaseTaskRepository.list_scheduled_between filters on (user_id, scheduled_start)
+-- across every status, so the partial pending-only idx_user_tasks_scheduled cannot
+-- serve it.
+create index if not exists idx_user_tasks_user_scheduled_start
+    on public.user_tasks (user_id, scheduled_start);
+
 -- TaskStatus plus pacing_pushed, which the Skip endpoint still writes until plan 2
 -- migrates it (the repositories read it as skipped). in_progress, cancelled and
 -- rolled_forward are gone: no code in app/ writes them.
@@ -729,10 +735,12 @@ create policy owner_all on public.task_completion_signals for all
 -- 12. accept_draft: accept a draft and write its tasks in one transaction
 -- ============================================================================
 -- Called by SupabaseDraftRepository.accept_atomic; tests/fakes.py mirrors it.
--- Locks the draft row, so of two concurrent accepts exactly one succeeds and the
--- other raises DRAFT_NOT_OPEN. Replaces the user's pending tasks (completed,
--- skipped and missed ones stay), inserts p_rows, marks the draft accepted, and
--- returns how many tasks it inserted. Any error rolls all of it back.
+-- Accepts for one user run one at a time, so of two concurrent accepts exactly one
+-- succeeds and the other raises DRAFT_NOT_OPEN, whether they target the same draft
+-- or two different ones. Replaces the user's pending tasks (completed, skipped and
+-- missed ones stay), inserts p_rows, marks the draft accepted and the user's other
+-- open drafts superseded, and returns how many tasks it inserted. Any error rolls
+-- all of it back.
 create or replace function public.accept_draft(p_draft_id uuid, p_user_id text, p_rows jsonb)
 returns integer
 language plpgsql
@@ -756,6 +764,23 @@ declare
     v_inserted integer;
     v_count    integer := 0;
 begin
+    -- One accept at a time per user. Without this, two accepts of two different
+    -- drafts lock different rows, both pass the status check, and both plans end up
+    -- pending.
+    -- * It locks the user's profile row rather than taking an advisory lock. A draft
+    --   always has a profile row (draft_schedules.user_id is a NOT NULL FK to it), so
+    --   when there is nothing to lock there is no draft either: the call ends in
+    --   DRAFT_NOT_FOUND having written nothing. A row lock is also exact per user,
+    --   where a hashtext() advisory key can collide across users.
+    -- * NO KEY UPDATE, not UPDATE: inserts that reference user_profiles take KEY
+    --   SHARE on this row, and NO KEY UPDATE does not block them.
+    -- * Taken BEFORE the draft lock: this function also updates the user's other
+    --   drafts, so draft-then-user ordering lets two accepts deadlock.
+    perform 1
+       from public.user_profiles
+      where user_id = p_user_id
+        for no key update;
+
     select status, expires_at into v_status, v_expires
       from public.draft_schedules
      where id = p_draft_id and user_id = p_user_id
@@ -792,9 +817,23 @@ begin
     update public.draft_schedules
        set status = 'accepted'
      where id = p_draft_id and user_id = p_user_id;
+
+    -- The accepted plan replaces every other plan the user had open.
+    update public.draft_schedules
+       set status = 'superseded'
+     where user_id = p_user_id
+       and id <> p_draft_id
+       and status in ('pending', 'modified');
+
     return v_count;
 end $$;
 
 comment on function public.accept_draft(uuid, text, jsonb) is
-    'Accept an open draft and replace the user''s pending tasks with p_rows, atomically. '
-    'Raises DRAFT_NOT_FOUND or DRAFT_NOT_OPEN; returns the number of tasks inserted.';
+    'Accept an open draft and replace the user''s pending tasks with p_rows, atomically; '
+    'the user''s other open drafts become superseded. Raises DRAFT_NOT_FOUND or '
+    'DRAFT_NOT_OPEN; returns the number of tasks inserted.';
+
+-- Only the backend (service_role) and signed-in users may call it. Functions are
+-- executable by PUBLIC by default, and Supabase also grants anon explicitly.
+revoke execute on function public.accept_draft(uuid, text, jsonb) from public, anon;
+grant execute on function public.accept_draft(uuid, text, jsonb) to service_role, authenticated;

@@ -9,10 +9,11 @@ They record why each choice was made. They are also the source for the ER diagra
 
 ## Before you apply
 
-1. **Switch the backend to the secret key first.** The capstone migration enables row-level security on every user table. Only the service role bypasses RLS, and the value in `.env` under `SUPABASE_SERVICE_KEY` is a **publishable** key (`sb_publishable_…`). A publishable key acts as the `anon` role. With RLS on, an anon client reads zero rows and every write it makes fails.
-   - Before or with this migration, put the project's secret key (`sb_secret_…`, or the legacy `service_role` JWT) in `SUPABASE_SERVICE_KEY`.
-   - A local run confirmed that the `anon` role sees 0 rows once RLS is on.
+1. **Check the backend key.** `SUPABASE_SERVICE_KEY` must hold the project's service-role (secret) key: `sb_secret_…`, or the legacy `service_role` JWT. The capstone enables row-level security on every user table, and only the service role bypasses it.
+   - A publishable key (`sb_publishable_…`, kept in `SUPABASE_PUBLISHABLE_KEY`) acts as the `anon` role. With RLS on, the app would read no rows and every write would fail.
+   - A local run confirmed that `anon` sees 0 rows and cannot execute `accept_draft`.
 2. **This wipes every user table** (section 0 of the capstone). The owner decided on 2026-11-14 that all live rows are test data. Export a backup first if you want one.
+   - **Pre-apply check:** on the live database, `select to_regclass('public.user_profiles');` must return NULL. Otherwise the guarded wipe is skipped, and constraints added over the old rows can fail.
 3. **Apply it.** Use either path:
    - `supabase db push --include-all`. The baseline's version (`20260101000000`) is older than versions the remote database has already recorded, so the CLI refuses to insert it unless you pass `--include-all`. On the live database, every statement in the baseline is a no-op.
    - Or paste the baseline, then the capstone, into the dashboard SQL editor. Each paste runs as a single transaction.
@@ -133,6 +134,17 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `habit_trackers.habit_id` | a habit | Free text. |
 | `llm_usage_events.session_id` | a chat session | Sessions can be ephemeral when persisting them fails. |
 
+### Indexes the capstone adds
+
+| Index | Serves |
+|---|---|
+| `task_events (user_id, occurred_at desc)`, `(user_id, task_id)` | event history and per-task lookups |
+| `proactive_suggestions (user_id, status, created_at desc)` | the suggestion inbox |
+| `llm_usage_events (user_id, created_at desc)` | usage summaries |
+| `user_tasks (user_id, goal_id)`, `draft_schedules (user_id, goal_id)` | the goal FKs |
+| `task_materials (user_id, source_id)` | the document FK |
+| `user_tasks (user_id, scheduled_start)` (full) | `SupabaseTaskRepository.list_scheduled_between`, which reads every status. The older `idx_user_tasks_scheduled` is partial (`where status = 'pending'`) and cannot serve it. |
+
 ## CHECK and NOT NULL constraints
 
 | Table | Constraint | Rule |
@@ -189,6 +201,12 @@ All 19 public tables have RLS enabled with one policy, `owner_all`: `using (user
 
 Wrapping `auth.uid()` in `(select …)` makes Postgres evaluate it once per statement instead of once per row (the form Supabase's linter recommends).
 
+**The auth seam.** A policy matches a signed-in user only when the app's `user_id` equals that user's Supabase auth UUID (`auth.uid()`). Today the backend uses free-form ids such as `demo` and connects as the service role, which bypasses RLS, so the policies take effect only once:
+- clients sign in through Supabase Auth, and
+- `user_id`s are the auth UUIDs.
+
+Until then the policies record the intent and lock out `anon`.
+
 Checked locally:
 - A signed-in user sees only their own rows.
 - A forged insert for another user is rejected.
@@ -199,34 +217,70 @@ Checked locally:
 
 It runs as one transaction:
 
-1. Locks the draft row (`select … for update`, matched on id *and* user).
-2. Raises `DRAFT_NOT_FOUND` if the draft is missing or belongs to someone else.
-3. Raises `DRAFT_NOT_OPEN` unless the status is `pending` or `modified` and the draft has not expired.
-4. Deletes that user's `status = 'pending'` tasks.
-5. Inserts `p_rows`.
-6. Marks the draft `accepted`.
-7. Returns the number of tasks inserted.
+1. Locks the user's `user_profiles` row (`for no key update`), so a user's accepts run one at a time. See "Serialisation" below.
+2. Locks the draft row (`select … for update`, matched on id *and* user).
+3. Raises `DRAFT_NOT_FOUND` if the draft is missing or belongs to someone else.
+4. Raises `DRAFT_NOT_OPEN` unless the status is `pending` or `modified` and the draft has not expired.
+5. Deletes that user's `status = 'pending'` tasks.
+6. Inserts `p_rows`.
+7. Marks the draft `accepted`.
+8. Marks every other open draft of the user (`pending` / `modified`) `superseded`.
+9. Returns the number of tasks inserted.
 
-Any error rolls back all of it. This matches the `accept_draft` fake in `tests/fakes.py`.
+Any error rolls back all of it.
 
-**Explicit column list.** The function does not use `select *` from `jsonb_populate_recordset`, because that would set `id`, `created_at`, `topic_keywords` and every other omitted column to NULL. Instead, `v_columns` lists every key `build_task_rows` emits (`tests/test_migrations.py` pins this):
+**Privileges.** `execute` is revoked from `public` and `anon` and granted to `service_role` and `authenticated`. The function is `SECURITY INVOKER`, so a signed-in caller is also bound by RLS.
+
+### Serialisation
+
+**Why the draft lock alone is not enough.** Two accepts of two *different* open drafts of one user lock different rows. Both pass the status check, and both plans end up pending. That race was reproduced locally against the first version of this function.
+
+**Why the profile row and not an advisory lock.** A draft always has a profile row, because `draft_schedules.user_id` is a NOT NULL FK to it. So when there is no profile row to lock there is no draft either, and the call ends in `DRAFT_NOT_FOUND` having written nothing. The lock is therefore correct in every case. It is also exact per user, whereas a `hashtext()` advisory key can collide across users.
+
+**Why `NO KEY UPDATE`.** Every insert into a table that references `user_profiles` takes `KEY SHARE` on the profile row. `NO KEY UPDATE` does not block those inserts; `UPDATE` would.
+
+**Why the user lock comes before the draft lock.** The function also updates the user's other drafts. Suppose the user lock came second:
+- Session A holds draft A and the user lock.
+- Session B holds draft B and waits for the user lock.
+- A then waits on draft B to supersede it.
+
+That is a deadlock. Locally, with the locks in that order and a 1 s pause, session B died with `deadlock detected`, which would reach the API as a 503. With the user lock first, B waits and then gets `DRAFT_NOT_OPEN`.
+
+### Explicit column list
+
+The function does not use `select *` from `jsonb_populate_recordset`, because that would set `id`, `created_at`, `topic_keywords` and every other omitted column to NULL. Instead, `v_columns` lists every key `build_task_rows` emits (`tests/test_migrations.py` pins this):
 - For each row it keeps only those keys, then inserts only the columns the row actually carries.
 - An omitted column therefore takes its real table default.
 - `user_id` is always overwritten with `p_user_id`, so a row cannot be written for another user.
 
-**Behaviour checked against PostgreSQL 18**, using rows produced by `build_task_rows` + `accepted_task_rows`:
+### Behaviour checked against PostgreSQL 18
+
+Rows were produced by `build_task_rows` + `accepted_task_rows`.
 
 | Case | Result |
 |---|---|
-| Happy path | Returns 3; the completed task survives; ids, `created_at` and the `topic_keywords` default are filled in; the goal is created. |
-| Second call on the same draft | `DRAFT_NOT_OPEN` |
-| Unknown draft, or another user's draft | `DRAFT_NOT_FOUND` |
+| Happy path | Returns 3; the completed task survives; ids, `created_at` and the `topic_keywords` default are filled in; the goal is created; the user's other open draft becomes `superseded`. |
+| Second call on the same draft, or accepting a superseded draft | `DRAFT_NOT_OPEN` |
+| Unknown draft, another user's draft, or a user with no profile | `DRAFT_NOT_FOUND` |
 | Expired draft | `DRAFT_NOT_OPEN` |
-| One bad row in `p_rows` | Whole call rolled back; pending tasks and draft status untouched. |
+| One bad row in `p_rows` | Whole call rolled back: pending tasks, the draft's status and the other draft's status are all untouched. |
+| Two sessions accept two different open drafts of one user at once | The second waits for the first. Only the first plan's tasks are pending, the other draft is `superseded`, the second session gets `DRAFT_NOT_OPEN`, and so does accepting that draft again afterwards. |
+| `anon` calls it | `permission denied for function accept_draft` |
 
-Two differences from the Python fake. The fake ignores both, but neither matters for rows built by `build_task_rows`:
-- The SQL drops unknown keys and forces `user_id`.
-- The SQL enforces every constraint on the inserted rows.
+### Fake vs SQL
+
+`tests/fakes.py` (`FakeSupabase._accept_draft`) and the InMemory repository mirror the function's contract, but differ in these ways:
+
+| | SQL `accept_draft` | Fake / InMemory |
+|---|---|---|
+| `id` key in a row | Stripped; the row gets a fresh `gen_random_uuid()` | Kept as given |
+| Other unknown keys | Stripped | Kept (fake) |
+| `user_id` in a row | Forced to `p_user_id` | Kept as given (`accepted_task_rows` already stamps it) |
+| Constraints (unique `(user_id, task_id)`, CHECKs, NOT NULL) | Enforced; one bad row rolls back the call | Not enforced |
+| The user's other open drafts | Marked `superseded` | Left open, so accepting one later succeeds in the fake but raises `DRAFT_NOT_OPEN` in SQL |
+| Serialisation | Per user (profile row lock) | Global lock (fake) / store lock (InMemory) |
+
+None of these differences matters for well-formed rows from `build_task_rows`, except supersession.
 
 ## Dropped tables
 

@@ -20,23 +20,18 @@ BASELINE = MIGRATIONS / "20260101000000_baseline_legacy_tables.sql"
 CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
-LEGACY_USER_TABLES = (
-    "user_tasks",
-    "draft_schedules",
-    "behavioral_constraints",
-    "habit_trackers",
-    "user_memories",
-    "chat_sessions",
-    "chat_messages",
-    "task_materials",
-    "ingested_documents",
-    "pending_calendar_updates",
-    "user_plan_updates",
-    "user_preferences",
-    "task_workspaces",
-    "task_completion_signals",
+# Tables a migration creates that need no row-level security: the dead tables the
+# capstone drops. Any other table must get RLS, or be added here deliberately.
+NO_RLS_ALLOWLIST = frozenset(
+    {
+        "pending_action_items",
+        "extracted_problems",
+        "task_completion_criteria",
+        "user_calendar_anchors",
+        "conversation_messages",
+        "conversation_sessions",
+    }
 )
-USER_TABLES = NEW_TABLES + LEGACY_USER_TABLES
 BASELINE_TABLES = (
     "behavioral_constraints",
     "habit_trackers",
@@ -57,6 +52,33 @@ def _sql(path: Path) -> str:
 
 def _all_migrations() -> list[Path]:
     return sorted(MIGRATIONS.glob("*.sql"))
+
+
+def _set_sql() -> str:
+    """Every migration's text, in filename order, as one string."""
+    return "\n".join(_sql(path) for path in _all_migrations())
+
+
+def _created_tables() -> set[str]:
+    return set(re.findall(rf"create table (?:if not exists )?{_TABLE}(\w+)", _set_sql()))
+
+
+def _dropped_tables() -> set[str]:
+    statements = re.findall(r"drop table if exists\s+([^;]*);", _set_sql())
+    return {
+        name for statement in statements for name in re.findall(rf"{_TABLE}(\w+)", statement)
+    } - {"cascade"}
+
+
+def _user_tables() -> set[str]:
+    """Every table the migrations create, except the allowlisted ones."""
+    return _created_tables() - NO_RLS_ALLOWLIST
+
+
+def _accept_draft_body() -> str:
+    function = re.search(r"function (?:public\.)?accept_draft\b.*?\$\$;", _sql(CAPSTONE), re.S)
+    assert function, "accept_draft not found"
+    return function.group(0)
 
 
 def _check_values(sql: str, constraint: str) -> set[str]:
@@ -107,20 +129,24 @@ def test_migrations__baseline__creates_legacy_tables_before_any_cli_file_alters_
     assert files[0] == BASELINE, "the baseline must sort first: later files ALTER its tables"
 
 
-def test_migrations__every_user_table__has_rls_enabled():
-    sql = _sql(CAPSTONE)
+def test_migrations__no_rls_allowlist__holds_only_dropped_tables():
+    assert NO_RLS_ALLOWLIST <= _dropped_tables()
 
-    for table in USER_TABLES:
+
+def test_migrations__every_user_table__has_rls_enabled():
+    sql = _set_sql()
+    tables = _user_tables()
+
+    assert set(NEW_TABLES) <= tables
+    for table in tables:
         assert re.search(rf"alter table {_TABLE}{table}\s+enable row level security", sql), table
         assert re.search(rf"create policy owner_all\s+on {_TABLE}{table}\s", sql), table
 
 
 def test_migrations__every_user_table__references_user_profiles():
-    sql = _sql(CAPSTONE)
+    sql = _set_sql()
 
-    for table in USER_TABLES:
-        if table == "user_profiles":
-            continue
+    for table in _user_tables() - {"user_profiles"}:
         inline = re.search(
             rf"create table if not exists {_TABLE}{table}\s*\((?:(?!\);).)*?"
             rf"references {_TABLE}user_profiles\s*\(user_id\)",
@@ -146,18 +172,58 @@ def test_migrations__statements_are_idempotent(path: Path):
     assert not re.search(r"create trigger", sql), "use create or replace trigger"
     for table in re.findall(rf"create policy \w+\s+on {_TABLE}(\w+)", sql):
         assert re.search(rf"drop policy if exists \w+ on {_TABLE}{table}\b", sql), table
+    for name in re.findall(r"add constraint (\w+)", sql):
+        dropped_first = re.search(rf"drop constraint if exists {name}\b", sql)
+        checked_first = re.search(rf"conname = '{name}'", sql)
+        assert dropped_first or checked_first, f"unguarded add constraint {name}"
 
 
 def test_migrations__accept_draft_columns__match_build_task_rows():
-    sql = _sql(CAPSTONE)
-    function = re.search(r"function (?:public\.)?accept_draft\b.*?\$\$;", sql, re.S)
-    assert function, "accept_draft not found"
-    listed = re.search(r"v_columns\s+constant\s+text\[\]\s*:=\s*array\[(.*?)\]", function.group(0), re.S)
+    body = _accept_draft_body()
+    listed = re.search(r"v_columns\s+constant\s+text\[\]\s*:=\s*array\[(.*?)\]", body, re.S)
     assert listed, "accept_draft has no explicit column list"
     columns = set(re.findall(r"'(\w+)'", listed.group(1)))
 
     assert set(_full_task_row()) <= columns
-    assert "select *" not in function.group(0)
+    assert "select *" not in body
+
+
+def test_migrations__accept_draft__locks_the_user_before_the_draft():
+    body = _accept_draft_body()
+    user_lock = re.search(
+        r"from public\.user_profiles\s+where user_id = p_user_id\s+for no key update", body
+    )
+    draft_lock = re.search(
+        r"from public\.draft_schedules\s+where id = p_draft_id and user_id = p_user_id\s+for update",
+        body,
+    )
+
+    assert user_lock and draft_lock
+    assert user_lock.start() < draft_lock.start(), "user lock must come first (deadlock order)"
+
+
+def test_migrations__accept_draft__supersedes_the_users_other_open_drafts():
+    assert re.search(
+        r"set status = 'superseded'\s+where user_id = p_user_id\s+and id <> p_draft_id\s+"
+        r"and status in \('pending', 'modified'\)",
+        _accept_draft_body(),
+    )
+
+
+def test_migrations__accept_draft__executable_by_service_role_and_authenticated_only():
+    sql = _sql(CAPSTONE)
+    signature = r"function (?:public\.)?accept_draft\(uuid, text, jsonb\)"
+
+    assert re.search(rf"revoke execute on {signature} from public, anon;", sql)
+    assert re.search(rf"grant execute on {signature} to service_role, authenticated;", sql)
+
+
+def test_migrations__user_tasks__full_index_on_scheduled_start():
+    # Full, not partial: list_scheduled_between reads every status.
+    assert re.search(
+        rf"create index if not exists \w+\s+on {_TABLE}user_tasks\s*\(user_id, scheduled_start\)\s*;",
+        _set_sql(),
+    )
 
 
 def test_migrations__status_checks__match_domain_enums():
