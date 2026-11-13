@@ -54,7 +54,11 @@ def to_task_chunk(raw: dict, index: int) -> Any:
 
 
 def _goal_id_of(task_id: str) -> str | None:
-    """The goal namespace of a prefixed task_id (``thesis_task_1`` -> ``thesis``)."""
+    """The goal namespace of a prefixed task_id (``thesis_task_1`` -> ``thesis``).
+
+    Legacy fallback only: it reads up to the first underscore, so a multi-word goal
+    comes out wrong (``learn_dsa_task_1`` -> ``learn``).
+    """
     if not task_id or "_" not in task_id:
         return None
     return task_id.split("_", 1)[0]
@@ -99,7 +103,12 @@ def build_task_rows(
     """Return ``(plan_id, rows)``: one pending ``user_tasks`` row per chunk.
 
     Chunks are TaskChunk objects or plain dicts with prefixed task_ids
-    (``{goal_id}_{task_id}``). Every row carries the plan_id minted here.
+    (``{goal_id}_{run}_{task_id}``, or ``{goal_id}_{task_id}`` from older plans).
+    Every row carries the plan_id minted here.
+
+    A row's goal_id is the chunk's own ``goal_id`` (the planner stamps one on every
+    chunk). Only a chunk without one, written before goal_id travelled, falls back
+    to reading it off the task_id.
 
     Args:
         schedule: Optional map of task_id -> {"start_min", "end_min"} (solver
@@ -122,7 +131,7 @@ def build_task_rows(
         # duration fall back on any falsy attribute (`or`); every other field falls
         # back only when the attribute is None (`_field`).
         task_id = getattr(chunk, "task_id", None) or _from_dict(chunk, "task_id")
-        goal_id = _goal_id_of(task_id) if task_id else None
+        goal_id = _field(chunk, "goal_id") or (_goal_id_of(task_id) if task_id else None)
 
         row: dict[str, Any] = {
             "user_id": user_id,

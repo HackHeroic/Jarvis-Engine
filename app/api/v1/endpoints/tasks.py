@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -42,9 +42,12 @@ class TaskUpdateRequest(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     difficulty_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     deadline_hint: Optional[str] = None
-    status: Optional[str] = Field(
+    status: Optional[Literal["pending", "completed", "skipped", "missed", "pacing_pushed"]] = Field(
         default=None,
-        description="New status: pending, completed, skipped, rolled_forward",
+        description=(
+            "New status: pending, completed, skipped, missed or pacing_pushed, the "
+            "statuses user_tasks accepts. Anything else is rejected with a 422."
+        ),
     )
 
 
@@ -269,14 +272,22 @@ async def skip_task(
     "/{task_id}",
     response_model=TaskResponse,
     summary="Update a task",
-    description="Update task fields (title, duration, difficulty, deadline, status).",
+    description=(
+        "Update task fields (title, duration, difficulty, deadline, status). Status must "
+        "be one of pending, completed, skipped, missed, pacing_pushed; anything else is a 422."
+    ),
 )
 async def update_task(
     task_id: str,
     body: TaskUpdateRequest,
     request: Request,
 ) -> TaskResponse:
-    """Update mutable fields on a task."""
+    """Update mutable fields on a task.
+
+    ``status`` is limited to the statuses the user_tasks CHECK constraint accepts
+    (pending, completed, skipped, missed, pacing_pushed). Request validation
+    rejects anything else with a 422 before the database is touched.
+    """
     supabase = _get_supabase(request)
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not available")

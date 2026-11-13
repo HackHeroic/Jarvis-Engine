@@ -1,5 +1,6 @@
 """Tests for the planning module graph topology and its scheduling node."""
 
+import re
 import threading
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -901,6 +902,14 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
 # makes "tasks belonging to THIS goal" decidable. These tests port that rule.
 
 
+def _run_token(task_id: str, goal_id: str) -> str:
+    """The run token of a `{goal_id}_{run}_{task}` id; fails the test on any other shape."""
+    assert task_id.startswith(f"{goal_id}_"), task_id
+    run, _, task = task_id[len(goal_id) + 1:].partition("_")
+    assert re.fullmatch(r"[0-9a-f]{6}", run) and task, task_id
+    return run
+
+
 class _PendingUserModel:
     """A UserModel with pending rows and nothing else — no DB, no memory store."""
 
@@ -938,11 +947,12 @@ async def test_decompose_goal__namespaces_task_ids_and_dependencies(monkeypatch)
 
     assert out.get("error") is None, out.get("error")
     assert out["goal_id"] == "revise_graph_algorithms"
+    run = _run_token(out["task_chunks"][0]["task_id"], "revise_graph_algorithms")
     assert [c["task_id"] for c in out["task_chunks"]] == [
-        "revise_graph_algorithms_task_1",
-        "revise_graph_algorithms_task_2",
+        f"revise_graph_algorithms_{run}_task_1",
+        f"revise_graph_algorithms_{run}_task_2",
     ]
-    assert out["task_chunks"][1]["dependencies"] == ["revise_graph_algorithms_task_1"]
+    assert out["task_chunks"][1]["dependencies"] == [f"revise_graph_algorithms_{run}_task_1"]
 
 
 @pytest.mark.asyncio
@@ -962,7 +972,8 @@ async def test_decompose_goal__goal_metadata_carries_an_id__it_wins_over_the_slu
     out = await decompose_goal({"planning_goal": "finish the thesis", "user_id": "u1"})
 
     assert out["goal_id"] == "thesis"
-    assert [c["task_id"] for c in out["task_chunks"]] == ["thesis_task_1"]
+    [chunk] = out["task_chunks"]
+    assert chunk["task_id"] == f"thesis_{_run_token(chunk['task_id'], 'thesis')}_task_1"
 
 
 @pytest.mark.asyncio
@@ -1059,10 +1070,11 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
     supabase.rows["draft_schedules"] = [draft]
     landed = await accept_draft_and_persist(_FakeDraftStore(), "u1", draft, supabase)
 
+    run = _run_token(decomposed["task_chunks"][0]["task_id"], "revise_graph_algorithms")
     assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == [
         "calculus_task_1",
-        "revise_graph_algorithms_task_1",
-        "revise_graph_algorithms_task_2",
+        f"revise_graph_algorithms_{run}_task_1",
+        f"revise_graph_algorithms_{run}_task_2",
         "task_1",
     ]
     assert landed == 4
@@ -1100,12 +1112,147 @@ async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft
     _user_id, tasks, _horizon_start, goal = store.calls[0]
     assert goal == "revise_graph_algorithms"  # the draft row names its own namespace
     draft_ids = [t["task_id"] for t in tasks]
+    run = _run_token(draft_ids[0], "revise_graph_algorithms")
     assert draft_ids == [
-        "revise_graph_algorithms_task_1",
-        "revise_graph_algorithms_task_2",
+        f"revise_graph_algorithms_{run}_task_1",
+        f"revise_graph_algorithms_{run}_task_2",
         "calculus_task_1",  # the other goal's pending row, fused in untouched
     ]
     assert set(result["schedule"]["schedule"]) == set(draft_ids)
+
+
+# --- task ids are unique per planning run ------------------------------------
+# The decomposer's ids are positional, so `{goal_id}_{task_id}` repeats every time
+# a goal is re-planned. Accept deletes only PENDING rows: a task the user already
+# finished keeps its id, the re-plan emits that id again, and the unique key on
+# user_tasks (user_id, task_id) refuses the whole accept. A token minted once per
+# planning run (`{goal_id}_{run}_{task_id}`) makes every new id new.
+
+
+def _supabase_planning_state(supabase, message: str = "revise graph algorithms") -> dict:
+    """Planning-module input over one FakeSupabase: tasks, constraints and drafts alike."""
+    from app.core.user_model import UserModel
+    from app.modules.planning_graph import planning_state_in
+    from app.services.draft_store import DraftStore
+    from tests.fakes import FakeDBClient
+
+    return planning_state_in({
+        # A fresh UserModel per run: it caches pending tasks for its lifetime.
+        "user_model": UserModel(user_id="u1", db=FakeDBClient(supabase)),
+        "user_message": message,
+        "draft_store": DraftStore(supabase_client=supabase),
+    })
+
+
+@pytest.mark.asyncio
+async def test_planning__replan_after_completion__new_task_ids_do_not_collide(no_llm, monkeypatch):
+    """Plan → accept → finish a task → re-plan the same goal → accept.
+
+    Without a run token the re-plan re-emitted the finished task's id, and the
+    accept failed on the unique key every time: the user could never take the
+    new plan. Real solver; only the LLM transport is faked.
+    """
+    from app.domain.entities import TaskStatus
+    from app.domain.events import NullEventBus
+    from app.infrastructure.persistence.factory import RepositoryFactory
+    from app.services.draft_service import DraftService
+    from tests.fakes import FakeSupabase
+
+    _patch_decompose_transport(
+        monkeypatch,
+        _decompose_transport([_chunk("task_1"), _chunk("task_2", dependencies=["task_1"])]),
+    )
+    supabase = FakeSupabase()
+    repos = RepositoryFactory.supabase(supabase)
+    service = DraftService(repos.drafts, NullEventBus())
+
+    async def plan_and_accept() -> list[str]:
+        result = await build_module_graph(planning_module).ainvoke(
+            _supabase_planning_state(supabase)
+        )
+        draft = await repos.drafts.get("u1", result["draft_id"])
+        assert await service.accept("u1", draft.id) == 2
+        return [t["task_id"] for t in draft.tasks]
+
+    first = await plan_and_accept()
+    await repos.tasks.update_status("u1", first[0], TaskStatus.COMPLETED)
+
+    second = await plan_and_accept()
+
+    assert first[0] not in second
+    assert sorted((r["task_id"], r["status"]) for r in supabase.rows["user_tasks"]) == sorted(
+        [(first[0], "completed"), (second[0], "pending"), (second[1], "pending")]
+    )
+
+
+@pytest.mark.asyncio
+async def test_planning__new_chunk_dependencies__rewritten_with_run_token(monkeypatch):
+    """All of one run's chunks share its token, and their dependencies are rewritten with it.
+
+    A dependency left at the old shape points at no chunk in the plan, and the
+    solver's precedence edge silently disappears.
+    """
+    from app.modules.planning_graph import decompose_goal
+
+    _patch_decompose_transport(
+        monkeypatch,
+        _decompose_transport([
+            _chunk("task_1"),
+            _chunk("task_2", dependencies=["task_1"]),
+            _chunk("task_3", dependencies=["task_1", "task_2"]),
+        ]),
+    )
+
+    out = await decompose_goal({"planning_goal": "revise graph algorithms", "user_id": "u1"})
+
+    goal = "revise_graph_algorithms"
+    ids = [c["task_id"] for c in out["task_chunks"]]
+    run = _run_token(ids[0], goal)
+    assert ids == [f"{goal}_{run}_task_1", f"{goal}_{run}_task_2", f"{goal}_{run}_task_3"]
+    assert [c["dependencies"] for c in out["task_chunks"]] == [[], [ids[0]], [ids[0], ids[1]]]
+    # The goal travels on the chunk, so nothing downstream has to parse it out of the id.
+    assert [c["goal_id"] for c in out["task_chunks"]] == [goal, goal, goal]
+
+
+@pytest.mark.asyncio
+async def test_planning__carried_forward_pending_tasks__keep_their_ids(no_llm, monkeypatch):
+    """Another goal's pending rows ride through fusion, the draft and accept unchanged.
+
+    Same id, same dependencies, same goal_id. Re-deriving the goal from the id
+    would file `linear_algebra_…` under `linear`; the new chunks are filed under
+    the draft's own goal.
+    """
+    from app.domain.events import NullEventBus
+    from app.infrastructure.persistence.factory import RepositoryFactory
+    from app.services.draft_service import DraftService
+    from tests.fakes import FakeSupabase
+
+    carried = [
+        {"user_id": "u1", "task_id": "linear_algebra_9f3e2a_task_1", "goal_id": "linear_algebra",
+         "title": "eigenvalues", "status": "pending", "duration_minutes": 20,
+         "dependencies": []},
+        {"user_id": "u1", "task_id": "linear_algebra_9f3e2a_task_2", "goal_id": "linear_algebra",
+         "title": "eigenvectors", "status": "pending", "duration_minutes": 20,
+         "dependencies": ["linear_algebra_9f3e2a_task_1"]},
+    ]
+    supabase = FakeSupabase({"user_tasks": [dict(r) for r in carried]})
+    _patch_decompose_transport(
+        monkeypatch, _decompose_transport([_chunk("task_1"), _chunk("task_2")])
+    )
+
+    result = await build_module_graph(planning_module).ainvoke(_supabase_planning_state(supabase))
+    repos = RepositoryFactory.supabase(supabase)
+    draft = await repos.drafts.get("u1", result["draft_id"])
+    await DraftService(repos.drafts, NullEventBus()).accept("u1", draft.id)
+
+    rows = supabase.rows["user_tasks"]
+    assert len(rows) == 4
+    by_id = {r["task_id"]: r for r in rows}
+    for old in carried:
+        assert by_id[old["task_id"]]["goal_id"] == "linear_algebra"
+        assert by_id[old["task_id"]]["dependencies"] == old["dependencies"]
+    new = [r for r in rows if r["task_id"] not in {c["task_id"] for c in carried}]
+    assert {r["goal_id"] for r in new} == {draft.goal_id} == {"revise_graph_algorithms"}
 
 
 # ---------------------------------------------------------------------------
