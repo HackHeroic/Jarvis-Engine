@@ -7,8 +7,8 @@ orchestrator's ``draft_action`` node performs exactly the same operation on the
 conversational path.
 
 A draft that is no longer open (already accepted, rejected or expired) cannot be
-accepted or rejected: ``InvalidStateTransition`` reaches the global handler,
-which answers 409 in the error envelope.
+accepted, rejected or edited: ``InvalidStateTransition`` reaches the global
+handler, which answers 409 in the error envelope.
 
 Every handler passes ``user_id`` into ``DraftStore``, which filters on it, so a
 draft belonging to somebody else reads as absent and answers 404 — never 403,
@@ -30,6 +30,7 @@ from app.schemas.draft import (
     DraftTaskEdit,
 )
 from app.services.draft_actions import accept_draft_and_persist
+from app.services.draft_store import is_open_draft
 
 router = APIRouter()
 
@@ -55,6 +56,21 @@ async def _load_draft(request: Request, draft_id: str, user_id: str) -> tuple:
     if draft is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     return store, draft
+
+
+async def _refused_edit(store, draft_id: str, user_id: str, not_found: str) -> Exception:
+    """Why an edit wrote nothing: a closed draft is a 409, anything else a 404.
+
+    An edit must never reopen an accepted draft, or a second accept would write
+    its tasks again.
+    """
+    draft = await asyncio.to_thread(store.get_draft, draft_id, user_id)
+    if draft is not None and not is_open_draft(draft):
+        return InvalidStateTransition(
+            "This draft is no longer open, so it cannot be changed.",
+            details={"draft_id": draft_id, "from": draft.get("status"), "to": "modified"},
+        )
+    return HTTPException(status_code=404, detail=not_found)
 
 
 def _supabase_of(request: Request):
@@ -150,7 +166,7 @@ async def modify_draft(draft_id: str, request: DraftModifyRequest, http_request:
     store, _ = await _load_draft(http_request, draft_id, request.user_id)
     updated = await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, request.data)
     if updated is None:
-        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+        raise await _refused_edit(store, draft_id, request.user_id, _NOT_FOUND)
     return {"status": "modified", "component": "tasks", "draft_id": draft_id}
 
 
@@ -181,7 +197,7 @@ async def edit_draft_task(
         store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict
     )
     if result is None:
-        raise HTTPException(status_code=404, detail="Draft or task not found")
+        raise await _refused_edit(store, draft_id, user_id, "Draft or task not found")
 
     return {"status": "modified", "draft_id": draft_id, "task_id": task_id, "updated_draft": result}
 
@@ -199,7 +215,9 @@ async def rearrange_draft(draft_id: str, request: DraftRearrangeRequest, http_re
     reordered = [by_id.pop(tid) for tid in request.task_order if tid in by_id]
     reordered.extend(by_id.values())
 
-    await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, reordered)
+    updated = await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, reordered)
+    if updated is None:
+        raise await _refused_edit(store, draft_id, request.user_id, _NOT_FOUND)
 
     # TODO: re-solve with OR-Tools after a rearrange — the stored start times
     # are the solver's and no longer match the new order.

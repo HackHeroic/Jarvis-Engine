@@ -357,7 +357,7 @@ async def solve_schedule(state: PlanningState) -> dict:
 async def create_draft(state: PlanningState) -> dict:
     """v1 parity: a feasible schedule is *proposed* as a draft, not committed.
 
-    Nothing is written to ``user_tasks`` here — ``_persist_fused_tasks`` runs
+    Nothing is written to ``user_tasks`` here — ``DraftService.accept`` writes
     only when the user accepts. Failure is non-fatal by design: a draft id is a
     convenience for the review turn, and losing it must never cost the user the
     schedule the solver just spent seconds producing.
@@ -394,7 +394,7 @@ async def create_draft(state: PlanningState) -> dict:
             # null makes the row unable to say which goal it re-plans.
             goal_id=state.get("goal_id"),
             # Compact solved map (task_id -> start/end minutes): accept converts
-            # these to wall-clock scheduled_start/end via _persist_fused_tasks.
+            # these to wall-clock scheduled_start/end via build_task_rows.
             schedule={
                 tid: {"start_min": t.get("start_min"), "end_min": t.get("end_min")}
                 for tid, t in ((state.get("schedule") or {}).get("schedule") or {}).items()

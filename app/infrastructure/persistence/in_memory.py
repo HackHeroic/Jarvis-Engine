@@ -210,14 +210,16 @@ class InMemoryDraftRepository(DraftRepository):
         )
 
     async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
-        i = self._index(user_id, draft_id)
-        if i is None:
-            raise not_found("draft", draft_id)
-        # model_copy assigns update values by reference: copy, or the caller keeps a handle.
-        self._store.drafts[i] = self._store.drafts[i].model_copy(
-            update={"tasks": copy.deepcopy(tasks)}
-        )
-        return self._store.drafts[i].model_copy(deep=True)
+        # Under the lock: an edit must not land in the middle of an accept.
+        async with self._store.lock:
+            i = self._index(user_id, draft_id)
+            if i is None:
+                raise not_found("draft", draft_id)
+            # model_copy assigns update values by reference: copy, or the caller keeps a handle.
+            self._store.drafts[i] = self._store.drafts[i].model_copy(
+                update={"tasks": copy.deepcopy(tasks)}
+            )
+            return self._store.drafts[i].model_copy(deep=True)
 
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
@@ -262,7 +264,12 @@ class InMemoryDraftRepository(DraftRepository):
                 if not (t.user_id == user_id and t.status == TaskStatus.PENDING)
             ]
             self._store.tasks.extend(new_tasks)
-            self._store.drafts[i] = draft.model_copy(update={"status": DraftStatus.ACCEPTED})
+            # Re-read rather than write back the copy from before the yield: only
+            # the status is this call's to change.
+            i = self._index(user_id, draft_id)
+            self._store.drafts[i] = self._store.drafts[i].model_copy(
+                update={"status": DraftStatus.ACCEPTED}
+            )
             return len(new_tasks)
 
 

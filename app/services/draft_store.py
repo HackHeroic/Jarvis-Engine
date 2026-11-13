@@ -48,6 +48,11 @@ _UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly Non
 _OPEN_STATUSES = [DraftStatus.PENDING.value, DraftStatus.MODIFIED.value]
 
 
+def is_open_draft(draft: dict | None) -> bool:
+    """Whether a draft row is still under review, so it may be edited, accepted or rejected."""
+    return bool(draft) and draft.get("status") in _OPEN_STATUSES
+
+
 class DraftStore:
     """Persists draft schedules in Supabase draft_schedules table."""
 
@@ -107,12 +112,18 @@ class DraftStore:
         The unit of revision for a draft is its task array — reordering
         (`POST /rearrange`) and per-task edits both end here. Status becomes
         'modified' so a revised draft is distinguishable from an untouched one.
+
+        Only an open draft is revised. None means absent, or closed: reopening an
+        accepted draft as 'modified' would let a second accept write its tasks
+        again. ``is_open_draft`` on a fresh read tells the two apart.
         """
         if not self._supabase:
             return None
-        if not self.get_draft(draft_id, user_id):
-            return None  # absent, or not this user's — same answer either way
-        self._supabase.table("draft_schedules").update({"tasks": tasks, "status": "modified"}).eq("id", draft_id).eq("user_id", user_id).execute()
+        if not is_open_draft(self.get_draft(draft_id, user_id)):
+            return None  # absent, not this user's, or closed
+        result = self._supabase.table("draft_schedules").update({"tasks": tasks, "status": "modified"}).eq("id", draft_id).eq("user_id", user_id).in_("status", _OPEN_STATUSES).execute()
+        if not result.data:
+            return None  # closed between the read and the write
         return self.get_draft(draft_id, user_id)
 
     def edit_task_in_draft(self, draft_id: str, user_id: str, task_id: str, edits: dict) -> dict | None:
@@ -177,7 +188,7 @@ class DraftStore:
         return True
 
     def accept_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
-        """Legacy no-op. No caller remains — drafts.py now uses accept_draft()."""
+        """Legacy no-op. No caller remains — drafts.py accepts via draft_actions.accept_draft_and_persist()."""
         return True
 
     def reject_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
