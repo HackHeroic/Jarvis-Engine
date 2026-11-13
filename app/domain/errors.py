@@ -1,0 +1,85 @@
+"""The Jarvis error hierarchy.
+
+Every error carries a stable machine-readable ``code`` and the HTTP status the
+API layer answers with; ``app/api/error_handlers.py`` turns them into the one
+error envelope. ``message`` is user-facing text — never put ``str(exc)`` of a
+lower-level exception in it.
+
+``ValidationError`` here shares its name with Pydantic's. In a module that uses
+both, import this module (``from app.domain import errors``) instead of the name.
+"""
+
+
+class JarvisError(Exception):
+    """Base of every error Jarvis raises on purpose."""
+
+    code: str = "internal_error"
+    http_status: int = 500
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.details = details
+
+
+class DomainError(JarvisError):
+    """A rule of the domain was broken; the request cannot be honoured as asked."""
+
+
+class ValidationError(DomainError):
+    code = "validation_error"
+    http_status = 422
+
+
+class NotFoundError(DomainError):
+    code = "not_found"
+    http_status = 404
+
+
+class ConflictError(DomainError):
+    code = "conflict"
+    http_status = 409
+
+
+class InvalidStateTransition(ConflictError):
+    code = "invalid_state_transition"
+
+
+class StaleVersionError(ConflictError):
+    code = "stale_version"
+
+
+class ScheduleInfeasibleError(DomainError):
+    code = "schedule_infeasible"
+    http_status = 422
+
+
+class ConsentRequiredError(DomainError):
+    code = "consent_required"
+    http_status = 202
+
+
+class InfrastructureError(JarvisError):
+    """Something Jarvis depends on (database, model) failed; the request was fine."""
+
+
+class PersistenceError(InfrastructureError):
+    code = "persistence_unavailable"
+    http_status = 503
+
+
+class LLMError(InfrastructureError):
+    code = "llm_error"
+    http_status = 503
+
+
+class LLMTimeoutError(LLMError):
+    code = "llm_timeout"
+
+
+class LLMUnavailableError(LLMError):
+    code = "llm_unavailable"
+
+
+class LLMOutputParseError(LLMError):
+    code = "llm_output_parse"
