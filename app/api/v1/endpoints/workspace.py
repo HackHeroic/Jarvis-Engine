@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.domain import errors
 from app.schemas.workspace import TaskWorkspace
 from app.services.analytical.workspace_builder import (
     get_or_build_task_workspace,
@@ -36,8 +37,10 @@ async def get_task_workspace(
             user_prompt=prompt,
             refresh=refresh,
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        # Not only a database call (RAG, web search and an LLM run here too), so
+        # a plain 500. The handler logs the chained cause; its text stays off the wire.
+        raise errors.JarvisError("Could not build the task workspace.") from exc
 
 
 @router.delete("/{task_id}/workspace")

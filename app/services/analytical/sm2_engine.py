@@ -1,11 +1,14 @@
 """SuperMemo-2 spaced repetition engine for habit persistence."""
 
+import logging
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from supabase import create_client
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_sm2(
@@ -55,10 +58,14 @@ def _get_supabase():
 async def record_completion(
     tracker_id: str,
     quality: int,
-    user_id: Optional[str] = None,
+    user_id: str,
     supabase_client: Any = None,
 ) -> dict[str, Any]:
-    """Record a completion and update tracker. Returns next_review_date and next_interval_days."""
+    """Record a completion and update tracker. Returns next_review_date and next_interval_days.
+
+    Scoped to ``user_id``: another user's tracker is reported as ``"not found"``,
+    exactly like a missing one, so its existence does not leak.
+    """
     client = supabase_client or _get_supabase()
     if not client:
         return {"status": "error", "reason": "Supabase not configured"}
@@ -68,15 +75,13 @@ async def record_completion(
             client.table("habit_trackers")
             .select("*")
             .eq("id", tracker_id)
+            .eq("user_id", user_id)
             .execute()
         )
         if not result.data or len(result.data) == 0:
             return {"status": "error", "reason": "not found"}
 
         row = result.data[0]
-        if user_id and row.get("user_id") != user_id:
-            return {"status": "error", "reason": "forbidden"}
-
         reps = row.get("repetitions") or 0
         ef = float(row.get("ef") or 2.5)
         interval = int(row.get("next_interval_days") or 1)
@@ -91,15 +96,16 @@ async def record_completion(
                 "next_interval_days": sm2_result["next_interval_days"],
                 "last_done_at": datetime.now(timezone.utc).isoformat(),
             }
-        ).eq("id", tracker_id).execute()
+        ).eq("id", tracker_id).eq("user_id", user_id).execute()
 
         return {
             "status": "ok",
             "next_review_date": sm2_result["next_review_date"].isoformat(),
             "next_interval_days": sm2_result["next_interval_days"],
         }
-    except Exception as e:
-        return {"status": "error", "reason": str(e)}
+    except Exception:
+        logger.warning("record_completion failed for tracker %s", tracker_id, exc_info=True)
+        return {"status": "error", "reason": "database error"}
 
 
 async def get_due_trackers(
