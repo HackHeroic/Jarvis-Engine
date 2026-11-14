@@ -1200,6 +1200,7 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
 async def chat_stream_v2(request: ChatRequest, http_request: Request):
     """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
     from app.core.model_router import ServedModels, attribute_llm_calls, recording_served_models
+    from app.core.observation import pearl_insights
     from app.core.user_model import UserModel
     from app.orchestrator.checkpoint import make_thread_id
     from app.orchestrator.state import ConversationPhase, NegotiationPhase
@@ -1299,6 +1300,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         # negotiation shortcut bypasses extract_brain_dump (which otherwise
         # re-decides it), so a stale True would mute the observation loop.
         "trivial_input": None,
+        # What this turn's memories cite as their source: the conversation, and the
+        # user's message (its id filled in by _read_conversation once it is saved).
+        # The handles are per turn too: extract_brain_dump sets them fresh.
+        "session_id": session_id,
+        "user_message_id": None,
+        "memory_handles": {},
         # When user picks Gemini in the model selector, force every LLM call
         # in this turn to route to cloud — not local Gemma.
         "force_cloud_request": force_cloud_request,
@@ -1332,7 +1339,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         initial_state["conversation_history"] = await build_context_messages(
             session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
         )
-        await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+        initial_state["user_message_id"] = await save_user_message(
+            session_id, request.user_id, request.user_prompt, supabase
+        )
         if memory_store:
             # Archival memory for the model, and the active memories for the panel.
             from app.services.memory.retriever import build_memory_context
@@ -1465,11 +1474,6 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     if node_state.get("needs_consent"):
                         yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
 
-                    if node_name == "observation_loop":
-                        if node_state.get("memories_extracted"):
-                            yield f"event: memory_extracted\ndata: {json_mod.dumps(node_state['memories_extracted'])}\n\n"
-                        if node_state.get("patterns_detected"):
-                            yield f"event: pattern_detected\ndata: {json_mod.dumps(node_state['patterns_detected'])}\n\n"
                     continue
 
                 # Sub-graph / synthesis bridge event (JSON string)
@@ -1632,10 +1636,19 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 supabase,
             )
 
-            # Memory extraction and PEARL already ran in the graph's observation
-            # loop, which skips greetings. A second extraction here cost an extra
-            # model call on every turn, mined "hi" for memories, and could store a
-            # contradicted fact's replacement twice.
+            # Memories and PEARL were learned in the graph's observation loop, which
+            # skips greetings, and their frames are already sent: every learning
+            # moment arrives before complete, and nothing is left running after it.
+            # The turn's learning, for the complete frame: PEARL's insights (a bounded
+            # read), a re-plan hint, and the honest status of a plan that did not fit.
+            _insights = await pearl_insights(request.user_id)
+            _infeasible = final_state.get("error") == "INFEASIBLE_EXHAUSTED"
+            _schedule_status = "draft" if _has_schedule else ("infeasible" if _infeasible else None)
+            _suggested_action = (
+                "replan"
+                if final_state.get("saved_constraints") or final_state.get("anti_guilt_message")
+                else None
+            )
 
             # --- Build full ChatResponse payload ---
             complete_payload = {
@@ -1646,10 +1659,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 "ingestion_result": final_state.get("ingestion_result"),
                 "action_proposals": None,
                 "search_result": None,
-                "suggested_action": None,
+                "suggested_action": _suggested_action,
                 "thinking_process": thinking_clean or final_state.get("thinking_process"),
                 "awaiting_task_confirmation": False,
-                "schedule_status": "draft" if _has_schedule else None,
+                "schedule_status": _schedule_status,
+                "conflict_summary": (
+                    final_state.get("clarification_request") if _infeasible else None
+                ),
                 "draft_id": _turn_draft_id,
                 "saved_constraints": final_state.get("saved_constraints"),
                 "conversation_id": session_id,
@@ -1662,7 +1678,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     ]
                     if _existing_memories else None
                 ),
-                "pearl_insights": None,
+                "pearl_insights": _insights,
                 "generation_metrics": {
                     "total_tokens": _token_count,
                     "total_time_s": round(_total_s, 2),

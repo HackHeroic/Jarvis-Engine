@@ -10,8 +10,6 @@ day it covers. Dismissing a pattern hands the hour back for good: PEARL recognis
 dismissed pattern by its key and never learns it again.
 """
 
-import json
-import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,7 +20,7 @@ import pytest
 import app.api.v1.endpoints.schedule as schedule_endpoint
 import app.services.task_service as task_service
 from app.domain.entities import TaskEvent, TaskEventType
-from tests.behaviour.conftest import brain_dump, decomposition
+from tests.behaviour.conftest import brain_dump, decomposition, said
 
 # The user's clock (India): plans start at 08:00 local, the start of their day, and
 # the skips PEARL learns from were at 09:00 local. (These were UTC times when the
@@ -161,14 +159,19 @@ async def test_pearl__another_users_skips__teach_me_nothing(jarvis, llm):
 
 
 def _script_rule(llm) -> None:
-    def extract(req) -> str:
-        user_line = re.search(r"^User: (.*)$", req.prompt, flags=re.MULTILINE).group(1)
-        if "before 11" not in user_line:
-            return '{"memories": []}'
-        rule = {"type": "constraint", "content": "No study before 11 AM", "confidence": 0.9}
-        return json.dumps({"memories": [rule]})
+    """The turn's extraction also hears a rule the user states, as a constraint memory.
 
-    llm.script("memory_extraction", extract)
+    Asking for a plan still plans, with the decomposition ``_script_plan`` scripted.
+    """
+
+    def extract(req) -> str:
+        message = said(req)
+        if "before 11" in message:
+            rule = {"type": "constraint", "content": "No study before 11 AM", "confidence": 0.9}
+            return brain_dump(memories=[rule])
+        return brain_dump(planning_goal="Revise DSA") if "plan" in message.lower() else "{}"
+
+    llm.script("brain_dump_extraction", extract)
 
 
 @pytest.mark.asyncio

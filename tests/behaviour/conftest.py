@@ -63,10 +63,11 @@ class ScriptedLLM(LLMProvider):
         self.unscripted: list[str] = []
         self._replies: dict[str, Callable[[LLMRequest], Any]] = {}
         # A turn with nothing to say still reaches these; their defaults are dull on purpose.
+        # No separate memory extraction: memories come back from brain_dump_extraction,
+        # so a memory_extraction call is unscripted and fails the test.
         self.script("brain_dump_extraction", "{}")
         self.script("voice_of_jarvis", "Very good, sir.")
         self.script("voice_of_jarvis_synthesis", "Done, sir.")
-        self.script("memory_extraction", '{"memories": []}')
 
     def script(self, task: str, reply: Reply) -> None:
         """Answer every later call for ``task`` with ``reply`` (or ``reply(request)``)."""
@@ -98,10 +99,6 @@ class ScriptedLLM(LLMProvider):
         return True
 
     async def complete(self, req: LLMRequest) -> str | BaseModel:
-        if req.task == "memory_extraction":
-            # A model takes time to answer. Without this, background extractions
-            # could never overlap in a test the way they do live.
-            await asyncio.sleep(0.05)
         return self.answer(req)
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
@@ -144,6 +141,16 @@ def llm(monkeypatch, embeddings) -> ScriptedLLM:
 def brain_dump(**fields: Any) -> str:
     """A ``BrainDumpExtraction`` as the model returns it: JSON in a markdown fence."""
     return f"```json\n{json.dumps(fields)}\n```"
+
+
+def said(req: LLMRequest) -> str:
+    """What the user said, out of a brain_dump_extraction prompt.
+
+    The prompt is the message itself, or, when the user has memories, the known
+    memories (``[m1] (type) content`` lines) followed by ``Message:`` and the message.
+    """
+    known, header, message = req.prompt.partition("\n\nMessage:\n")
+    return message if header else known
 
 
 def decomposition(
@@ -230,7 +237,7 @@ def _parse_sse(raw: str) -> list[tuple[str, Any]]:
 
 
 async def settle_background_tasks(timeout: float = 10.0) -> None:
-    """Wait for every task a turn left running (memory extraction, PEARL) to finish."""
+    """Wait for every task a turn left running to finish."""
     current = asyncio.current_task()
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
