@@ -417,10 +417,6 @@ async def test_anti_guilt__solver_api_infeasible__422_says_scope_without_blame(m
 async def test_anti_guilt__skipping_tasks__every_reply_and_note_is_blame_free(
     jarvis, embeddings, monkeypatch
 ):
-    async def replan_is_off(*_args, **_kwargs):  # known gap: background replan never worked
-        return None
-
-    monkeypatch.setattr("app.services.analytical.control_policy.trigger_replan", replan_is_off)
     for task_id, minutes in (("short", 25), ("long", 90)):
         jarvis.db.table("user_tasks").insert({
             "user_id": "alice", "task_id": task_id, "title": f"Revise {task_id} notes",
