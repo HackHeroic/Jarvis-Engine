@@ -526,6 +526,18 @@ class DraftPlanner(ABC):
         30 days. Never breaks a goal into new tasks.
         """
 
+    @abstractmethod
+    async def reslot_from_now(self, user_id: str, draft: DraftSchedule) -> dict | None:
+        """The draft's own tasks re-solved from now, as a draft stores its schedule
+        (task_id -> {start_min, end_min} from the draft's ``horizon_start``).
+
+        Every rule a plan keeps holds (the stored rules, the constraint memories no rule
+        covers, the learned set-aside hours, the night), on the user's clock and leaning
+        on their learned focus. None when the tasks no longer fit. Raises
+        LLMUnavailableError, a transient error, when the user's free-text habits could
+        not be read: never a schedule that ignores them.
+        """
+
 
 # --- Learning ---------------------------------------------------------------
 

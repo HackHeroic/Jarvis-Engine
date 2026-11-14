@@ -19,7 +19,6 @@ belonging to somebody else simply reads as absent (house IDOR rule).
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -118,14 +117,16 @@ async def accept_on_time(
     """Accept the draft, never with a slot that has already begun (both accept paths).
 
     No slot begun: ``DraftService.accept`` as drafted. Some begun: the draft's own tasks
-    are re-solved from now first (the draft-edit re-solve: its horizon, the user's
-    habits, their clock and learned focus profile), the new times put on the draft and
-    the draft accepted, ``moved``. Written as drafted, the passed slots would be set
+    are re-solved from now first (``DraftPlanner.reslot_from_now``: every rule a plan
+    keeps, on the user's clock, leaning on their learned focus), the new times put on
+    the draft and the draft accepted, ``moved``. Written as drafted, the passed slots would be set
     aside by the next sweep as if the user had, feeding PEARL and the focus profile
     evidence that never happened. Every slot begun: ``DraftOutdatedError``, as before.
 
-    Raises ScheduleInfeasibleError (NO_ROOM_ON_ACCEPT) when the re-solve finds no room:
-    nothing is accepted and the draft stays open. Otherwise as ``DraftService.accept``.
+    Raises ScheduleInfeasibleError (NO_ROOM_ON_ACCEPT) when the re-solve finds no room,
+    and LLMUnavailableError when the user's habits could not be read for it: either
+    way nothing is accepted and the draft stays open. Otherwise as
+    ``DraftService.accept``. ``supabase`` is unused (kept for the callers).
     """
     draft = await service.get(user_id, draft_id)
     draft.transition(DraftStatus.ACCEPTED)  # a closed draft fails fast, as accept does
@@ -134,37 +135,21 @@ async def accept_on_time(
     begun = [task for task, start in starts.items() if start <= now]
     if not begun or len(begun) == len(starts):
         return AcceptOutcome(written=await service.accept(user_id, draft_id))
-    schedule = await _resolved_from_now(user_id, draft, supabase)
+    schedule = await _resolved_from_now(user_id, draft)
     if schedule is None:
         raise errors.ScheduleInfeasibleError(NO_ROOM_ON_ACCEPT, details={"draft_id": draft_id})
     await service.reschedule(user_id, draft_id, schedule)
     return AcceptOutcome(written=await service.accept(user_id, draft_id), moved=True)
 
 
-async def _resolved_from_now(user_id: str, draft: Any, supabase: Any) -> Optional[dict]:
-    """The draft's tasks re-solved from now on its own horizon; None if they no longer fit."""
-    from app.services.analytical.schedule_modifier import draft_constraints, resolve_from_now
-    from app.services.energy import solver_focus
-    from app.services.planning.local_time import stored_user_zone
-
+async def _resolved_from_now(user_id: str, draft: Any) -> Optional[dict]:
+    """The draft's tasks re-solved from now (``DraftPlanner.reslot_from_now``: every rule a
+    plan keeps); None if they no longer fit. LLMUnavailableError when the user's habits
+    could not be read."""
     container = registered_container()
-    zone = await stored_user_zone(
-        container.repos.profiles if container is not None else None, user_id
-    )
-    horizon_start = datetime.fromisoformat(draft.horizon_start)
-    if horizon_start.tzinfo is None:  # a legacy horizon without an offset was UTC
-        horizon_start = horizon_start.replace(tzinfo=timezone.utc)
-    slots = await draft_constraints(user_id, supabase, horizon_start)
-    focus = await solver_focus(
-        container.energy if container is not None else None, user_id, zone, now=utc_now()
-    )
-    resolved = await asyncio.to_thread(
-        resolve_from_now, draft.tasks, slots, horizon_start, focus_by_hour=focus, zone=zone
-    )
-    if resolved is None:
+    if container is None:  # tests and scripts: no planner to re-solve with
         return None
-    _graph, schedule = resolved
-    return schedule.model_dump(mode="json")
+    return await container.planner.reslot_from_now(user_id, draft)
 
 
 async def accept_draft_on_time(

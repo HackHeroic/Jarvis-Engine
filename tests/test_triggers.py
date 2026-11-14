@@ -87,6 +87,9 @@ class _PinnedPlanner(DraftPlanner):
         self._raises = raises
         self.calls: list[list[str]] = []
 
+    async def reslot_from_now(self, user_id: str, draft: DraftSchedule) -> dict | None:
+        raise AssertionError("the brief never re-solves a draft in place")
+
     async def replan(self, user_id: str, *, reslot_task_ids: list[str]) -> DraftSchedule | None:
         self.calls.append(list(reslot_task_ids))
         if self._raises is not None:

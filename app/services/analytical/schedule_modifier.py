@@ -248,11 +248,14 @@ def resolve_from_now(
     the horizon ladder fits them (or they cannot be read as tasks).
 
     ``horizon_start`` is the draft's minute 0; the minutes already gone by are blocked
-    (``block_past``). ``focus_by_hour`` is the user's learned focus profile, ``zone``
-    their clock. CPU-bound (CP-SAT): an async caller runs it with ``asyncio.to_thread``.
+    (``block_past``). ``time_slots`` (TimeSlots or their dicts) may run past a rung's
+    horizon, as planning's do: each rung drops the ones that start past it.
+    ``focus_by_hour`` is the user's learned focus profile, ``zone`` their clock.
+    CPU-bound (CP-SAT): an async caller runs it with ``asyncio.to_thread``.
     """
     from app.api.v1.endpoints.schedule import run_schedule
     from app.core.config import DEFAULT_HORIZON_MINUTES, MAX_HORIZON_MINUTES
+    from app.schemas.context import TimeSlot
     from app.schemas.decomposition import ExecutionGraph, TaskChunk
 
     try:
@@ -278,13 +281,20 @@ def resolve_from_now(
     except Exception as exc:  # tasks that cannot be read as tasks cannot be re-solved
         logger.warning("Re-solve skipped: the tasks could not be read (%s)", type(exc).__name__)
         return None
+    slots = []
+    for slot in time_slots:
+        try:
+            slots.append(slot if isinstance(slot, TimeSlot) else TimeSlot.model_validate(slot))
+        except (ValueError, TypeError):  # pydantic's ValidationError is a ValueError
+            logger.warning("Re-solve skipped an unreadable time slot")
     for horizon_min in (DEFAULT_HORIZON_MINUTES, *_LONGER_HORIZONS):
         if horizon_min > MAX_HORIZON_MINUTES:
             break
         try:
             schedule = run_schedule(
                 graph,
-                time_slots,
+                # A fresh list each rung: run_schedule appends its night block in place.
+                [s for s in slots if s.start_min < horizon_min],
                 horizon_minutes=horizon_min,
                 horizon_start=horizon_start,
                 zone=zone,
@@ -297,24 +307,3 @@ def resolve_from_now(
             continue
         return graph, schedule
     return None
-
-
-async def draft_constraints(user_id: str, supabase: Any, horizon_start: Any) -> list:
-    """The time slots a draft re-solve respects: the user's stored habits, translated and
-    expanded over the default horizon from ``horizon_start`` (weekdays counted from its
-    own first day). Habits that cannot be read or translated give none, logged."""
-    from app.core.config import DEFAULT_HORIZON_MINUTES
-    from app.services.analytical.habit_translator import translate_habits_to_slots
-    from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
-    from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
-
-    semantic_slots: list = []
-    try:
-        habits = await get_behavioral_context_for_calendar(user_id, supabase)
-        if habits and habits.strip():
-            semantic_slots = await translate_habits_to_slots(habits)
-    except Exception as exc:  # the re-solve goes on without them
-        logger.warning("Habits unread for a re-solve (%s)", type(exc).__name__)
-    return expand_semantic_slots_to_time_slots(
-        semantic_slots, horizon_minutes=DEFAULT_HORIZON_MINUTES, plan_start=horizon_start
-    )
