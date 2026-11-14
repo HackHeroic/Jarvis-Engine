@@ -18,6 +18,7 @@ from app.services.planning.task_rows import build_task_rows
 MIGRATIONS = Path(__file__).resolve().parent.parent / "supabase" / "migrations"
 BASELINE = MIGRATIONS / "20260101000000_baseline_legacy_tables.sql"
 CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
+SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
 # Tables a migration creates that need no row-level security: the dead tables the
@@ -240,6 +241,21 @@ def test_migrations__status_checks__match_domain_enums():
     assert _check_values(sql, "proactive_suggestions_status_check") == {
         s.value for s in SuggestionStatus
     }
+
+
+def test_migrations__skip_migration__maps_pacing_pushed_and_drops_it_from_check():
+    sql = _sql(SKIP_WRITES_SKIPPED)
+
+    mapped = re.search(
+        rf"update {_TABLE}user_tasks\s+set status = 'skipped'\s+where status = 'pacing_pushed'\s*;",
+        sql,
+    )
+    added = re.search(r"add constraint user_tasks_status_check\b", sql)
+    assert mapped and added
+    assert mapped.start() < added.start(), "rows must be mapped before the narrower CHECK"
+    assert _check_values(sql, "user_tasks_status_check") == {s.value for s in TaskStatus}
+    # The set ends on this definition: no later file brings pacing_pushed back.
+    assert _check_values(_set_sql(), "user_tasks_status_check") == {s.value for s in TaskStatus}
 
 
 def _user_tasks_columns() -> set[str]:

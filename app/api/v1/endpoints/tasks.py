@@ -1,13 +1,19 @@
-"""Task lifecycle endpoints: complete, update, delete, list, skip."""
+"""Task lifecycle endpoints: complete, update, delete, list, skip.
 
-import asyncio
+Complete and Skip are outcomes: they go through ``TaskService``, which records
+each one as a single append-only task event.
+"""
+
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from app.api.deps import get_container
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain import errors
+from app.domain.entities import TaskStatus
 
 router = APIRouter()
 
@@ -42,11 +48,11 @@ class TaskUpdateRequest(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     difficulty_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     deadline_hint: Optional[str] = None
-    status: Optional[Literal["pending", "completed", "skipped", "missed", "pacing_pushed"]] = Field(
+    status: Optional[Literal["pending", "completed", "skipped", "missed"]] = Field(
         default=None,
         description=(
-            "New status: pending, completed, skipped, missed or pacing_pushed, the "
-            "statuses user_tasks accepts. Anything else is rejected with a 422."
+            "New status: pending, completed, skipped or missed, the statuses "
+            "user_tasks accepts. Anything else is rejected with a 422."
         ),
     )
 
@@ -81,40 +87,8 @@ def _get_supabase(request: Request) -> Any:
     return None
 
 
-async def _update_task_status(
-    supabase: Any,
-    task_id: str,
-    user_id: str,
-    new_status: str,
-    extra_fields: Optional[dict] = None,
-) -> dict:
-    """Update a task's status in user_tasks, scoped by user_id."""
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    result = (
-        supabase.table("user_tasks")
-        .select("*")
-        .eq("task_id", task_id)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    )
-    rows = result.data or []
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found for this user")
-
-    update_payload = {
-        "status": new_status,
-    }
-    if extra_fields:
-        update_payload.update(extra_fields)
-
-    supabase.table("user_tasks").update(update_payload).eq(
-        "task_id", task_id
-    ).eq("user_id", user_id).execute()
-
-    return rows[0]
+# What a task that is no longer pending already is, in the user's words.
+_ALREADY = {TaskStatus.COMPLETED: "done", TaskStatus.MISSED: "set aside"}
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +100,10 @@ async def _update_task_status(
     "/{task_id}/complete",
     response_model=TaskResponse,
     summary="Mark a task as completed",
-    description="Records completion with quality rating.",
+    description=(
+        "Records one completed outcome event with the quality rating and actual "
+        "duration. A repeat click records nothing more; an unknown task is a 404."
+    ),
 )
 async def complete_task(
     task_id: str,
@@ -134,29 +111,17 @@ async def complete_task(
     request: Request,
 ) -> TaskResponse:
     """Complete a task and record its quality signal."""
-    supabase = _get_supabase(request)
-
-    extra = {}
-    if body.actual_duration_minutes is not None:
-        extra["actual_duration_minutes"] = body.actual_duration_minutes
-
-    await asyncio.to_thread(
-        _update_task_status_sync,
-        supabase, task_id, body.user_id, "completed", extra,
+    event = await get_container(request).task_service.complete(
+        body.user_id,
+        task_id,
+        actual_duration_minutes=body.actual_duration_minutes,
+        quality=body.quality,
     )
-
-    # Record quality signal for future DKT/RL integration
-    _record_completion_signal(
-        supabase, task_id, body.user_id, body.quality, body.actual_duration_minutes,
-    )
-
-    # Fire-and-forget: detect behavioral patterns from task history
-    memory_store = getattr(request.app.state, "memory_store", None)
-    if memory_store and supabase:
-        from app.services.memory.pearl import detect_patterns
-        asyncio.create_task(asyncio.to_thread(
-            detect_patterns, body.user_id, supabase, memory_store
-        ))
+    if event is not None:  # a repeat click recorded nothing, so it adds no signal either
+        _record_completion_signal(
+            _get_supabase(request), task_id, body.user_id, body.quality,
+            body.actual_duration_minutes,
+        )
 
     return TaskResponse(
         task_id=task_id,
@@ -169,97 +134,54 @@ async def complete_task(
 @router.post(
     "/{task_id}/skip",
     response_model=TaskResponse,
-    summary="Skip / reschedule a task (anti-guilt)",
-    description="Marks task as pacing_pushed (not 'overdue' or 'failed'). "
-    "Suggests today's buffer or tomorrow morning for it (nothing is re-placed), "
-    "and stores a re-decomposition memory if pushed 3+ times.",
+    summary="Skip a task (anti-guilt)",
+    description="Marks the task skipped (never 'overdue' or 'failed') and records one "
+    "skipped outcome event. Suggests today's buffer or tomorrow morning for it "
+    "(nothing is re-placed). An unknown task is a 404.",
 )
 async def skip_task(
     task_id: str,
     body: TaskDeleteRequest,
     request: Request,
 ) -> TaskResponse:
-    """Anti-guilt task rescheduling — 'Slippery Deadlines'.
+    """Anti-guilt skip — 'Slippery Deadlines'.
 
-    Never says 'overdue' or 'failed'. Reframes as adaptive pacing.
-    Blueprint: handle_missed_deadline() logic.
+    Never says 'overdue' or 'failed'. A repeat skip, or a skip of a task that is
+    already done, records nothing.
     """
-    supabase = _get_supabase(request)
+    container = get_container(request)
+    await container.task_service.skip(body.user_id, task_id)
+    task = await container.repos.tasks.get(body.user_id, task_id)
+    if task is None:
+        raise errors.NotFoundError("That task does not exist.", details={"task_id": task_id})
+    if task.status is not TaskStatus.SKIPPED:
+        return TaskResponse(
+            task_id=task_id,
+            status=task.status.value,
+            message=(
+                f"'{task.title}' is already {_ALREADY.get(task.status, 'on your list')}, "
+                "so nothing changed."
+            ),
+        )
 
-    # 1. Fetch current task to get reschedule_count
-    task_result = await asyncio.to_thread(
-        lambda: supabase.table("user_tasks")
-        .select("reschedule_count, duration_minutes, title, goal_id")
-        .eq("task_id", task_id)
-        .eq("user_id", body.user_id)
-        .limit(1)
-        .execute()
-    )
-    current_count = 0
-    task_title = task_id
-    task_duration = 25
-    task_goal_id = None
-    if task_result.data:
-        row = task_result.data[0]
-        current_count = row.get("reschedule_count", 0) or 0
-        task_title = row.get("title", task_id)
-        task_duration = row.get("duration_minutes", 25)
-        task_goal_id = row.get("goal_id")
-
-    new_count = current_count + 1
-
-    # 2. Update status to pacing_pushed (NOT 'skipped' or 'overdue')
-    await asyncio.to_thread(
-        lambda: supabase.table("user_tasks")
-        .update({"status": "pacing_pushed", "reschedule_count": new_count})
-        .eq("task_id", task_id)
-        .eq("user_id", body.user_id)
-        .execute()
-    )
-
-    # 3. Determine reassignment (buffer reallocation)
+    # Buffer advice, not a claim: nothing re-places the task on the schedule here.
     from app.utils.pacing import compute_adaptive_daily_cap
     daily_cap = compute_adaptive_daily_cap(horizon_minutes=2880, total_task_minutes=480)
     buffer_minutes = daily_cap * 0.25  # 25% anti-guilt reserve
-    # Advice, not a claim: nothing re-places the task on the schedule here.
-    if task_duration <= buffer_minutes:
-        reassignment = "today_buffer"
+    if task.duration_minutes <= buffer_minutes:
         message = (
-            f"Life happened — '{task_title}' is off the list for now. "
+            f"Life happened — '{task.title}' is off the list for now. "
             f"It's short enough for today's buffer time if you want it back."
         )
     else:
-        reassignment = "tomorrow_morning_peak"
         message = (
-            f"Life happened — '{task_title}' is off the list for now, "
+            f"Life happened — '{task.title}' is off the list for now, "
             f"and tomorrow morning suits it well. No stress."
         )
 
-    # 4. Reschedule count >= 3 → memory: needs re-decomposition
-    if new_count >= 3:
-        memory_store = getattr(request.app.state, "memory_store", None)
-        if memory_store:
-            try:
-                memory_store.store_memory(body.user_id, {
-                    "type": "behavioral_pattern",
-                    "content": f"User struggles with '{task_title}' — needs re-decomposition into smaller chunks",
-                    "source": "pacing_pushed",
-                    "confidence": 0.8,
-                })
-            except Exception as e:
-                logger.warning(f"Failed to store re-decomposition memory: {e}")
-
-    # 5. Fire-and-forget: detect behavioral patterns
-    memory_store = getattr(request.app.state, "memory_store", None)
-    if memory_store and supabase:
-        from app.services.memory.pearl import detect_patterns
-        asyncio.create_task(asyncio.to_thread(
-            detect_patterns, body.user_id, supabase, memory_store
-        ))
-
     return TaskResponse(
         task_id=task_id,
-        status="pacing_pushed",
+        status="skipped",
         message=message,
         replan_triggered=False,
     )
@@ -271,7 +193,7 @@ async def skip_task(
     summary="Update a task",
     description=(
         "Update task fields (title, duration, difficulty, deadline, status). Status must "
-        "be one of pending, completed, skipped, missed, pacing_pushed; anything else is a 422."
+        "be one of pending, completed, skipped, missed; anything else is a 422."
     ),
 )
 async def update_task(
@@ -282,8 +204,8 @@ async def update_task(
     """Update mutable fields on a task.
 
     ``status`` is limited to the statuses the user_tasks CHECK constraint accepts
-    (pending, completed, skipped, missed, pacing_pushed). Request validation
-    rejects anything else with a 422 before the database is touched.
+    (pending, completed, skipped, missed). Request validation rejects anything
+    else with a 422 before the database is touched.
     """
     supabase = _get_supabase(request)
     if not supabase:
@@ -322,18 +244,7 @@ async def update_task(
         "task_id", task_id
     ).eq("user_id", body.user_id).execute()
 
-    # Schedule-affecting edits feed pattern detection (duration edits feed
-    # detect_duration_preference). No replan runs: the background replan is off.
-    schedule_affecting = {"duration_minutes", "difficulty_weight", "deadline_hint", "status"}
-    if schedule_affecting & set(update_payload.keys()):
-        # Fire-and-forget: detect behavioral patterns
-        memory_store = getattr(request.app.state, "memory_store", None)
-        if memory_store and supabase:
-            from app.services.memory.pearl import detect_patterns
-            asyncio.create_task(asyncio.to_thread(
-                detect_patterns, body.user_id, supabase, memory_store
-            ))
-
+    # No replan runs: the background replan is off.
     return TaskResponse(
         task_id=task_id,
         status=body.status or "updated",
@@ -418,7 +329,7 @@ async def list_tasks(
     user_id: str = Query(..., description="User ID"),
     status: Optional[str] = Query(
         default=None,
-        description="Filter by status: pending, completed, skipped, missed, pacing_pushed",
+        description="Filter by status: pending, completed, skipped, missed",
     ),
     request: Request = None,
 ) -> dict:
@@ -442,42 +353,8 @@ async def list_tasks(
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers (sync wrappers for asyncio.to_thread)
+# Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _update_task_status_sync(
-    supabase: Any,
-    task_id: str,
-    user_id: str,
-    new_status: str,
-    extra_fields: Optional[dict],
-) -> None:
-    """Synchronous wrapper for DB update (runs in thread)."""
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
-
-    result = (
-        supabase.table("user_tasks")
-        .select("*")
-        .eq("task_id", task_id)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    )
-    rows = result.data or []
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found for this user")
-
-    update_payload = {
-        "status": new_status,
-    }
-    if extra_fields:
-        update_payload.update(extra_fields)
-
-    supabase.table("user_tasks").update(update_payload).eq(
-        "task_id", task_id
-    ).eq("user_id", user_id).execute()
 
 
 def _record_completion_signal(

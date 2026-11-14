@@ -131,7 +131,7 @@ def main():
     tasks.append({
         "user_id": user_id, "task_id": f"{goal_b_id}_calc_pushed1",
         "goal_id": goal_b_id, "title": "Integration by parts",
-        "status": "pacing_pushed", "duration_minutes": 25,
+        "status": "skipped", "duration_minutes": 25,
         "difficulty_weight": 0.7, "reschedule_count": 1,
         "deadline_hint": next_wed.isoformat(),
         "completion_criteria": "Solve 3 integration by parts problems",
@@ -139,7 +139,7 @@ def main():
     tasks.append({
         "user_id": user_id, "task_id": f"{goal_b_id}_calc_pushed2",
         "goal_id": goal_b_id, "title": "Partial fractions",
-        "status": "pacing_pushed", "duration_minutes": 25,
+        "status": "skipped", "duration_minutes": 25,
         "difficulty_weight": 0.6, "reschedule_count": 2,
         "deadline_hint": next_wed.isoformat(),
         "completion_criteria": "Decompose 5 rational expressions",
@@ -147,7 +147,7 @@ def main():
     tasks.append({
         "user_id": user_id, "task_id": f"{goal_a_id}_dsa_pushed",
         "goal_id": goal_a_id, "title": "Advanced DP patterns",
-        "status": "pacing_pushed", "duration_minutes": 25,
+        "status": "skipped", "duration_minutes": 25,
         "difficulty_weight": 0.8, "reschedule_count": 1,
         "deadline_hint": friday.isoformat(),
         "completion_criteria": "Solve 2 advanced DP problems (bitmask, interval)",

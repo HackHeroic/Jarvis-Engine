@@ -93,7 +93,7 @@ async def run_coaching_response(state: dict) -> dict:
         all_tasks = await user_model.get_all_tasks()
         completed = sum(1 for t in all_tasks if t.get("status") == "completed")
         pending = sum(1 for t in all_tasks if t.get("status") == "pending")
-        pushed = sum(1 for t in all_tasks if t.get("status") == "pacing_pushed")
+        skipped = sum(1 for t in all_tasks if t.get("status") == "skipped")
 
         sources = _identify_sources_used(mastery, trend, streak, energy)
 
@@ -103,7 +103,7 @@ async def run_coaching_response(state: dict) -> dict:
             f"- Success ratio: {sr:.0%}\n"
             f"- Quality trend: {trend}\n"
             f"- Completion streak: {streak} days\n"
-            f"- Tasks completed: {completed}, pending: {pending}, rescheduled: {pushed}\n"
+            f"- Tasks completed: {completed}, pending: {pending}, set aside: {skipped}\n"
             f"- Current energy estimate: {energy:.1f}/1.0\n"
             f"- Bandura sources to emphasize: {', '.join(sources)}\n"
         )

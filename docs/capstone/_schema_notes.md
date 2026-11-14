@@ -5,6 +5,8 @@ These notes cover the two migrations that complete the Supabase schema:
 - `supabase/migrations/20260101000000_baseline_legacy_tables.sql`
 - `supabase/migrations/20261114000001_capstone_lld.sql`
 
+Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own section below ("Plan 2: Skip writes `skipped`").
+
 They record why each choice was made. They are also the source for the ER diagram: every key, relationship and constraint below was checked by introspecting a database built from `supabase/migrations/` alone (PostgreSQL 18, local).
 
 ## Before you apply
@@ -30,7 +32,7 @@ They record why each choice was made. They are also the source for the ER diagra
 
 | | Baseline |
 |---|---|
-| **Contains** | `app/db/migrations/001`–`004` and `006`–`008`: `pending_calendar_updates`, `behavioral_constraints`, `habit_trackers`, base `user_tasks`, `task_materials`, `user_plan_updates`, `ingested_documents`, plus the `user_tasks` columns from `006`/`007`. Also the three `user_tasks` columns from `014` (`quality_score`, `reschedule_count`, `completed_at`). No CLI file ever added those three, yet the Skip endpoint writes `reschedule_count` and `mastery_tracker` reads all three. |
+| **Contains** | `app/db/migrations/001`–`004` and `006`–`008`: `pending_calendar_updates`, `behavioral_constraints`, `habit_trackers`, base `user_tasks`, `task_materials`, `user_plan_updates`, `ingested_documents`, plus the `user_tasks` columns from `006`/`007`. Also the three `user_tasks` columns from `014` (`quality_score`, `reschedule_count`, `completed_at`). No CLI file ever added those three, yet the Skip endpoint wrote `reschedule_count` (until plan 2) and `mastery_tracker` reads all three. |
 | **Leaves out** | `005` (`user_calendar_anchors`, which is dead) and the status CHECK from `014` (superseded). |
 
 **One older CLI file was edited:** `20260329000000_chat_sessions.sql` now says `CREATE INDEX IF NOT EXISTS` on its three indexes. Before the edit, a second application of the set failed on them. Supabase does not checksum applied migrations, so the edit has no effect on the live history.
@@ -154,7 +156,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `task_events` | `task_events_event_type_check` | `TaskEventType` values |
 | `proactive_suggestions` | `proactive_suggestions_status_check`, `…_consent_behavior_check` | `SuggestionStatus` values; `allow / ask / deny` |
 | `llm_usage_events` | `llm_usage_events_location_check` | `local / cloud` |
-| `user_tasks` | `user_tasks_status_check` | `pending, completed, skipped, missed, pacing_pushed` |
+| `user_tasks` | `user_tasks_status_check` | `pending, completed, skipped, missed` (`pacing_pushed` until `20261115000000`) |
 | `user_tasks` | `user_tasks_duration_minutes_positive` | `duration_minutes > 0` (NOT NULL, default 25) |
 | `user_tasks` | `user_tasks_difficulty_weight_range` | `0 ≤ difficulty_weight ≤ 1` (NOT NULL, default 0.5) |
 | `user_tasks` | `user_tasks_scheduled_window_check` | end after start when both are set |
@@ -170,7 +172,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 **`user_tasks` status.** `grep` over `app/` finds exactly these writes:
 - `pending` (`build_task_rows`)
 - `completed` (`/tasks/{id}/complete`)
-- `pacing_pushed` (`/tasks/{id}/skip`)
+- `pacing_pushed` (`/tasks/{id}/skip`; since plan 2 it writes `skipped`, see below)
 - `missed` (`missed_deadlines`)
 - `TaskStatus` values (repository `update_status`)
 
@@ -183,6 +185,17 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 **`ingested_documents.s3_key text` is new.** The ingestion pipeline writes it whenever the S3 upload succeeds, but no migration created it.
 
 **`task_completion_signals` keeps its `quality` column.**
+
+## Plan 2: Skip writes `skipped`
+
+`supabase/migrations/20261115000000_skip_writes_skipped.sql` retires `pacing_pushed`.
+
+- **Why.** Complete and Skip now go through `TaskService` (`app/services/task_service.py`). Each outcome is a compare-and-set on `user_tasks.status` plus one append-only `task_events` row, and Skip writes `skipped`. Nothing writes `pacing_pushed` any more.
+- **What it does.** First it runs `update user_tasks set status = 'skipped' where status = 'pacing_pushed'`. Then it replaces `user_tasks_status_check` with `pending, completed, skipped, missed`, the `TaskStatus` values.
+- **Old reads.** `_mapping._LEGACY_TASK_STATUSES` stays, so a stray `pacing_pushed` row still reads as `skipped`.
+- **What Skip no longer writes.** The `reschedule_count` column and the "needs re-decomposition" memory. Later plan 2 tasks replace both from the `skipped` events: a repeated-skip detector (Task 6) and a per-task event count (Task 12).
+- **Missed tasks.** A missed slot is inferred, not asked about. `SlotPassedSweep` marks a pending task `missed`, with a `missed` event, once `scheduled_end + SLOT_GRACE_MINUTES` (30) has passed with no outcome recorded since the slot began. A passed deadline gives status `missed` with a `deadline_missed` event.
+- **Re-runs.** The file is idempotent: a re-run maps nothing and re-creates the same CHECK. `tests/test_migrations.py` pins the mapping, its order before the CHECK, and the final CHECK values.
 
 ## Triggers
 

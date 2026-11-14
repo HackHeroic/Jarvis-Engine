@@ -4,7 +4,8 @@ Services and the orchestrator depend on ports (``app.domain.ports``) and on the
 event bus, and receive their collaborators. ``AppContainer.build`` decides which
 repository family stores the data, creates the bus and subscribes its listeners,
 and builds the language-model chain ``route_llm_call`` uses — metered onto that
-bus, so every call reaches the usage ledger.
+bus, so every call reaches the usage ledger. It also lists the background sweeps
+each subsystem owns, for the scheduler to run.
 """
 
 import logging
@@ -14,11 +15,13 @@ from typing import Any
 
 from app.core.model_router import build_chain
 from app.domain.events import EventBus, LLMCallCompleted
+from app.domain.ports import Sweep
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.orchestrator.hooks import ActionHooks
 from app.services.draft_service import DraftService
+from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,8 @@ class AppContainer:
     llm: FallbackChainProvider
     draft_service: DraftService
     usage_ledger: UsageLedger
+    task_service: TaskService
+    sweeps: list[Sweep]
 
     @classmethod
     def build(
@@ -58,10 +63,14 @@ class AppContainer:
         llm = build_chain(cfg, hooks, events)
         set_chain(llm)
 
+        task_service = TaskService(repos.tasks, repos.task_events, events)
+
         return cls(
             repos=repos,
             events=events,
             llm=llm,
             draft_service=DraftService(repos.drafts, events),
             usage_ledger=usage_ledger,
+            task_service=task_service,
+            sweeps=[SlotPassedSweep(task_service)],
         )

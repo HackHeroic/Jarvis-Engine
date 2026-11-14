@@ -9,13 +9,16 @@ anti-guilt framing — never shame language.
 import asyncio
 import re
 from datetime import date, datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from zoneinfo import ZoneInfo
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.domain import errors
 from app.domain.entities import TaskStatus
 from app.services.planning.local_time import end_of_local_day, user_zone
+
+if TYPE_CHECKING:
+    from app.services.task_service import TaskService
 
 
 def _parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
@@ -43,13 +46,21 @@ def _parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
 
 
 async def detect_and_mark_missed(
-    user_id: str, supabase: Any, zone: Optional[ZoneInfo] = None
+    user_id: str,
+    supabase: Any,
+    zone: Optional[ZoneInfo] = None,
+    *,
+    task_service: "TaskService | None" = None,
 ) -> list[dict]:
     """Find pending tasks whose deadline has passed; mark them `missed`.
 
     ``zone`` is the user's (default ``user_zone()``): it decides when a date-only
-    deadline has passed. Returns the list of (task_id, title, deadline) tuples
-    that were just marked. Empty list if none. Tolerates supabase=None (returns []).
+    deadline has passed. With ``task_service`` each task is set aside through
+    ``TaskService.mark_deadline_missed``, which also records a ``deadline_missed``
+    event; a task that changed meanwhile is left alone and not returned. Without
+    one (the deprecated v1 flow) the status is written directly. Returns the list
+    of (task_id, title, deadline) tuples that were just marked. Empty list if none.
+    Tolerates supabase=None (returns []).
     """
     if not supabase:
         return []
@@ -82,16 +93,27 @@ async def detect_and_mark_missed(
     if not overdue:
         return []
 
-    # Mark missed in DB
-    for o in overdue:
-        try:
-            supabase.table("user_tasks").update(
-                {"status": "missed"}
-            ).eq("id", o["id"]).eq("user_id", user_id).execute()
-        except Exception as e:
-            logger.warning(f"Failed to mark task {o['task_id']} missed: {e}")
+    if task_service is not None:
+        marked: list[dict] = []
+        for o in overdue:
+            try:
+                if await task_service.mark_deadline_missed(user_id, o["task_id"]) is not None:
+                    marked.append(o)
+            except errors.JarvisError as e:
+                logger.warning(f"Could not set task {o['task_id']} aside: {e.code}")
+        overdue = marked
+    else:
+        # Mark missed in DB
+        for o in overdue:
+            try:
+                supabase.table("user_tasks").update(
+                    {"status": "missed"}
+                ).eq("id", o["id"]).eq("user_id", user_id).execute()
+            except Exception as e:
+                logger.warning(f"Failed to mark task {o['task_id']} missed: {e}")
 
-    logger.info(f"Set aside {len(overdue)} missed tasks for user {user_id}")
+    if overdue:
+        logger.info(f"Set aside {len(overdue)} missed tasks for user {user_id}")
     return overdue
 
 

@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from datetime import date, datetime
-from typing import Any, Literal
+from datetime import date, datetime, timedelta
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -200,6 +200,23 @@ class UsageRepository(ABC):
     @abstractmethod
     async def summary(self, user_id: str, *, since: datetime | None = None) -> dict:
         """Return local_calls, cloud_calls, input_tokens, output_tokens, pii_redactions totals."""
+
+
+# --- Background work --------------------------------------------------------
+
+
+class Sweep(ABC):
+    """A periodic job over every user, owned by the subsystem whose data it maintains."""
+
+    name: ClassVar[str]
+    interval: ClassVar[timedelta]
+
+    @abstractmethod
+    async def run(self, user_ids: list[str], now: datetime) -> int:
+        """Sweep each user as of ``now``; return items changed.
+
+        One user's failure is logged, never raised: the other users are still swept.
+        """
 
 
 # --- Language models --------------------------------------------------------

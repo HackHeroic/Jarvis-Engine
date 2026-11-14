@@ -179,6 +179,12 @@ EVENING_CUTOFF_HOUR: int = 22
 # of every plan is DAY_START_HOUR in the user's zone, never in UTC.
 DEFAULT_TIMEZONE: str = os.getenv("JARVIS_DEFAULT_TIMEZONE", "Asia/Kolkata")
 
+# The slot sweep (TaskService.sweep_passed_slots): a pending task becomes "missed" once
+# its slot ended this many minutes ago with no outcome recorded, so a Complete clicked
+# just after the slot still counts. The sweep looks back this many days of slots.
+SLOT_GRACE_MINUTES: int = 30
+SLOT_SWEEP_LOOKBACK_DAYS: int = 7
+
 # CP-SAT wall-clock cap. An uncapped solve has no upper bound, and it sits on
 # the request path — on the streaming plan flow that is an unbounded stall with
 # every queued SSE frame stuck behind it. Capped, CP-SAT returns the best
