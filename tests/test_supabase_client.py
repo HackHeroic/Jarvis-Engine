@@ -35,3 +35,21 @@ def test_build_supabase_client__requests_keep_the_service_key_and_absolute_urls(
     assert str(request.path).startswith("https://example.supabase.co/rest/v1/user_tasks")
     assert request.headers["apikey"] == "service-role-key"
     assert request.headers["authorization"] == "Bearer service-role-key"
+
+
+def test_one_way_to_build_a_client__nothing_else_calls_create_client():
+    """The app, the seed and the live check all build their client with
+    ``build_supabase_client``: a second way would bring the shared HTTP/2 connection back."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    callers = []
+    for path in sorted([*(root / "app").rglob("*.py"), *(root / "scripts").rglob("*.py")]):
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if name == "create_client":
+                    callers.append(str(path.relative_to(root)))
+
+    assert callers == ["app/db/supabase_py.py"]

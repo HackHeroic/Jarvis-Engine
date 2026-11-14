@@ -467,9 +467,9 @@ def main() -> int:
     if not cfg.SUPABASE_URL or not cfg.SUPABASE_SERVICE_KEY:
         print("SUPABASE_URL / SUPABASE_SERVICE_KEY are not set in .env; nothing to check against.")
         return 1
-    from supabase import create_client
+    from app.db.supabase_py import build_supabase_client
 
-    db = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_SERVICE_KEY)
+    db = build_supabase_client(cfg.SUPABASE_URL, cfg.SUPABASE_SERVICE_KEY)
     user_id = f"{E2E_PREFIX}{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(2)}"
     client = Client(args.base_url, user_id)
     run = Run()

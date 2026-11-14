@@ -839,9 +839,9 @@ def _connect() -> Any | None:
     """A Supabase client from .env, or None when it is not configured."""
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_KEY:
         return None
-    from supabase import create_client
+    from app.db.supabase_py import build_supabase_client
 
-    return create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
+    return build_supabase_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
 
 
 class _OfflineEmbedder(TextEmbedder):
