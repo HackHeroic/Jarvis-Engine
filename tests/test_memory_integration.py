@@ -1,7 +1,7 @@
 # tests/test_memory_integration.py
 """The memory schemas, and the time ranges the constraint bridge reads out of a memory."""
 
-from app.services.memory.constraint_bridge import parse_time_range
+from app.services.planning.rule_windows import parse_time_range
 from app.schemas.memory import MemoryRecord, ExtractedMemory, MemoryExtractionResponse
 
 

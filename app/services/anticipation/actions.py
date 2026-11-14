@@ -18,10 +18,10 @@ from app.domain.ports import ConstraintRepository, DraftPlanner
 from app.schemas.context import SemanticTimeSlot
 from app.services.anticipation.service import ActionFactory
 from app.services.draft_service import DraftService
-from app.services.memory.constraint_bridge import to_horizon
 from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import clock_hour
 from app.services.memory.stated_rules import RULE_MEMORY_KEY
+from app.services.planning.rule_windows import to_horizon
 
 logger = logging.getLogger(__name__)
 
