@@ -24,7 +24,7 @@ from app.domain.events import (
     TaskMissed,
     TaskSkipped,
 )
-from app.domain.ports import TaskRepository
+from app.domain.ports import TaskEventRepository, TaskRepository
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryStore
 from app.services.task_service import SlotPassedSweep, TaskService
@@ -94,6 +94,22 @@ class _DelegatingTasks(TaskRepository):
 
     async def reschedule(self, user_id, task_id, start, end):
         return await self._inner.reschedule(user_id, task_id, start, end)
+
+
+class _FailingEvents(TaskEventRepository):
+    """An event log whose writes fail while ``fail`` is set (the database dropped)."""
+
+    def __init__(self, inner: TaskEventRepository) -> None:
+        self._inner = inner
+        self.fail = True
+
+    async def append(self, user_id, event):
+        if self.fail:
+            raise errors.PersistenceError("Could not reach the database.")
+        return await self._inner.append(user_id, event)
+
+    async def list_for_user(self, user_id, *, since=None, types=None):
+        return await self._inner.list_for_user(user_id, since=since, types=types)
 
 
 class _YieldingTasks(_DelegatingTasks):
@@ -198,6 +214,38 @@ async def test_complete__missed_task__allowed_and_status_completed(service, repo
 
 
 @pytest.mark.asyncio
+async def test_complete__skipped_task__allowed_and_status_completed(service, repos, store):
+    _seed(store, _task(status=TaskStatus.SKIPPED))  # "I actually did that"
+
+    event = await service.complete(U1, "t1")
+
+    assert event.event_type == TaskEventType.COMPLETED
+    assert await _status(repos) == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_complete__event_write_fails__status_restored_and_error_raised(
+    repos, store, bus, recorder
+):
+    # Status and event are two writes. If the event is lost the status must go back,
+    # or the outcome is gone for good: a retry would find the task already completed.
+    _seed(store, _task(status=TaskStatus.SKIPPED))
+    events = _FailingEvents(repos.task_events)
+    service = TaskService(repos.tasks, events, bus, clock=lambda: NOW)
+
+    with pytest.raises(errors.PersistenceError):
+        await service.complete(U1, "t1")
+
+    assert await _status(repos) == TaskStatus.SKIPPED  # the status it came from
+    assert await _events(repos) == []
+    assert recorder.events == []
+    events.fail = False
+    retried = await service.complete(U1, "t1")
+    assert retried.event_type == TaskEventType.COMPLETED
+    assert await _events(repos) == [retried]
+
+
+@pytest.mark.asyncio
 async def test_complete__unknown_task__not_found(service, repos):
     with pytest.raises(errors.NotFoundError):
         await service.complete(U1, "nope")
@@ -297,6 +345,32 @@ async def test_sweep__completed_inside_grace__never_marked_missed(repos, store, 
 
 
 @pytest.mark.asyncio
+async def test_sweep__outcome_before_reslot__new_slot_still_marked_missed(service, repos, store):
+    # The task was missed in an earlier slot and re-slotted (pending again, later
+    # slot). That old outcome predates the new slot, so it does not settle it.
+    task = _ended_ago(31)
+    _seed(store, task)
+    await repos.task_events.append(
+        U1,
+        TaskEvent(
+            user_id=U1,
+            task_id="t1",
+            event_type=TaskEventType.MISSED,
+            occurred_at=task.scheduled_start - timedelta(days=1),
+            scheduled_start=task.scheduled_start - timedelta(days=1, minutes=30),
+            scheduled_end=task.scheduled_end - timedelta(days=1, minutes=30),
+        ),
+    )
+
+    (event,) = await service.sweep_passed_slots(U1, NOW)
+
+    assert event.event_type == TaskEventType.MISSED
+    assert event.scheduled_start == task.scheduled_start
+    assert await _status(repos) == TaskStatus.MISSED
+    assert len(await _events(repos)) == 2
+
+
+@pytest.mark.asyncio
 async def test_sweep__race_with_completion__stale_version_swallowed_one_event(repos, store, bus):
     _seed(store, _ended_ago(31))
     user = TaskService(repos.tasks, repos.task_events, bus, clock=lambda: NOW)
@@ -364,14 +438,37 @@ async def test_slot_passed_sweep__one_users_failure__others_still_swept(repos, s
         TaskService(_BobUnreadable(repos.tasks), repos.task_events, bus, clock=lambda: NOW)
     )
 
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.INFO, logger="app.services.task_service"):
         changed = await sweep.run(["alice", "bob", "carol"], NOW)
 
     assert changed == 2
     assert await _status(repos, user_id="alice") == TaskStatus.MISSED
     assert await _status(repos, user_id="carol") == TaskStatus.MISSED
-    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    (warning,) = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warning.levelno == logging.WARNING and "1 of 3" in warning.getMessage()
     assert (SlotPassedSweep.name, SlotPassedSweep.interval) == ("slot_passed", timedelta(minutes=1))
+
+
+@pytest.mark.asyncio
+async def test_slot_passed_sweep__db_down__one_warning_with_count_and_no_traceback(
+    repos, bus, caplog
+):
+    class _Unreachable(_DelegatingTasks):
+        async def list_scheduled_between(self, user_id, start, end):
+            raise errors.PersistenceError("Could not reach the database.")
+
+    sweep = SlotPassedSweep(
+        TaskService(_Unreachable(repos.tasks), repos.task_events, bus, clock=lambda: NOW)
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.task_service"):
+        assert await sweep.run(["alice", "bob", "carol"], NOW) == 0
+
+    # Once per run, not a traceback per user per tick while the database is down.
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert "3 of 3" in record.getMessage() and "PersistenceError" in record.getMessage()
+    assert record.exc_info is None
 
 
 # --- Deadline misses ---------------------------------------------------------------
@@ -416,3 +513,37 @@ async def test_detect_and_mark_missed__with_task_service__writes_deadline_missed
     assert (event["task_id"], event["event_type"]) == ("t1", "deadline_missed")
     statuses = {r["task_id"]: r["status"] for r in fake.rows["user_tasks"]}
     assert statuses == {"t1": "missed", "t2": "pending"}
+
+
+@pytest.mark.asyncio
+async def test_detect_and_mark_missed__one_task_errors__others_still_marked_and_returned():
+    from app.services.analytical.missed_deadlines import detect_and_mark_missed
+    from tests.fakes import FakeSupabase
+
+    rows = [
+        {"id": f"row-{t}", "user_id": U1, "task_id": t, "title": f"Revise {t}",
+         "status": "pending", "deadline_hint": "2020-01-01"}
+        for t in ("t1", "t2", "t3")
+    ]
+
+    class _FlakyService:
+        """Marks every task but t2, which fails with an error nobody planned for."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def mark_deadline_missed(self, user_id, task_id):
+            self.calls.append(task_id)
+            if task_id == "t2":
+                raise RuntimeError("unexpected")
+            return TaskEvent(
+                user_id=user_id, task_id=task_id, event_type=TaskEventType.DEADLINE_MISSED,
+                occurred_at=NOW,
+            )
+
+    service = _FlakyService()
+
+    overdue = await detect_and_mark_missed(U1, FakeSupabase({"user_tasks": rows}), task_service=service)
+
+    assert service.calls == ["t1", "t2", "t3"]
+    assert [o["task_id"] for o in overdue] == ["t1", "t3"]
