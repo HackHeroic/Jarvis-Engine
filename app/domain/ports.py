@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.entities import (
     BehavioralConstraint,
+    ConsentDecision,
     DraftSchedule,
     DraftStatus,
     FocusProfile,
@@ -206,6 +207,16 @@ class SuggestionRepository(ABC):
         """
 
     @abstractmethod
+    async def dedupe_keys(
+        self, user_id: str, *, status: SuggestionStatus, limit: int = 500
+    ) -> list[str]:
+        """Return the dedupe_key of the user's newest ``limit`` suggestions in ``status``.
+
+        Newest first, read from the stored action alone. An action without a string
+        dedupe_key is skipped. A negative ``limit`` raises ValidationError.
+        """
+
+    @abstractmethod
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
         """Return the user's suggestion with this id, or None."""
 
@@ -217,12 +228,14 @@ class SuggestionRepository(ABC):
         to: SuggestionStatus,
         *,
         expected: SuggestionStatus | None = None,
+        consent: ConsentDecision | None = None,
     ) -> Suggestion:
         """Set the status if it is ``expected`` (when given) and return the suggestion.
 
         A compare-and-set: of two racing calls expecting the same status, one wins.
-        Raises NotFoundError if the user has no such suggestion, and StaleVersionError
-        if its status is no longer ``expected``.
+        ``consent``, when given, replaces the stored consent decision in the same
+        write. Raises NotFoundError if the user has no such suggestion, and
+        StaleVersionError if its status is no longer ``expected``.
         """
 
     @abstractmethod

@@ -4,11 +4,13 @@ The skeleton owns the order: idempotency, timing, gathering, consent, storage.
 A counting fake trigger proves which steps ran and which never did.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.domain import errors
 from app.domain.anticipation import ConsentContext, ConsentPolicy, TriggerContext
 from app.domain.entities import (
     AutonomyMode,
@@ -23,6 +25,7 @@ from tests.anticipation_fakes import (
     FakeAction,
     FakeLowRiskAction,
     FakeReadOnlyAction,
+    until_started,
 )
 
 U1 = "u1"
@@ -171,3 +174,85 @@ async def test_trigger_run__allowed_read_only__pending_and_never_executed(sugges
     assert outcome.suggestion.status is SuggestionStatus.PENDING
     assert outcome.suggestion.consent_kind is ConsentReasonKind.RISK_CHECK
     assert log.runs == []
+
+
+_ASKING_AFTER_FAILED_APPLY = "I couldn't make this change on my own, so I'm asking first."
+
+
+@pytest.mark.asyncio
+async def test_trigger_run__auto_apply__claimed_while_the_action_runs(suggestions):
+    log = ActionLog(hold=asyncio.Event())
+    trigger = CountingTrigger(action=FakeLowRiskAction(log))
+
+    running = asyncio.create_task(
+        _run(trigger, suggestions, consent_ctx=_consent_ctx(AutonomyMode.AUTO_LOW_RISK))
+    )
+    await until_started(log)
+    (in_flight,) = await suggestions.list(U1)
+    log.hold.set()
+    outcome = await asyncio.wait_for(running, 2.0)
+
+    assert in_flight.status is SuggestionStatus.ACCEPTED  # nothing else can claim it
+    assert outcome.suggestion.status is SuggestionStatus.AUTO_APPLIED
+    assert log.runs == [U1]
+
+
+@pytest.mark.asyncio
+async def test_trigger_run__auto_apply_fails__pending_with_ask_reason_and_raises(suggestions):
+    log = ActionLog(errors=[errors.PersistenceError("Could not reach the database.")])
+    trigger = CountingTrigger(action=FakeLowRiskAction(log))
+
+    with pytest.raises(errors.PersistenceError):
+        await _run(trigger, suggestions, consent_ctx=_consent_ctx(AutonomyMode.AUTO_LOW_RISK))
+
+    (left,) = await suggestions.list(U1)
+    assert left.status is SuggestionStatus.PENDING
+    assert left.consent_behavior == "ask"
+    assert left.consent_kind is ConsentReasonKind.MODE_DECISION
+    assert left.consent_reason == _ASKING_AFTER_FAILED_APPLY
+    assert log.runs == []
+
+
+@pytest.mark.asyncio
+async def test_trigger_run__auto_apply_cancelled__pending_with_ask_reason(suggestions):
+    log = ActionLog(hold=asyncio.Event())
+    trigger = CountingTrigger(action=FakeLowRiskAction(log))
+    running = asyncio.create_task(
+        _run(trigger, suggestions, consent_ctx=_consent_ctx(AutonomyMode.AUTO_LOW_RISK))
+    )
+    await until_started(log)
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    (left,) = await suggestions.list(U1)
+    assert (left.status, left.consent_behavior) == (SuggestionStatus.PENDING, "ask")
+    assert log.runs == []
+
+
+@pytest.mark.asyncio
+async def test_trigger_run__consent_loaded_only_when_a_run_reaches_it(suggestions):
+    loads = []
+
+    async def load_consent() -> ConsentContext:
+        loads.append(1)
+        return _consent_ctx()
+
+    async def run(trigger, now=NOW):
+        return await trigger.run(
+            _ctx(now=now),
+            consent=ConsentPolicy.default(),
+            consent_ctx=load_consent,
+            suggestions=suggestions,
+        )
+
+    statuses = [
+        (await run(CountingTrigger(due=False))).status,
+        (await run(CountingTrigger(gathered=None))).status,
+        (await run(CountingTrigger())).status,
+        (await run(CountingTrigger(), now=NOW + timedelta(hours=1))).status,
+    ]
+
+    assert statuses == ["not_due", "nothing_to_say", "created", "already_done"]
+    assert len(loads) == 1

@@ -5,17 +5,31 @@ before its action runs, so a double-click runs the action once.
 """
 
 import asyncio
+import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
+from typing import Any, ClassVar
 from uuid import uuid4
 
 import pytest
 
 from app.domain import errors
 from app.domain.anticipation import ConsentPolicy
-from app.domain.entities import BehavioralConstraint, ConsentReasonKind, SuggestionStatus
+from app.domain.entities import (
+    AutonomyMode,
+    BehavioralConstraint,
+    ConsentReasonKind,
+    SuggestionStatus,
+)
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.services.anticipation.service import ActionFactory, AnticipationService
-from tests.anticipation_fakes import ActionLog, CountingTrigger, FakeAction
+from tests.anticipation_fakes import (
+    ActionLog,
+    CountingTrigger,
+    FakeAction,
+    FakeLowRiskAction,
+    until_started,
+)
 
 U1, U2 = "u1", "u2"
 NOW = datetime(2026, 11, 14, 3, 30, tzinfo=timezone.utc)  # 09:00 in India
@@ -37,6 +51,7 @@ def _service(
     if actions is None:
         actions = ActionFactory()
         actions.register(FakeAction.kind, FakeAction.builder(log))
+        actions.register(FakeLowRiskAction.kind, FakeLowRiskAction.builder(log))
     return AnticipationService(
         {t.name: t for t in triggers},
         actions,
@@ -46,6 +61,27 @@ def _service(
         repos.constraints,
         clock=lambda: NOW,
     )
+
+
+class _SecondTrigger(CountingTrigger):
+    name: ClassVar[str] = "second"
+
+
+class _CountingCalls:
+    """Wraps a repository and counts each call made to it, by method name."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls: Counter[str] = Counter()
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self._inner, name)
+
+        async def counted(*args: Any, **kwargs: Any) -> Any:
+            self.calls[name] += 1
+            return await method(*args, **kwargs)
+
+        return counted
 
 
 async def _pending(service: AnticipationService, user_id: str = U1) -> str:
@@ -235,3 +271,179 @@ async def test_run_due__runs_each_trigger_on_the_users_local_day(repos, log):
 def test_action_factory__unknown_kind__validation_error():
     with pytest.raises(errors.ValidationError):
         ActionFactory().from_payload({"kind": "teleport", "dedupe_key": "teleport"})
+
+
+# --- fix round 1: claims are always released, once a day holds, triggers are isolated ----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unlisted",
+    [errors.LLMUnavailableError("Every model is down."), RuntimeError("driver text")],
+    ids=["llm_unavailable", "unexpected"],
+)
+async def test_accept__unlisted_error_after_the_claim__back_to_pending_and_raised(
+    repos, log, unlisted
+):
+    service = _service(repos, log, CountingTrigger(action=FakeAction(log)))
+    suggestion_id = await _pending(service)
+    log.errors.append(unlisted)
+
+    with pytest.raises(type(unlisted)):
+        await service.accept(U1, suggestion_id)
+
+    assert (await repos.suggestions.get(U1, suggestion_id)).status is SuggestionStatus.PENDING
+    suggestion, _ = await service.accept(U1, suggestion_id)  # it can be accepted again
+    assert suggestion.status is SuggestionStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_accept__cancelled_while_the_action_runs__back_to_pending(repos):
+    log = ActionLog(hold=asyncio.Event())
+    service = _service(repos, log, CountingTrigger(action=FakeAction(log)))
+    suggestion_id = await _pending(service)
+
+    accepting = asyncio.create_task(service.accept(U1, suggestion_id))
+    await until_started(log)
+    accepting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await accepting
+
+    assert (await repos.suggestions.get(U1, suggestion_id)).status is SuggestionStatus.PENDING
+    assert log.runs == []
+
+
+@pytest.mark.asyncio
+async def test_accept__past_expires_at__expired_and_409_never_listed(repos, log):
+    stale = CountingTrigger(action=FakeAction(log), expires_at=NOW - timedelta(minutes=1))
+    service = _service(repos, log, stale)
+    outcome = await service.run_trigger(U1, stale.name, force=True)
+
+    listed = await service.list_suggestions(U1)
+    with pytest.raises(errors.InvalidStateTransition) as raised:
+        await service.accept(U1, outcome.suggestion.id)
+
+    assert listed == []
+    assert raised.value.message == "This suggestion is out of date — a newer plan replaced it."
+    stored = await repos.suggestions.get(U1, outcome.suggestion.id)
+    assert stored.status is SuggestionStatus.EXPIRED
+    assert log.runs == []
+
+
+@pytest.mark.asyncio
+async def test_run_trigger__concurrent_runs__one_suggestion(repos, log):
+    trigger = CountingTrigger(action=FakeAction(log))
+    service = _service(repos, log, trigger)
+
+    outcomes = await asyncio.gather(
+        *(service.run_trigger(U1, trigger.name, force=True) for _ in range(3)),
+        service.run_due(U1, NOW),
+    )
+
+    statuses = [o.status for o in outcomes[:3]] + [o.status for o in outcomes[3]]
+    assert sorted(statuses) == ["already_done", "already_done", "already_done", "created"]
+    assert len(await repos.suggestions.list(U1, status=None)) == 1
+    assert trigger.calls["gather"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_due__denied__gathered_once_until_the_next_local_day(repos, log):
+    trigger = CountingTrigger(action=FakeAction(log, key="move:deep-work"))
+    service = _service(repos, log, trigger)
+    suggestion_id = await _pending(service)
+    await service.dismiss(U1, suggestion_id)
+    tomorrow = NOW + timedelta(days=1)
+    trigger.calls.clear()
+
+    outcomes = [await service.run_due(U1, tomorrow + timedelta(minutes=m)) for m in range(5)]
+
+    assert [o.status for (o,) in outcomes] == ["denied"] * 5
+    assert trigger.calls["gather"] == 1
+    assert trigger.calls["build_suggestion"] == 1
+    await service.run_due(U1, tomorrow + timedelta(days=1))
+    assert trigger.calls["gather"] == 2  # a new local day asks again
+
+
+@pytest.mark.asyncio
+async def test_run_due__one_trigger_raises__the_next_still_runs(repos, log, caplog):
+    broken = CountingTrigger(action=FakeAction(log), fail_for=frozenset({U1}))
+    second = _SecondTrigger(action=FakeAction(log, key="second"))
+    service = _service(repos, log, broken, second)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.anticipation.service"):
+        outcomes = await service.run_due(U1, NOW)
+
+    assert [o.status for o in outcomes] == ["failed", "created"]
+    (record,) = caplog.records
+    assert "counting" in record.getMessage() and "RuntimeError" in record.getMessage()
+    assert "secret" not in record.getMessage() and record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_auto_apply__racing_accept__409_and_action_runs_once(repos):
+    log = ActionLog(hold=asyncio.Event())
+    trigger = CountingTrigger(action=FakeLowRiskAction(log))
+    service = _service(repos, log, trigger)
+    await repos.profiles.update(U1, autonomy_mode=AutonomyMode.AUTO_LOW_RISK)
+
+    applying = asyncio.create_task(service.run_trigger(U1, trigger.name, force=True))
+    await until_started(log)
+    (in_flight,) = await repos.suggestions.list(U1, status=None)
+    with pytest.raises(errors.StaleVersionError):
+        await asyncio.wait_for(service.accept(U1, in_flight.id), 1.0)
+    log.hold.set()
+    outcome = await asyncio.wait_for(applying, 2.0)
+
+    assert outcome.suggestion.status is SuggestionStatus.AUTO_APPLIED
+    assert log.runs == [U1]
+
+
+@pytest.mark.asyncio
+async def test_run_due__not_due__one_profile_read_and_one_cheap_read_per_trigger(log):
+    repos = RepositoryFactory.in_memory()
+    profiles, suggestions = _CountingCalls(repos.profiles), _CountingCalls(repos.suggestions)
+    constraints = _CountingCalls(repos.constraints)
+    service = AnticipationService(
+        {t.name: t for t in (CountingTrigger(due=False), _SecondTrigger(due=False))},
+        ActionFactory(),
+        ConsentPolicy.default(),
+        suggestions,
+        profiles,
+        constraints,
+    )
+
+    outcomes = await service.run_due(U1, NOW)
+
+    assert [o.status for o in outcomes] == ["not_due", "not_due"]
+    assert profiles.calls == {"get_or_create": 1}
+    assert suggestions.calls == {"exists_today": 2}
+    assert constraints.calls == {}  # consent is never loaded for a trigger that is not due
+
+
+@pytest.mark.asyncio
+async def test_run_due__settled_for_the_day__no_reads_until_the_next_local_day(log):
+    repos = RepositoryFactory.in_memory()
+    profiles, suggestions = _CountingCalls(repos.profiles), _CountingCalls(repos.suggestions)
+    constraints = _CountingCalls(repos.constraints)
+    triggers = (CountingTrigger(action=FakeAction(log)), _SecondTrigger(gathered=None))
+    service = AnticipationService(
+        {t.name: t for t in triggers},
+        ActionFactory(),
+        ConsentPolicy.default(),
+        suggestions,
+        profiles,
+        constraints,
+    )
+    first = await service.run_due(U1, NOW)
+    for repo in (profiles, suggestions, constraints):
+        repo.calls.clear()
+
+    later = [await service.run_due(U1, NOW + timedelta(hours=h)) for h in (1, 2, 3)]
+    reads_today = profiles.calls + suggestions.calls + constraints.calls
+    await service.run_due(U1, NOW + timedelta(days=1))
+
+    assert [o.status for o in first] == ["created", "nothing_to_say"]
+    for outcomes in later:
+        assert [o.status for o in outcomes] == ["already_done", "nothing_to_say"]
+    assert reads_today == Counter()
+    assert profiles.calls["get_or_create"] == 1  # the next local day reads again

@@ -17,6 +17,7 @@ from app.domain import errors
 from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
+    ConsentDecision,
     ConsentReasonKind,
     DraftStatus,
     LLMLocation,
@@ -953,6 +954,55 @@ async def test_suggestions__list__limit_and_read_cap__keep_the_newest(repos, fak
     assert limited == [times[4], times[3]]
     with pytest.raises(errors.ValidationError):
         await repos.suggestions.list(U1, limit=-1)
+
+
+@pytest.mark.asyncio
+async def test_suggestions__set_status_with_consent__rewrites_the_decision(repos):
+    claimed = _suggestion(U1).model_copy(
+        update={"status": SuggestionStatus.ACCEPTED, "consent_behavior": "allow"}
+    )
+    stored = await repos.suggestions.add(U1, claimed)
+    asking = ConsentDecision(
+        behavior="ask", kind=ConsentReasonKind.MODE_DECISION, message="Asking first."
+    )
+
+    reopened = await repos.suggestions.set_status(
+        U1, stored.id, SuggestionStatus.PENDING, expected=SuggestionStatus.ACCEPTED, consent=asking
+    )
+
+    assert reopened.status is SuggestionStatus.PENDING
+    assert (reopened.consent_behavior, reopened.consent_kind, reopened.consent_reason) == (
+        "ask", ConsentReasonKind.MODE_DECISION, "Asking first."
+    )
+    assert await repos.suggestions.get(U1, stored.id) == reopened
+
+
+@pytest.mark.asyncio
+async def test_suggestions__dedupe_keys__newest_first_one_status_one_user_one_column(
+    repos, fake_client
+):
+    rows = [(0, "a", SuggestionStatus.DISMISSED), (1, "b", SuggestionStatus.PENDING),
+            (2, "c", SuggestionStatus.DISMISSED)]
+    for minute, key, status in rows:
+        await repos.suggestions.add(
+            U1,
+            _suggestion(U1, created_at=T0 + timedelta(minutes=minute)).model_copy(
+                update={"status": status, "action": {"kind": "move", "dedupe_key": key}}
+            ),
+        )
+    await repos.suggestions.add(
+        U2,
+        _suggestion(U2).model_copy(
+            update={"status": SuggestionStatus.DISMISSED, "action": {"dedupe_key": "z"}}
+        ),
+    )
+
+    assert await repos.suggestions.dedupe_keys(U1, status=SuggestionStatus.DISMISSED) == ["c", "a"]
+    assert await repos.suggestions.dedupe_keys(
+        U1, status=SuggestionStatus.DISMISSED, limit=1
+    ) == ["c"]
+    reads = [names for table, names in fake_client.selects if table == "proactive_suggestions"]
+    assert all(names == ("action",) for names in reads)  # no reads at all for the in-memory family
 
 
 # --- Usage -------------------------------------------------------------------

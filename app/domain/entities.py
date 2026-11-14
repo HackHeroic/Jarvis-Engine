@@ -406,6 +406,20 @@ class FocusProfile(BaseModel):
         return [h.score for h in self.hours]
 
 
+class ConsentDecision(BaseModel):
+    """What the consent chain decided for one action, and why, in words the user can read.
+
+    Defined here, beside ``Suggestion`` which stores it, so the repository port can
+    take one; ``app.domain.anticipation`` re-exports it.
+    """
+
+    behavior: Literal["allow", "ask", "deny"] = Field(
+        description="Run it without asking, ask the user first, or drop it."
+    )
+    kind: ConsentReasonKind = Field(description="Which consent rule decided.")
+    message: str = Field(description="The reason, as shown to the user.")
+
+
 class Suggestion(BaseModel):
     """A proactive proposal Jarvis makes to the user, subject to consent."""
 

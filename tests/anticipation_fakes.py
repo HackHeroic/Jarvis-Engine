@@ -8,6 +8,7 @@ import asyncio
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, ClassVar
 
 from app.domain.anticipation import (
@@ -26,11 +27,25 @@ from app.domain.ports import LLMProvider, LLMRequest
 class ActionLog:
     """What every ``FakeAction`` sharing this log did.
 
-    ``errors`` are raised one per ``execute``, in order, before anything runs.
+    ``started`` counts every ``execute`` begun. While ``hold`` is set to an unset
+    event, ``execute`` waits on it before anything else. ``errors`` are raised one
+    per ``execute``, in order, before anything runs.
     """
 
     runs: list[str] = field(default_factory=list)
     errors: list[BaseException] = field(default_factory=list)
+    started: int = 0
+    hold: asyncio.Event | None = None
+
+
+async def until_started(log: ActionLog, timeout: float = 2.0) -> None:
+    """Wait until an action sharing ``log`` has begun to run; TimeoutError if none does."""
+
+    async def wait() -> None:
+        while log.started == 0:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout)
 
 
 class FakeAction(ProactiveAction):
@@ -57,6 +72,9 @@ class FakeAction(ProactiveAction):
         return {"kind": self.kind, "dedupe_key": self.dedupe_key(), "hours": self._hours}
 
     async def execute(self, user_id: str) -> ActionResult:
+        self.log.started += 1
+        if self.log.hold is not None:
+            await self.log.hold.wait()
         await asyncio.sleep(0)  # a real action awaits storage: let a racing request in
         if self.log.errors:
             raise self.log.errors.pop(0)
@@ -95,7 +113,8 @@ class CountingTrigger(Trigger):
 
     ``gathered=None`` means it has nothing to say. ``fail_for`` users make
     ``gather`` raise. ``ask_model`` makes ``build_suggestion`` phrase the body
-    through ``route_llm_call``, as a model-backed trigger would.
+    through ``route_llm_call``, as a model-backed trigger would. ``gather`` yields
+    to the event loop once, as a real read of storage does.
     """
 
     name: ClassVar[str] = "counting"
@@ -108,12 +127,14 @@ class CountingTrigger(Trigger):
         action: ProactiveAction | None = None,
         fail_for: frozenset[str] = frozenset(),
         ask_model: bool = False,
+        expires_at: datetime | None = None,
     ) -> None:
         self.due = due
         self.gathered = gathered
         self.action = action if action is not None else FakeAction()
         self.fail_for = fail_for
         self.ask_model = ask_model
+        self.expires_at = expires_at
         self.calls: Counter[str] = Counter()
 
     async def should_fire(self, ctx: TriggerContext) -> bool:
@@ -122,6 +143,7 @@ class CountingTrigger(Trigger):
 
     async def gather(self, ctx: TriggerContext) -> Any | None:
         self.calls["gather"] += 1
+        await asyncio.sleep(0)
         if ctx.user_id in self.fail_for:
             raise RuntimeError("secret connection string in the driver text")
         return self.gathered
@@ -134,7 +156,11 @@ class CountingTrigger(Trigger):
 
             body = await route_llm_call(task="voice_of_jarvis", prompt=f"Say kindly: {gathered}")
         return SuggestionDraft(
-            kind="nudge", title="A thought for today", body=body, action=self.action
+            kind="nudge",
+            title="A thought for today",
+            body=body,
+            action=self.action,
+            expires_at=self.expires_at,
         )
 
 

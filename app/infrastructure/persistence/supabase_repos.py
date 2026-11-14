@@ -19,6 +19,7 @@ from pydantic import ValidationError as PydanticValidationError
 from app.domain import errors
 from app.domain.entities import (
     BehavioralConstraint,
+    ConsentDecision,
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
@@ -453,6 +454,21 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
 
         return [_read(Suggestion, r) for r in await self._run(build)]
 
+    async def dedupe_keys(
+        self, user_id: str, *, status: SuggestionStatus, limit: int = 500
+    ) -> list[str]:
+        """Selects only the action column, newest first."""
+        check_limit(limit)
+        rows = await self._run(
+            lambda q: q.select("action")
+            .eq("user_id", user_id)
+            .eq("status", SuggestionStatus(status).value)
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        keys = ((r.get("action") or {}).get("dedupe_key") for r in rows)
+        return [key for key in keys if isinstance(key, str)]
+
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
         if not is_uuid(suggestion_id):
             return None
@@ -468,14 +484,20 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         to: SuggestionStatus,
         *,
         expected: SuggestionStatus | None = None,
+        consent: ConsentDecision | None = None,
     ) -> Suggestion:
         if not is_uuid(suggestion_id):
             raise not_found("suggestion", suggestion_id)
+        payload: dict = {"status": SuggestionStatus(to).value}
+        if consent is not None:
+            payload |= {
+                "consent_behavior": consent.behavior,
+                "consent_reason": consent.message,
+                "consent_kind": consent.kind.value,
+            }
 
         def build(q: Any) -> Any:
-            q = q.update({"status": SuggestionStatus(to).value}).eq("id", suggestion_id).eq(
-                "user_id", user_id
-            )
+            q = q.update(payload).eq("id", suggestion_id).eq("user_id", user_id)
             if expected is not None:  # compare-and-set: only a row still in ``expected``
                 q = q.eq("status", SuggestionStatus(expected).value)
             return q

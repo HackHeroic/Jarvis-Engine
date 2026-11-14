@@ -1,14 +1,29 @@
 """Run the proactive triggers under consent, and settle the suggestions they make.
 
-Triggers run for one user at a time and one after another, so no two triggers'
-model calls ever overlap. Accepting a suggestion is claim-then-execute: a
-compare-and-set moves it from pending to accepted before its action runs, so a
-double-click runs the action once and the second click is a 409.
+A user's triggers run one at a time under that user's lock, so a run from the API
+and the scheduler's tick never overlap for one user: once a day holds (the check
+and the insert happen inside the lock), and no two triggers' model calls overlap.
+
+A trigger that has settled the user's local day (it made its suggestion, found one
+already made, was denied, or had nothing to say) is remembered in this process and
+not run again until the next local day, so a denied trigger does not gather and
+draft again every minute. Consent is read only when a run reaches it. Per user per
+tick that comes to: no reads while every trigger is settled; otherwise one profile
+read plus one existence check per unsettled trigger, and the two consent reads
+(constraints, dismissed keys) only when a run reaches consent.
+
+Accepting a suggestion is claim-then-execute: a compare-and-set moves it from
+pending to accepted before its action runs, so a double-click runs the action once
+and the second click is a 409. However the action ends without finishing (any
+error, or a cancellation) the claim is released again.
 """
 
+import asyncio
 import logging
-from collections.abc import Callable
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from app.domain import errors
 from app.domain.anticipation import (
@@ -20,8 +35,9 @@ from app.domain.anticipation import (
     TriggerContext,
     TriggerOutcome,
 )
-from app.domain.entities import HOURS_PER_DAY, Suggestion, SuggestionStatus
+from app.domain.entities import HOURS_PER_DAY, AutonomyMode, Suggestion, SuggestionStatus
 from app.domain.ports import ConstraintRepository, ProfileRepository, SuggestionRepository
+from app.services.anticipation.user_locks import UserLocks
 from app.services.memory.constraint_bridge import DAY_START_MIN, _parse_time_range
 from app.services.planning.local_time import user_zone
 from app.services.task_service import utc_now
@@ -34,6 +50,9 @@ _LIST_LIMIT = 100
 _DISMISSED_LIMIT = 500
 
 _OUT_OF_DATE = "This suggestion is out of date — a newer plan replaced it."
+
+# Outcomes that hold for the rest of the user's local day.
+_SETTLES_THE_DAY = frozenset({"created", "already_done", "denied", "nothing_to_say"})
 
 
 class ActionFactory:
@@ -70,6 +89,20 @@ def _whole_local_hours(start_min: int, end_min: int) -> tuple[int, int] | None:
     return start % HOURS_PER_DAY, end % HOURS_PER_DAY
 
 
+def _aware(now: datetime) -> datetime:
+    """A naive instant is UTC, as it is in storage."""
+    return now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+
+
+@dataclass(frozen=True)
+class _Settled:
+    """A trigger's outcome for one local day: [since, until) as instants."""
+
+    since: datetime
+    until: datetime
+    outcome: TriggerOutcome
+
+
 class AnticipationService:
     """The proactive triggers, the consent chain they answer to, and their suggestions."""
 
@@ -91,6 +124,9 @@ class AnticipationService:
         self._profiles = profiles
         self._constraints = constraints
         self._clock = clock
+        self._locks = UserLocks()
+        # One entry per (user, trigger), replaced each local day.
+        self._settled: dict[tuple[str, str], _Settled] = {}
 
     def register_trigger(self, trigger: Trigger) -> None:
         """Add ``trigger`` (or replace the one with its name)."""
@@ -99,39 +135,88 @@ class AnticipationService:
     async def run_trigger(
         self, user_id: str, name: str, *, force: bool = False, now: datetime | None = None
     ) -> TriggerOutcome:
-        """Run one trigger for the user; NotFoundError if no trigger has that name."""
+        """Run one trigger for the user; NotFoundError if no trigger has that name.
+
+        A trigger that already settled the user's local day returns that outcome
+        without running again, forced or not.
+        """
         trigger = self._triggers.get(name)
         if trigger is None:
             raise errors.NotFoundError("That trigger does not exist.", details={"trigger": name})
-        ctx, consent_ctx = await self._contexts(user_id, now or self._clock(), force=force)
-        return await self._run(trigger, ctx, consent_ctx)
+        now = _aware(now or self._clock())
+        async with self._locks.hold(user_id):
+            remembered = self._remembered(user_id, name, now)
+            if remembered is not None:
+                return remembered
+            ctx = await self._context(user_id, now, force=force)
+            return await self._run(trigger, ctx, self._consent_loader(ctx))
 
     async def run_due(self, user_id: str, now: datetime) -> list[TriggerOutcome]:
-        """Run every trigger for the user as of ``now``, one after another."""
-        if not self._triggers:
+        """Run every trigger for the user as of ``now``, one after another.
+
+        One outcome per trigger. A trigger that raises is logged (its name and the
+        exception type) and reported as "failed"; the next one still runs.
+        """
+        triggers = list(self._triggers.values())
+        if not triggers:
             return []
-        ctx, consent_ctx = await self._contexts(user_id, now, force=False)
-        triggers = list(self._triggers.values())  # a trigger registered meanwhile waits a tick
-        return [await self._run(trigger, ctx, consent_ctx) for trigger in triggers]
+        now = _aware(now)
+        async with self._locks.hold(user_id):
+            remembered = {t.name: self._remembered(user_id, t.name, now) for t in triggers}
+            if all(outcome is not None for outcome in remembered.values()):
+                return [remembered[t.name] for t in triggers]
+            ctx = await self._context(user_id, now, force=False)
+            load_consent = self._consent_loader(ctx)
+            outcomes = []
+            for trigger in triggers:
+                outcome = remembered[trigger.name]
+                if outcome is None:
+                    try:
+                        outcome = await self._run(trigger, ctx, load_consent)
+                    except Exception as exc:  # one trigger's failure never stops the next
+                        logger.warning(
+                            "Trigger %s for user %s could not finish (%s)",
+                            trigger.name,
+                            user_id,
+                            type(exc).__name__,
+                        )
+                        outcome = TriggerOutcome(status="failed")
+                outcomes.append(outcome)
+            return outcomes
 
     async def list_suggestions(
         self, user_id: str, *, status: SuggestionStatus | None = SuggestionStatus.PENDING
     ) -> list[Suggestion]:
-        """The user's newest suggestions in ``status`` (every status for None), newest first."""
-        return await self._suggestions.list(user_id, status=status, limit=_LIST_LIMIT)
+        """The user's newest suggestions in ``status`` (every status for None), newest first.
+
+        A pending suggestion past its ``expires_at`` is not listed as pending.
+        """
+        found = await self._suggestions.list(user_id, status=status, limit=_LIST_LIMIT)
+        if status == SuggestionStatus.PENDING:
+            now = self._clock()
+            found = [s for s in found if s.expires_at is None or s.expires_at > now]
+        return found
 
     async def accept(self, user_id: str, suggestion_id: str) -> tuple[Suggestion, ActionResult]:
         """Claim the pending suggestion, then run its action.
 
         Raises NotFoundError if the user has no such suggestion, StaleVersionError
-        (409) if it is no longer pending, and InvalidStateTransition (409) if its
-        action is out of date, after marking it expired. A PersistenceError (503)
-        from the action puts it back to pending, so it can be accepted again.
+        (409) if it is no longer pending, and InvalidStateTransition (409) if it is
+        past its ``expires_at`` or its action is out of date, after marking it
+        expired. Any other way the action ends without finishing, an error or a
+        cancellation, puts it back to pending and is raised as it came.
         """
         suggestion = await self._suggestions.get(user_id, suggestion_id)
         if suggestion is None:
             raise errors.NotFoundError(
                 "That suggestion does not exist.", details={"suggestion_id": suggestion_id}
+            )
+        if suggestion.expires_at is not None and self._clock() >= suggestion.expires_at:
+            await self._suggestions.set_status(
+                user_id, suggestion_id, SuggestionStatus.EXPIRED, expected=SuggestionStatus.PENDING
+            )
+            raise errors.InvalidStateTransition(
+                _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
             )
         action = self._actions.from_payload(suggestion.action)
         claimed = await self._suggestions.set_status(
@@ -140,12 +225,13 @@ class AnticipationService:
         try:
             result = await action.execute(user_id)
         except (errors.InvalidStateTransition, errors.NotFoundError) as exc:
-            await self._release(user_id, suggestion_id, SuggestionStatus.EXPIRED)
+            await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.EXPIRED))
             raise errors.InvalidStateTransition(
                 _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
             ) from exc
-        except errors.PersistenceError:
-            await self._release(user_id, suggestion_id, SuggestionStatus.PENDING)
+        except BaseException:
+            # Shielded: a cancellation must not also cancel the release.
+            await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.PENDING))
             raise
         return claimed, result
 
@@ -160,11 +246,33 @@ class AnticipationService:
         )
 
     async def _run(
-        self, trigger: Trigger, ctx: TriggerContext, consent_ctx: ConsentContext
+        self,
+        trigger: Trigger,
+        ctx: TriggerContext,
+        load_consent: Callable[[], Awaitable[ConsentContext]],
     ) -> TriggerOutcome:
-        return await trigger.run(
-            ctx, consent=self._consent, consent_ctx=consent_ctx, suggestions=self._suggestions
+        outcome = await trigger.run(
+            ctx, consent=self._consent, consent_ctx=load_consent, suggestions=self._suggestions
         )
+        if outcome.status in _SETTLES_THE_DAY:
+            zone = ZoneInfo(ctx.profile.timezone)
+            since = datetime.combine(ctx.local_day, time(0), tzinfo=zone)
+            self._settled[(ctx.user_id, trigger.name)] = _Settled(
+                since=since,
+                until=datetime.combine(ctx.local_day + timedelta(days=1), time(0), tzinfo=zone),
+                # Made today means done for today.
+                outcome=TriggerOutcome(status="already_done")
+                if outcome.status == "created"
+                else outcome,
+            )
+        return outcome
+
+    def _remembered(self, user_id: str, name: str, now: datetime) -> TriggerOutcome | None:
+        """The trigger's outcome if it already settled the local day ``now`` falls on."""
+        settled = self._settled.get((user_id, name))
+        if settled is None or not settled.since <= now < settled.until:
+            return None
+        return settled.outcome
 
     async def _release(self, user_id: str, suggestion_id: str, to: SuggestionStatus) -> None:
         """Move a claimed suggestion whose action did not finish to ``to``.
@@ -175,7 +283,7 @@ class AnticipationService:
             await self._suggestions.set_status(
                 user_id, suggestion_id, to, expected=SuggestionStatus.ACCEPTED
             )
-        except errors.JarvisError as exc:
+        except Exception as exc:
             logger.warning(
                 "Suggestion %s of user %s stays accepted: could not mark it %s (%s)",
                 suggestion_id,
@@ -184,30 +292,42 @@ class AnticipationService:
                 type(exc).__name__,
             )
 
-    async def _contexts(
-        self, user_id: str, now: datetime, *, force: bool
-    ) -> tuple[TriggerContext, ConsentContext]:
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)  # a naive instant is UTC, as in storage
+    async def _context(self, user_id: str, now: datetime, *, force: bool) -> TriggerContext:
         profile = await self._profiles.get_or_create(user_id)
         zone = user_zone(profile)
         if profile.timezone != zone.key:
             # An unknown zone falls back to the default; triggers and the repositories
             # read the local day off profile.timezone, so it must name that same zone.
             profile = profile.model_copy(update={"timezone": zone.key})
-        ctx = TriggerContext(
+        return TriggerContext(
             user_id=user_id,
             profile=profile,
             now=now,
             local_day=now.astimezone(zone).date(),
             force=force,
         )
-        consent_ctx = ConsentContext(
-            autonomy_mode=profile.autonomy_mode,
-            stated_blocks=await self._stated_blocks(user_id),
-            dismissed_keys=await self._dismissed_keys(user_id),
+
+    def _consent_loader(self, ctx: TriggerContext) -> Callable[[], Awaitable[ConsentContext]]:
+        """Reads the user's consent context the first time a run reaches consent, once."""
+        loaded: list[ConsentContext] = []
+        user_id, mode = ctx.user_id, ctx.profile.autonomy_mode
+
+        async def load() -> ConsentContext:
+            if not loaded:
+                loaded.append(await self._consent_context(user_id, mode))
+            return loaded[0]
+
+        return load
+
+    async def _consent_context(self, user_id: str, mode: AutonomyMode) -> ConsentContext:
+        dismissed = await self._suggestions.dedupe_keys(
+            user_id, status=SuggestionStatus.DISMISSED, limit=_DISMISSED_LIMIT
         )
-        return ctx, consent_ctx
+        return ConsentContext(
+            autonomy_mode=mode,
+            stated_blocks=await self._stated_blocks(user_id),
+            dismissed_keys=frozenset(dismissed),
+        )
 
     async def _stated_blocks(self, user_id: str) -> list[tuple[int, int, str]]:
         """The hours the user said (never inferred) to keep free, on their local clock."""
@@ -220,10 +340,3 @@ class AnticipationService:
             if hours is not None:
                 blocks.append((*hours, constraint.raw_text))
         return blocks
-
-    async def _dismissed_keys(self, user_id: str) -> frozenset[str]:
-        dismissed = await self._suggestions.list(
-            user_id, status=SuggestionStatus.DISMISSED, limit=_DISMISSED_LIMIT
-        )
-        keys = (s.action.get("dedupe_key") for s in dismissed)
-        return frozenset(key for key in keys if isinstance(key, str))
