@@ -50,9 +50,15 @@ the chain **Local (LM Studio Gemma) → Claude (`CLAUDE_MODEL`, default Sonnet
 5.5) → Gemini**. Gemini is the last resort, and the only provider for web
 search (Gemini search grounding). Before any cloud send the PII gate redacts the
 prompt, the system prompt and the conversation history; every call, billed
-failures included, is metered into `llm_usage_events`.
+failures included, is metered into `llm_usage_events`. Roles (`MODEL_ROUTING`):
+PRIMARY (the heavy local model; never two at once) for `socratic_chunker`,
+`habit_translation`, `document_understanding`, `research_summarization`,
+`practice_generation` and `calendar_parsing`; FAST for `intent_classification`,
+`brain_dump_extraction`, `memory_extraction`, `voice_of_jarvis`, the reply
+synthesis, `goal_validation`, `task_edit_parsing` and `action_item_extraction`.
+Web search also redacts its query before it leaves the machine.
 
-**Test suite: 1,029 tests in 61 files; the default run is 1,024 passed and 4 strict xfails in ~15 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
+**Test suite: 1,034 tests in 61 files; the default run is 1,029 passed and 4 strict xfails in ~15 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach
 Supabase, Gemini, or ChromaDB.
 
@@ -538,7 +544,7 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
 
 ## Test Coverage
 
-**1,029 collected · 1,024 passed · 4 strict xfails · 1 slow (deselected by default) · 61 files · ~15 s · fully offline.**
+**1,034 collected · 1,029 passed · 4 strict xfails · 1 slow (deselected by default) · 61 files · ~15 s · fully offline.**
 
 Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
 form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).

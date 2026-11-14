@@ -14,8 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.core.model_router import PreCloudLLMRedactor
 from app.domain.errors import LLMUnavailableError
 from app.models.brain.litellm_conf import gemini_web_search
+from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
 from app.services.user_preferences import get_learning_style
@@ -38,7 +40,17 @@ async def _search_web(user_prompt: str, system_prompt: str) -> str:
     Still Gemini-only: no other provider in the LLM chain has search grounding, so a
     fallback model would only invent links. ``gemini_web_search`` answers an empty
     string when the key is missing or the call fails.
+
+    The query carries user text (a task title, the chat message) and goes to the
+    cloud outside the provider chain, so the chain's PII gate is run here first. A
+    gate that denies the send, or wants to ask, means no search is made.
     """
+    redactor = PreCloudLLMRedactor(get_hooks())
+    try:
+        user_prompt, _ = await redactor.redact(user_prompt)
+        system_prompt, _ = await redactor.redact(system_prompt)
+    except LLMUnavailableError as exc:
+        raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE) from exc
     raw = await gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt)
     if not raw or not raw.strip():
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
