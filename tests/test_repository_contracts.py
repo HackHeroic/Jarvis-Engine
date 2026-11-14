@@ -665,6 +665,41 @@ async def test_drafts__accept_atomic__task_id_already_taken__raises_conflict_and
     assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
 
 
+@pytest.mark.asyncio
+async def test_drafts__accept_atomic__reslots_missed_row_with_same_task_id(repos):
+    """A task whose slot passed comes back in a new plan under its own id.
+
+    Accept replaces the user's missed row for that id, so the unique key does not
+    clash; the row is pending again, with the new slot. Another user's row is untouched.
+    """
+    await _seed_tasks(repos, U1, [_row("m", status="missed", start=T0)])
+    await _seed_tasks(repos, U2, [_row("m", status="missed", start=T0)])
+    draft = await _new_draft(repos)
+    later = T0 + timedelta(days=1)
+
+    assert await repos.drafts.accept_atomic(U1, draft.id, [_row("m", start=later)]) == 1
+
+    task = await repos.tasks.get(U1, "m")
+    assert task.status is TaskStatus.PENDING
+    assert (task.scheduled_start, task.scheduled_end) == (later, later + timedelta(minutes=25))
+    window = (T0 - timedelta(days=1), T0 + timedelta(days=2))
+    assert [t.task_id for t in await repos.tasks.list_scheduled_between(U1, *window)] == ["m"]
+    assert (await repos.tasks.get(U2, "m")).status is TaskStatus.MISSED
+
+
+@pytest.mark.asyncio
+async def test_drafts__accept_atomic__unrelated_missed_row_kept(repos):
+    """Only the missed rows the plan re-slots are replaced; the others stay set aside."""
+    await _seed_tasks(repos, U1, [_row("m", status="missed", start=T0), _row("open")])
+    draft = await _new_draft(repos)
+
+    assert await repos.drafts.accept_atomic(U1, draft.id, [_row("x")]) == 1
+
+    kept = await repos.tasks.get(U1, "m")
+    assert (kept.status, kept.scheduled_start) == (TaskStatus.MISSED, T0)
+    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["x"]
+
+
 # --- Constraints -------------------------------------------------------------
 
 

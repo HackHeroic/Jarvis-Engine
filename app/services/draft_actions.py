@@ -180,6 +180,13 @@ def _draft_service(supabase: Any) -> Optional[DraftService]:
         return None
     # The no-container fallback: the one place outside the composition root that
     # builds a repository itself.
-    from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
+    from app.infrastructure.persistence.supabase_repos import (
+        SupabaseDraftRepository,
+        SupabaseTaskEventRepository,
+    )
 
-    return DraftService(SupabaseDraftRepository(supabase), NullEventBus())
+    return DraftService(
+        SupabaseDraftRepository(supabase),
+        NullEventBus(),
+        task_events=SupabaseTaskEventRepository(supabase),
+    )

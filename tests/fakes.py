@@ -289,11 +289,14 @@ class FakeSupabase:
         return _Result(found[:p_limit])
 
     def _accept_draft(self, p_draft_id: str, p_user_id: str, p_rows: list[dict]) -> _Result:
-        """Mirror of the accept_draft SQL function: one transaction, all or nothing.
+        """Mirror of the accept_draft SQL function (v2): one transaction, all or nothing.
+
+        It replaces the user's pending rows, plus their missed rows whose task_id
+        appears in ``p_rows`` (20261115000001_accept_draft_reslots_missed.sql).
 
         Also enforces the migrated table's ``UNIQUE (user_id, task_id)``: a row whose
-        task_id one of the user's surviving (non-pending) rows, or an earlier row of
-        the same call, already holds fails the whole call, as the real insert would.
+        task_id one of the user's surviving rows, or an earlier row of the same call,
+        already holds fails the whole call, as the real insert would.
         Only this path checks it; ``table().insert`` does not.
         """
         with self._rpc_lock:
@@ -315,10 +318,17 @@ class FakeSupabase:
                 raise Exception("DRAFT_NOT_OPEN")
 
             tasks = self.rows.setdefault("user_tasks", [])
+            reslotted = {row.get("task_id") for row in p_rows}
             remaining = [
                 r
                 for r in tasks
-                if not (r.get("user_id") == p_user_id and r.get("status") == "pending")
+                if not (
+                    r.get("user_id") == p_user_id
+                    and (
+                        r.get("status") == "pending"
+                        or (r.get("status") == "missed" and r.get("task_id") in reslotted)
+                    )
+                )
             ]
             # Checked before anything is written, so a violation changes nothing.
             taken = {r.get("task_id") for r in remaining if r.get("user_id") == p_user_id}

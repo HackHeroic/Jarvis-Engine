@@ -27,6 +27,7 @@ MIGRATIONS = Path(__file__).resolve().parent.parent / "supabase" / "migrations"
 BASELINE = MIGRATIONS / "20260101000000_baseline_legacy_tables.sql"
 CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
 SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
+ACCEPT_DRAFT_RESLOTS = MIGRATIONS / "20261115000001_accept_draft_reslots_missed.sql"
 MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
@@ -85,8 +86,8 @@ def _user_tables() -> set[str]:
     return _created_tables() - NO_RLS_ALLOWLIST
 
 
-def _accept_draft_body() -> str:
-    function = re.search(r"function (?:public\.)?accept_draft\b.*?\$\$;", _sql(CAPSTONE), re.S)
+def _accept_draft_body(path: Path = CAPSTONE) -> str:
+    function = re.search(r"function (?:public\.)?accept_draft\b.*?\$\$;", _sql(path), re.S)
     assert function, "accept_draft not found"
     return function.group(0)
 
@@ -224,6 +225,38 @@ def test_migrations__accept_draft__executable_by_service_role_and_authenticated_
     sql = _sql(CAPSTONE)
     signature = r"function (?:public\.)?accept_draft\(uuid, text, jsonb\)"
 
+    assert re.search(rf"revoke execute on {signature} from public, anon;", sql)
+    assert re.search(rf"grant execute on {signature} to service_role, authenticated;", sql)
+
+
+_ACCEPT_DRAFT_DELETE = r"delete from public\.user_tasks\b[^;]*;"
+
+
+def test_migrations__accept_draft_v2__deletes_reslotted_missed_rows():
+    """v2 also deletes the user's missed rows whose task_id the plan re-slots.
+
+    Everything else is the capstone function, word for word, so the checks above on
+    its columns, lock order and supersede still hold for the definition now in force.
+    """
+    v1, v2 = _accept_draft_body(CAPSTONE), _accept_draft_body(ACCEPT_DRAFT_RESLOTS)
+    [delete] = re.findall(_ACCEPT_DRAFT_DELETE, v2)
+
+    assert re.fullmatch(
+        r"delete from public\.user_tasks\s+where user_id = p_user_id\s+"
+        r"and \(\s*status = 'pending'\s+"
+        r"or \(\s*status = 'missed'\s+"
+        r"and task_id in \(\s*select value ->> 'task_id'\s+"
+        r"from jsonb_array_elements\(coalesce\(p_rows, '\[\]'::jsonb\)\)\s*\)\s*\)\s*\)\s*;",
+        delete,
+    )
+
+    def without_delete(body: str) -> str:
+        return " ".join(re.sub(_ACCEPT_DRAFT_DELETE, "", body).split())
+
+    assert without_delete(v2) == without_delete(v1)
+    sql = _sql(ACCEPT_DRAFT_RESLOTS)
+    signature = r"function public\.accept_draft\(uuid, text, jsonb\)"
+    assert re.search(rf"comment on {signature} is", sql)
     assert re.search(rf"revoke execute on {signature} from public, anon;", sql)
     assert re.search(rf"grant execute on {signature} to service_role, authenticated;", sql)
 
