@@ -84,8 +84,11 @@ async def delete_document(
         from app.utils.chroma_client import get_chroma_client
 
         client = get_chroma_client()
-        collection = client.get_or_create_collection("jarvis_knowledge")
-        results = collection.get(where={"source_id": source_id})
+        collection = client.get_or_create_collection(
+            "jarvis_knowledge", metadata={"hnsw:space": "cosine"}
+        )
+        # Only the caller's chunks: a source id alone would delete another user's.
+        results = collection.get(where={"$and": [{"source_id": source_id}, {"user_id": user_id}]})
         if results["ids"]:
             collection.delete(ids=results["ids"])
             log_step("DOC_DELETE", f"Removed {len(results['ids'])} chunks from ChromaDB")
@@ -136,7 +139,8 @@ async def get_document_chunks(
         collection = client.get_or_create_collection(
             "jarvis_knowledge", metadata={"hnsw:space": "cosine"}
         )
-        results = collection.get(where={"source_id": source_id})
+        # Only the caller's chunks: a source id alone would read another user's.
+        results = collection.get(where={"$and": [{"source_id": source_id}, {"user_id": user_id}]})
         chunks = results.get("documents", []) if results else []
         return {"source_id": source_id, "chunks": chunks, "count": len(chunks)}
     except Exception as exc:

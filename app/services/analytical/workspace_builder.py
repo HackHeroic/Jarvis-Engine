@@ -96,7 +96,8 @@ async def fetch_chunks_for_task(
 
             for sid in source_ids:
                 try:
-                    out = collection.get(where={"source_id": sid})
+                    # The owner too, not the source id alone: chunks are user-scoped.
+                    out = collection.get(where={"$and": [{"source_id": sid}, {"user_id": user_id}]})
                     if out and out.get("documents"):
                         chunks.extend(out["documents"])
                 except Exception:
@@ -104,13 +105,12 @@ async def fetch_chunks_for_task(
 
         if not chunks and (task_title or topic_kw):
             query_text = f"{task_title} {' '.join(topic_kw)}".strip()
-            if query_text:
-                try:
-                    out = collection.query(query_texts=[query_text], n_results=5)
-                    if out and out.get("documents") and len(out["documents"]) > 0:
-                        chunks.extend(out["documents"][0])
-                except Exception:
-                    pass
+            if query_text and user_id:
+                # The shared, user-scoped search with its relevance cut-off — an
+                # unfiltered query here surfaced other users' documents.
+                from app.utils.chroma_client import query_knowledge
+
+                chunks.extend(await asyncio.to_thread(query_knowledge, user_id, query_text, 5))
     except ImportError:
         pass
     except Exception as e:

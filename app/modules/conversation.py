@@ -5,6 +5,7 @@ conversational system prompt. synthesize_response wraps other modules'
 structured output in Voice of Jarvis personality.
 """
 
+import asyncio
 import re
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -119,12 +120,15 @@ async def run_general_chat(state: dict) -> dict:
         if memory_context:
             system_prompt += f"\n\nWhat you know about this user:\n{memory_context}"
 
-        # Inject relevant knowledge from ChromaDB if available
+        # Inject relevant knowledge from the user's own documents, if any. The
+        # search is a blocking network call: off the event loop, and skipped
+        # without a user to scope it to.
         try:
             from app.utils.chroma_client import query_knowledge
             user_model = state.get("user_model")
-            if user_model:
-                chunks = query_knowledge(user_model.user_id, user_message, n_results=3)
+            rag_user_id = getattr(user_model, "user_id", None) if user_model else None
+            if rag_user_id:
+                chunks = await asyncio.to_thread(query_knowledge, rag_user_id, user_message, 3)
                 if chunks:
                     system_prompt += "\n\nRelevant knowledge from user's documents:\n" + "\n---\n".join(chunks[:3])
         except Exception:
