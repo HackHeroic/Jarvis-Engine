@@ -47,7 +47,7 @@ def app_with_db():
             setattr(app.state, name, original)
 
 
-def test_complete_task__writes_signal_with_existing_columns_only(app_with_db):
+def test_complete_task__completion_signal__written_with_existing_columns_only(app_with_db):
     app, supabase = app_with_db
 
     resp = TestClient(app).post(
@@ -67,7 +67,7 @@ def test_complete_task__writes_signal_with_existing_columns_only(app_with_db):
 
 
 @pytest.mark.asyncio
-async def test_check_connection__queries_user_tasks():
+async def test_check_connection__health_probe__queries_user_tasks():
     supabase = _RecordingSupabase()
     client = DatabaseClient.__new__(DatabaseClient)
     client.supabase = supabase

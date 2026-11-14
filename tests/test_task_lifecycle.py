@@ -159,7 +159,8 @@ def test_list_constraints__returns_user_rows_only():
         app.state.db_client = original
 
 
-def test_list_constraints__degraded_db__empty_list():
+def test_list_constraints__degraded_db__503_not_an_empty_list():
+    """An outage is not "you have no rules": the list answers 503, never []."""
     from fastapi.testclient import TestClient
     from app.main import app
 
@@ -168,8 +169,8 @@ def test_list_constraints__degraded_db__empty_list():
     try:
         client = TestClient(app)
         resp = client.get("/api/v1/habits/constraints?user_id=u1")
-        assert resp.status_code == 200
-        assert resp.json()["constraints"] == []
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "persistence_unavailable"
     finally:
         app.state.db_client = original
 

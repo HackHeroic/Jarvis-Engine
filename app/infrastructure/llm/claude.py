@@ -9,7 +9,12 @@ Built so the API credits buy answers, not waste:
 * a structured request uses the API's structured outputs, so the reply is
   schema-valid by construction — no fence stripping, no repair loop;
 * every reply the API bills is metered, including one that is then discarded (cut
-  off, refused, or failing its schema);
+  off, refused, or failing its schema). When the server-side fallback ran, the
+  top-level ``usage`` covers only the attempt that answered; ``usage.iterations``
+  lists every attempt, and the declined ones are billed too, so it is their sum
+  that is metered;
+* a 200 whose body is not a Messages API message (a proxy's HTML page, say) is
+  ``LLMUnavailableError``, so the chain falls over to the next provider;
 * the SDK never retries (``max_retries=0``) because ``RetryingProvider`` owns retries;
   a rejected credential switches the provider off for the rest of the process, and a
   refusal is never asked again;
@@ -17,6 +22,7 @@ Built so the API credits buy answers, not waste:
   model (``fallbacks: "default"``) within the same call.
 """
 
+import json
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
@@ -25,6 +31,7 @@ from types import ModuleType
 from typing import Any
 
 import anthropic
+from anthropic.types.beta import BetaMessage
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
@@ -109,9 +116,9 @@ class ClaudeProvider(LLMProvider):
         messages_api = self._client().beta.messages
         params = self._params(req)
         if req.response_schema is None:
-            with self._translated_errors():
+            with self._translated_errors(), _unreadable_reply_is_unavailable():
                 reply = await messages_api.create(**params)
-            body = reply.to_dict()
+            body = _message_body(reply)
             _meter(body)
             _check_stop(body)
             return "".join(block.text for block in reply.content if block.type == "text")
@@ -123,7 +130,8 @@ class ClaudeProvider(LLMProvider):
             raw = await messages_api.with_raw_response.parse(
                 **params, output_format=req.response_schema
             )
-            body = await raw.json()
+        with _unreadable_reply_is_unavailable():
+            body = _message_body(await raw.json())
         _meter(body)
         _check_stop(body)
         with self._translated_errors():
@@ -243,19 +251,52 @@ def _messages(req: LLMRequest) -> list[dict]:
     return turns
 
 
+_UNREADABLE_REPLY = "The language model sent a reply that could not be read."
+
+
+@contextmanager
+def _unreadable_reply_is_unavailable() -> Iterator[None]:
+    """A 200 whose body is not JSON is a broken upstream, not an answer: fall over."""
+    try:
+        yield
+    except json.JSONDecodeError as exc:
+        raise LLMUnavailableError(_UNREADABLE_REPLY, details={"cause": "unreadable_reply"}) from exc
+
+
+def _message_body(reply: Any) -> dict:
+    """The reply as a dict, or ``LLMUnavailableError`` if it is not a Messages API message.
+
+    The SDK hands back what a 200 carried: a ``BetaMessage`` when it was a message,
+    otherwise a string or whatever JSON value the body held.
+    """
+    body = reply.to_dict() if isinstance(reply, BetaMessage) else reply
+    if not isinstance(body, dict) or body.get("type") != "message":
+        raise LLMUnavailableError(_UNREADABLE_REPLY, details={"cause": "unreadable_reply"})
+    return body
+
+
 def _meter(body: dict) -> None:
     """Record a billed reply's usage, and the model that wrote it, for ``MeteredProvider``.
 
     ``input_tokens`` is the whole prompt: uncached, written to cache, and read from
     cache. The tally has no cache-write field, so writes are counted there only;
     cache reads are also reported on their own.
+
+    With ``usage.iterations`` (a server-side fallback ran, or another server-side
+    step), the counts are summed over every iteration: the top-level fields cover
+    only the attempt that produced the message, and a declined attempt is billed too.
     """
     usage = body.get("usage") or {}
-    cache_read = usage.get("cache_read_input_tokens") or 0
-    cache_write = usage.get("cache_creation_input_tokens") or 0
+    attempts = usage.get("iterations") or [usage]
+
+    def total(field: str) -> int:
+        return sum(attempt.get(field) or 0 for attempt in attempts)
+
+    cache_read = total("cache_read_input_tokens")
+    cache_write = total("cache_creation_input_tokens")
     report_token_usage(
-        input_tokens=(usage.get("input_tokens") or 0) + cache_write + cache_read,
-        output_tokens=usage.get("output_tokens") or 0,
+        input_tokens=total("input_tokens") + cache_write + cache_read,
+        output_tokens=total("output_tokens"),
         cache_read_tokens=cache_read,
     )
     _served_model.set(body.get("model") or None)

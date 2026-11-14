@@ -430,3 +430,15 @@ async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_ll
 
     assert graph.seen == [True]  # the turn itself ran on the cloud
     assert force_cloud_var.get() is False  # and nothing after it does
+
+
+def test_project__python_floor__is_3_12():
+    """The lock's bounded wait leans on 3.12's asyncio.wait_for (a timeout that lands as
+    the lock is granted keeps it), and the Claude provider's served-model ContextVar on
+    3.12 task-context semantics: the package must not claim to run on anything older."""
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+
+    assert pyproject["project"]["requires-python"] == ">=3.12,<3.14"

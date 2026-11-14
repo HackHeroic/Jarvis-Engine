@@ -1,10 +1,13 @@
 """Behavioral pipeline: Store constraints in Strategy Hub (L7)."""
 
+import logging
 from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.services.analytical.habit_translator import invalidate_habit_cache
 from supabase import create_client
+
+logger = logging.getLogger(__name__)
 
 
 def _get_supabase():
@@ -52,7 +55,10 @@ async def store_behavioral_constraint(
             return {"status": "stored", "id": result.data[0].get("id")}
         return {"status": "stored"}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        # The result can reach an HTTP response (/ingestion/process): log the cause,
+        # return a fixed text.
+        logger.warning("Could not store behavioral constraint", exc_info=e)
+        return {"status": "error", "error": "Could not save this preference."}
 
 
 async def get_behavioral_context_for_calendar(user_id: Optional[str] = None, supabase_client=None) -> str:
@@ -111,7 +117,8 @@ async def delete_behavioral_constraint(
         invalidate_habit_cache()
         return {"status": "deleted", "id": constraint_id}
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        logger.warning("Could not delete behavioral constraint %s", constraint_id, exc_info=e)
+        return {"status": "error", "reason": "delete failed"}
 
 
 _SYSTEM_FALLBACK_PHRASES = {

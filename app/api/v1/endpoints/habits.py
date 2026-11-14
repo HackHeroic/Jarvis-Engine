@@ -54,9 +54,11 @@ async def list_due_trackers(
     http_request: Request,
     user_id: str = Query(..., description="User ID"),
 ) -> dict:
-    """List SM-2 trackers due for review today or earlier."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    """List SM-2 trackers due for review today or earlier; 503 when the database is down.
+
+    An outage is never an empty list: "nothing due" would be a false answer.
+    """
+    supabase = require_supabase(http_request)
     due = await get_due_trackers(user_id=user_id, supabase_client=supabase)
     return {"due_trackers": due}
 
@@ -70,13 +72,13 @@ async def list_behavioral_constraints(
     http_request: Request,
     user_id: str = Query(..., description="User ID"),
 ) -> dict:
-    """List the user's behavioral constraints, newest first. Degrades to [] when DB is down."""
+    """List the user's behavioral constraints, newest first; 503 when the database is down.
+
+    An outage is never an empty list: "no rules" would be a false answer.
+    """
     import asyncio
 
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-    if supabase is None:
-        return {"constraints": []}
+    supabase = require_supabase(http_request)
 
     def _query():
         return (
@@ -89,9 +91,9 @@ async def list_behavioral_constraints(
 
     try:
         result = await asyncio.to_thread(_query)
-        return {"constraints": result.data or []}
-    except Exception:
-        return {"constraints": []}
+    except Exception as exc:
+        raise errors.PersistenceError("Could not reach the database.") from exc
+    return {"constraints": result.data or []}
 
 
 @router.delete(

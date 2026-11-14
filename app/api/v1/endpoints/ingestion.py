@@ -1,6 +1,7 @@
 """Semantic Router endpoint for intent classification and autonomous extraction pipeline."""
 
 import base64
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -12,6 +13,11 @@ from app.schemas.context import IngestionPipelineResult, IntentClassification, T
 from app.services.extraction.behavioral_store import delete_behavioral_constraint
 from app.services.extraction.orchestrator import process_ingestion
 from app.utils.docling_helper import extract_document
+
+logger = logging.getLogger(__name__)
+
+# Fixed texts: an exception's own message never goes on the wire (it is logged).
+_BAD_BASE64 = "file_base64 is not valid base64."
 
 SEMANTIC_ROUTER_SYSTEM_PROMPT = (
     "You are the Jarvis Semantic Router. You process data for CEOs, students, "
@@ -59,10 +65,7 @@ def _get_text_for_classification(request: IngestionRequest) -> str:
         try:
             raw_bytes = base64.b64decode(request.file_base64)
         except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid base64 in file_base64: {e!s}",
-            ) from e
+            raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
         extracted = extract_document(raw_bytes, request.media_type)
         parts.append(extracted)
     combined = "\n\n".join(p for p in parts if p)
@@ -105,9 +108,10 @@ async def ingest(request: IngestionRequest) -> IntentClassification:
     except HTTPException:
         raise
     except Exception as exc:
+        logger.warning("Semantic Router could not classify the payload", exc_info=exc)
         raise HTTPException(
             status_code=502,
-            detail=f"Semantic Router failed to classify the payload. {exc!s}",
+            detail="Could not classify the payload. Try again shortly.",
         ) from exc
 
 
@@ -141,7 +145,7 @@ async def process_full_pipeline(
         try:
             file_bytes = base64.b64decode(request.file_base64)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid base64: {e!s}") from e
+            raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
     db_client = getattr(http_request.app.state, "db_client", None)
     return await process_ingestion(
         payload=request.payload or None,
@@ -257,5 +261,5 @@ async def delete_behavioral_constraint_endpoint(
             raise HTTPException(status_code=404, detail="Constraint not found")
         if "not configured" in reason.lower():
             raise HTTPException(status_code=503, detail="Database not available")
-        raise HTTPException(status_code=500, detail=reason or "Deletion failed")
+        raise HTTPException(status_code=500, detail="Could not delete the constraint.")
     return result

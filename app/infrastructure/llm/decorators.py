@@ -216,9 +216,10 @@ def _billed(tally: TokenTally) -> bool:
 class MeteredProvider(_ProviderDecorator):
     """Times each call and publishes ``LLMCallCompleted``.
 
-    A call that answers is always published. A call that failed — raised, or a stream
-    that broke or was abandoned — is published only if the transport reported tokens
-    for it: those were billed even though no answer came of them. Token counts are
+    A call that answers is always published. A call that did not — it raised, was
+    cancelled, or was a stream that broke or was abandoned — is published only if the
+    transport reported tokens for it: those were billed even though no answer came of
+    them. The policy is the same for ``complete`` and ``stream``. Token counts are
     whatever the transport reports through ``transport.report_token_usage`` during the
     call. ``model_for_role`` names the model the wrapped provider uses for a role.
     """
@@ -256,7 +257,8 @@ class MeteredProvider(_ProviderDecorator):
         try:
             with collecting_tokens(tally):
                 result = await self._inner.complete(req)
-        except Exception:
+        except (Exception, asyncio.CancelledError):
+            # Cancelled too, as a stream's ``finally`` is: billed tokens are recorded.
             if _billed(tally):
                 await self._publish(req, started, tally)
             raise

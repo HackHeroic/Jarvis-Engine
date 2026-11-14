@@ -1038,7 +1038,12 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
     try:
         task_chunks = [TaskChunk(**t) for t in request.tasks]
     except Exception as exc:
-        return {"status": "error", "message": f"Invalid tasks: {exc}", "task_count": 0}
+        logger.warning(f"accept-schedule got tasks it cannot parse: {exc}")
+        return {
+            "status": "error",
+            "message": "Invalid tasks: some tasks are not in the expected shape.",
+            "task_count": 0,
+        }
 
     # A goal_id the client sends (a v2 plan's tasks carry one) rides along:
     # TaskChunk has no such field, and build_task_rows would otherwise read it off
@@ -1650,9 +1655,16 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             )
             yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
         except Exception as exc:
-            import traceback
-            traceback.print_exc()  # full traceback to server terminal
-            yield f"event: error\ndata: {json_mod.dumps({'error': str(exc)})}\n\n"
+            # The cause is logged with the request id; its text never goes to the client.
+            request_id = request_id_of(http_request)
+            logger.error(
+                f"v2 stream failed [request_id={request_id}]: {type(exc).__name__}",
+                exc_info=exc,
+            )
+            envelope = error_envelope(
+                request_id, "internal_error", "Something went wrong on our side."
+            )
+            yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
         finally:
             # The graph no longer runs inline, so a client disconnect (GeneratorExit)
             # would otherwise leave it churning through LLM calls nobody reads.

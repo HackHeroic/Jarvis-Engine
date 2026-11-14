@@ -166,6 +166,26 @@ def test_tracker_complete__wrong_user__404(client, app_state):
     assert _row(supabase, "habit_trackers", "tr-alice")["repetitions"] == 0
 
 
+@pytest.mark.parametrize("path", ["/api/v1/habits/tracker/due", "/api/v1/habits/constraints"])
+@pytest.mark.parametrize("outage", ["no_client", "client_raises"])
+def test_habits_lists__db_unavailable__503_not_an_empty_list(client, app_state, path, outage):
+    app, _ = app_state
+    app.state.db_client.supabase = None if outage == "no_client" else _RaisingSupabase()
+
+    resp = client.get(path, params={"user_id": "alice"})
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "persistence_unavailable"
+    assert "hunter2" not in resp.text
+
+
+def test_tracker_due__as_alice__only_alices_trackers(client):
+    resp = client.get("/api/v1/habits/tracker/due", params={"user_id": "alice"})
+
+    assert resp.status_code == 200
+    assert [t["id"] for t in resp.json()["due_trackers"]] == ["tr-alice"]
+
+
 # ── task workspace ──────────────────────────────────────────
 
 

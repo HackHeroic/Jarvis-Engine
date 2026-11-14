@@ -1,7 +1,7 @@
 # Jarvis Engine — Project Status
 
-**Last Updated:** 2026-08-08
-**Branch:** `spine-may1-wip`
+**Last Updated:** 2026-11-14
+**Branch:** `capstone-lld`
 **Scope of this document:** what the code actually does today. Every number and
 claim below was checked against the repository at the commit that carries this
 file. Where something is a stub, it says stub.
@@ -26,12 +26,35 @@ which now survives only as a library of helpers the v2 graph calls into
 - **Conversation state survives the turn:** an async SQLite checkpointer
   (`data/checkpoints.sqlite`) persists graph state per `(user_id, session_id)`
   thread, so a draft proposed on one turn is still under review on the next.
+  One turn at a time per thread (`app/services/turn_locks.py`); a turn queued
+  behind another waits at most 120 s, then gets a `conflict` error frame.
 
-**Test suite: 510 tests collected — 509 passed, zero xfails, in ~6 seconds.**
-39 test files. The suite runs fully offline: `tests/conftest.py` installs a
+**Layers (capstone LLD).** Dependencies point inward:
+
+- `app/domain/` — framework-free core: Pydantic entities (`Task`, `DraftSchedule`
+  and its state machine, `LLMUsageEvent`, …), domain events and the `EventBus`
+  (a subscription to a base class receives its subclasses' events), `abc` ports
+  (repositories, `LLMProvider`), and the `JarvisError` hierarchy. Imports nothing
+  from the outer layers (`tests/test_layering.py`).
+- `app/infrastructure/` — adapters behind the ports. `persistence/`: an InMemory
+  and a Supabase repository family, held to one shared contract suite
+  (`tests/test_repository_contracts.py`). `llm/`: the provider adapters (local,
+  Claude, Gemini), decorators (redaction, retry, timeout, metering), the
+  fallback chain and its factory.
+- `app/container.py` — the composition root (`AppContainer`): repositories,
+  event bus, usage ledger, the LLM chain and `DraftService`, built once in the
+  lifespan. Only it chooses a repository family.
+
+**LLM provider chain.** Every live LLM call goes through `route_llm_call` and
+the chain **Local (LM Studio Gemma) → Claude (`CLAUDE_MODEL`, default Sonnet
+5.5) → Gemini**. Gemini is the last resort, and the only provider for web
+search (Gemini search grounding). Before any cloud send the PII gate redacts the
+prompt, the system prompt and the conversation history; every call, billed
+failures included, is metered into `llm_usage_events`.
+
+**Test suite: 1,029 tests in 61 files; the default run is 1,024 passed and 4 strict xfails in ~15 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach
-Supabase, Gemini, or ChromaDB. (Updated 2026-08-13: the previous strict
-xfail — the single-task pacing bug — is fixed; see Known Issues #4.)
+Supabase, Gemini, or ChromaDB.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q     # or just: pytest tests/
@@ -145,6 +168,7 @@ flowchart TD
 
     SS -->|OPTIMAL| CD["create_draft<br/>insert into draft_schedules incl. goal_id<br/>writes NOTHING to user_tasks"]
     SS -->|INFEASIBLE| HI["handle_infeasible"]
+    SS -->|no schedule| RU["report_unsolved"] --> ENDD(["END → honest 'try again'"])
     HI -->|retry| SS
     HI -->|exhausted| ENDB(["END → anti-guilt message"])
     CD --> ENDC(["END → negotiation_state = REVIEWING"])
@@ -174,8 +198,10 @@ flowchart TD
 - **One goal, one namespace.** `decompose_goal` derives a `goal_id` via
   `derive_goal_id` (the model's `goal_metadata.goal_id` → a slug of the
   objective/planning goal → `plan_{uuid8}`) and prefixes every chunk and every
-  dependency ref as `{goal_id}_{task_id}`. `fuse_tasks` then decides membership
-  by that prefix — pending rows from *other* goals are carried into the plan,
+  dependency ref as `{goal_id}_{run}_{task_id}` (`run` is a fresh token per
+  decomposition, so a re-plan never reuses the id of a task already finished).
+  Every chunk also carries its `goal_id`, and `fuse_tasks` decides membership by
+  it (the prefix only for legacy rows) — pending rows from *other* goals are carried into the plan,
   rows from *this* goal are replaced by the fresh decomposition. Matching on
   task_id equality was F5: the decomposer's ids are positional, so a new plan
   shadowed an unrelated older one and `_persist_fused_tasks`'s
@@ -263,13 +289,13 @@ The two properties that make this safe:
    and any `?` disqualify outright. This matters because ACCEPT_DRAFT is the
    only v2 intent that writes to `user_tasks`, and `_persist_fused_tasks`
    deletes every pending row before inserting.
-2. **plan_id-verified persistence.** `accept_draft_and_persist` writes first,
-   then re-reads `user_tasks` filtered on the freshly minted `plan_id`, and only
-   then flips the draft's status to `accepted`. Verifying on task_ids would read
-   an outage as a success, because `fuse_tasks` carries pre-existing pending rows
-   forward under the same ids. Returns `n > 0` (verified), `0` (nothing
-   schedulable), or `None` (write did not land — draft stays pending, user can
-   retry).
+2. **Atomic accept.** `accept_draft_and_persist` calls `DraftService.accept`,
+   whose one repository call (`accept_draft()` in SQL) replaces the user's
+   pending tasks with the draft's, marks the draft `accepted` and the user's
+   other open drafts `superseded`, in one transaction — all or nothing. A second
+   accept finds the draft closed and writes nothing ("already locked in").
+   Returns `n > 0` (written), `0` (nothing schedulable), or `None` (write did
+   not land — draft stays open, user can retry).
 
 Both the conversational path (`handle_draft_action` in the orchestrator) and the
 REST path (`POST /api/v1/drafts/{id}/accept`) import the same
@@ -301,7 +327,7 @@ all.
 | Draft actions | `app/services/draft_actions.py` | Shared accept/resolve/coerce logic for the graph node and the REST API |
 | Drafts REST API | `app/api/v1/endpoints/drafts.py` | GET / accept / reject / modify / delete / PATCH task / rearrange / chat — all on the live Supabase-backed `DraftStore` |
 | Real token streaming | `app/api/v1/endpoints/chat.py` | Background pump task + shared queue; `token` → `event: message`, `thinking_token` → `event: thinking` |
-| Model router | `app/core/model_router.py` | Task → role (PRIMARY/FAST/CLOUD); local-first, cloud on `force_cloud` kwarg, per-request ContextVar, or `GEMINI_PRIMARY` |
+| Model router | `app/core/model_router.py` | Task → role (PRIMARY/FAST/CLOUD), then the provider chain Local → Claude → Gemini; cloud-first on `force_cloud`, the per-request ContextVar, `GEMINI_PRIMARY` or `CLAUDE_PRIMARY`. Web search stays on Gemini (`gemini_web_search`) |
 | Model auto-detection | `app/core/config.py` | Probes LM Studio `/v1/models`; heavy markers `27b/26b/22b/14b/12b`, fast markers `e4b/e2b/-4b/1b/3b`; Gemma preferred, qwen accepted; env pins outrank detection |
 | Memory system | `app/services/memory/` | 3-tier memory, SM-2 decay, extractor, retriever, PEARL detectors |
 | Memory → constraint bridge | `app/services/memory/constraint_bridge.py` | `memories_to_constraints` turns stored preferences into solver `TimeSlot`s — this is the moat |
@@ -436,10 +462,11 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
    The file-field scrubbing keeps uploads out of it, but the row count only ever
    goes up.
 
-6. **`conversation_history` bypasses the PII gate.** The `PreCloudLLM` hook is
-   applied to `prompt` only — `system_prompt` and `conversation_history` go to
-   the cloud unfiltered. L8 remains a regex placeholder (email + US phone), not
-   a real privacy gateway.
+6. **FIXED 2026-11-14** — the PII gate now covers `prompt`, `system_prompt` and
+   `conversation_history` on every cloud provider in the chain
+   (`RedactingProvider`). Still a regex gate (email + US phone), not a real
+   privacy gateway. Original description: `system_prompt` and
+   `conversation_history` reached the cloud unfiltered.
 
 7. **`validate_goal` rejects terse real goals.** The gate is
    `len(goal.strip()) < 5`, so "DSA" or "gym" is treated as too vague and
@@ -478,11 +505,40 @@ in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
     `decompose_goal`; follow-up task, deliberately not folded into the
     final-review wave.
 
+12. **FIXED 2026-11-14** — draft acceptance was not atomic (write, re-read, then
+    flip the status, in separate calls). It is now one transaction:
+    `accept_draft()` in `supabase/migrations/20261114000001_capstone_lld.sql`,
+    mirrored by the InMemory repository and the test fake.
+
+13. **The background replan is off.** `trigger_replan` (meant to re-plan after a
+    task is completed, skipped, edited or deleted) crashes before it writes
+    anything (`ExecutionGraph(goal_metadata=None)`), pinned by a strict xfail in
+    `tests/test_background_replan.py`. The task endpoints do not schedule it and
+    report `replan_triggered: false`.
+
+14. **Web search is Gemini-only.** It needs Gemini's search grounding; with no
+    Gemini key (or no credits) research and workspace links come back empty,
+    and say so. Claude web search is not wired.
+
+15. **TMT only separates tasks due today.** `run_schedule` gives the solver
+    `max(1, int(motivation*100))`, which is 1 for any deadline more than ~16 h
+    away, so tasks due in 2 and in 5 days tie and the decomposer's order decides.
+    Pinned by a strict xfail in `tests/behaviour/test_psychology.py`.
+
+16. **Dismissing a learned pattern does not stick.** Dismiss lowers the memory's
+    confidence 0.9 → 0.6, which still meets the bridge's 0.6 gate, and PEARL
+    re-detects and reinforces the same pattern next turn. Pinned by a strict
+    xfail in `tests/behaviour/test_learning.py`.
+
+17. **PEARL's duration- and deadline-edit detectors have no data.** They read
+    `user_tasks.original_duration_minutes` / `original_deadline_hint`, and
+    nothing writes those columns, so neither detector can fire.
+
 ---
 
 ## Test Coverage
 
-**510 collected · 509 passed · zero xfails · 39 files · ~6 s · fully offline.**
+**1,029 collected · 1,024 passed · 4 strict xfails · 1 slow (deselected by default) · 61 files · ~15 s · fully offline.**
 
 Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
 form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).
@@ -507,6 +563,10 @@ Areas covered, by file:
 | `test_document_*.py` (3 files) | Document type registry, classification, ingestion end-to-end |
 | `test_scheduler.py`, `test_chunker.py` | Real CP-SAT constraints; chunk parsing |
 | `test_store_resilience.py` | Explicit-`None` client sentinel — degrade, don't 500 |
+| `behaviour/` (5 suites) | The real `/chat/v2/stream` handler, orchestrator, CP-SAT and draft service over a fake database and a scripted LLM: chat turns, short- and long-term memory, learning, psychology |
+| `test_domain.py`, `test_layering.py`, `test_repository_contracts.py`, `test_container.py` | Entities and the draft state machine, the event bus, import rules between layers, both repository families against one contract, the composition root |
+| `test_llm_providers.py`, `test_claude_provider.py`, `test_llm_call_sites.py`, `test_usage_ledger.py` | The provider chain and its decorators, Claude on the real SDK over a mock transport, every LLM call site through the chain, usage metering |
+| `test_errors.py`, `test_error_text_leaks.py`, `test_data_isolation.py`, `test_turn_locks.py` | One error envelope, no exception text on the wire, per-user scoping, one turn at a time per conversation |
 | `test_observation.py`, `test_hooks.py`, `test_user_model.py`, `test_clarification.py`, `test_task_lifecycle.py`, `test_chat_history.py`, `test_chat_sessions_integration.py`, `test_core_pipeline.py`, `test_integration.py`, `test_intent_routing.py`, `test_registry.py` | Observation loop, hook pipeline semantics, user model facade, clarification paths, task lifecycle, session/history persistence, registries |
 
 ---

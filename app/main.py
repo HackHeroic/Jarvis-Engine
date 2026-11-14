@@ -13,7 +13,7 @@ class _StubDBClient:
         return False
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.error_handlers import RequestIdMiddleware, register_error_handlers
+from app.api.error_handlers import REQUEST_ID_HEADER, RequestIdMiddleware, register_error_handlers
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
 from app.domain.errors import PersistenceError
@@ -156,6 +156,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The browser hides response headers from page scripts unless they are listed:
+    # the frontend reads the request id to quote it in a bug report.
+    expose_headers=[REQUEST_ID_HEADER],
 )
 app.add_middleware(RequestIdMiddleware)
 register_error_handlers(app)
@@ -176,12 +179,11 @@ async def health(request: Request):
     Returns 200 if healthy; 503 `persistence_unavailable` if the database is unreachable.
     """
     db_client: DatabaseClient = request.app.state.db_client
+    unreachable = PersistenceError("Database is unreachable.", details={"database": "disconnected"})
     try:
         connected = await db_client.check_connection()
     except Exception as exc:
-        raise PersistenceError(
-            "Database is unreachable.", details={"database": "disconnected"}
-        ) from exc
+        raise unreachable from exc
     if not connected:
-        raise PersistenceError("Database is unreachable.", details={"database": "disconnected"})
+        raise unreachable
     return {"status": "healthy", "database": "connected"}

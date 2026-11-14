@@ -220,8 +220,8 @@ class Pattern(BaseModel):
 
     detector: str = Field(description="Name of the detector that found the pattern.")
     description: str = Field(description="Human-readable statement of the pattern.")
-    occurrences: int = Field(description="How many times the pattern was observed.")
-    confidence: float = Field(description="Detector confidence in the pattern.")
+    occurrences: int = Field(ge=1, description="How many times the pattern was observed.")
+    confidence: float = Field(ge=0.0, le=1.0, description="Detector confidence in the pattern, 0 to 1.")
     evidence: list[str] = Field(
         default_factory=list, description="References to the observations behind it."
     )
@@ -263,12 +263,12 @@ class LLMUsageEvent(BaseModel):
     provider: str = Field(description="Provider that answered (e.g. local, gemini).")
     model: str = Field(description="Model identifier that answered.")
     location: LLMLocation = Field(description="Whether the call ran on-device or in the cloud.")
-    input_tokens: int = Field(description="Prompt tokens consumed.")
-    output_tokens: int = Field(description="Completion tokens produced.")
+    input_tokens: int = Field(ge=0, description="Prompt tokens consumed.")
+    output_tokens: int = Field(ge=0, description="Completion tokens produced.")
     cache_read_tokens: int = Field(
-        default=0, description="Prompt tokens served from the provider's cache."
+        default=0, ge=0, description="Prompt tokens served from the provider's cache."
     )
-    latency_ms: int = Field(description="Wall-clock duration of the call in milliseconds.")
+    latency_ms: int = Field(ge=0, description="Wall-clock duration of the call in milliseconds.")
     pii_redactions: int = Field(
         default=0, description="How many PII spans were redacted before a cloud send."
     )

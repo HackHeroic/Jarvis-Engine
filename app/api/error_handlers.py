@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -138,14 +138,34 @@ async def _handle_request_validation(
     )
 
 
+# Statuses whose responses must not carry a body (RFC 9110): no envelope for them.
+_BODILESS_STATUSES = frozenset({204, 205, 304})
+
+
+def _status_phrase(status_code: int) -> str:
+    """The standard reason phrase; a generic one for a status outside the registry."""
+    try:
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        return "Error"
+
+
 async def _handle_http_exception(
     request: Request, exc: StarletteHTTPException
-) -> JSONResponse:
-    message = (
-        exc.detail if isinstance(exc.detail, str) else HTTPStatus(exc.status_code).phrase
-    )
+) -> Response:
+    request_id = _request_id(request)
+    if exc.status_code in _BODILESS_STATUSES or exc.status_code < 200:
+        return Response(
+            status_code=exc.status_code,
+            headers={**(exc.headers or {}), REQUEST_ID_HEADER: request_id},
+        )
+    if isinstance(exc.detail, str):
+        message, details = exc.detail, None
+    else:
+        # Structured detail is the raiser's data: keep it, under details.
+        message, details = _status_phrase(exc.status_code), {"detail": exc.detail}
     return _envelope(
-        _request_id(request), exc.status_code, "http_error", message, headers=exc.headers
+        request_id, exc.status_code, "http_error", message, details, headers=exc.headers
     )
 
 

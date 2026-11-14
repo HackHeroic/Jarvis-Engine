@@ -70,18 +70,31 @@ class EventListener(ABC):
 
 
 class EventBus:
-    """Observer subject: delivers each event to its exact type's listeners, in order."""
+    """Observer subject: delivers each event to the listeners of its type and of its bases.
+
+    A subscription to a base class (``DomainEvent`` itself, say) receives every event
+    of every subclass. Listeners of the most specific type run first.
+    """
 
     def __init__(self) -> None:
         self._listeners: dict[type[DomainEvent], list[EventListener]] = {}
 
     def subscribe(self, event_type: type[DomainEvent], listener: EventListener) -> None:
-        """Deliver every future event of exactly ``event_type`` to ``listener``."""
+        """Deliver every future event of ``event_type``, or of a subclass, to ``listener``."""
         self._listeners.setdefault(event_type, []).append(listener)
+
+    def _listeners_for(self, event: DomainEvent) -> list[EventListener]:
+        """Listeners of each class in the event's MRO, most specific first, each once."""
+        found: list[EventListener] = []
+        for cls in type(event).__mro__:
+            for listener in self._listeners.get(cls, ()):
+                if not any(listener is seen for seen in found):
+                    found.append(listener)
+        return found
 
     async def publish(self, event: DomainEvent) -> None:
         """Hand ``event`` to each listener in turn; a listener's failure is logged, never raised."""
-        for listener in list(self._listeners.get(type(event), ())):
+        for listener in self._listeners_for(event):
             try:
                 await listener.handle(event)
             except Exception:

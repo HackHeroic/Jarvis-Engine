@@ -741,3 +741,58 @@ async def test_factory__claude_reply_cut_off__billed_usage_and_answering_model_p
     assert claude_event.usage.model == "claude-sonnet-5"
     assert (claude_event.usage.input_tokens, claude_event.usage.output_tokens) == (50, 2048)
     assert gemini_event.usage.provider == "gemini"
+
+
+# --- billing across a server-side fallback, and unreadable replies --------------------
+
+
+def _iteration(kind: str, model: str, input_tokens: int, output_tokens: int, cache_read=0, cache_write=0):
+    return {"type": kind, "model": model, **_usage(input_tokens, output_tokens, cache_read, cache_write)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", [None, _Tiny], ids=["text", "structured"])
+async def test_claude__fallback_ran__every_billed_attempt_is_metered(claude_cfg, schema):
+    """Top-level usage covers only the attempt that answered; usage.iterations covers all."""
+    answered = _iteration("fallback_message", "claude-sonnet-5", 40, 7, cache_read=100, cache_write=10)
+    usage = {
+        **_usage(40, 7, cache_read=100, cache_write=10),
+        "iterations": [_iteration("message", "claude-sonnet-5-5", 30, 12), answered],
+    }
+    text = '{"color": "teal"}' if schema else "ready"
+    api = FakeAPI([_reply(text, model="claude-sonnet-5", usage=usage)])
+    provider = _provider(claude_cfg, api)
+    bus, recorder = _recording_bus()
+
+    await MeteredProvider(provider, bus, provider.model_for_role).complete(_req(response_schema=schema))
+
+    (event,) = recorder.events
+    assert event.usage.input_tokens == 30 + (40 + 100 + 10)
+    assert event.usage.output_tokens == 12 + 7
+    assert event.usage.cache_read_tokens == 100
+    assert event.usage.model == "claude-sonnet-5"
+
+
+_NOT_A_MESSAGE = [
+    httpx2.Response(200, content=b"<html>bad gateway</html>", headers={"content-type": "text/html"}),
+    httpx2.Response(200, content=b"<html>bad gateway</html>", headers={"content-type": "application/json"}),
+    httpx2.Response(200, json="just a string"),
+    httpx2.Response(200, json=[1, 2]),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", [None, _Tiny], ids=["text", "structured"])
+@pytest.mark.parametrize(
+    "response", _NOT_A_MESSAGE, ids=["html", "html_labelled_json", "json_string", "json_list"]
+)
+async def test_claude__200_whose_body_is_not_a_message__unavailable_so_the_chain_falls_over(
+    claude_cfg, schema, response
+):
+    provider = _provider(claude_cfg, FakeAPI([response]))
+
+    with pytest.raises(LLMUnavailableError) as raised:
+        await provider.complete(_req(response_schema=schema))
+
+    assert raised.value.details == {"cause": "unreadable_reply"}
+    assert provider.is_available()  # a garbled reply is not a rejected credential
