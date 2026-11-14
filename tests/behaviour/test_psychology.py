@@ -337,6 +337,78 @@ async def test_anti_guilt__overdue_tasks__are_left_out_of_the_plan_as_the_messag
     assert [claim for claim in REQUEUE_CLAIMS if claim in framing.lower()] == []
 
 
+def _seed_overdue(jarvis) -> None:
+    """Two pending tasks three days past their deadline, as the table holds them."""
+    for i, title in enumerate(["Problem set 3", "Read chapter 2"]):
+        jarvis.db.table("user_tasks").insert({
+            "id": f"row-{i}", "user_id": "alice", "task_id": f"old_task_{i}", "goal_id": "old",
+            "title": title, "status": "pending", "duration_minutes": 25,
+            "difficulty_weight": 0.5, "deadline_hint": _day(-3),
+        }).execute()
+
+
+@pytest.mark.asyncio
+async def test_anti_guilt__user_asks_for_the_missed_tasks__they_come_back_into_the_next_draft(
+    jarvis, llm, monday_morning
+):
+    """The overdue message offers to work set-aside tasks into the plan; asking does it."""
+    _seed_overdue(jarvis)
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    planned = await jarvis.say("Plan my DSA revision")
+    assert {r["status"] for r in jarvis.rows("user_tasks", goal_id="old")} == {"missed"}
+    calls_before = len(llm.calls)
+
+    turn = await jarvis.say("Yes please, add the missed tasks back in", session=planned.conversation_id)
+
+    assert {r["status"] for r in jarvis.rows("user_tasks", goal_id="old")} == {"pending"}
+    draft_titles = {t["title"] for t in jarvis.draft(turn.draft_id)["tasks"]}
+    assert {"Problem set 3", "Read chapter 2"} <= draft_titles
+    scheduled_titles = {t["title"] for t in turn.payload["schedule"]["schedule"].values()}
+    assert {"Problem set 3", "Read chapter 2"} <= scheduled_titles
+    (synthesis,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis_synthesis"]
+    (framing,) = [line for line in synthesis.prompt.splitlines() if line.startswith("anti_guilt:")]
+    assert "Problem set 3" in framing and "back" in framing
+    assert blame_phrases_in(framing) == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Plan my DSA revision", "Don't add the missed tasks, just plan DSA"],
+    ids=["no_ask", "declined"],
+)
+@pytest.mark.asyncio
+async def test_anti_guilt__replan_without_asking__missed_tasks_stay_set_aside(
+    jarvis, llm, monday_morning, message
+):
+    _seed_overdue(jarvis)
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    planned = await jarvis.say("Plan my DSA revision")
+
+    turn = await jarvis.say(message, session=planned.conversation_id)
+
+    assert {r["status"] for r in jarvis.rows("user_tasks", goal_id="old")} == {"missed"}
+    titles = {t["title"] for t in turn.payload["schedule"]["schedule"].values()}
+    assert not {"Problem set 3", "Read chapter 2"} & titles
+
+
+@pytest.mark.parametrize(
+    ("message", "asks"),
+    [
+        ("add the missed tasks back", True),
+        ("Please include the missed ones", True),
+        ("bring back what I missed", True),
+        ("ok, work them in — the missed ones", True),
+        ("bring the set-aside tasks back", True),
+        ("I missed the bus", False),
+        ("add graphs to the plan", False),
+        ("don't add the missed tasks", False),
+        ("", False),
+    ],
+)
+def test_asks_to_bring_back_missed__deterministic_phrases(message, asks):
+    assert missed_deadlines.asks_to_bring_back_missed(message) is asks
+
+
 @pytest.mark.asyncio
 async def test_anti_guilt__planning_with_overdue_tasks__marks_them_missed_and_frames_it_kindly(
     jarvis, llm, monday_morning

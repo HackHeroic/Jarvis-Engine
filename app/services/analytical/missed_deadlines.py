@@ -6,11 +6,15 @@ pending tasks) without deleting them, and surfaced in the synthesis with
 anti-guilt framing — never shame language.
 """
 
+import asyncio
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain import errors
+from app.domain.entities import TaskStatus
 from app.services.planning.local_time import end_of_local_day, user_zone
 
 
@@ -91,13 +95,81 @@ async def detect_and_mark_missed(
     return overdue
 
 
+# "Say the word and I'll work it into this plan": the word, deterministically (no
+# model call). The message must name the set-aside tasks ("missed", "set aside")
+# and ask for them back; a negation anywhere ("don't add the missed ones") is a no.
+_SET_ASIDE_RE = re.compile(r"\b(missed|set[- ]aside)\b", re.IGNORECASE)
+_BRING_BACK_RE = re.compile(
+    r"\b(add|include|bring\b.*\bback|put\b.*\bback|restore|work (them|it) in(to)?)\b",
+    re.IGNORECASE,
+)
+_NEGATION_RE = re.compile(r"\b(don'?t|do not|never|no need|skip)\b", re.IGNORECASE)
+
+
+def asks_to_bring_back_missed(message: str | None) -> bool:
+    """Does this message ask for the set-aside (missed) tasks back?"""
+    text = message or ""
+    return bool(
+        _SET_ASIDE_RE.search(text) and _BRING_BACK_RE.search(text) and not _NEGATION_RE.search(text)
+    )
+
+
+async def restore_missed(user_id: str, supabase: Any) -> list[dict]:
+    """Flip the user's ``missed`` tasks back to ``pending``; return the ones flipped.
+
+    Each move goes through ``TaskRepository.update_status`` as a compare-and-set
+    from MISSED, so a task that changed meanwhile is left alone. Returns
+    ``[{"task_id", "title"}]`` for the tasks that are pending again.
+    """
+    if not supabase:
+        return []
+    from app.services.draft_actions import task_repository
+
+    tasks = task_repository(supabase)
+    try:
+        result = await asyncio.to_thread(
+            lambda: supabase.table("user_tasks")
+            .select("task_id, title")
+            .eq("user_id", user_id)
+            .eq("status", TaskStatus.MISSED.value)
+            .execute()
+        )
+        rows = result.data or []
+    except Exception as e:
+        logger.warning(f"Listing missed tasks failed: {e!r}")
+        return []
+
+    restored: list[dict] = []
+    for row in rows:
+        try:
+            await tasks.update_status(
+                user_id, row["task_id"], TaskStatus.PENDING, expected=TaskStatus.MISSED
+            )
+        except errors.JarvisError as e:
+            logger.warning(f"Could not bring task {row.get('task_id')} back: {e.code}")
+            continue
+        restored.append({"task_id": row["task_id"], "title": row.get("title")})
+    if restored:
+        logger.info(f"Brought {len(restored)} missed tasks back for user {user_id}")
+    return restored
+
+
+def build_restored_message(restored: list[dict]) -> str:
+    """Say which set-aside tasks are back in the plan. Only what happened; no blame."""
+    titles = [f"'{r['title']}'" for r in restored[:3] if r.get("title")]
+    extra = f" and {len(restored) - 3} more" if len(restored) > 3 else ""
+    named = ", ".join(titles) + extra if titles else f"{len(restored)} set-aside tasks"
+    return f"Sir, as you asked, {named} {'is' if len(restored) == 1 else 'are'} back in this plan."
+
+
 def build_anti_guilt_message(overdue: list[dict]) -> str:
     """Synthesize a short, blame-free framing of missed tasks.
 
     Anti-Guilt principle: missed deadlines are scope problems, not moral failures.
     The framing says only what is true: ``detect_and_mark_missed`` marked these
     tasks ``missed``, so they are set aside and stay out of this plan (it fuses
-    pending tasks only). Nothing is deleted, and the user can ask for them back.
+    pending tasks only). Nothing is deleted, and asking for them back in a
+    planning turn (``asks_to_bring_back_missed``) makes them pending again.
     """
     if not overdue:
         return ""
@@ -106,12 +178,13 @@ def build_anti_guilt_message(overdue: list[dict]) -> str:
         title = overdue[0]["title"] or "a task"
         return (
             f"Sir, '{title}' slipped past its deadline, so I've set it aside rather than "
-            f"cram it in — nothing is lost. Say the word and I'll work it into this plan."
+            f"cram it in — nothing is lost. Say the word (\"add the missed tasks\") and "
+            f"I'll work it into this plan."
         )
     titles = ", ".join(f"'{o['title']}'" for o in overdue[:3] if o.get("title"))
     extra = f" and {n - 3} more" if n > 3 else ""
     return (
         f"Sir, {n} tasks have slipped past their deadlines ({titles}{extra}), so I've set "
-        f"them aside rather than cram them in — nothing is lost. Say the word and I'll "
-        f"work them into this plan."
+        f"them aside rather than cram them in — nothing is lost. Say the word (\"add the "
+        f"missed tasks\") and I'll work them into this plan."
     )

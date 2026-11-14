@@ -25,8 +25,13 @@ def _merge_lists(left: list, right: list) -> list:
 class PlanningState(TypedDict):
     user_id: str
     user_model: Any
+    # The user's words this turn: mark_missed reads them for "add the missed tasks".
+    user_message: str
     planning_goal: Optional[str]
     missed_deadlines: Optional[list]
+    # Missed tasks the user asked back this turn: pending again, and fuse_tasks
+    # keeps them even when they belong to the goal being re-planned.
+    restored_task_ids: list
     anti_guilt_message: Optional[str]
     habits_text: str
     semantic_slots: list
@@ -102,6 +107,20 @@ async def mark_missed(state: PlanningState) -> dict:
     user_model = state.get("user_model")
     db = getattr(user_model, "_db", None) if user_model is not None else None
     supabase = getattr(db, "supabase", None)
+    if md.asks_to_bring_back_missed(state.get("user_message")):
+        # The overdue message's offer ("say the word and I'll work it into this
+        # plan"), kept: the set-aside tasks are pending again before fusion reads
+        # pending tasks, so this plan schedules them. Nothing is marked this turn.
+        restored = await md.restore_missed(state.get("user_id", "demo"), supabase)
+        if restored:
+            if user_model is not None and hasattr(user_model, "invalidate"):
+                user_model.invalidate("pending_tasks")
+            return {
+                "missed_deadlines": [],
+                "anti_guilt_message": md.build_restored_message(restored),
+                "restored_task_ids": [r["task_id"] for r in restored],
+                "_tool_detail": {"restored": len(restored)},
+            }
     try:
         overdue = await md.detect_and_mark_missed(
             state.get("user_id", "demo"), supabase, zone=await _user_zone(state)
@@ -365,13 +384,14 @@ async def fuse_tasks(state: PlanningState) -> dict:
 
     new_chunks = state.get("task_chunks", [])
     goal_id = state.get("goal_id")
+    restored = set(state.get("restored_task_ids") or [])
     new_ids = {c.get("task_id") for c in new_chunks if c.get("task_id")}
     merged = list(new_chunks)  # start with new tasks
     for p in pending:
         pid = p.get("task_id")
         if not pid or pid in new_ids:
             continue
-        if goal_id and belongs_to_goal(pid, p.get("goal_id"), goal_id):
+        if goal_id and pid not in restored and belongs_to_goal(pid, p.get("goal_id"), goal_id):
             continue  # THIS goal's stale row: the new decomposition replaces it
         # Convert pending task row to TaskChunk-compatible dict
         merged.append({
@@ -613,6 +633,8 @@ def planning_state_in(state) -> dict:
     return {
         "user_id": user_model.user_id if user_model else "demo",
         "user_model": user_model,
+        "user_message": state.get("user_message") or "",
+        "restored_task_ids": [],
         "planning_goal": (
             brain_dump.planning_goal
             if brain_dump and hasattr(brain_dump, "planning_goal")
