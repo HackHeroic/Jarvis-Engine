@@ -1,5 +1,8 @@
 """The suggestions Jarvis makes on its own: list them, accept or dismiss one, run a trigger.
 
+The triggers are the container's: ``GET /triggers`` lists what is registered, and a
+run is checked against that list, so adding a trigger needs no change here.
+
 Routing and request parsing only; ``AnticipationService`` does the work. Errors
 are ``JarvisError``s, answered in the one error envelope. Every route first requires
 the database (``require_supabase``): without it the container runs on empty in-memory
@@ -14,6 +17,7 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, get_container, require_supabase
+from app.domain import errors
 from app.domain.anticipation import ActionResult, ConsentDecision
 from app.domain.entities import ConsentReasonKind, Suggestion, SuggestionStatus
 from app.services.anticipation.service import AnticipationService
@@ -98,9 +102,25 @@ class ConsentOut(BaseModel):
 
 
 class RunTriggerRequest(BaseModel):
-    trigger: Literal["morning_brief", "pattern_rule"] = Field(
-        description="Trigger to run now, whether or not it is due; once a day still holds."
+    trigger: str = Field(
+        min_length=1,
+        max_length=64,
+        description=(
+            "Trigger to run now (one GET /triggers lists), whether or not it is due;"
+            " once a day still holds."
+        ),
     )
+
+
+class TriggerOut(BaseModel):
+    """A trigger Jarvis can run."""
+
+    name: str = Field(description="The trigger's name, as POST /run takes it.")
+    description: str = Field(description="What it offers, in one line.")
+
+
+class TriggerListResponse(BaseModel):
+    triggers: list[TriggerOut] = Field(description="Every registered trigger.")
 
 
 def _anticipation(request: Request) -> AnticipationService:
@@ -167,16 +187,41 @@ async def dismiss_suggestion(
     return SuggestionOut.of(await _anticipation(request).dismiss(user, suggestion_id))
 
 
+@router.get(
+    "/triggers",
+    response_model=TriggerListResponse,
+    summary="List triggers",
+    description="The triggers Jarvis can run, each with what it offers.",
+)
+async def list_triggers(request: Request, user: CurrentUser) -> TriggerListResponse:
+    return TriggerListResponse(
+        triggers=[
+            TriggerOut(name=name, description=description)
+            for name, description in _anticipation(request).triggers()
+        ]
+    )
+
+
 @router.post(
     "/run",
     response_model=RunTriggerResponse,
     summary="Run a trigger now",
-    description="Runs a trigger for the user even if it is not due yet (once a day still holds).",
+    description=(
+        "Runs a registered trigger for the user even if it is not due yet (once a day"
+        " still holds); an unregistered name is a 422."
+    ),
 )
 async def run_trigger(
     body: RunTriggerRequest, request: Request, user: CurrentUser
 ) -> RunTriggerResponse:
-    outcome = await _anticipation(request).run_trigger(user, body.trigger, force=True)
+    anticipation = _anticipation(request)
+    known = [name for name, _ in anticipation.triggers()]
+    if body.trigger not in known:
+        raise errors.ValidationError(
+            "There is no trigger with that name.",
+            details={"trigger": body.trigger, "known": known},
+        )
+    outcome = await anticipation.run_trigger(user, body.trigger, force=True)
     return RunTriggerResponse(
         status=outcome.status,
         suggestion=SuggestionOut.of(outcome.suggestion) if outcome.suggestion else None,

@@ -25,6 +25,16 @@ def invalidate_habit_cache() -> None:
     logger.info("Habit translation cache invalidated")
 
 
+def is_translation_cached(habits_text: str) -> bool:
+    """Whether ``translate_habits_to_slots(habits_text)`` would answer from the cache now.
+
+    Planning asks before taking the PRIMARY lock: a cached translation calls no model,
+    so it never waits for another heavy call.
+    """
+    cached = _habit_cache.get(hashlib.sha256(habits_text.encode()).hexdigest())
+    return cached is not None and (_time.time() - cached[0]) < _CACHE_TTL_S
+
+
 def invalidate_translation_cache() -> None:
     """Clear habit translation cache when habits are modified."""
     _habit_cache.clear()

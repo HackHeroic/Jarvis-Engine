@@ -12,9 +12,16 @@ that memory: it always re-evaluates (once a day still holds, by the stored
 suggestion), and what it settles updates the memory. A second manual run of the
 same trigger within ``ANTICIPATION_MANUAL_COOLDOWN_SECONDS`` gets the first one's
 outcome. Consent is read only when a run reaches it. Per user per tick that comes
-to: no reads while every trigger is settled; otherwise one profile read plus one
-existence check per unsettled trigger, and the two consent reads (constraints,
-dismissed keys) only when a run reaches consent.
+to: no reads while every trigger is settled; otherwise one profile read, plus one
+existence check per unsettled trigger that is due (a trigger outside its window
+reads nothing), and the two consent reads (constraints, dismissed keys) only when a
+run reaches consent.
+
+A trigger whose run fails (its habits cannot be read while the model is down, say)
+is not run again on every tick: the scheduler's tick waits 1, 2, 4, ... minutes
+before trying it again for that user, never more than 30, and a run that does not
+fail resets the wait. A tick that is waiting reads nothing. In this process only, for
+at most ``_BACKOFF_ENTRIES`` (user, trigger) pairs.
 
 Accepting a suggestion is claim-then-execute: a compare-and-set moves it from
 pending to accepted before its action runs, so a double-click runs the action once
@@ -24,6 +31,7 @@ error, or a cancellation) the claim is released again.
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -39,6 +47,7 @@ from app.domain.anticipation import (
     Trigger,
     TriggerContext,
     TriggerOutcome,
+    move_suggestion,
 )
 from app.domain.entities import (
     HOURS_PER_DAY,
@@ -49,7 +58,7 @@ from app.domain.entities import (
 )
 from app.domain.ports import ConstraintRepository, ProfileRepository, SuggestionRepository
 from app.services.anticipation.user_locks import UserLocks
-from app.services.memory.constraint_bridge import DAY_START_MIN, _parse_time_range
+from app.services.memory.constraint_bridge import DAY_START_MIN, parse_time_range
 from app.services.planning.local_time import user_zone
 from app.services.task_service import utc_now
 
@@ -64,6 +73,11 @@ _OUT_OF_DATE = "This suggestion is out of date — a newer plan replaced it."
 
 # Outcomes that hold for the rest of the user's local day.
 _SETTLES_THE_DAY = frozenset({"created", "already_done", "denied", "nothing_to_say"})
+
+# A failing trigger's wait before the tick tries it again: doubling from the first, capped.
+_BACKOFF_FIRST = timedelta(minutes=1)
+_BACKOFF_CAP = timedelta(minutes=30)
+_BACKOFF_ENTRIES = 10_000  # the oldest wait is forgotten past this many
 
 
 class ActionFactory:
@@ -109,7 +123,7 @@ def stated_blocks(constraints: list[BehavioralConstraint]) -> list[tuple[int, in
     for constraint in constraints:
         if constraint.source != "said":
             continue
-        window = _parse_time_range(constraint.raw_text)
+        window = parse_time_range(constraint.raw_text)
         hours = _whole_local_hours(*window) if window is not None else None
         if hours is not None:
             blocks.append((*hours, constraint.raw_text))
@@ -119,6 +133,14 @@ def stated_blocks(constraints: list[BehavioralConstraint]) -> list[tuple[int, in
 def _aware(now: datetime) -> datetime:
     """A naive instant is UTC, as it is in storage."""
     return now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+
+
+@dataclass(frozen=True)
+class _Backoff:
+    """A failing trigger's wait for one user: not before ``until``; the last wait, ``delay``."""
+
+    until: datetime
+    delay: timedelta
 
 
 @dataclass(frozen=True)
@@ -156,10 +178,16 @@ class AnticipationService:
         self._settled: dict[tuple[str, str], _Settled] = {}
         # The last manual run per (user, trigger): when it ran and how it ended.
         self._manual: dict[tuple[str, str], tuple[datetime, TriggerOutcome]] = {}
+        # Per (user, trigger) whose last tick failed: when the tick may try it again.
+        self._backoff: OrderedDict[tuple[str, str], _Backoff] = OrderedDict()
 
     def register_trigger(self, trigger: Trigger) -> None:
         """Add ``trigger`` (or replace the one with its name)."""
         self._triggers[trigger.name] = trigger
+
+    def triggers(self) -> list[tuple[str, str]]:
+        """Every registered trigger as (name, one-line description), in registration order."""
+        return [(name, trigger.description) for name, trigger in self._triggers.items()]
 
     async def run_trigger(
         self, user_id: str, name: str, *, force: bool = False, now: datetime | None = None
@@ -201,7 +229,8 @@ class AnticipationService:
         """Run every trigger for the user as of ``now``, one after another.
 
         One outcome per trigger. A trigger that raises is logged (its name and the
-        exception type) and reported as "failed"; the next one still runs.
+        exception type) and reported as "failed"; the next one still runs, and the
+        failed one waits out its backoff (reported "not_due" meanwhile).
         """
         triggers = list(self._triggers.values())
         if not triggers:
@@ -209,6 +238,9 @@ class AnticipationService:
         now = _aware(now)
         async with self._locks.hold(user_id):
             remembered = {t.name: self._remembered(user_id, t.name, now) for t in triggers}
+            for trigger in triggers:
+                if remembered[trigger.name] is None and self._backing_off(user_id, trigger, now):
+                    remembered[trigger.name] = TriggerOutcome(status="not_due")
             if all(outcome is not None for outcome in remembered.values()):
                 return [remembered[t.name] for t in triggers]
             ctx = await self._context(user_id, now, force=False)
@@ -227,8 +259,25 @@ class AnticipationService:
                             type(exc).__name__,
                         )
                         outcome = TriggerOutcome(status="failed")
+                        self._back_off(user_id, trigger, now)
+                    else:
+                        self._backoff.pop((user_id, trigger.name), None)
                 outcomes.append(outcome)
             return outcomes
+
+    def _backing_off(self, user_id: str, trigger: Trigger, now: datetime) -> bool:
+        """Whether the trigger failed for the user lately and its wait is not over."""
+        wait = self._backoff.get((user_id, trigger.name))
+        return wait is not None and now < wait.until
+
+    def _back_off(self, user_id: str, trigger: Trigger, now: datetime) -> None:
+        """Double the trigger's wait for the user (the first is a minute, at most 30)."""
+        key = (user_id, trigger.name)
+        last = self._backoff.pop(key, None)
+        delay = _BACKOFF_FIRST if last is None else min(last.delay * 2, _BACKOFF_CAP)
+        self._backoff[key] = _Backoff(until=now + delay, delay=delay)
+        while len(self._backoff) > _BACKOFF_ENTRIES:
+            self._backoff.popitem(last=False)
 
     async def list_suggestions(
         self, user_id: str, *, status: SuggestionStatus | None = SuggestionStatus.PENDING
@@ -261,15 +310,17 @@ class AnticipationService:
                 "That suggestion does not exist.", details={"suggestion_id": suggestion_id}
             )
         if suggestion.expires_at is not None and self._clock() >= suggestion.expires_at:
-            await self._suggestions.set_status(
-                user_id, suggestion_id, SuggestionStatus.EXPIRED, expected=SuggestionStatus.PENDING
+            await move_suggestion(
+                self._suggestions, user_id, suggestion_id,
+                SuggestionStatus.PENDING, SuggestionStatus.EXPIRED,
             )
             raise errors.InvalidStateTransition(
                 _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
             )
         action = self._actions.from_payload(suggestion.action)
-        claimed = await self._suggestions.set_status(
-            user_id, suggestion_id, SuggestionStatus.ACCEPTED, expected=SuggestionStatus.PENDING
+        claimed = await move_suggestion(
+            self._suggestions, user_id, suggestion_id,
+            SuggestionStatus.PENDING, SuggestionStatus.ACCEPTED,
         )
         try:
             result = await action.execute(user_id)
@@ -295,8 +346,9 @@ class AnticipationService:
         NotFoundError if the user has no such suggestion; StaleVersionError if it
         is no longer pending.
         """
-        return await self._suggestions.set_status(
-            user_id, suggestion_id, SuggestionStatus.DISMISSED, expected=SuggestionStatus.PENDING
+        return await move_suggestion(
+            self._suggestions, user_id, suggestion_id,
+            SuggestionStatus.PENDING, SuggestionStatus.DISMISSED,
         )
 
     async def _run(
@@ -352,8 +404,8 @@ class AnticipationService:
         A failure is logged, never raised: the caller re-raises the action's own error.
         """
         try:
-            await self._suggestions.set_status(
-                user_id, suggestion_id, to, expected=SuggestionStatus.ACCEPTED
+            await move_suggestion(
+                self._suggestions, user_id, suggestion_id, SuggestionStatus.ACCEPTED, to
             )
         except Exception as exc:
             logger.warning(

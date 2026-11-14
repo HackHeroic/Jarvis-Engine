@@ -266,6 +266,27 @@ async def test_tasks__update_status__expected_mismatch__raises_stale_version(rep
 
 
 @pytest.mark.asyncio
+async def test_tasks__update_status__expected_start_moved__stale_and_unchanged(repos):
+    """The slot sweep's compare-and-set: the status AND the slot it read. A task re-slotted
+    meanwhile (same id, new start) is left alone. Starts compare as instants: the row
+    holds the user's offset, the caller passes UTC."""
+    slot = T0.astimezone(ZoneInfo("Asia/Kolkata"))
+    await _seed_tasks(repos, U1, [_row("a", start=slot)])
+
+    with pytest.raises(errors.StaleVersionError):
+        await repos.tasks.update_status(
+            U1, "a", TaskStatus.MISSED, expected=TaskStatus.PENDING,
+            expected_start=T0 - timedelta(days=1),
+        )
+
+    assert (await repos.tasks.get(U1, "a")).status is TaskStatus.PENDING
+    missed = await repos.tasks.update_status(
+        U1, "a", TaskStatus.MISSED, expected=TaskStatus.PENDING, expected_start=T0
+    )
+    assert missed.status is TaskStatus.MISSED
+
+
+@pytest.mark.asyncio
 async def test_tasks__update_status__unknown_task__raises_not_found(repos):
     await _seed_tasks(repos, U2, [_row("theirs")])
 

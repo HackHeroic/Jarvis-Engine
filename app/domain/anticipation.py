@@ -26,6 +26,7 @@ from app.domain.entities import (
     Suggestion,
     SuggestionStatus,
     UserProfile,
+    check_suggestion_move,
 )
 from app.domain.ports import SuggestionRepository
 
@@ -104,7 +105,7 @@ class ConsentContext(BaseModel):
     )
 
 
-def _clock_hours(start: int, end: int) -> set[int]:
+def clock_hours(start: int, end: int) -> set[int]:
     """The local hours in [start, end); ``end <= start`` wraps past midnight."""
     span = end - start if end > start else end + HOURS_PER_DAY - start
     return {(start + i) % HOURS_PER_DAY for i in range(span)}
@@ -151,9 +152,9 @@ class StatedRuleCoverageRule(ConsentRule):
         hours = action.blocked_hours()
         if hours is None:
             return None
-        wanted = _clock_hours(*hours)
+        wanted = clock_hours(*hours)
         for start, end, raw_text in ctx.stated_blocks:
-            if wanted <= _clock_hours(start, end):
+            if wanted <= clock_hours(start, end):
                 return ConsentDecision(
                     behavior="deny",
                     kind=ConsentReasonKind.RULE_MATCH,
@@ -286,6 +287,27 @@ class TriggerOutcome(BaseModel):
     )
 
 
+async def move_suggestion(
+    suggestions: SuggestionRepository,
+    user_id: str,
+    suggestion_id: str,
+    frm: SuggestionStatus,
+    to: SuggestionStatus,
+    *,
+    consent: ConsentDecision | None = None,
+) -> Suggestion:
+    """The one way a suggestion's status changes: a move SUGGESTION_TRANSITIONS allows,
+    stored as a compare-and-set from ``frm``.
+
+    InvalidStateTransition for a move the table forbids (nothing is written);
+    otherwise as ``SuggestionRepository.set_status``.
+    """
+    to = check_suggestion_move(frm, to)
+    return await suggestions.set_status(
+        user_id, suggestion_id, to, expected=frm, consent=consent
+    )
+
+
 # A suggestion whose automatic change did not go through waits for the user instead.
 ASK_AFTER_FAILED_APPLY = ConsentDecision(
     behavior="ask",
@@ -297,11 +319,12 @@ ASK_AFTER_FAILED_APPLY = ConsentDecision(
 async def _ask_instead(suggestions: SuggestionRepository, user_id: str, suggestion_id: str) -> None:
     """Release a claimed auto-apply back to PENDING, asking; a failure is logged, not raised."""
     try:
-        await suggestions.set_status(
+        await move_suggestion(
+            suggestions,
             user_id,
             suggestion_id,
+            SuggestionStatus.ACCEPTED,
             SuggestionStatus.PENDING,
-            expected=SuggestionStatus.ACCEPTED,
             consent=ASK_AFTER_FAILED_APPLY,
         )
     except Exception as exc:  # the caller raises the action's own error
@@ -316,11 +339,13 @@ async def _ask_instead(suggestions: SuggestionRepository, user_id: str, suggesti
 class Trigger(ABC):
     """A proactive trigger (Template Method).
 
-    ``run`` is the fixed skeleton; a trigger supplies the steps. Once a day,
-    timing, gathering, drafting, consent and storage always happen in that order.
+    ``run`` is the fixed skeleton; a trigger supplies the steps. Timing, once a
+    day, gathering, drafting, consent and storage always happen in that order.
     """
 
     name: ClassVar[str]
+    # One line saying what the trigger offers, for the list of registered triggers.
+    description: ClassVar[str] = ""
 
     async def run(
         self,
@@ -342,10 +367,12 @@ class Trigger(ABC):
         the error is raised. An allowed read-only one is stored as PENDING: it is
         information. A denied one is not stored; the decision is returned.
         """
-        if await self.already_done(ctx, suggestions):
-            return TriggerOutcome(status="already_done")
+        # The timing check is free and the once-a-day check is a read: a tick outside
+        # the trigger's window reads nothing.
         if not ctx.force and not await self.should_fire(ctx):
             return TriggerOutcome(status="not_due")
+        if await self.already_done(ctx, suggestions):
+            return TriggerOutcome(status="already_done")
         gathered = await self.gather(ctx)
         if gathered is None:
             return TriggerOutcome(status="nothing_to_say")
@@ -381,11 +408,12 @@ class Trigger(ABC):
                 # Whatever stopped it, cancellation included: hand it to the user.
                 await asyncio.shield(_ask_instead(suggestions, ctx.user_id, stored.id))
                 raise
-            stored = await suggestions.set_status(
+            stored = await move_suggestion(
+                suggestions,
                 ctx.user_id,
                 stored.id,
+                SuggestionStatus.ACCEPTED,
                 SuggestionStatus.AUTO_APPLIED,
-                expected=SuggestionStatus.ACCEPTED,
             )
         return TriggerOutcome(status="created", suggestion=stored, decision=decision)
 

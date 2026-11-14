@@ -75,6 +75,34 @@ def test_anticipation_api__run_unknown_trigger__422_envelope(client):
     assert set(error) == {"code", "message", "details", "request_id"}
 
 
+def test_anticipation_api__triggers__lists_what_the_container_registered(client, container):
+    response = client.get("/api/v1/anticipation/triggers", params={"user_id": U1})
+
+    assert response.status_code == 200
+    listed = {t["name"]: t["description"] for t in response.json()["triggers"]}
+    assert set(listed) == {"morning_brief", "pattern_rule"}
+    assert all(description for description in listed.values())
+
+
+def test_anticipation_api__run_a_newly_registered_trigger__no_api_edit_needed(
+    client, container, log
+):
+    class _Evening(CountingTrigger):
+        name: ClassVar[str] = "evening_review"
+        description: ClassVar[str] = "How the day went, before bed."
+
+    container.anticipation.register_trigger(_Evening(action=FakeAction(log)))
+
+    listed = client.get("/api/v1/anticipation/triggers", params={"user_id": U1})
+    response = client.post(
+        "/api/v1/anticipation/run", params={"user_id": U1}, json={"trigger": "evening_review"}
+    )
+
+    assert "evening_review" in {t["name"] for t in listed.json()["triggers"]}
+    assert response.status_code == 200
+    assert response.json()["suggestion"]["trigger"] == "evening_review"
+
+
 @pytest.mark.asyncio
 async def test_anticipation_api__list__pending_only_by_default(client, container):
     pending = await container.repos.suggestions.add(U1, _suggestion())

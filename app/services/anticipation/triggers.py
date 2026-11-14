@@ -8,7 +8,6 @@ offers an hour the user keeps setting aside as a standing rule; ``AnticipationLi
 runs it as soon as PEARL finds such an hour.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -18,13 +17,12 @@ from zoneinfo import ZoneInfo
 import app.core.config as config
 from app.core.model_router import attribute_llm_calls
 from app.domain import errors
-from app.domain.anticipation import SuggestionDraft, Trigger, TriggerContext, _clock_hours
+from app.domain.anticipation import SuggestionDraft, Trigger, TriggerContext, clock_hours
 from app.domain.entities import (
     DraftSchedule,
     FocusProfile,
     SuggestionStatus,
     Task,
-    TaskEvent,
     TaskEventType,
     TaskStatus,
 )
@@ -47,18 +45,16 @@ from app.services.anticipation.service import (
     AnticipationService,
     stated_blocks,
 )
+from app.services.background import PerUserSingleFlight
 from app.services.draft_service import slot_map
 from app.services.memory.patterns import (
-    INSIGHT_CONFIDENCE,
-    MIN_OCCURRENCES,
     OBSERVER_SHUTDOWN_GRACE_S,
     PatternService,
     PatternView,
-    RepeatedSkipDetector,
-    SkipTimeWindowDetector,
-    _clock_hour,
+    clock_hour,
 )
 from app.services.planning.local_time import end_of_local_day
+from app.services.task_service import latest_outcome_per_slot
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +91,10 @@ class MorningBriefTrigger(Trigger):
     """Today's plan, drafted by the time the user wakes, and one thing Jarvis noticed."""
 
     name: ClassVar[str] = "morning_brief"
+    description: ClassVar[str] = (
+        "Today's plan, drafted by your wake time, with yesterday's set-aside tasks in new"
+        " slots and one thing Jarvis noticed."
+    )
 
     def __init__(
         self,
@@ -104,6 +104,8 @@ class MorningBriefTrigger(Trigger):
         energy: EnergyEstimator,
         patterns: PatternService,
         actions: ActionFactory,
+        *,
+        suggestions: SuggestionRepository,
     ) -> None:
         self._tasks = tasks
         self._task_events = task_events
@@ -111,6 +113,7 @@ class MorningBriefTrigger(Trigger):
         self._energy = energy
         self._patterns = patterns
         self._actions = actions
+        self._suggestions = suggestions
 
     async def should_fire(self, ctx: TriggerContext) -> bool:
         """From the user's wake time, for MORNING_BRIEF_WINDOW_HOURS, on their clock."""
@@ -124,9 +127,7 @@ class MorningBriefTrigger(Trigger):
         zone = ZoneInfo(ctx.profile.timezone)
         pending = await self._tasks.list_by_status(ctx.user_id, frozenset({TaskStatus.PENDING}))
         reslot = await self._passed_slots(ctx, zone)
-        insight = next(
-            (v for v in await self._patterns.current(ctx.user_id) if _worth_telling(v)), None
-        )
+        insight = await self._insight(ctx)
         if not pending and not reslot and insight is None:
             return None
         focus = await self._energy.estimate(ctx.user_id, zone, now=ctx.now)
@@ -135,7 +136,9 @@ class MorningBriefTrigger(Trigger):
     async def build_suggestion(self, ctx: TriggerContext, gathered: _Brief) -> SuggestionDraft:
         zone = ZoneInfo(ctx.profile.timezone)
         expires_at = end_of_local_day(ctx.local_day, zone)
-        insight_line = _insight_line(gathered.insight)
+        insight_line = (
+            self._patterns.noticed(gathered.insight.pattern) if gathered.insight else None
+        )
         if gathered.pending or gathered.reslot:
             try:
                 draft = await self._planner.replan(
@@ -180,6 +183,27 @@ class MorningBriefTrigger(Trigger):
             expires_at=expires_at,
         )
 
+    async def _insight(self, ctx: TriggerContext) -> PatternView | None:
+        """The first pattern worth telling the user has not dismissed in any form.
+
+        A pattern whose memory was dismissed or forgotten is not current at all; one
+        whose "Something I noticed" note was dismissed is not told again either, not
+        even as a line inside a brief. The dismissals are read only when there is a
+        pattern to tell.
+        """
+        views = [
+            v for v in await self._patterns.current(ctx.user_id) if self._patterns.worth_telling(v)
+        ]
+        if not views:
+            return None
+        dismissed = set(await self._suggestions.dedupe_keys(
+            ctx.user_id, status=SuggestionStatus.DISMISSED, limit=_SUGGESTION_READ_LIMIT
+        ))
+        untold = (
+            v for v in views if ShareInsightAction.key_for(v.pattern.pattern_key) not in dismissed
+        )
+        return next(untold, None)
+
     async def _passed_slots(self, ctx: TriggerContext, zone: ZoneInfo) -> list[Task]:
         """Set-aside tasks whose latest outcome is a passed slot, recorded since 00:00
         yesterday on the user's clock. A passed deadline is not re-slotted."""
@@ -190,11 +214,8 @@ class MorningBriefTrigger(Trigger):
         events = await self._task_events.list_for_user(
             ctx.user_id, since=since, types=set(_OUTCOMES), task_ids={t.task_id for t in missed}
         )
-        latest: dict[str, TaskEvent] = {}
-        for event in events:  # oldest first: the later of two wins
-            seen = latest.get(event.task_id)
-            if seen is None or event.occurred_at >= seen.occurred_at:
-                latest[event.task_id] = event
+        # Each slot's latest outcome, oldest first: the last one per task is its latest.
+        latest = {e.task_id: e for e in latest_outcome_per_slot(events, outcomes=_OUTCOMES)}
         return [
             t for t in missed
             if t.task_id in latest and latest[t.task_id].event_type is TaskEventType.MISSED
@@ -203,32 +224,6 @@ class MorningBriefTrigger(Trigger):
 
 def _lines(*lines: str | None) -> str:
     return "\n".join(line for line in lines if line)
-
-
-def _worth_telling(view: PatternView) -> bool:
-    """A remembered pattern seen 3+ times at 0.7+ (what PatternService.insights tells)."""
-    return (
-        view.memory_id is not None
-        and view.pattern.pattern_key is not None
-        and view.pattern.confidence >= INSIGHT_CONFIDENCE
-        and view.pattern.occurrences >= MIN_OCCURRENCES
-    )
-
-
-def _insight_line(view: PatternView | None) -> str | None:
-    """The line "I noticed ...": the pattern in its own second-person words, evidence once.
-
-    A repeated skip's words already count the times, so it gets no second count.
-    """
-    if view is None:
-        return None
-    pattern = view.pattern
-    words = pattern.description.rstrip(".")
-    words = words[:1].lower() + words[1:]
-    if pattern.detector == RepeatedSkipDetector.name:
-        return f"I noticed {words}."
-    n = round(pattern.confidence * pattern.occurrences)
-    return f"I noticed {words} ({n} of the last {pattern.occurrences} times)."
 
 
 def _reslot_lines(
@@ -304,9 +299,16 @@ def _peak(focus: FocusProfile, hour: int) -> str:
 
 
 class PatternRuleTrigger(Trigger):
-    """Offers an hour the user keeps setting aside as a rule: no demanding work there."""
+    """Offers an hour the user keeps setting aside as a rule: no demanding work there.
+
+    Which patterns may become rules is their detector's to say (``proposes_rule``):
+    a new detector needs no change here.
+    """
 
     name: ClassVar[str] = "pattern_rule"
+    description: ClassVar[str] = (
+        "Offers an hour you keep setting aside as a standing rule that keeps it clear."
+    )
 
     def __init__(
         self,
@@ -335,7 +337,7 @@ class PatternRuleTrigger(Trigger):
         after every fresh one: the consent chain turns it down, saying why, and it never
         hides a fresh one.
         """
-        windows = [v for v in await self._patterns.current(ctx.user_id) if _qualifies(v)]
+        windows = [v for v in await self._patterns.current(ctx.user_id) if self._qualifies(v)]
         if not windows:
             return None
         made = await self._suggestions.list(
@@ -349,15 +351,23 @@ class PatternRuleTrigger(Trigger):
         said = stated_blocks(await self._constraints.list_active(ctx.user_id))
 
         def covered(view: PatternView) -> bool:
-            return any(view.pattern.hour in _clock_hours(start, end) for start, end, _ in said)
+            return any(view.pattern.hour in clock_hours(start, end) for start, end, _ in said)
 
         # Stable: fresh first, then dismissed, then already covered by what the user said.
         fresh.sort(key=lambda v: (covered(v), _rule_key(v) in dismissed))
         return fresh[0]
 
+    def _qualifies(self, view: PatternView) -> bool:
+        """A remembered, unconfirmed pattern worth telling whose detector proposes rules."""
+        return (
+            self._patterns.proposes_rule(view.pattern)
+            and self._patterns.worth_telling(view)
+            and not view.confirmed
+        )
+
     async def build_suggestion(self, ctx: TriggerContext, gathered: PatternView) -> SuggestionDraft:
         pattern = gathered.pattern
-        h12 = _clock_hour(pattern.hour)
+        h12 = clock_hour(pattern.hour)
         n, total = round(pattern.confidence * pattern.occurrences), pattern.occurrences
         return SuggestionDraft(
             kind=self.name,
@@ -377,19 +387,6 @@ class PatternRuleTrigger(Trigger):
         )
 
 
-def _qualifies(view: PatternView) -> bool:
-    pattern = view.pattern
-    return (
-        pattern.detector == SkipTimeWindowDetector.name
-        and pattern.hour is not None
-        and pattern.pattern_key is not None
-        and view.memory_id is not None
-        and not view.confirmed
-        and pattern.confidence >= INSIGHT_CONFIDENCE
-        and pattern.occurrences >= MIN_OCCURRENCES
-    )
-
-
 def _rule_key(view: PatternView) -> str:
     return f"pattern_rule:{view.pattern.pattern_key}"
 
@@ -400,66 +397,38 @@ def _key_of(action: dict) -> str | None:
 
 
 class AnticipationListener(EventListener):
-    """Runs the pattern-rule trigger for the user when PEARL finds a skip window.
+    """Runs the pattern-rule trigger for the user when PEARL finds a pattern that may
+    become a rule (its detector says so).
 
     In the background, like PEARL itself: whoever published the pattern (an outcome,
     a turn, the You page) never waits for it. One run per user at a time; patterns
-    found meanwhile ask for one more run after it. The run is a manual one (forced),
-    so it re-evaluates even after the day's tick settled the trigger; model calls in
-    it are the user's. A failed run is logged by its type.
+    found meanwhile ask for one more run after it (``PerUserSingleFlight``). The run is
+    a manual one (forced), so it re-evaluates even after the day's tick settled the
+    trigger; model calls in it are the user's. A failed run is logged by its type.
     """
 
-    def __init__(self, anticipation: AnticipationService) -> None:
+    def __init__(self, anticipation: AnticipationService, patterns: PatternService) -> None:
         self._anticipation = anticipation
-        self._running: dict[str, asyncio.Task] = {}
-        self._dirty: set[str] = set()
-        self._closed = False
+        self._patterns = patterns
+        self._flight = PerUserSingleFlight(self._propose, label="Pattern proposal")
 
     async def handle(self, event: DomainEvent) -> None:
-        if not isinstance(event, PatternDetected) or event.user_id is None or self._closed:
+        if not isinstance(event, PatternDetected) or event.user_id is None:
             return
-        if not (event.pattern.pattern_key or "").startswith(f"{SkipTimeWindowDetector.name}:"):
-            return
-        user_id = event.user_id
-        if user_id in self._running:
-            self._dirty.add(user_id)
-            return
-        self._running[user_id] = asyncio.create_task(self._run(user_id))
+        if self._patterns.proposes_rule(event.pattern):
+            self._flight.request(event.user_id)
 
     async def settle(self) -> None:
         """Wait until no run is in flight."""
-        while self._running:
-            await asyncio.wait(set(self._running.values()))
+        await self._flight.settle()
 
     async def shutdown(self, grace_s: float = OBSERVER_SHUTDOWN_GRACE_S) -> None:
         """Take no more patterns; give runs in flight ``grace_s``, then cancel the rest."""
-        self._closed = True
-        runs = set(self._running.values())
-        if not runs:
-            return
-        _, unfinished = await asyncio.wait(runs, timeout=grace_s)
-        for run in unfinished:
-            run.cancel()
-        await asyncio.gather(*unfinished, return_exceptions=True)
+        await self._flight.shutdown(grace_s)
 
-    async def _run(self, user_id: str) -> None:
+    async def _propose(self, user_id: str) -> None:
+        end_attribution = attribute_llm_calls(user_id, None)
         try:
-            while True:
-                self._dirty.discard(user_id)
-                end_attribution = attribute_llm_calls(user_id, None)
-                try:
-                    await self._anticipation.run_trigger(
-                        user_id, PatternRuleTrigger.name, force=True
-                    )
-                except Exception as exc:  # the next pattern found tries again
-                    logger.warning(
-                        "Pattern proposal for user %s could not finish (%s)",
-                        user_id,
-                        type(exc).__name__,
-                    )
-                finally:
-                    end_attribution()
-                if user_id not in self._dirty:
-                    return
+            await self._anticipation.run_trigger(user_id, PatternRuleTrigger.name, force=True)
         finally:
-            self._running.pop(user_id, None)
+            end_attribution()

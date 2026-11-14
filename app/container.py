@@ -140,13 +140,14 @@ class AppContainer:
         )
         anticipation.register_trigger(
             MorningBriefTrigger(
-                repos.tasks, repos.task_events, planner, energy, patterns, actions
+                repos.tasks, repos.task_events, planner, energy, patterns, actions,
+                suggestions=repos.suggestions,
             )
         )
         anticipation.register_trigger(
             PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
         )
-        anticipation_listener = AnticipationListener(anticipation)
+        anticipation_listener = AnticipationListener(anticipation, patterns)
         events.subscribe(PatternDetected, anticipation_listener)
         # Conversations that remember: the window, its summaries, "since we last spoke".
         conversation_memory = ConversationMemoryService(

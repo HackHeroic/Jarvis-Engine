@@ -18,9 +18,9 @@ from app.domain.ports import ConstraintRepository, DraftPlanner
 from app.schemas.context import SemanticTimeSlot
 from app.services.anticipation.service import ActionFactory
 from app.services.draft_service import DraftService
-from app.services.memory.constraint_bridge import _to_horizon
+from app.services.memory.constraint_bridge import to_horizon
 from app.services.memory.memory_service import MemoryService
-from app.services.memory.patterns import _clock_hour
+from app.services.memory.patterns import clock_hour
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ class AdoptRuleAction(ProactiveAction):
         self._planner = planner
 
     def describe(self) -> str:
-        return f"Keep {_clock_hour(self._hour)} clear"
+        return f"Keep {clock_hour(self._hour)} clear"
 
     def dedupe_key(self) -> str:
         return f"pattern_rule:{self._pattern_key}"
@@ -177,7 +177,7 @@ class AdoptRuleAction(ProactiveAction):
             ) from exc
         if not await self._rule_stored(user_id):
             await self._constraints.add(user_id, self._rule(user_id))
-        h12 = _clock_hour(self._hour)
+        h12 = clock_hour(self._hour)
         saved = f"Saved. Every plan from now on keeps {h12} clear"
         try:
             draft = await self._planner.replan(user_id, reslot_task_ids=[])
@@ -212,7 +212,7 @@ class AdoptRuleAction(ProactiveAction):
 
     def _rule(self, user_id: str) -> BehavioralConstraint:
         h = self._hour
-        start = _to_horizon(h * 60)
+        start = to_horizon(h * 60)
         slot = SemanticTimeSlot(
             name=f"learned_rule_{h:02d}",
             start_min=start,
@@ -253,7 +253,12 @@ class ShareInsightAction(ProactiveAction):
         return self._insight
 
     def dedupe_key(self) -> str:
-        return f"share_insight:{self._key}"
+        return self.key_for(self._key)
+
+    @staticmethod
+    def key_for(key: str) -> str:
+        """The dedupe_key of a note about ``key`` (a pattern's key, or one day's brief)."""
+        return f"share_insight:{key}"
 
     def to_payload(self) -> dict:
         return {

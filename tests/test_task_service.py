@@ -92,8 +92,12 @@ class _DelegatingTasks(TaskRepository):
     async def list_scheduled_between(self, user_id, start, end):
         return await self._inner.list_scheduled_between(user_id, start, end)
 
-    async def update_status(self, user_id, task_id, status, *, expected=None):
-        return await self._inner.update_status(user_id, task_id, status, expected=expected)
+    async def update_status(
+        self, user_id, task_id, status, *, expected=None, expected_start=None
+    ):
+        return await self._inner.update_status(
+            user_id, task_id, status, expected=expected, expected_start=expected_start
+        )
 
     async def reschedule(self, user_id, task_id, start, end):
         return await self._inner.reschedule(user_id, task_id, start, end)
@@ -390,11 +394,15 @@ async def test_sweep__race_with_completion__stale_version_swallowed_one_event(re
 
         landed = False
 
-        async def update_status(self, user_id, task_id, status, *, expected=None):
+        async def update_status(
+            self, user_id, task_id, status, *, expected=None, expected_start=None
+        ):
             if status == TaskStatus.MISSED and not self.landed:
                 self.landed = True
                 await user.complete(user_id, task_id)
-            return await super().update_status(user_id, task_id, status, expected=expected)
+            return await super().update_status(
+                user_id, task_id, status, expected=expected, expected_start=expected_start
+            )
 
     sweeper = TaskService(
         _CompletionLandsFirst(repos.tasks), repos.task_events, bus, clock=lambda: NOW
@@ -404,6 +412,41 @@ async def test_sweep__race_with_completion__stale_version_swallowed_one_event(re
 
     assert await _status(repos) == TaskStatus.COMPLETED
     assert [e.event_type for e in await _events(repos)] == [TaskEventType.COMPLETED]
+
+
+@pytest.mark.asyncio
+async def test_sweep__accept_reslots_task_mid_sweep__new_slot_never_marked_missed(
+    repos, store, bus
+):
+    """An accept re-writes the same task id with a new slot ahead, between the sweep's
+    read and its write. The compare-and-set carries the slot the sweep read, so the
+    new slot is left alone: no miss, no event."""
+    _seed(store, _ended_ago(31))
+    ahead = (NOW + timedelta(hours=3)).astimezone(timezone.utc)
+
+    class _AcceptLandsFirst(_DelegatingTasks):
+        landed = False
+
+        async def update_status(
+            self, user_id, task_id, status, *, expected=None, expected_start=None
+        ):
+            if status == TaskStatus.MISSED and not self.landed:
+                self.landed = True  # still pending, now in a slot that has not begun
+                store.tasks[0] = store.tasks[0].model_copy(update={
+                    "scheduled_start": ahead, "scheduled_end": ahead + timedelta(minutes=25),
+                })
+            return await super().update_status(
+                user_id, task_id, status, expected=expected, expected_start=expected_start
+            )
+
+    sweeper = TaskService(_AcceptLandsFirst(repos.tasks), repos.task_events, bus,
+                          clock=lambda: NOW)
+
+    assert await sweeper.sweep_passed_slots(U1, NOW) == []
+
+    task = await repos.tasks.get(U1, "t1")
+    assert (task.status, task.scheduled_start) == (TaskStatus.PENDING, ahead)
+    assert await _events(repos) == []
 
 
 @pytest.mark.asyncio

@@ -790,7 +790,7 @@ def _brief_world(fake, repos, now: datetime):
         memory=MemoryService(repos.memories, BagOfWordsEmbedder(), clock=clock), planner=planner,
     )
     brief = MorningBriefTrigger(repos.tasks, repos.task_events, planner, _energy(repos), patterns,
-                                actions)
+                                actions, suggestions=repos.suggestions)
     rule = PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
     return AnticipationService(
         {brief.name: brief, rule.name: rule}, actions, ConsentPolicy.default(),

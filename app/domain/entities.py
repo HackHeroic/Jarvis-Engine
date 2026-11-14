@@ -120,6 +120,38 @@ DRAFT_TRANSITIONS: dict[DraftStatus, frozenset[DraftStatus]] = {
 }
 
 
+# Legal suggestion lifecycle moves. PENDING waits for the user; ACCEPTED is claimed (its
+# action is running, or ran); the rest are terminal. Every status change is checked
+# against this table first (``check_suggestion_move``); the store's compare-and-set
+# on the status it expects is what stops two racing moves.
+SUGGESTION_TRANSITIONS: dict[SuggestionStatus, frozenset[SuggestionStatus]] = {
+    SuggestionStatus.PENDING: frozenset(
+        {SuggestionStatus.ACCEPTED, SuggestionStatus.DISMISSED, SuggestionStatus.EXPIRED}
+    ),
+    # Back to PENDING when the action did not finish; EXPIRED when it was out of date.
+    SuggestionStatus.ACCEPTED: frozenset(
+        {SuggestionStatus.PENDING, SuggestionStatus.EXPIRED, SuggestionStatus.AUTO_APPLIED}
+    ),
+    SuggestionStatus.DISMISSED: frozenset(),
+    SuggestionStatus.EXPIRED: frozenset(),
+    SuggestionStatus.AUTO_APPLIED: frozenset(),
+}
+
+
+def check_suggestion_move(frm: SuggestionStatus, to: SuggestionStatus) -> SuggestionStatus:
+    """``to``, if SUGGESTION_TRANSITIONS allows moving there from ``frm``.
+
+    Raises InvalidStateTransition otherwise.
+    """
+    frm, to = SuggestionStatus(frm), SuggestionStatus(to)
+    if to not in SUGGESTION_TRANSITIONS[frm]:
+        raise InvalidStateTransition(
+            f"A {frm.value} suggestion cannot become {to.value}.",
+            details={"from": frm.value, "to": to.value},
+        )
+    return to
+
+
 class UserProfile(BaseModel):
     """Per-user settings that shape how Jarvis plans and how much it may act on its own."""
 

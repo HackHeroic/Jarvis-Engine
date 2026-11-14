@@ -252,6 +252,14 @@ def _precomputed_slots(constraint: dict) -> list[dict]:
     return slots
 
 
+def _translates_habits(state: dict) -> bool:
+    """Whether ``translate_habits`` will call the model: free-text habits not yet cached."""
+    from app.services.analytical.habit_translator import is_translation_cached
+
+    habits_text = state.get("habits_text") or ""
+    return bool(habits_text.strip()) and not is_translation_cached(habits_text)
+
+
 async def translate_habits(state: PlanningState) -> dict:
     """Translate the free-text habits into semantic slots, joined by the precomputed ones.
 
@@ -943,10 +951,11 @@ planning_module = ModuleDefinition(
         ModuleStep(name="fetch_constraints", handler=fetch_constraints,
                    depends_on=["mark_missed"], concurrent_safe=True),
         # Both PRIMARY steps take the PRIMARY lock first, so their timeouts count their
-        # own work, never the wait for another heavy call (a background brief's).
+        # own work, never the wait for another heavy call (a background brief's). A
+        # translation already cached calls no model, so it never waits for the lock.
         ModuleStep(name="translate_habits", handler=translate_habits,
                    depends_on=["fetch_constraints"], timeout_ms=45_000,
-                   holds_primary=lambda state: bool((state.get("habits_text") or "").strip())),
+                   holds_primary=_translates_habits),
         ModuleStep(name="expand_slots", handler=expand_slots,
                    depends_on=["translate_habits"], concurrent_safe=True, read_only=True),
         ModuleStep(name="memory_to_constraints", handler=memory_to_constraints,

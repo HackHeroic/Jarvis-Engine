@@ -46,19 +46,21 @@ def as_aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
-def latest_outcome_per_slot(events: Iterable[TaskEvent]) -> list[TaskEvent]:
+def latest_outcome_per_slot(
+    events: Iterable[TaskEvent], *, outcomes: frozenset[TaskEventType] = SLOT_OUTCOMES
+) -> list[TaskEvent]:
     """The outcome each slot came to, oldest first: what learning counts.
 
     A slot is a task's ``(task_id, scheduled_start)``. It can have more than one
     outcome: the sweep marks it missed, then the user completes it after all. It
     counts once, as its latest outcome by ``occurred_at``. Events that are not
-    outcomes are dropped. Outcomes with no ``scheduled_start`` are kept, one per task:
-    the latest of them, as that task's one unscheduled slot. A reader that needs an
-    hour skips them.
+    ``outcomes`` (by default the slot outcomes learning counts) are dropped. Outcomes
+    with no ``scheduled_start`` are kept, one per task: the latest of them, as that
+    task's one unscheduled slot. A reader that needs an hour skips them.
     """
     latest: dict[tuple[str, datetime | None], TaskEvent] = {}
     for event in sorted(events, key=lambda e: as_aware(e.occurred_at)):
-        if event.event_type in SLOT_OUTCOMES:
+        if event.event_type in outcomes:
             start = as_aware(event.scheduled_start) if event.scheduled_start is not None else None
             latest[(event.task_id, start)] = event
     return sorted(latest.values(), key=lambda e: as_aware(e.occurred_at))
@@ -158,7 +160,9 @@ class TaskService:
         instants (never by date, so a slot just after the user's local midnight is no
         different). Slots that started up to ``SLOT_SWEEP_LOOKBACK_DAYS`` ago are
         considered. A completed, skipped or missed event recorded since the slot began
-        leaves the task alone. A task that changes under the sweep is left for the next pass.
+        leaves the task alone. A task that changes under the sweep is left for the next pass,
+        and one re-slotted meanwhile (an accept wrote it again, in a new slot) is never
+        marked: the compare-and-set holds the slot the sweep read as well as the status.
         """
         lookback = timedelta(days=config.SLOT_SWEEP_LOOKBACK_DAYS)
         grace = timedelta(minutes=config.SLOT_GRACE_MINUTES)
@@ -189,6 +193,7 @@ class TaskService:
                     now,
                     {},
                     TaskMissed(occurred_at=now, user_id=user_id, task_id=task.task_id),
+                    slot=task.scheduled_start,
                 )
             except (errors.NotFoundError, errors.StaleVersionError):
                 logger.info("Task changed during the slot sweep; the next pass decides")
@@ -203,18 +208,22 @@ class TaskService:
             raise errors.NotFoundError("That task does not exist.", details={"task_id": task_id})
         return task
 
-    async def _move(self, task: Task, move: _Move) -> tuple[Task, TaskStatus] | None:
-        """Compare-and-set ``task`` to ``move.target``.
+    async def _move(
+        self, task: Task, move: _Move, *, slot: datetime | None = None
+    ) -> tuple[Task, TaskStatus] | None:
+        """Compare-and-set ``task`` to ``move.target`` (and, with ``slot``, only while the
+        task is still in that slot).
 
         Returns the moved task and the status it moved from, or None if nothing
         changed. A lost race re-reads the task and tries again from the status that
-        won, while the move is still legal from it.
+        won, while the move is still legal from it and the task is still in ``slot``.
         """
         attempts = 0
         while task.status != move.target and task.status in move.allowed_from:
             try:
                 moved = await self._tasks.update_status(
-                    task.user_id, task.task_id, move.target, expected=task.status
+                    task.user_id, task.task_id, move.target, expected=task.status,
+                    expected_start=slot,
                 )
                 return moved, task.status
             except errors.StaleVersionError:
@@ -222,6 +231,8 @@ class TaskService:
                 if attempts >= _CAS_ATTEMPTS:
                     raise
                 task = await self._get(task.user_id, task.task_id)
+                if slot is not None and task.scheduled_start != slot:
+                    return None  # re-slotted meanwhile: that slot is not this move's
         return None
 
     async def _record(
@@ -231,14 +242,17 @@ class TaskService:
         now: datetime,
         details: dict,
         announcement: DomainEvent,
+        *,
+        slot: datetime | None = None,
     ) -> TaskEvent | None:
-        """Make the move; if it happened, store its event, then publish ``announcement``.
+        """Make the move (in ``slot`` only, when given); if it happened, store its event,
+        then publish ``announcement``.
 
         The status and the event are two writes. If the event cannot be stored the
         status is set back before the error is re-raised, so the outcome is not lost:
         a retry finds the task where it was and records it.
         """
-        result = await self._move(task, move)
+        result = await self._move(task, move, slot=slot)
         if result is None:
             return None
         moved, previous = result
