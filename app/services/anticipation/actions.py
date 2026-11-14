@@ -21,6 +21,7 @@ from app.services.draft_service import DraftService
 from app.services.memory.constraint_bridge import to_horizon
 from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import clock_hour
+from app.services.memory.stated_rules import RULE_MEMORY_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,9 @@ class AdoptRuleAction(ProactiveAction):
             structured_semantics={
                 "pattern_key": self._pattern_key,
                 "semantic_slots": [slot.model_dump(mode="json")],
+                # Linked to the pattern it was adopted from, as a stated rule is to the
+                # memory of saying it: letting go of one lets go of the other.
+                RULE_MEMORY_KEY: self._memory_id,
             },
         )
 

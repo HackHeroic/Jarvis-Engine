@@ -321,3 +321,69 @@ async def test_delete_rule__same_words_said_twice__both_copies_go_whatever_the_s
 
     assert await repos.constraints.list_active("alice") == []
     assert (await repos.memories.get("alice", remembered.id)).status is MemoryStatus.FORGOTTEN
+
+
+# --- a rule adopted from a learned pattern is linked to the pattern ----------------------
+
+
+class _NoPlan:
+    async def replan(self, user_id, *, reslot_task_ids):
+        return None
+
+
+async def _adopted(repos, memory):
+    """A skip window PEARL learned at 9 AM, and the rule the user adopted from it."""
+    from app.domain.entities import Memory
+    from app.services.anticipation.actions import AdoptRuleAction
+
+    pattern = await repos.memories.add("alice", Memory(
+        user_id="alice", memory_type="behavioral_pattern",
+        content="You tend to set work aside around 9 AM", provenance=MemorySource.INFERRED,
+        origin="behavior", pattern_key="skip_time_window:9", confidence=0.8,
+        strength_as_of=NOW, created_at=NOW,
+    ))
+    action = AdoptRuleAction(
+        "skip_time_window:9", 9, pattern.id, confidence=0.8, occurrences=5,
+        constraints=repos.constraints, memory=memory, planner=_NoPlan(),
+    )
+    await action.execute("alice")
+    (rule,) = await repos.constraints.list_active("alice")
+    return pattern, rule
+
+
+@pytest.mark.asyncio
+async def test_adopted_rule__linked_to_the_patterns_memory(repos, memory):
+    pattern, rule = await _adopted(repos, memory)
+
+    assert rule_memory_id(rule) == pattern.id
+    assert rule.structured_semantics["pattern_key"] == "skip_time_window:9"  # still there
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("let_go", ["forget_memory", "dismiss_memory"])
+async def test_pattern_let_go__its_adopted_rule_goes_too(repos, rules, memory, let_go):
+    pattern, rule = await _adopted(repos, memory)
+
+    gone = await getattr(rules, let_go)("alice", pattern.id)
+    if let_go == "dismiss_memory":
+        dismissed, gone = gone
+        assert dismissed.id == pattern.id
+
+    assert gone == [rule.id]
+    assert await repos.constraints.list_active("alice") == []
+    expected = MemoryStatus.FORGOTTEN if let_go == "forget_memory" else MemoryStatus.DISMISSED
+    assert (await repos.memories.get("alice", pattern.id)).status is expected
+
+
+@pytest.mark.asyncio
+async def test_delete_adopted_rule__pattern_dismissed_not_forgotten_never_proposed_again(
+    repos, rules, memory
+):
+    pattern, rule = await _adopted(repos, memory)
+
+    assert await rules.delete_rule("alice", rule.id) is True
+
+    stored = await repos.memories.get("alice", pattern.id)
+    assert stored.status is MemoryStatus.DISMISSED  # PEARL never re-learns or re-proposes it
+    assert stored.content == pattern.content  # dismissed, not erased
+    assert await repos.constraints.list_active("alice") == []
