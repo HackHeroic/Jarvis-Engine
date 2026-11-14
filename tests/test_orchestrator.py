@@ -499,6 +499,34 @@ async def test_draft_action__reject__clears_negotiation(_captured_persist):
     assert _captured_persist == []  # rejection must never touch user_tasks
 
 
+class _ClosedDraftStore(_FakeDraftStore):
+    """The draft closed before the reject arrived; the store's reject finds nothing open."""
+
+    def reject_draft(self, draft_id, user_id, reason=None):
+        self.rejected.append((draft_id, user_id, reason))
+        return False
+
+
+@pytest.mark.asyncio
+async def test_draft_action__reject_with_no_service_and_a_closed_draft__no_discard_claimed(
+    _captured_persist,
+):
+    """No container and no Supabase client: the store's False is honoured, not ignored."""
+    from app.orchestrator.graph import handle_draft_action
+
+    store = _ClosedDraftStore()
+    state = _make_state(
+        intent=IntentType.REJECT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id="d1", user_message="scrap it",
+    )
+    result = await handle_draft_action(state)
+
+    assert "discarded" not in result["response_message"].lower()
+    assert "that draft has closed" in result["response_message"].lower()
+    assert result["negotiation_state"] == NegotiationPhase.NONE
+    assert result["draft_id"] is None
+
+
 @pytest.mark.asyncio
 async def test_draft_action__edit__keeps_negotiation_open(_captured_persist):
     from app.orchestrator.graph import handle_draft_action

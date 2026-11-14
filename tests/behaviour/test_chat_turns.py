@@ -14,6 +14,7 @@ import pytest
 import app.api.v1.endpoints.schedule as schedule_endpoint
 from app.domain.events import NullEventBus
 from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
+from app.orchestrator.state import NegotiationPhase
 from app.services.draft_service import DraftService
 from tests.behaviour.conftest import brain_dump, decomposition
 
@@ -97,6 +98,41 @@ async def test_chat__plan_already_accepted_in_the_review_ui__looks_good_says_alr
     assert jarvis.rows("user_tasks", user_id="alice") == rows_after_ui_accept
     task_ids = [r["task_id"] for r in jarvis.rows("user_tasks", user_id="alice")]
     assert len(task_ids) == len(set(task_ids)) == len(DSA_TOPICS)
+
+
+@pytest.mark.asyncio
+async def test_chat__scrap_it_on_an_open_draft__discards_it_and_says_so(jarvis, llm):
+    planned = await _plan(jarvis, llm)
+
+    turn = await jarvis.say("scrap it", session=planned.conversation_id)
+
+    assert "Draft discarded" in turn.reply
+    draft = jarvis.draft(planned.draft_id)
+    assert draft["status"] == "rejected"
+    assert draft["rejection_reason"] == "scrap it"  # the signal PEARL learns from
+    assert jarvis.rows("user_tasks", user_id="alice") == []
+
+
+@pytest.mark.asyncio
+async def test_chat__scrap_it_after_accepting_in_the_review_ui__never_claims_a_discard(
+    jarvis, llm
+):
+    planned = await _plan(jarvis, llm)
+    # Accepted from the review panel; the chat thread's checkpoint still says REVIEWING.
+    review_ui = DraftService(SupabaseDraftRepository(jarvis.db), NullEventBus())
+    await review_ui.accept("alice", planned.draft_id)
+    rows_after_ui_accept = jarvis.rows("user_tasks", user_id="alice")
+
+    turn = await jarvis.say("scrap it", session=planned.conversation_id)
+
+    assert "discarded" not in turn.reply.lower()
+    assert "already locked in" in turn.reply
+    assert jarvis.draft(planned.draft_id)["status"] == "accepted"
+    assert jarvis.rows("user_tasks", user_id="alice") == rows_after_ui_accept
+    # The negotiation is over: the thread no longer reads the next message as a draft verb.
+    thread = {"configurable": {"thread_id": f"alice:{planned.conversation_id}"}}
+    checkpoint = (await jarvis.state.jarvis_graph.aget_state(thread)).values
+    assert checkpoint["negotiation_state"] not in (NegotiationPhase.REVIEWING, NegotiationPhase.EDITING)
 
 
 @pytest.mark.asyncio
