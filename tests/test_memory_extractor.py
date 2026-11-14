@@ -151,3 +151,48 @@ async def test_safe_extract_catches_errors():
         assistant_response="test",
         memory_store=mock_store,
     )
+
+
+# --- legacy PEARL: never once the composition root is registered --------------------
+
+
+async def _safe_extract_with_db(monkeypatch, *, with_container: bool) -> list[str]:
+    """Run the v1 fire-and-forget extraction with a db client; return the users the
+    legacy PEARL detector ran for."""
+    import app.core.config as config
+    from app.container import AppContainer
+    from app.core.runtime import set_container
+    from app.orchestrator.hooks import ActionHooks
+
+    ran_for: list[str] = []
+    monkeypatch.setattr(
+        "app.services.memory.pearl.detect_patterns",
+        lambda user_id, *_args, **_kwargs: ran_for.append(user_id),
+    )
+    if with_container:
+        set_container(AppContainer.build(
+            supabase_client=None, cfg=config, hooks=ActionHooks(), install_chain=False,
+            embedder=MagicMock(),
+        ))
+    mock_store = MagicMock()
+    mock_store.get_active_memories.return_value = []
+    _extraction_returns({"memories": []})
+
+    await safe_extract_memories(
+        user_id="u1",
+        user_message="I prefer mornings",
+        assistant_response="Noted.",
+        memory_store=mock_store,
+        db_client=MagicMock(),
+    )
+    return ran_for
+
+
+@pytest.mark.asyncio
+async def test_safe_extract__composition_root_registered__legacy_pearl_never_runs(monkeypatch):
+    assert await _safe_extract_with_db(monkeypatch, with_container=True) == []
+
+
+@pytest.mark.asyncio
+async def test_safe_extract__no_composition_root__legacy_pearl_still_runs(monkeypatch):
+    assert await _safe_extract_with_db(monkeypatch, with_container=False) == ["u1"]

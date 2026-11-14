@@ -12,6 +12,8 @@ Same duty as `/api/v1/drafts/{id}/accept` (see test_draft_endpoints.py): never
 call an unverified write a success.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -185,3 +187,57 @@ def test_accept_schedule__client_sends_goal_id__row_keeps_it(client):
 
     assert resp.status_code == 200
     assert {r["goal_id"] for r in _rows(client)} == {"learn_dsa"}
+
+
+# --- legacy PEARL: never once the composition root is registered --------------------
+
+
+async def _accept_directly(monkeypatch, *, with_container: bool) -> list[str]:
+    """Accept TASKS through the handler itself (in this event loop, so its fire-and-forget
+    work can be awaited); return the users the legacy PEARL detector ran for."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import app.core.config as config
+    from app.api.v1.endpoints.chat import AcceptScheduleRequest, accept_schedule
+    from app.container import AppContainer
+    from app.core.runtime import set_container
+    from app.orchestrator.hooks import ActionHooks
+    from app.services.memory.store import MemoryStore
+
+    ran_for: list[str] = []
+    monkeypatch.setattr(
+        "app.services.memory.pearl.detect_patterns",
+        lambda user_id, *_args, **_kwargs: ran_for.append(user_id),
+    )
+    if with_container:
+        set_container(AppContainer.build(
+            supabase_client=None, cfg=config, hooks=ActionHooks(), install_chain=False,
+            embedder=MagicMock(),
+        ))
+    supabase = FakeSupabase()
+    state = SimpleNamespace(
+        db_client=FakeDBClient(supabase), memory_store=MemoryStore(supabase_client=supabase)
+    )
+    before = asyncio.all_tasks()
+
+    result = await accept_schedule(
+        AcceptScheduleRequest(user_id="test_user", tasks=TASKS),
+        SimpleNamespace(app=SimpleNamespace(state=state)),
+    )
+
+    assert result["status"] == "accepted"
+    leftover = asyncio.all_tasks() - before
+    if leftover:
+        await asyncio.wait(leftover, timeout=5)
+    return ran_for
+
+
+@pytest.mark.asyncio
+async def test_accept_schedule__composition_root_registered__legacy_pearl_never_runs(monkeypatch):
+    assert await _accept_directly(monkeypatch, with_container=True) == []
+
+
+@pytest.mark.asyncio
+async def test_accept_schedule__no_composition_root__legacy_pearl_still_runs(monkeypatch):
+    assert await _accept_directly(monkeypatch, with_container=False) == ["test_user"]
