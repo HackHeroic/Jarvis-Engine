@@ -15,7 +15,8 @@ into PEARL is the next plan's work, so these tests seed the status PEARL reads.)
 import json
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -23,13 +24,17 @@ import pytest
 import app.api.v1.endpoints.schedule as schedule_endpoint
 from tests.behaviour.conftest import brain_dump, decomposition
 
-MONDAY_0730 = datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc)
+# The user's clock (India): plans start at 08:00 local, the start of their day, and
+# the skips PEARL learns from were at 09:00 local. (These were UTC times when the
+# horizon was UTC-anchored.)
+IST = ZoneInfo("Asia/Kolkata")
+MONDAY_8AM = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
 FIVE_TOPICS = ["Graphs", "DP", "Trees", "Heaps", "Mocks"]
 
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_0730, schedule_endpoint)
+    clock.freeze(MONDAY_8AM, schedule_endpoint)
 
 
 def _seed_history_at_nine(jarvis, statuses: list[str]) -> None:
@@ -38,7 +43,7 @@ def _seed_history_at_nine(jarvis, statuses: list[str]) -> None:
         jarvis.db.table("user_tasks").insert({
             "user_id": "alice", "task_id": f"past_{i}", "goal_id": "past",
             "title": f"Morning task {i}", "status": status, "duration_minutes": 25,
-            "scheduled_start": f"2026-11-{5 + i:02d}T09:00:00+00:00",
+            "scheduled_start": f"2026-11-{5 + i:02d}T09:00:00+05:30",
         }).execute()
 
 
@@ -128,7 +133,7 @@ async def test_pearl__another_users_skips__teach_me_nothing(jarvis, llm):
     for i in range(3):
         jarvis.db.table("user_tasks").insert({
             "user_id": "bob", "task_id": f"bob_{i}", "status": "skipped",
-            "scheduled_start": f"2026-11-{5 + i:02d}T09:00:00+00:00",
+            "scheduled_start": f"2026-11-{5 + i:02d}T09:00:00+05:30",
         }).execute()
 
     turn = await jarvis.say("Anything I should know about my week?", user="alice")

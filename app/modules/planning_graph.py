@@ -56,6 +56,39 @@ class PlanningState(TypedDict):
 
 
 
+async def _user_zone(state: PlanningState) -> Any:
+    """The zone this user's day runs in: their profile's timezone, else DEFAULT_TIMEZONE.
+
+    The profile comes through the turn's UserModel facade, which reads it once
+    (off the event loop) and caches it for the turn's later steps.
+    """
+    from app.services.planning.local_time import user_zone
+
+    user_model = state.get("user_model")
+    get_profile = getattr(user_model, "get_profile", None)
+    profile = None
+    if get_profile is not None:
+        try:
+            profile = await get_profile()
+        except Exception as e:  # a missing profile means the default zone, not a failed plan
+            logger.warning(f"Profile lookup failed (default timezone used): {e!r}")
+    return user_zone(profile)
+
+
+def _horizon_start_of(state: PlanningState) -> Any:
+    """The turn's horizon_start as an aware datetime, or None when not yet fixed."""
+    from datetime import datetime
+
+    raw = state.get("horizon_start")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        logger.warning(f"Unparseable horizon_start on state: {raw!r}")
+        return None
+
+
 async def mark_missed(state: PlanningState) -> dict:
     """Mark pending tasks whose deadline has passed as `missed` (v1 parity).
 
@@ -70,7 +103,9 @@ async def mark_missed(state: PlanningState) -> dict:
     db = getattr(user_model, "_db", None) if user_model is not None else None
     supabase = getattr(db, "supabase", None)
     try:
-        overdue = await md.detect_and_mark_missed(state.get("user_id", "demo"), supabase)
+        overdue = await md.detect_and_mark_missed(
+            state.get("user_id", "demo"), supabase, zone=await _user_zone(state)
+        )
     except Exception as e:
         logger.warning(f"Missed-deadline scan failed (non-fatal): {e}")
         overdue = []
@@ -84,6 +119,15 @@ async def mark_missed(state: PlanningState) -> dict:
 
 
 async def fetch_constraints(state: PlanningState) -> dict:
+    """Load the user's stored habits, and fix where this turn's plan starts.
+
+    The horizon is fixed here, once, before the branches fan out: habit expansion
+    (which weekday is day 0) and every solve attempt must agree on minute 0. It is
+    08:00 in the user's zone on their logical day, as an offset-aware ISO string.
+    """
+    from app.api.v1.endpoints import schedule as schedule_ep
+
+    horizon_start = schedule_ep.current_horizon_start(await _user_zone(state)).isoformat()
     user_model = state["user_model"]
     if user_model:
         constraints = await user_model.get_behavioral_constraints()
@@ -93,9 +137,10 @@ async def fetch_constraints(state: PlanningState) -> dict:
         return {
             "constraints": constraints,
             "habits_text": habits_text,
+            "horizon_start": horizon_start,
             "_tool_detail": {"rows": len(constraints)},
         }
-    return {"constraints": [], "habits_text": ""}
+    return {"constraints": [], "habits_text": "", "horizon_start": horizon_start}
 
 
 async def translate_habits(state: PlanningState) -> dict:
@@ -118,8 +163,7 @@ async def expand_slots(state: PlanningState) -> dict:
     if not semantic_slots:
         return {"time_slots": []}
     try:
-        from datetime import datetime, timezone
-
+        from app.api.v1.endpoints import schedule as schedule_ep
         from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
         from app.schemas.context import SemanticTimeSlot
         # Convert dicts back to SemanticTimeSlot objects
@@ -127,8 +171,13 @@ async def expand_slots(state: PlanningState) -> dict:
         horizon = state.get("horizon_minutes", 2880)
         # plan_start is REQUIRED (weekday/validity anchoring). Omitting it raised
         # TypeError into the except below and silently dropped every habit block.
+        # It is the horizon's own start — day 0's local date — not "now" in UTC,
+        # which names the wrong weekday for half the user's night.
+        plan_start = _horizon_start_of(state) or schedule_ep.current_horizon_start(
+            await _user_zone(state)
+        )
         time_slots = expand_semantic_slots_to_time_slots(
-            slot_objects, horizon_minutes=horizon, plan_start=datetime.now(timezone.utc)
+            slot_objects, horizon_minutes=horizon, plan_start=plan_start
         )
         return {"time_slots": [ts.model_dump() if hasattr(ts, 'model_dump') else ts for ts in time_slots]}
     except Exception as e:
@@ -385,9 +434,11 @@ async def solve_schedule(state: PlanningState) -> dict:
         daily_context.append(parsed)
 
     try:
-        # horizon_start is left to run_schedule (Optional[datetime], never a
-        # str) so its 8 AM-of-plan-date convention stays the single source of
-        # truth; the resolved value comes back on the response.
+        # horizon_start is the one fetch_constraints fixed for this turn (habit
+        # expansion used it too), handed over as a datetime, never a str; with none
+        # on state run_schedule resolves it. Either way it is 08:00 in the user's
+        # zone, the past before now is blocked, and the resolved value comes back
+        # on the response.
         # Off-thread: run_schedule is a synchronous CP-SAT solve, and a bare
         # call freezes the event loop for its whole duration — on the streaming
         # path every queued SSE frame stalls behind it, so the user watches a
@@ -397,6 +448,9 @@ async def solve_schedule(state: PlanningState) -> dict:
             graph,
             daily_context,
             horizon_minutes=horizon,
+            horizon_start=_horizon_start_of(state),
+            zone=await _user_zone(state),
+            block_past=True,
         )
     except HTTPException as exc:
         if exc.status_code == 422:

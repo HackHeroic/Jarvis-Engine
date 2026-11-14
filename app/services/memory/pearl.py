@@ -40,17 +40,15 @@ def detect_skip_time_window(
     """
     detected = []
 
-    # Group tasks by scheduled hour. user_tasks stores scheduled_start (timestamptz).
-    # We derive hour in the user's local tz when JARVIS_USER_TZ env is set,
-    # otherwise UTC. UTC is a safe default for personal-machine demos.
-    import os
+    # Group tasks by scheduled hour. user_tasks stores scheduled_start (timestamptz);
+    # the hour is read on the user's clock, because the constraint bridge turns
+    # "hour 9" back into 09:00 in the user's zone. Read in UTC, a skip at 09:00 IST
+    # was learned as "hour 3" and blocked 03:00 instead.
     from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        _tz_name = os.getenv("JARVIS_USER_TZ", "")
-        _user_tz = ZoneInfo(_tz_name) if _tz_name else None
-    except Exception:
-        _user_tz = None
+
+    from app.services.planning.local_time import user_zone
+
+    _user_tz = user_zone()
 
     hour_buckets: dict[int, list[dict]] = {}
     for task in tasks:

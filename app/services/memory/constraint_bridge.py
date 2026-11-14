@@ -16,7 +16,7 @@ from app.core.config import DAY_START_HOUR
 from app.schemas.context import TimeSlot
 
 MINUTES_PER_DAY = 1440
-DAY_START_MIN = DAY_START_HOUR * 60  # horizon minute 0 == 08:00 wall clock
+DAY_START_MIN = DAY_START_HOUR * 60  # horizon minute 0 == 08:00 on the user's clock
 
 
 def _to_horizon(clock_min: int) -> int:

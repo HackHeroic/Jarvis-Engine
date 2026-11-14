@@ -244,6 +244,9 @@ def apply_modification(
                     time_slots,
                     horizon_minutes=horizon_min,
                     horizon_start=horizon_start,
+                    # The draft's horizon began earlier: a re-schedule now must not
+                    # put tasks before now.
+                    block_past=True,
                 )
                 break
             except Exception:

@@ -1,6 +1,7 @@
 """Unit tests for OR-Tools JarvisScheduler and INFEASIBLE states."""
 
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -144,14 +145,23 @@ def test_adaptive_cap__composable_from_task_atoms():
     assert cap % 25 == 0 and cap >= 75, f"cap {cap} not composable from 25-min atoms"
 
 
+# Plans run on the user's clock (DEFAULT_TIMEZONE, pinned to Asia/Kolkata by
+# conftest); these tests froze UTC times when the horizon was UTC-anchored, and
+# now freeze the same local times in India.
+IST = ZoneInfo("Asia/Kolkata")
+
+
 @pytest.fixture
 def before_the_horizon(clock):
-    """Plans made at 07:30 UTC: the 08:00 horizon is still ahead, so none of it is past."""
-    from datetime import datetime, timezone
+    """Plans made at 08:00 local, the start of the user's day: none of the horizon is past.
+
+    (Before 08:00 the logical day is still yesterday's, most of it past.)
+    """
+    from datetime import datetime
 
     from app.api.v1.endpoints import schedule as sep
 
-    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), sep)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), sep)
 
 
 def _five_task_graph():
@@ -165,26 +175,26 @@ def _five_task_graph():
 
 
 def test_run_schedule__horizon_from_now__nothing_starts_before_now_rounded_up(clock):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.api.v1.endpoints import schedule as sep
 
-    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=timezone.utc), sep)
+    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=IST), sep)
 
     resp = sep.run_schedule(_five_task_graph(), [], horizon_minutes=2880)
 
-    assert resp.horizon_start == datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
+    assert resp.horizon_start == datetime(2026, 11, 16, 8, 0, tzinfo=IST)
     # 14:02 is 362 minutes in; the past is blocked to the next whole 5 minutes.
     assert min(t.start_min for t in resp.schedule.values()) >= 365
 
 
 def test_run_schedule__explicit_horizon_start__is_left_as_given(clock):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from app.api.v1.endpoints import schedule as sep
 
-    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=timezone.utc), sep)
-    eight_am = datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
+    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=IST), sep)
+    eight_am = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
 
     resp = sep.run_schedule(_five_task_graph(), [], horizon_minutes=2880, horizon_start=eight_am)
 

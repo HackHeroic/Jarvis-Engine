@@ -10,14 +10,16 @@ recalibration rather than user guilt.
 from __future__ import annotations
 
 import math
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Protocol
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
-from app.core.config import DAY_START_HOUR, DEFAULT_HORIZON_MINUTES
+from app.core.config import DEFAULT_HORIZON_MINUTES
+from app.services.planning.local_time import day_start_on, logical_day_start, user_zone
 from app.utils.deadline_parser import parse_deadline_to_date
 from app.utils.pacing import compute_adaptive_daily_cap
 from app.core.or_tools.solver import JarvisScheduler
@@ -98,10 +100,25 @@ class ScheduledTask(BaseModel):
     title: Optional[str] = Field(default=None, description="Human-readable task title from decomposition.")
 
 
-def _compute_horizon_start(plan_start: Optional[datetime] = None) -> datetime:
-    """Compute horizon_start = 8 AM of plan date. Minute 0 = this datetime."""
-    ref = plan_start or datetime.now(timezone.utc)
-    return datetime.combine(ref.date(), time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
+def _compute_horizon_start(
+    plan_start: Optional[datetime] = None, zone: Optional[ZoneInfo] = None
+) -> datetime:
+    """DAY_START_HOUR on the plan's local date, in ``zone`` (the user's). Minute 0 = this instant.
+
+    For a caller that names its plan start (``/generate-schedule``); a naive
+    ``plan_start`` is the user's wall time. Offset-aware, so the client's
+    ``horizon_start + minutes`` is the right instant in any browser.
+    """
+    return day_start_on(plan_start or datetime.now(timezone.utc), zone or user_zone())
+
+
+def current_horizon_start(zone: Optional[ZoneInfo] = None) -> datetime:
+    """Where a plan made now starts: DAY_START_HOUR local on the user's logical day.
+
+    Read off this module's clock, which is the one tests freeze. Before
+    DAY_START_HOUR the logical day is yesterday's (the late-night rule).
+    """
+    return logical_day_start(datetime.now(timezone.utc), zone or user_zone())
 
 
 # The past is blocked out to the next whole 5 minutes, so the first task never
@@ -112,8 +129,8 @@ PAST_BLOCK_STEP_MINUTES = 5
 def _minutes_already_past(horizon_start: datetime, now: datetime, horizon_minutes: int) -> int:
     """How much of the horizon lies before ``now``, rounded up to the next 5 minutes.
 
-    0 when the horizon has not started yet (a plan made before 08:00), never more
-    than the horizon itself.
+    0 when the horizon has not started yet (a caller's horizon in the future), never
+    more than the horizon itself.
     """
     elapsed = (now - horizon_start).total_seconds() / 60
     if elapsed <= 0:
@@ -184,7 +201,11 @@ class GenerateScheduleResponse(BaseModel):
     )
     horizon_start: datetime = Field(
         ...,
-        description="ISO-8601 datetime when minute 0 of the horizon occurs. Client: wall_time = horizon_start + timedelta(minutes=start_min).",
+        description=(
+            "ISO-8601 instant, with its UTC offset, when minute 0 of the horizon occurs: "
+            "08:00 in the user's zone. Client: wall_time = horizon_start + "
+            "timedelta(minutes=start_min), shown in the viewer's local time."
+        ),
     )
 
 
@@ -192,6 +213,7 @@ router = APIRouter()
 
 
 MINUTES_PER_DAY = 1440
+# Local time: minute 0 is 08:00 in the user's zone, so 960 is their midnight.
 SLEEP_START = 960  # midnight (intra-day: 0=8 AM, 960=midnight)
 SLEEP_END = 1440  # 8 AM
 
@@ -220,21 +242,26 @@ def run_schedule(
     min_task_duration_minutes: Optional[int] = None,
     user_id: Optional[str] = None,
     db_client: object = None,
+    zone: Optional[ZoneInfo] = None,
+    block_past: Optional[bool] = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
     Raises HTTPException on INFEASIBLE.
 
-    Without an explicit ``horizon_start`` the horizon starts at 08:00 today (UTC),
-    which is in the past for any plan made after 08:00: that stretch is blocked,
-    so nothing is scheduled before now. An explicit ``horizon_start`` is the
-    caller's to place, and is left exactly as given.
+    Minute 0 is 08:00 in the user's ``zone`` (default: ``user_zone()``). Without an
+    explicit ``horizon_start`` it is 08:00 on the user's logical day — yesterday's
+    before 08:00 — which is in the past for any plan made after 08:00: that stretch
+    is blocked, so nothing is scheduled before now. An explicit ``horizon_start`` is
+    the caller's to place and is left as given; its past is blocked only when the
+    caller asks (``block_past=True``: the planner fixes one horizon per turn, then
+    solves against now).
     """
     now = datetime.now(timezone.utc)
-    resolved_horizon_start = horizon_start or _compute_horizon_start(now)
+    resolved_horizon_start = horizon_start or current_horizon_start(zone)
+    if block_past is None:
+        block_past = horizon_start is None
     already_past = (
-        _minutes_already_past(resolved_horizon_start, now, horizon_minutes)
-        if horizon_start is None
-        else 0
+        _minutes_already_past(resolved_horizon_start, now, horizon_minutes) if block_past else 0
     )
 
     # Per-task duration clamp when overrides provided

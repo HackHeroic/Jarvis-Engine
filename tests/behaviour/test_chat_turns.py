@@ -7,7 +7,8 @@ notice: the reply, whether a draft is waiting, what landed in their task list,
 and how many model calls the turn cost.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -19,13 +20,17 @@ from app.services.draft_service import DraftService
 from tests.behaviour.conftest import brain_dump, decomposition
 
 DSA_DUMP = "DSA exam on Friday. I still need to revise graphs, DP and trees, and do some mock problems."
+IST = ZoneInfo("Asia/Kolkata")
 DSA_TOPICS = ["Graph traversal", "Shortest paths", "DP on sequences", "Tree recursion", "Mock problems"]
 
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    """Plans are made at 07:30 UTC on a Monday, so the 08:00 horizon is still ahead."""
-    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), schedule_endpoint)
+    """Plans are made at 08:00 in India on a Monday, the start of the user's day.
+
+    (Was 07:30 UTC, when the horizon was UTC's 08:00; the day is the user's now.)
+    """
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), schedule_endpoint)
 
 
 def _script_dsa_plan(llm) -> None:

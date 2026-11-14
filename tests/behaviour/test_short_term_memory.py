@@ -9,6 +9,7 @@ and not repeated here.
 
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -92,7 +93,9 @@ async def test_chat__second_turn__model_sees_the_first_exchange_but_not_the_new_
 async def test_chat__new_conversation__starts_with_no_history_and_no_draft_under_review(
     jarvis, llm, clock
 ):
-    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), schedule_endpoint)
+    # 08:00 in India, the start of the user's day (was 07:30 UTC, before the
+    # horizon was the user's local day).
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
     llm.script(
         "brain_dump_extraction",
         lambda req: brain_dump(planning_goal="Revise DSA") if "DSA" in req.prompt else "{}",
