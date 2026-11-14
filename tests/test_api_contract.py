@@ -303,6 +303,101 @@ async def test_chat_context_window__messages_unreachable__the_turn_goes_on_with_
     assert "history could not be read" in caplog.text
 
 
+# --- a body is capped before it is read ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/api/v1/chat/stream", "/api/v1/ingestion/process"])
+async def test_upload_routes__content_length_over_the_cap__413_envelope_before_the_body_is_read(
+    api, monkeypatch, path
+):
+    """The field limits (an 8,000-character message, a 10 MB file) are checked after
+    the whole body is parsed; a body far past them is refused on its declared length."""
+    from app.api.request_limits import MAX_REQUEST_BODY_BYTES
+
+    reached = []
+    monkeypatch.setattr(
+        "app.services.chat_turn.service.ChatTurnService.open_turn",
+        lambda *a, **k: reached.append("chat"),
+    )
+    monkeypatch.setattr(
+        "app.api.v1.endpoints.ingestion.process_ingestion",
+        lambda **k: reached.append("ingestion"),
+    )
+
+    response = await api.post(
+        path, content=b'{"user_id": "u1"}',
+        headers={"content-type": "application/json",
+                 "content-length": str(MAX_REQUEST_BODY_BYTES + 1)},
+    )
+
+    assert response.status_code == 413
+    assert _error(response)["code"] == "payload_too_large"
+    assert _error(response)["details"] == {"max_bytes": MAX_REQUEST_BODY_BYTES}
+    assert _error(response)["request_id"] == response.headers["x-request-id"]
+    assert reached == []
+
+
+def test_request_body_cap__room_for_the_largest_valid_request():
+    """The cap sits above the biggest body the field limits allow: a 10 MB file in
+    base64 and an 8,000-character message, every character escaped."""
+    from app.api.request_limits import MAX_REQUEST_BODY_BYTES
+    from app.core.config import MAX_CHAT_PROMPT_CHARS, MAX_CHAT_UPLOAD_BYTES
+
+    largest_file = 4 * -(-MAX_CHAT_UPLOAD_BYTES // 3)
+    largest_message = MAX_CHAT_PROMPT_CHARS * len('"\\ud83d\\ude00"')
+    assert largest_file + largest_message < MAX_REQUEST_BODY_BYTES < 2 * largest_file
+
+
+async def _post_through_cap(body, *, limit: int = 64):
+    """POST ``body`` (bytes, or an iterator of chunks: sent chunked, with no length)
+    to a route behind a ``BodyLimitMiddleware`` capping it at ``limit`` bytes."""
+    from fastapi import FastAPI, Request
+
+    from app.api.error_handlers import RequestIdMiddleware, register_error_handlers
+    from app.api.request_limits import BodyLimitMiddleware
+
+    app = FastAPI()
+    seen = []
+
+    @app.post("/capped")
+    async def capped(request: Request) -> dict:
+        seen.append(await request.body())
+        return {"ok": True}
+
+    app.add_middleware(BodyLimitMiddleware, limits={"/capped": limit})
+    app.add_middleware(RequestIdMiddleware)
+    register_error_handlers(app)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.post("/capped", content=body), seen
+
+
+@pytest.mark.asyncio
+async def test_body_limit__chunked_body_over_the_cap__413_and_the_route_never_runs():
+    async def chunks():
+        for _ in range(10):
+            yield b"x" * 10
+
+    response, seen = await _post_through_cap(chunks())
+
+    assert response.status_code == 413
+    assert _error(response)["code"] == "payload_too_large"
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_body_limit__chunked_body_within_the_cap__the_route_reads_all_of_it():
+    async def chunks():
+        for _ in range(4):
+            yield b"x" * 10
+
+    response, seen = await _post_through_cap(chunks())
+
+    assert response.status_code == 200
+    assert seen == [b"x" * 40]
+
+
 # --- the schedule: infeasible is a scope problem, in the envelope ------------------------
 
 

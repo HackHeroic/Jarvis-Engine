@@ -31,6 +31,13 @@ class ValidationError(DomainError):
     http_status = 422
 
 
+class PayloadTooLargeError(ValidationError):
+    """The request body is larger than any valid request could be; refused unread."""
+
+    code = "payload_too_large"
+    http_status = 413
+
+
 class NotFoundError(DomainError):
     code = "not_found"
     http_status = 404
