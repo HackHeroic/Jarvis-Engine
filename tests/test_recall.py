@@ -268,3 +268,29 @@ async def test_recall__hundred_memories__never_over_500_tokens(memories):
     assert _lines_tokens(recall.all()) <= 500
     assert recall.tokens <= 500
     assert len({m.id for m in recall.all()}) == len(recall.all())  # nothing shown twice
+
+
+@pytest.mark.asyncio
+async def test_recall__memory_longer_than_the_budget__skipped_and_the_rest_fit(memories):
+    huge = "Prefers " + "very " * 380 + "long study blocks"  # one line, far over 200 tokens
+    await _add(memories, huge, "preference", created_at=NOW)  # newest: first in line
+    await _add(memories, "Prefers studying in the mornings", "preference")
+    await _add(memories, "Never schedules work on Sundays", "constraint")
+    service = MemoryService(memories, _CountingEmbedder(), clock=lambda: NOW)
+
+    recall = await service.recall("alice", "hi", trivial=True, now=NOW)
+
+    assert estimate_tokens(render_memory_line(recall.profile[0], NOW)) < 200
+    assert huge not in _contents(recall.profile)
+    assert _contents(recall.profile) == [
+        "Never schedules work on Sundays", "Prefers studying in the mornings",
+    ]
+
+
+def test_estimate_tokens__three_and_a_half_characters_a_token():
+    from app.services.memory.context import CHARS_PER_TOKEN_ESTIMATE
+
+    assert CHARS_PER_TOKEN_ESTIMATE == 3.5
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("abcdefg") == 2
+    assert estimate_tokens("abcdefgh") == 3
