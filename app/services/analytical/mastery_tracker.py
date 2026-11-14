@@ -10,44 +10,25 @@ under the store's row cap. A streak's days are dates on the user's clock.
 """
 
 import asyncio
-
-from collections.abc import Iterable
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import app.core.config as config
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.clock import utc_now
 from app.domain.entities import TaskEvent, TaskEventType
 from app.domain.ports import TaskEventRepository
-from app.services.task_service import utc_now
+from app.services.task_service import SLOT_OUTCOMES, as_aware, latest_outcome_per_slot
 
-# The outcomes a slot can come to: scheduled and rescheduled events are not outcomes.
-OUTCOME_TYPES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
+# The outcomes a slot can come to (task_service's, the one definition): scheduled and
+# rescheduled events are not outcomes.
+OUTCOME_TYPES = SLOT_OUTCOMES
 # How far back a streak is counted: a longer run reads as this many days.
 STREAK_WINDOW_DAYS = 60
 
 
-def _aware(moment: datetime) -> datetime:
-    """Stored instants are UTC: a naive one is read as such."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
-
-
-def _latest_outcomes(events: Iterable[TaskEvent]) -> list[TaskEvent]:
-    """The last outcome of each slot (task, scheduled start); events that are not outcomes dropped.
-
-    A slot can have more than one outcome (skipped, then completed after all); it
-    counts once, as what happened last.
-    """
-    latest: dict[tuple[str, datetime | None], TaskEvent] = {}
-    for event in sorted(events, key=lambda e: _aware(e.occurred_at)):
-        if event.event_type in OUTCOME_TYPES:
-            start = _aware(event.scheduled_start) if event.scheduled_start is not None else None
-            latest[(event.task_id, start)] = event
-    return list(latest.values())
-
-
-def _calculate_sr(user_id: str, goal_id: Optional[str], db) -> float:
+def calculate_success_ratio(user_id: str, goal_id: Optional[str], db) -> float:
     """Success Ratio: completed / total for a goal or all tasks.
 
     Feeds into: TMT Expectancy, Mastery score, Coach messages.
@@ -111,7 +92,7 @@ def _skips(events: list[TaskEvent], goal_id: Optional[str]) -> int:
     """Slots of the goal (all goals when None) whose latest outcome is a skip."""
     return sum(
         1
-        for event in _latest_outcomes(events)
+        for event in latest_outcome_per_slot(events)
         if event.event_type is TaskEventType.SKIPPED
         and (goal_id is None or event.metadata.get("goal_id") == goal_id)
     )
@@ -167,7 +148,7 @@ def compute_mastery(user_id: str, goal_id: Optional[str], db, *, reschedule_coun
     Same interface as future DKT — only internals change.
     """
     avg_quality = _get_avg_quality(user_id, goal_id, db)
-    sr = _calculate_sr(user_id, goal_id, db)
+    sr = calculate_success_ratio(user_id, goal_id, db)
 
     raw_mastery = (
         (avg_quality / 5.0) * 0.5
@@ -264,8 +245,8 @@ def compute_streak_from_events(events: list[TaskEvent], zone: ZoneInfo, today: d
     not the previous UTC one). No completion today is a streak of 0.
     """
     days = {
-        _aware(event.occurred_at).astimezone(zone).date()
-        for event in _latest_outcomes(events)
+        as_aware(event.occurred_at).astimezone(zone).date()
+        for event in latest_outcome_per_slot(events)
         if event.event_type is TaskEventType.COMPLETED
     }
     streak = 0

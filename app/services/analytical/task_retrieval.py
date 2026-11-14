@@ -2,9 +2,9 @@
 
 from typing import Any
 
-from app.api.v1.endpoints.reasoning import TaskChunk
+from app.schemas.decomposition import TaskChunk
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from supabase import create_client
+from app.db.supabase_py import build_supabase_client
 
 
 def _get_supabase(client: Any = None):
@@ -12,7 +12,7 @@ def _get_supabase(client: Any = None):
         return client
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 def get_all_pending_tasks_with_goals(

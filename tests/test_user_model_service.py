@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.container import default_pattern_detectors
 from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
@@ -115,7 +116,8 @@ def memory(repos, clock) -> MemoryService:
 @pytest.fixture
 def service(repos, memory, clock) -> UserModelService:
     patterns = PatternService(
-        repos.task_events, repos.memories, repos.profiles, EventBus(), clock=clock
+        repos.task_events, repos.memories, repos.profiles, EventBus(),
+        detectors=default_pattern_detectors(), clock=clock,
     )
     return UserModelService(
         repos.profiles,

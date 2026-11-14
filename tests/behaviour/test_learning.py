@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 import app.api.v1.endpoints.schedule as schedule_endpoint
-import app.services.task_service as task_service
+import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from tests.behaviour.conftest import brain_dump, decomposition, said
 
@@ -33,7 +33,7 @@ FIVE_TOPICS = ["Graphs", "DP", "Trees", "Heaps", "Mocks"]
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint, task_service)
+    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
 
 
 # What TaskService adds to an outcome's metadata, besides the task's title, goal and deadline.

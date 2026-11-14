@@ -18,17 +18,18 @@ import asyncio
 import functools
 from collections.abc import Callable
 from datetime import datetime, time, timedelta
-from typing import Literal
 from zoneinfo import available_timezones
 
 from pydantic import BaseModel, Field
 
 from app.domain import errors
+from app.domain.clock import utc_now
 from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
     FocusProfile,
     Memory,
+    MemorySource,
     TaskEventType,
     UserProfile,
 )
@@ -42,7 +43,7 @@ from app.domain.ports import (
 from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import PatternService, PatternView
 from app.services.planning.local_time import user_zone
-from app.services.task_service import SLOT_OUTCOMES, utc_now
+from app.services.task_service import SLOT_OUTCOMES
 from app.services.usage_ledger import UsageLedger
 
 # How each outcome reads on the page: never "missed", "skipped" or "failed".
@@ -106,7 +107,7 @@ class RuleShown(BaseModel):
 
     id: str = Field(description="The rule's id.")
     text: str = Field(description="The rule as said, or as inferred.")
-    provenance: Literal["said", "inferred"] = Field(
+    provenance: MemorySource = Field(
         description="'said': the user stated it. 'inferred': Jarvis noticed it."
     )
     created_at: datetime | None = Field(

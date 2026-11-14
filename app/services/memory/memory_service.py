@@ -28,17 +28,18 @@ from pydantic import BaseModel, Field
 
 import app.core.config as config
 from app.domain import errors
+from app.domain.clock import utc_now
 from app.domain.entities import (
     SUPPRESSING_STATUSES,
     Memory,
     MemorySource,
     MemoryStatus,
     MemoryType,
+    memory_moves_to,
 )
 from app.domain.errors import EmbeddingUnavailableError
 from app.domain.ports import MemoryRepository, Sweep, TextEmbedder
 from app.services.memory.context import Recall, estimate_tokens, render_memory_line
-from app.services.task_service import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +47,17 @@ logger = logging.getLogger(__name__)
 _MAX_STABILITY = 20.0
 # Confirming a memory makes Jarvis at least this sure of it.
 _CONFIRMED_CONFIDENCE = 0.9
-# Memories still in use: a mention reinforces one (a faded one comes back), the user may
-# confirm or edit one. A dismissed or forgotten memory is never among them again.
-_IN_USE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+# Each write's compare-and-set guard: the statuses the domain's MEMORY_TRANSITIONS lets
+# the memory move from. In use (a mention reinforces one, a faded one comes back; the
+# user may confirm or edit one): a dismissed or forgotten memory is never among them.
+_IN_USE = memory_moves_to(MemoryStatus.ACTIVE)
 # What the user's forget may erase: anything not already forgotten.
-_FORGETTABLE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED, MemoryStatus.DISMISSED})
+_FORGETTABLE = memory_moves_to(MemoryStatus.FORGOTTEN)
+_DISMISSABLE = memory_moves_to(MemoryStatus.DISMISSED)
+# What the decay sweep may fade, and so persist decay on.
+_DECAYING = memory_moves_to(MemoryStatus.FADED)
+# What recall reads, and what a contradiction may replace (no status change: the old
+# memory stays as it was, pointing at its replacement).
 _ACTIVE = frozenset({MemoryStatus.ACTIVE})
 # The memory that replaces memory X has an id derived from (user, X), so a supersede
 # retried after a partial failure finds the replacement it already stored.
@@ -279,7 +286,8 @@ class MemoryService:
         if memory.status is not MemoryStatus.DISMISSED:
             try:
                 return await self._memories.update(
-                    user_id, memory_id, only_if_status=_IN_USE, status=MemoryStatus.DISMISSED
+                    user_id, memory_id, only_if_status=_DISMISSABLE,
+                    status=MemoryStatus.DISMISSED,
                 )
             except errors.StaleVersionError:  # dismissed or forgotten meanwhile
                 memory = await self._get(user_id, memory_id)
@@ -497,7 +505,9 @@ class MemoryService:
             if fades:
                 fields["status"] = MemoryStatus.FADED
             try:
-                await self._memories.update(user_id, memory.id, only_if_status=_ACTIVE, **fields)
+                await self._memories.update(
+                    user_id, memory.id, only_if_status=_DECAYING, **fields
+                )
             except errors.StaleVersionError:  # dismissed, forgotten or faded meanwhile
                 continue
             if fades:
@@ -552,9 +562,10 @@ class MemoryService:
         return vector
 
 
-def _let_go(memory: Memory, verb: str) -> errors.ConflictError:
-    """The user let go of ``memory`` (dismissed or forgotten); it cannot be ``verb`` now."""
-    return errors.ConflictError(
+def _let_go(memory: Memory, verb: str) -> errors.InvalidStateTransition:
+    """The user let go of ``memory`` (dismissed or forgotten); it cannot be ``verb`` now:
+    a move MEMORY_TRANSITIONS does not allow (409)."""
+    return errors.InvalidStateTransition(
         f"This memory was {memory.status.value}, so it can't be {verb}.",
         details={"memory_id": memory.id, "status": memory.status.value},
     )

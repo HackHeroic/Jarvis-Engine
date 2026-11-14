@@ -65,7 +65,7 @@ async def _completion_streak(user_id: str) -> int:
         OUTCOME_TYPES, STREAK_WINDOW_DAYS, compute_streak_from_events,
     )
     from app.services.planning.local_time import user_zone
-    from app.services.task_service import utc_now
+    from app.domain.clock import utc_now
 
     container = registered_container()
     if container is None:
@@ -105,7 +105,7 @@ async def run_coaching_response(state: dict) -> dict:
 
     try:
         from app.services.analytical.mastery_tracker import (
-            get_mastery_summary, _calculate_sr, compute_quality_trend,
+            get_mastery_summary, calculate_success_ratio, compute_quality_trend,
         )
 
         db = user_model._db.supabase  # explicit path — avoids wiring bug
@@ -113,7 +113,7 @@ async def run_coaching_response(state: dict) -> dict:
         task_events = container.repos.task_events if container is not None else None
 
         mastery = await get_mastery_summary(user_model.user_id, db, task_events)
-        sr = await asyncio.to_thread(_calculate_sr, user_model.user_id, None, db)
+        sr = await asyncio.to_thread(calculate_success_ratio, user_model.user_id, None, db)
         trend = await asyncio.to_thread(compute_quality_trend, user_model.user_id, db)
         streak = await _completion_streak(user_model.user_id)
         energy = await user_model.get_estimated_energy()

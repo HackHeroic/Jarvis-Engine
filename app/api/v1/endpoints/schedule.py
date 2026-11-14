@@ -71,7 +71,7 @@ def _compute_tmt_priority(
     Args:
         difficulty_weight: Cognitive load (0-1). Inverted to reward if no mastery_value.
         delay_hours: Hours until deadline. Floor 0.1.
-        success_rate: From mastery tracker _calculate_sr(). Feeds Expectancy.
+        success_rate: From mastery tracker calculate_success_ratio(). Feeds Expectancy.
         self_efficacy_proxy: Task-level confidence (default 0.8).
         mastery_value: Explicit value (1-5) from goal_metadata if available.
 
@@ -375,10 +375,10 @@ def run_schedule(
     _sr = 0.5  # neutral prior
     if user_id and db_client and hasattr(db_client, "supabase"):
         try:
-            from app.services.analytical.mastery_tracker import _calculate_sr
+            from app.services.analytical.mastery_tracker import calculate_success_ratio
 
             goal_id = getattr(graph.goal_metadata, "goal_id", None)
-            _sr = _calculate_sr(user_id, goal_id, db_client.supabase)
+            _sr = calculate_success_ratio(user_id, goal_id, db_client.supabase)
         except Exception:
             pass
 

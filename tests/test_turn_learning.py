@@ -25,7 +25,7 @@ import pytest
 
 import app.api.v1.endpoints.schedule as schedule_endpoint
 import app.core.observation as observation
-import app.services.task_service as task_service
+import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from app.schemas.context import BrainDumpExtraction
 from tests.behaviour.conftest import (  # noqa: F401 - embeddings, jarvis and llm are fixtures
@@ -50,7 +50,7 @@ PATTERN_FRAME_KEYS = {
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
     """Planning, PEARL and memory writes read one frozen clock: Monday 08:00 in India."""
-    clock.freeze(MONDAY_8AM, schedule_endpoint, task_service)
+    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
 
 
 def _frames(turn, event: str) -> list[dict]:

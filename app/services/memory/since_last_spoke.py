@@ -15,13 +15,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import app.core.config as config
+from app.domain.clock import utc_now
 from app.domain.entities import ConversationSession, Memory, SuggestionStatus, TaskEventType
 from app.domain.ports import ConversationRepository, SuggestionRepository, TaskEventRepository
 from app.services.memory.context import as_data
 from app.services.memory.memory_service import MemoryService, MemorySnapshot
 from app.services.memory.summary_text import CleanSummary, SummaryFilter, fit, sentence
 from app.services.planning.local_time import local_date
-from app.services.task_service import as_aware, latest_outcome_per_slot, utc_now
+from app.services.task_service import as_aware, latest_outcome_per_slot
 
 logger = logging.getLogger(__name__)
 

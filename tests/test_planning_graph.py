@@ -1037,7 +1037,7 @@ async def test_decompose_goal__namespaces_task_ids_and_dependencies(monkeypatch)
     """Fresh chunks leave decomposition already namespaced, deps included.
 
     Dependencies must be re-prefixed in the same pass or the solver's precedence
-    edges point at ids that no longer exist (`_namespace_chunk`'s docstring).
+    edges point at ids that no longer exist (`namespace_chunk`'s docstring).
     """
     from app.modules.planning_graph import decompose_goal
 

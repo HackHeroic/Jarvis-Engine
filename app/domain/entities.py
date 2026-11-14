@@ -80,15 +80,60 @@ class MemorySource(str, Enum):
     INFERRED = "inferred"
 
 
+# The one definition of each vocabulary below: schemas and API models import them.
 MemoryType = Literal[
     "fact", "preference", "behavioral_pattern", "temporal_event", "goal", "feedback", "constraint"
 ]
+
+# A consent decision: run without asking, ask the user first, or drop it.
+ConsentBehavior = Literal["allow", "ask", "deny"]
 
 # A memory in one of these states never comes back on its own: the same fact said or
 # observed again is recognised by its pattern key and not stored again.
 SUPPRESSING_STATUSES: frozenset[MemoryStatus] = frozenset(
     {MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN}
 )
+
+# Legal memory lifecycle moves (the State pattern, as a table). A mention, a confirmation
+# or an edit keeps a memory in use: ACTIVE, and a FADED one comes back. The decay sweep
+# fades an ACTIVE one. The user may dismiss a memory in use and forget anything not yet
+# forgotten; DISMISSED leads only to FORGOTTEN, and FORGOTTEN nowhere: nothing automatic
+# ever brings back what the user let go of. Every move is checked against this table
+# (``check_memory_move``), and a store's compare-and-set guard for a move is the set of
+# statuses it may start from (``memory_moves_to``), so a forget landing between a read
+# and its write still wins.
+MEMORY_TRANSITIONS: dict[MemoryStatus, frozenset[MemoryStatus]] = {
+    MemoryStatus.ACTIVE: frozenset(
+        {MemoryStatus.ACTIVE, MemoryStatus.FADED, MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN}
+    ),
+    MemoryStatus.FADED: frozenset(
+        {MemoryStatus.ACTIVE, MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN}
+    ),
+    MemoryStatus.DISMISSED: frozenset({MemoryStatus.FORGOTTEN}),
+    MemoryStatus.FORGOTTEN: frozenset(),
+}
+
+
+def memory_moves_to(to: MemoryStatus | str) -> frozenset[MemoryStatus]:
+    """The statuses a memory may move to ``to`` from: the guard of a write that sets it."""
+    to = MemoryStatus(to)
+    return frozenset(frm for frm, targets in MEMORY_TRANSITIONS.items() if to in targets)
+
+
+def check_memory_move(
+    memory_id: str | None, frm: MemoryStatus | str, to: MemoryStatus | str
+) -> MemoryStatus:
+    """``to``, if MEMORY_TRANSITIONS allows moving there from ``frm``.
+
+    Raises InvalidStateTransition otherwise.
+    """
+    frm, to = MemoryStatus(frm), MemoryStatus(to)
+    if to not in MEMORY_TRANSITIONS[frm]:
+        raise InvalidStateTransition(
+            f"This memory was {frm.value}, so it can't become {to.value}.",
+            details={"memory_id": memory_id, "from": frm.value, "to": to.value},
+        )
+    return to
 
 # At stability 1 a memory's strength falls by a factor of e every week.
 BASE_HALFLIFE_HOURS = 168
@@ -286,8 +331,8 @@ class BehavioralConstraint(BaseModel):
     structured_semantics: dict | None = Field(
         default=None, description="Machine-readable form the scheduler consumes."
     )
-    source: Literal["said", "inferred"] = Field(
-        default="said",
+    source: MemorySource = Field(
+        default=MemorySource.SAID,
         description="Whether the user stated it or Jarvis inferred it from behaviour.",
     )
     created_at: datetime | None = Field(
@@ -455,7 +500,7 @@ class ConsentDecision(BaseModel):
     take one; ``app.domain.anticipation`` re-exports it.
     """
 
-    behavior: Literal["allow", "ask", "deny"] = Field(
+    behavior: ConsentBehavior = Field(
         description="Run it without asking, ask the user first, or drop it."
     )
     kind: ConsentReasonKind = Field(description="Which consent rule decided.")
@@ -476,7 +521,7 @@ class Suggestion(BaseModel):
         description="Machine-readable action applied if the suggestion is taken.",
     )
     status: SuggestionStatus = Field(description="Where the suggestion is in its lifecycle.")
-    consent_behavior: Literal["allow", "ask", "deny"] = Field(
+    consent_behavior: ConsentBehavior = Field(
         description="Consent decision: apply without asking, ask first, or never apply."
     )
     consent_reason: str = Field(description="Why that consent decision was made.")

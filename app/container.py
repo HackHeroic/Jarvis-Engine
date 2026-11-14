@@ -44,13 +44,31 @@ from app.services.memory.conversation_memory import (
     SessionSummarySweep,
 )
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
-from app.services.memory.patterns import PatternObserver, PatternService
+from app.services.memory.patterns import (
+    DeadlineCrunchDetector,
+    PatternDetector,
+    PatternObserver,
+    PatternService,
+    PeakHourDetector,
+    RepeatedSkipDetector,
+    SkipTimeWindowDetector,
+)
 from app.services.memory.stated_rules import StatedRules
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 from app.services.user_model_service import UserModelService
 
 logger = logging.getLogger(__name__)
+
+
+def default_pattern_detectors() -> list[PatternDetector]:
+    """The ways PEARL reads the outcome history: the one place they are chosen."""
+    return [
+        SkipTimeWindowDetector(),
+        PeakHourDetector(),
+        DeadlineCrunchDetector(),
+        RepeatedSkipDetector(),
+    ]
 
 
 @dataclass
@@ -115,7 +133,10 @@ class AppContainer:
         task_service = TaskService(repos.tasks, repos.task_events, events)
         embedder = embedder if embedder is not None else MiniLMEmbedder()
         memory_service = MemoryService(repos.memories, embedder)
-        patterns = PatternService(repos.task_events, repos.memories, repos.profiles, events)
+        patterns = PatternService(
+            repos.task_events, repos.memories, repos.profiles, events,
+            detectors=default_pattern_detectors(),
+        )
         observer = PatternObserver(patterns)  # PEARL looks again after every outcome
         for outcome in (TaskCompleted, TaskSkipped, TaskMissed):
             events.subscribe(outcome, observer)

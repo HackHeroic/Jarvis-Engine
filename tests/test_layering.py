@@ -145,24 +145,141 @@ def test_infrastructure__imports_nothing_from_api_or_orchestrator():
 # helper builds a DraftService over the Supabase repository itself.
 _LEGACY_SHIM = _APP_DIR / "services" / "draft_actions.py"
 
+# Files under app/ (not the composition roots) that may import app.infrastructure, and
+# why. The list can only shrink: an entry that no longer imports it is a failure too.
+_INFRASTRUCTURE_IMPORTS_ALLOWED: dict[str, str] = {
+    "services/draft_actions.py": "the legacy shim above",
+    "core/model_router.py": (
+        "route_llm_call drives the provider chain the container installs (set_chain,"
+        " current_chain) and its transport helpers"
+    ),
+}
 
-def test_layering__services_and_orchestrator__do_not_import_infrastructure():
-    files = sorted([*(_APP_DIR / "services").rglob("*.py"), *(_APP_DIR / "orchestrator").rglob("*.py")])
-    assert files
 
-    importing = {
-        path: [m for m in _resolved_imports(path) if m == "app.infrastructure" or m.startswith("app.infrastructure.")]
-        for path in files
+def _imports_under(path: Path, prefix: str) -> list[str]:
+    return [m for m in _resolved_imports(path) if m == prefix or m.startswith(prefix + ".")]
+
+
+def _layer_report(
+    dirs: list[str], prefix: str, allowed: dict[str, object]
+) -> tuple[list[str], list[str]]:
+    """(imports of ``prefix`` under ``dirs`` outside ``allowed``, stale ``allowed`` entries).
+
+    ``allowed`` maps a file under app/ to a reason (any module under ``prefix`` is
+    allowed there) or to a set of the modules it may import.
+    """
+    files = sorted(p for d in dirs for p in (_APP_DIR / d).rglob("*.py"))
+    assert files, f"nothing under {dirs}"
+    unexpected, used = [], set()
+    for path in files:
+        where = path.relative_to(_APP_DIR).as_posix()
+        for module in _imports_under(path, prefix):
+            permitted = allowed.get(where)
+            ok = isinstance(permitted, str) or (
+                isinstance(permitted, (set, frozenset))
+                and any(module == m or module.startswith(m + ".") for m in permitted)
+            )
+            if ok:
+                used.add(where)
+            else:
+                unexpected.append(f"{where}: {module}")
+    in_scope = {
+        where for where in allowed if any(where.startswith(d.rstrip("/") + "/") for d in dirs)
     }
-    violations = [
-        f"{path.relative_to(_APP_DIR)}: {module}"
-        for path, modules in importing.items()
-        if path != _LEGACY_SHIM
-        for module in modules
+    return unexpected, sorted(in_scope - used)
+
+
+def test_layering__services_orchestrator_modules_core_api__do_not_import_infrastructure():
+    unexpected, stale = _layer_report(
+        ["services", "orchestrator", "modules", "core", "api"],
+        "app.infrastructure",
+        _INFRASTRUCTURE_IMPORTS_ALLOWED,
+    )
+
+    assert unexpected == [], "take the concrete from the container instead"
+    assert stale == [], "no longer imports infrastructure: drop it from the allow-list"
+    assert _imports_under(_LEGACY_SHIM, "app.infrastructure"), "the shim is gone: drop the exception"
+
+
+# Services, the domain and infrastructure never reach up into the API layer. These
+# legacy imports remain (the list can only shrink): run_schedule and the horizon start
+# are reusable module-level functions of the schedule endpoint (CLAUDE.md), and the v1
+# control-policy flow still borrows the chunker's prompt and fence-stripper.
+_API_IMPORTS_ALLOWED: dict[str, frozenset[str]] = {
+    "services/analytical/control_policy.py": frozenset({
+        "app.api.v1.endpoints.reasoning",  # SYSTEM_PROMPT, _sanitize_llm_json (v1 only)
+        "app.api.v1.endpoints.schedule",  # run_schedule, current_horizon_start
+    }),
+    "services/analytical/schedule_modifier.py": frozenset({
+        "app.api.v1.endpoints.schedule",  # run_schedule
+    }),
+}
+
+
+def test_layering__services_domain_infrastructure__do_not_import_the_api():
+    unexpected, stale = _layer_report(
+        ["services", "domain", "infrastructure"], "app.api", _API_IMPORTS_ALLOWED
+    )
+
+    assert unexpected == [], "move what is shared below the API (e.g. app/schemas)"
+    assert stale == [], "no longer imports the API: drop it from the allow-list"
+
+
+# No service talks to the Supabase driver: clients come from app.db.supabase_py (one
+# configured transport) and repositories from the container. Legacy exceptions would be
+# listed here; there are none left.
+_SUPABASE_DRIVER_ALLOWED: dict[str, str] = {}
+
+
+def test_layering__services__do_not_import_the_supabase_driver():
+    unexpected, stale = _layer_report(["services"], "supabase", _SUPABASE_DRIVER_ALLOWED)
+
+    assert unexpected == [], "use app.db.supabase_py.build_supabase_client or a repository"
+    assert stale == []
+
+
+# What Plan 2 built is held to every rule: none of it may sit on an allow-list.
+_PLAN_2 = (
+    "services/anticipation/",
+    "services/memory/",  # MemoryService, PEARL, conversation memory, "since we last spoke"
+    "domain/anticipation.py",
+    "infrastructure/embedding.py",
+    "infrastructure/llm/messages.py",
+    "services/user_model_service.py",
+)
+
+
+def test_layering__plan_2_code__is_on_no_allow_list():
+    listed = [
+        *_INFRASTRUCTURE_IMPORTS_ALLOWED,
+        *_API_IMPORTS_ALLOWED,
+        *_SUPABASE_DRIVER_ALLOWED,
+        *(file for file, _owner in _LEGACY_LLM_CALLS_ALLOWED),
+        *(file for file, _owner in _WEB_SEARCH_CALLS_ALLOWED),
     ]
 
-    assert violations == []
-    assert importing[_LEGACY_SHIM], "the shim no longer imports infrastructure: drop the exception"
+    assert [f for f in listed if f.startswith(_PLAN_2)] == []
+    assert (_APP_DIR / "services" / "memory" / "since_last_spoke.py").exists()
+
+
+def test_layer_report__an_import_off_the_list__is_caught_and_a_stale_entry_named(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys.modules[__name__], "_APP_DIR", tmp_path / "app")
+    services = tmp_path / "app" / "services"
+    services.mkdir(parents=True)
+    (services / "fresh.py").write_text("from app.api.v1.endpoints import schedule\n")
+    (services / "legacy.py").write_text("import supabase\n")
+
+    unexpected, stale = _layer_report(
+        ["services"], "app.api", {"services/gone.py": frozenset({"app.api"})}
+    )
+
+    assert unexpected == [
+        "services/fresh.py: app.api.v1.endpoints",
+        "services/fresh.py: app.api.v1.endpoints.schedule",
+    ]
+    assert stale == ["services/gone.py"]
 
 
 _CONCRETE_REPOSITORY = re.compile(r"^(Supabase|InMemory)\w*Repository$")

@@ -19,7 +19,12 @@ from pydantic import BaseModel, Field
 from app.api.deps import CurrentUser, get_container, require_supabase
 from app.domain import errors
 from app.domain.anticipation import ActionResult, ConsentDecision
-from app.domain.entities import ConsentReasonKind, Suggestion, SuggestionStatus
+from app.domain.entities import (
+    ConsentBehavior,
+    ConsentReasonKind,
+    Suggestion,
+    SuggestionStatus,
+)
 from app.services.anticipation.service import AnticipationService
 
 router = APIRouter()
@@ -34,7 +39,7 @@ class SuggestionOut(BaseModel):
     title: str = Field(description="Short headline.")
     body: str = Field(description="Full text.")
     status: SuggestionStatus = Field(description="Where it is in its lifecycle.")
-    consent_behavior: Literal["allow", "ask", "deny"] = Field(
+    consent_behavior: ConsentBehavior = Field(
         description="Whether it was applied without asking or is waiting for the user."
     )
     consent_kind: ConsentReasonKind | None = Field(
@@ -90,7 +95,7 @@ class AcceptSuggestionResponse(BaseModel):
 class ConsentOut(BaseModel):
     """The consent decision behind a trigger run."""
 
-    behavior: Literal["allow", "ask", "deny"] = Field(
+    behavior: ConsentBehavior = Field(
         description="Apply without asking, ask first, or not at all."
     )
     kind: ConsentReasonKind = Field(description="Which consent rule decided.")

@@ -10,8 +10,8 @@ from app.services.memory.context import with_context_note
 # ContextVar used by /stream endpoint to capture execution_summary without calling VoJ.
 # When set to a dict, synthesize_jarvis_response writes the summary into it and returns
 # empty placeholders instead of calling the LLM.
-_summary_capture: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "_summary_capture", default=None
+summary_capture: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "summary_capture", default=None
 )
 
 VOICE_OF_JARVIS_PROMPT = (
@@ -83,7 +83,7 @@ def _fallback_reply(execution_summary: dict[str, Any]) -> str:
     return "My language model is out of reach at the moment, sir. Shall we try again shortly?"
 
 
-def _build_thinking_fallback(execution_summary: dict[str, Any]) -> str | None:
+def build_thinking_fallback(execution_summary: dict[str, Any]) -> str | None:
     """Build human-readable thinking_process from execution summary when LLM does not emit think blocks."""
     bullets: list[str] = []
     if execution_summary.get("schedule_generated"):
@@ -112,7 +112,7 @@ def _build_thinking_fallback(execution_summary: dict[str, Any]) -> str | None:
     return " ".join(bullets)
 
 
-def _extract_thinking_process(raw_text: str) -> tuple[str, str | None]:
+def extract_thinking_process(raw_text: str) -> tuple[str, str | None]:
     """Extract think blocks and strip from main message.
 
     Uses greedy .* (not non-greedy .*?) so that </think> appearing as text inside
@@ -227,16 +227,16 @@ async def synthesize_jarvis_response(
 ) -> tuple[str, str | None]:
     """Generate message and extract thinking process. Returns (message, thinking_process).
 
-    When _summary_capture ContextVar is set (streaming mode), captures the summary
+    When summary_capture ContextVar is set (streaming mode), captures the summary
     and returns empty placeholders instead of calling the LLM.
     """
-    capture = _summary_capture.get()
+    capture = summary_capture.get()
     if capture is not None:
         capture.update(execution_summary)
         return ("", None)
 
     if execution_summary.get("spread_across_days"):
-        thinking = _build_thinking_fallback(execution_summary)
+        thinking = build_thinking_fallback(execution_summary)
         return (
             "I've spread this across multiple days to fit your constraints. Here's your schedule.",
             thinking,
@@ -272,7 +272,7 @@ async def synthesize_jarvis_response(
         msg = msg.strip() if msg else "Standing by, sir."
         # A local model may still emit a <think> block; it is split off here. With
         # none, there is no reasoning to show, and none is made up.
-        message, thinking_process = _extract_thinking_process(msg)
+        message, thinking_process = extract_thinking_process(msg)
         return (message, thinking_process)
     except Exception as e:
         print(f"[Voice of Jarvis] Synthesis failed: {e}")
@@ -294,7 +294,7 @@ async def synthesize_jarvis_response_stream(
     made synthesis context-blind exactly where users actually hit it.
     """
     if execution_summary.get("spread_across_days"):
-        thinking = _build_thinking_fallback(execution_summary) or ""
+        thinking = build_thinking_fallback(execution_summary) or ""
         if thinking:
             yield ("thinking", thinking)
         yield ("message", "I've spread this across multiple days to fit your constraints. Here's your schedule.")

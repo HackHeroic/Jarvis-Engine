@@ -21,7 +21,7 @@ import pytest
 
 import app.services.memory.retriever as retriever_module
 import app.services.memory.store as store_module
-import app.services.task_service as task_service_module
+import app.domain.clock as utc_clock
 from app.services.memory.retriever import build_memory_context
 from tests.behaviour.conftest import brain_dump, said
 
@@ -94,7 +94,7 @@ async def _memory_api(jarvis, monkeypatch):
 @pytest.fixture
 def frozen_memory_clock(clock):
     """Memory writes and decay read one controllable clock."""
-    clock.freeze(_T0, store_module, retriever_module, task_service_module)
+    clock.freeze(_T0, store_module, retriever_module, utc_clock)
     return clock
 
 

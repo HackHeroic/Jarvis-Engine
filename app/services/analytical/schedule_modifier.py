@@ -160,7 +160,7 @@ def apply_modification(
     user's learned focus profile (``solver_focus``): the re-solve leans on it as the
     plan did, so an edit does not drop it.
     """
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, TaskChunk
     from app.api.v1.endpoints.schedule import run_schedule
 
     decomposition = execution_graph.get("decomposition", [])

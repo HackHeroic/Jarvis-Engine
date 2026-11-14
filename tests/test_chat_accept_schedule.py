@@ -210,14 +210,17 @@ async def _accept_directly(monkeypatch, *, with_container: bool) -> list[str]:
         "app.services.memory.pearl.detect_patterns",
         lambda user_id, *_args, **_kwargs: ran_for.append(user_id),
     )
-    if with_container:
-        set_container(AppContainer.build(
+    container = None
+    if with_container:  # as the lifespan does: on app.state, and registered
+        container = AppContainer.build(
             supabase_client=None, cfg=config, hooks=ActionHooks(), install_chain=False,
             embedder=MagicMock(),
-        ))
+        )
+        set_container(container)
     supabase = FakeSupabase()
     state = SimpleNamespace(
-        db_client=FakeDBClient(supabase), memory_store=MemoryStore(supabase_client=supabase)
+        db_client=FakeDBClient(supabase), memory_store=MemoryStore(supabase_client=supabase),
+        container=container,
     )
     before = asyncio.all_tasks()
 
