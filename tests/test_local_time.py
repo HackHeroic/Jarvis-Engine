@@ -70,7 +70,7 @@ def test_logical_day_start__naive_now__read_as_local_wall_time():
 
 
 def _graph(n: int = 5):
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
 
     chunks = [TaskChunk(task_id=f"t{i}", title=f"part {i}", duration_minutes=25,
                         difficulty_weight=0.5, dependencies=[], completion_criteria="done")
@@ -80,7 +80,7 @@ def _graph(n: int = 5):
 
 
 def test_run_schedule__planned_at_nine_ist__horizon_and_tasks_on_the_local_clock(clock):
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     clock.freeze(datetime(2026, 11, 16, 9, 0, tzinfo=IST), sep)
 
@@ -93,9 +93,9 @@ def test_run_schedule__planned_at_nine_ist__horizon_and_tasks_on_the_local_clock
 
 
 def test_generate_schedule__naive_plan_start__eight_am_local_on_that_date():
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
-    assert sep._compute_horizon_start(datetime(2026, 11, 16, 15, 0), IST) == datetime(
+    assert sep.logical_horizon_start(IST, plan_start=datetime(2026, 11, 16, 15, 0)) == datetime(
         2026, 11, 16, 8, 0, tzinfo=IST
     )
 

@@ -36,7 +36,7 @@ def resolve_from_now(
     ``focus_by_hour`` is the user's learned focus profile, ``zone`` their clock.
     CPU-bound (CP-SAT): an async caller runs it with ``asyncio.to_thread``.
     """
-    from app.api.v1.endpoints.schedule import run_schedule
+    from app.services.planning.scheduling import run_schedule
     from app.core.config import DEFAULT_HORIZON_MINUTES, MAX_HORIZON_MINUTES
     from app.schemas.context import TimeSlot
     from app.schemas.decomposition import ExecutionGraph, TaskChunk

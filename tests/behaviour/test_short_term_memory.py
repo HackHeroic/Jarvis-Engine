@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.services.chat_history import build_context_messages
 from tests.behaviour.conftest import brain_dump, decomposition
 from tests.fakes import FakeSupabase
@@ -97,7 +97,7 @@ async def test_chat__new_conversation__starts_with_no_history_and_no_draft_under
 ):
     # 08:00 in India, the start of the user's day (was 07:30 UTC, before the
     # horizon was the user's local day).
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), scheduling)
     llm.script(
         "brain_dump_extraction",
         lambda req: brain_dump(planning_goal="Revise DSA") if "DSA" in req.prompt else "{}",

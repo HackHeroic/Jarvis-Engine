@@ -1,28 +1,72 @@
-"""Document management endpoints: list, delete, and view chunks for user-ingested documents."""
+"""Document management endpoints: list, delete, and view chunks for user-ingested documents.
 
-from fastapi import APIRouter, HTTPException, Query, Request
+The document and task-material rows have no repository yet (Plan 3 cut Task 6): these
+routes read and write ``ingested_documents`` and ``task_materials`` through the app's
+Supabase client, a documented leftover of the layering test's raw-table allow-list. No
+database is 503 ``persistence_unavailable``; a document that is not the caller's is 404
+``not_found``.
+"""
 
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.api.deps import require_supabase
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.jarvis_logger import log_step
-from app.domain.errors import PersistenceError
+from app.domain.errors import NotFoundError, PersistenceError
 
 router = APIRouter()
 
 
+class DocumentOut(BaseModel):
+    """One ingested document, as the documents page shows it."""
+
+    model_config = ConfigDict(extra="allow")  # the row's other columns pass through
+
+    source_id: str = Field(description="The document's id (its chunks carry it too).")
+    id: Optional[str] = Field(default=None, description="The row's id.")
+    user_id: Optional[str] = Field(default=None, description="The document's owner.")
+    file_name: Optional[str] = Field(default=None, description="The uploaded file's name.")
+    media_type: Optional[str] = Field(default=None, description="'pdf', 'png', 'jpeg'...")
+    document_topics: Optional[list[str]] = Field(
+        default=None, description="The topics read from it."
+    )
+    chunk_count: Optional[int] = Field(default=None, description="How many chunks it became.")
+    created_at: Optional[str] = Field(default=None, description="When it was ingested.")
+    linked_task_ids: list[str] = Field(
+        default_factory=list, description="The caller's tasks it was linked to."
+    )
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentOut] = Field(description="The caller's documents, newest first.")
+
+
+class DocumentDeleteResponse(BaseModel):
+    status: Literal["deleted"] = Field(description="Always 'deleted'.")
+    source_id: str = Field(description="The document deleted, with its chunks and links.")
+
+
+class DocumentChunksResponse(BaseModel):
+    source_id: str = Field(description="The document.")
+    chunks: list[str] = Field(description="Its extracted text chunks (the caller's only).")
+    count: int = Field(ge=0, description="How many chunks.")
+
+
 @router.get(
     "/",
+    response_model=DocumentListResponse,
     summary="List user documents",
     description="Returns all documents ingested by the user, with linked task IDs.",
 )
 async def list_documents(
     http_request: Request,
     user_id: str = Query(..., description="User identifier"),
-) -> dict:
+) -> DocumentListResponse:
     """List all ingested documents for a user."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-    if not supabase:
-        raise HTTPException(503, "Database not available")
+    supabase = require_supabase(http_request)
 
     try:
         docs_result = (
@@ -58,11 +102,12 @@ async def list_documents(
     for doc in documents:
         doc["linked_task_ids"] = link_map.get(doc["source_id"], [])
 
-    return {"documents": documents}
+    return DocumentListResponse(documents=documents)
 
 
 @router.delete(
     "/{source_id}",
+    response_model=DocumentDeleteResponse,
     summary="Delete a document",
     description="Cascade delete: ChromaDB chunks, task_materials links, ingested_documents row.",
 )
@@ -70,12 +115,9 @@ async def delete_document(
     source_id: str,
     http_request: Request,
     user_id: str = Query(..., description="User identifier"),
-) -> dict:
+) -> DocumentDeleteResponse:
     """Delete a document and all associated data."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-    if not supabase:
-        raise HTTPException(503, "Database not available")
+    supabase = require_supabase(http_request)
 
     log_step("DOC_DELETE", "Deleting document", {"user_id": user_id, "source_id": source_id})
 
@@ -110,19 +152,18 @@ async def delete_document(
             .eq("source_id", source_id)
             .execute()
         )
-        if not result.data:
-            raise HTTPException(404, "Document not found")
-    except HTTPException:
-        raise
     except Exception as exc:
         logger.error(f"Deleting the document record failed: {exc!r}")
         raise PersistenceError("Could not delete the document.") from exc
+    if not result.data:
+        raise NotFoundError("Document not found.")
 
-    return {"status": "deleted", "source_id": source_id}
+    return DocumentDeleteResponse(status="deleted", source_id=source_id)
 
 
 @router.get(
     "/{source_id}/chunks",
+    response_model=DocumentChunksResponse,
     summary="Get document chunks",
     description="Returns extracted text chunks for a document from ChromaDB.",
 )
@@ -130,7 +171,7 @@ async def get_document_chunks(
     source_id: str,
     http_request: Request,
     user_id: str = Query(...),
-) -> dict:
+) -> DocumentChunksResponse:
     """Fetch text chunks for a document from ChromaDB."""
     try:
         from app.utils.chroma_client import get_chroma_client
@@ -142,7 +183,7 @@ async def get_document_chunks(
         # Only the caller's chunks: a source id alone would read another user's.
         results = collection.get(where={"$and": [{"source_id": source_id}, {"user_id": user_id}]})
         chunks = results.get("documents", []) if results else []
-        return {"source_id": source_id, "chunks": chunks, "count": len(chunks)}
+        return DocumentChunksResponse(source_id=source_id, chunks=chunks, count=len(chunks))
     except Exception as exc:
         logger.error(f"Fetching document chunks failed: {exc!r}")
         raise PersistenceError("Could not load the document's chunks.") from exc

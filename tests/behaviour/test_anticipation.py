@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.domain.clock as utc_clock
 from tests.behaviour.conftest import brain_dump, decomposition, settle_background_tasks
 
@@ -27,7 +27,7 @@ LIGHT_TOPICS = ["Arrays", "Hashing", "Stacks", "Queues", "Graphs", "DP", "Trees"
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
 
 
 @asynccontextmanager

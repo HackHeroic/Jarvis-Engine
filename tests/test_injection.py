@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.domain.clock as utc_clock
 from app.domain.entities import BehavioralConstraint, TaskEvent, TaskEventType
 from app.infrastructure.persistence.factory import RepositoryFactory
@@ -128,7 +128,7 @@ async def test_turn__container_only_in_turn_state__rule_memory_and_pattern_reach
     jarvis, llm, clock
 ):
     """The harness holds its container on ``app.state`` and nowhere else."""
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
     _script(llm)
 
     # A taught rule reaches the planner (planning.memory) and every day keeps it.
@@ -166,7 +166,7 @@ async def test_chat_plan__calendar_rule_expired__no_longer_constrains_the_plan(j
     as the morning brief and a late accept do: an expired calendar block frees its hours."""
     from app.services.memory.constraint_bridge import to_horizon
 
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
     _script(llm)
     start = to_horizon(8 * 60)
     morning_block = {"semantic_slots": [{

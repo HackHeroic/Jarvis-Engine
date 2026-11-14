@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.domain.events import NullEventBus
 from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
 from app.services.draft_service import DraftService
@@ -27,7 +27,7 @@ TOPICS = ["Graphs", "DP", "Trees", "Heaps", "Mocks", "Tries", "Sorting", "Hashin
 
 def _at(clock, hour: int, minute: int = 0, day: date = MONDAY) -> datetime:
     when = datetime.combine(day, time(hour, minute), tzinfo=IST)
-    clock.freeze(when, schedule_endpoint)
+    clock.freeze(when, scheduling)
     return when
 
 
@@ -173,7 +173,7 @@ async def test_local_day__profile_timezone__the_plan_runs_on_that_zones_clock(ja
         {"user_id": "alice", "timezone": "America/New_York"}
     ).execute()
     now = datetime.combine(MONDAY, time(9, 0), tzinfo=new_york)
-    clock.freeze(now, schedule_endpoint)
+    clock.freeze(now, scheduling)
     _script_plan(llm)
 
     turn = await jarvis.say("Plan my DSA revision")

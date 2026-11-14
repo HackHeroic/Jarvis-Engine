@@ -392,10 +392,10 @@ async def test_prune_checkpoints__planning_subgraph_namespaces__pruned_with_thei
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    import app.api.v1.endpoints.schedule as schedule_endpoint
+    import app.services.planning.scheduling as scheduling
     from app.orchestrator.checkpoint import prune_checkpoints
 
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), scheduling)
     llm.script(
         "brain_dump_extraction",
         lambda req: brain_dump(planning_goal="Revise DSA") if "DSA" in req.prompt else "{}",

@@ -16,7 +16,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
 
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
@@ -408,14 +407,15 @@ async def test_ingest_endpoint__routes_through_the_chain__returns_the_classifica
 
 
 @pytest.mark.asyncio
-async def test_ingest_endpoint__model_down__answers_502(llm):
+async def test_ingest_endpoint__model_down__llm_unavailable_503(llm):
     from app.api.v1.endpoints.ingestion import IngestionRequest, ingest
+    from app.domain.errors import LLMUnavailableError
 
     llm(intent_classification=_down())
 
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(LLMUnavailableError) as caught:
         await ingest(IngestionRequest(payload="Mon 9-10 OS Lec"))
-    assert caught.value.status_code == 502
+    assert caught.value.http_status == 503
 
 
 # --- the reasoning endpoint ------------------------------------------------------------
@@ -479,29 +479,33 @@ async def test_decompose_goal__undersized_local_graph__retried_on_the_cloud(loca
 
 
 @pytest.mark.asyncio
-async def test_decompose_goal__undersized_graph_and_no_cloud_model__answers_502(local_then_cloud):
+async def test_decompose_goal__undersized_graph_and_no_cloud_model__llm_output_parse_503(
+    local_then_cloud,
+):
     from app.api.v1.endpoints.reasoning import decompose_goal
+    from app.domain.errors import LLMOutputParseError
 
     local, _ = local_then_cloud(_graph(2), None)
     set_chain(FallbackChainProvider([local]))  # no cloud provider configured
 
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(LLMOutputParseError) as caught:
         await decompose_goal(user_prompt="Learn graphs")
-    assert caught.value.status_code == 502
-    assert "insufficient tasks" in caught.value.detail
+    assert caught.value.http_status == 503
+    assert "insufficient tasks" in caught.value.message
     assert local.tasks == ["socratic_chunker"]
 
 
 @pytest.mark.asyncio
-async def test_decompose_goal__no_model_answers_parseably__answers_502(local_then_cloud):
+async def test_decompose_goal__no_model_answers_parseably__llm_output_parse_503(local_then_cloud):
     from app.api.v1.endpoints.reasoning import decompose_goal
+    from app.domain.errors import LLMOutputParseError
 
     local_then_cloud("not json", "still not json")
 
-    with pytest.raises(HTTPException) as caught:
+    with pytest.raises(LLMOutputParseError) as caught:
         await decompose_goal(user_prompt="Learn graphs")
-    assert caught.value.status_code == 502
-    assert "could not be parsed" in caught.value.detail
+    assert caught.value.http_status == 503
+    assert "could not be parsed" in caught.value.message
 
 
 # --- still Gemini-only: web search ------------------------------------------------------

@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.domain import errors
 from app.domain.entities import DraftStatus
 from app.domain.events import NullEventBus
@@ -41,7 +41,7 @@ DSA_TOPICS = ["Graph traversal", "Shortest paths", "DP on sequences", "Tree recu
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
     """Plans start at 08:00 on Monday on the user's clock; accepts happen before then."""
-    clock.freeze(MONDAY_8AM, schedule_endpoint)
+    clock.freeze(MONDAY_8AM, scheduling)
 
 
 def _script_dsa_plan(llm) -> None:

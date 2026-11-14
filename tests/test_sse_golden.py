@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from app.domain.errors import ConflictError
@@ -71,7 +71,7 @@ def _fixed_verbs(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
 
 
 async def _post(monkeypatch, state: dict, **body) -> str:

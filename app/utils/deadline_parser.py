@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Union
 from app.core.config import MAX_HORIZON_MINUTES
 
 if TYPE_CHECKING:
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, TaskChunk
 
 
 def parse_deadline_to_date(hint: str | None, ref: datetime) -> datetime | None:

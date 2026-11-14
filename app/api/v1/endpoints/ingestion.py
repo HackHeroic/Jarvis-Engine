@@ -1,15 +1,22 @@
-"""Semantic Router endpoint for intent classification and autonomous extraction pipeline."""
+"""Semantic Router endpoint for intent classification and autonomous extraction pipeline.
+
+The pending-calendar rows have no repository yet (Plan 3 cut Task 6): those routes use
+the app's Supabase client, a documented leftover of the layering test's raw-table
+allow-list. A malformed request is 422 ``validation_error``; a classifier that cannot
+answer is 503 ``llm_unavailable``.
+"""
 
 import base64
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import CurrentUser, container_of, require_supabase
 from app.domain import errors
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
+from app.schemas.upload import UploadMediaType, within_upload_limit
 from app.services.extraction.orchestrator import process_ingestion
 from app.utils.docling_helper import extract_document
 
@@ -17,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Fixed texts: an exception's own message never goes on the wire (it is logged).
 _BAD_BASE64 = "file_base64 is not valid base64."
+_MEDIA_TYPE_REQUIRED = "media_type is required when file_base64 is provided."
+_NOTHING_TO_READ = "Provide either payload (text) or file_base64 with media_type."
+_CLASSIFIER_DOWN = "Could not classify the payload. Try again shortly."
 
 SEMANTIC_ROUTER_SYSTEM_PROMPT = (
     "You are the Jarvis Semantic Router. You process data for CEOs, students, "
@@ -39,7 +49,8 @@ router = APIRouter()
 
 
 class IngestionRequest(BaseModel):
-    """Request body for the ingest endpoint."""
+    """Request body for the ingest endpoint. A file has the chat upload's bounds: one of
+    the kinds the document reader takes, at most ``MAX_CHAT_UPLOAD_BYTES`` decoded."""
 
     payload: str = Field(
         default="",
@@ -49,10 +60,43 @@ class IngestionRequest(BaseModel):
         default=None,
         description="Base64-encoded PDF or image (PNG, JPEG)",
     )
-    media_type: Optional[str] = Field(
+    media_type: Optional[UploadMediaType] = Field(
         default=None,
         description="One of 'pdf', 'image', 'png', 'jpeg'. Required when file_base64 is set.",
     )
+
+    _file_within_the_limit = field_validator("file_base64")(within_upload_limit)
+
+
+class PendingCalendarOut(BaseModel):
+    """One timetable extraction awaiting the user's approval, as stored."""
+
+    model_config = ConfigDict(extra="allow")  # the row's other columns pass through
+
+    id: str = Field(description="The pending update's id.")
+    user_id: Optional[str] = Field(default=None, description="Its owner.")
+    extracted_slots: list[dict[str, Any]] = Field(
+        default_factory=list, description="The time slots read from the timetable."
+    )
+    source_summary: Optional[str] = Field(default=None, description="What was read.")
+    status: Optional[str] = Field(default=None, description="'pending'.")
+    created_at: Optional[str] = Field(default=None, description="When it was extracted.")
+    valid_until: Optional[str] = Field(default=None, description="When the timetable ends.")
+
+
+class PendingCalendarListResponse(BaseModel):
+    pending: list[PendingCalendarOut] = Field(description="The caller's pending updates.")
+
+
+class PendingCalendarApproved(BaseModel):
+    status: Literal["approved"] = Field(description="Always 'approved'.")
+    daily_context: list[TimeSlot] = Field(
+        description="The approved slots, as a schedule's daily context."
+    )
+
+
+class PendingCalendarRejected(BaseModel):
+    status: Literal["rejected"] = Field(description="Always 'rejected'.")
 
 
 def _get_text_for_classification(request: IngestionRequest) -> str:
@@ -61,19 +105,21 @@ def _get_text_for_classification(request: IngestionRequest) -> str:
     if request.payload:
         parts.append(request.payload.strip())
     if request.file_base64 and request.media_type:
-        try:
-            raw_bytes = base64.b64decode(request.file_base64)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
+        raw_bytes = _decoded(request.file_base64)
         extracted = extract_document(raw_bytes, request.media_type)
         parts.append(extracted)
     combined = "\n\n".join(p for p in parts if p)
     if not combined:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either payload (text) or file_base64 with media_type.",
-        )
+        raise errors.ValidationError(_NOTHING_TO_READ)
     return combined
+
+
+def _decoded(file_base64: str) -> bytes:
+    """The file's bytes; ValidationError (422, a fixed text) when it is not base64."""
+    try:
+        return base64.b64decode(file_base64)
+    except Exception as exc:
+        raise errors.ValidationError(_BAD_BASE64) from exc
 
 
 @router.post(
@@ -89,10 +135,7 @@ def _get_text_for_classification(request: IngestionRequest) -> str:
 async def ingest(request: IngestionRequest) -> IntentClassification:
     """Classify incoming unstructured data via the Semantic Router (SLM)."""
     if request.file_base64 and not request.media_type:
-        raise HTTPException(
-            status_code=400,
-            detail="media_type is required when file_base64 is provided.",
-        )
+        raise errors.ValidationError(_MEDIA_TYPE_REQUIRED)
     text = _get_text_for_classification(request)
     try:
         from app.core.model_router import route_llm_call
@@ -104,14 +147,9 @@ async def ingest(request: IngestionRequest) -> IntentClassification:
             response_schema=IntentClassification,
         )
         return IntentClassification.model_validate(result)
-    except HTTPException:
-        raise
     except Exception as exc:
         logger.warning("Semantic Router could not classify the payload", exc_info=exc)
-        raise HTTPException(
-            status_code=502,
-            detail="Could not classify the payload. Try again shortly.",
-        ) from exc
+        raise errors.LLMUnavailableError(_CLASSIFIER_DOWN) from exc
 
 
 class ProcessIngestionRequest(IngestionRequest):
@@ -135,16 +173,10 @@ async def process_full_pipeline(
 ) -> IngestionPipelineResult:
     """Run the autonomous extraction pipeline."""
     if request.file_base64 and not request.media_type:
-        raise HTTPException(
-            status_code=400,
-            detail="media_type is required when file_base64 is provided.",
-        )
+        raise errors.ValidationError(_MEDIA_TYPE_REQUIRED)
     file_bytes = None
     if request.file_base64 and request.media_type:
-        try:
-            file_bytes = base64.b64decode(request.file_base64)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
+        file_bytes = _decoded(request.file_base64)
     db_client = getattr(http_request.app.state, "db_client", None)
     # Rules, tasks and goals are read and stored through the container's repositories,
     # and only with a database: without one the container is in-memory and nothing
@@ -166,9 +198,12 @@ async def process_full_pipeline(
 
 @router.get(
     "/pending-calendar",
+    response_model=PendingCalendarListResponse,
     summary="List pending calendar updates",
 )
-async def list_pending_calendar(http_request: Request, user: CurrentUser) -> dict:
+async def list_pending_calendar(
+    http_request: Request, user: CurrentUser
+) -> PendingCalendarListResponse:
     """List the caller's pending calendar updates awaiting approval."""
     supabase = require_supabase(http_request)
     try:
@@ -181,7 +216,7 @@ async def list_pending_calendar(http_request: Request, user: CurrentUser) -> dic
         )
     except Exception as exc:
         raise errors.PersistenceError("Could not reach the database.") from exc
-    return {"pending": result.data or []}
+    return PendingCalendarListResponse(pending=result.data or [])
 
 
 def _resolve_pending_calendar(
@@ -209,34 +244,33 @@ def _resolve_pending_calendar(
 
 @router.post(
     "/pending-calendar/{pending_id}/approve",
+    response_model=PendingCalendarApproved,
     summary="Approve pending calendar update",
 )
 async def approve_pending_calendar(
     pending_id: str,
     http_request: Request,
     user: CurrentUser,
-) -> dict:
+) -> PendingCalendarApproved:
     """Approve one of the caller's pending calendar updates. Returns daily_context for schedule."""
     supabase = require_supabase(http_request)
     row = _resolve_pending_calendar(supabase, pending_id, user, "approved")
     slots = row.get("extracted_slots") or []
     daily_context = [TimeSlot.model_validate(s) for s in slots]
-    return {
-        "status": "approved",
-        "daily_context": [s.model_dump() for s in daily_context],
-    }
+    return PendingCalendarApproved(status="approved", daily_context=daily_context)
 
 
 @router.post(
     "/pending-calendar/{pending_id}/reject",
+    response_model=PendingCalendarRejected,
     summary="Reject pending calendar update",
 )
 async def reject_pending_calendar(
     pending_id: str,
     http_request: Request,
     user: CurrentUser,
-) -> dict:
+) -> PendingCalendarRejected:
     """Reject one of the caller's pending calendar updates."""
     supabase = require_supabase(http_request)
     _resolve_pending_calendar(supabase, pending_id, user, "rejected")
-    return {"status": "rejected"}
+    return PendingCalendarRejected(status="rejected")

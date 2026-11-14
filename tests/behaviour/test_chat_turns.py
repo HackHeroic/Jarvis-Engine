@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.domain.events import NullEventBus
 from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
 from app.orchestrator.state import NegotiationPhase
@@ -30,7 +30,7 @@ def _monday_morning(clock):
 
     (Was 07:30 UTC, when the horizon was UTC's 08:00; the day is the user's now.)
     """
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), scheduling)
 
 
 def _script_dsa_plan(llm) -> None:
@@ -189,7 +189,7 @@ async def test_chat__solve_outlasts_its_step_timeout__no_plan_claimed_and_no_dra
 
     solve_step = next(s for s in planning_module.steps if s.name == "solve_schedule")
     monkeypatch.setattr(solve_step, "timeout_ms", 50)
-    monkeypatch.setattr(schedule_endpoint, "run_schedule", stuck_solver)
+    monkeypatch.setattr(scheduling, "run_schedule", stuck_solver)
     _script_dsa_plan(llm)
     calls_before = len(llm.calls)
 

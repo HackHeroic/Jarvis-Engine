@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.services.analytical.missed_deadlines as missed_deadlines
 from app.domain.errors import LLMUnavailableError
 from app.utils.pacing import compute_adaptive_daily_cap
@@ -64,7 +64,7 @@ def _minutes_per_day(turn) -> dict[int, int]:
 
 @pytest.fixture
 def monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint, missed_deadlines)
+    clock.freeze(MONDAY_8AM, scheduling, missed_deadlines)
     return clock
 
 
@@ -78,7 +78,7 @@ def cap_spy(monkeypatch) -> list[dict]:
         seen.append({**kwargs, "cap": cap})
         return cap
 
-    monkeypatch.setattr(schedule_endpoint, "compute_adaptive_daily_cap", spy)
+    monkeypatch.setattr(scheduling, "compute_adaptive_daily_cap", spy)
     return seen
 
 
@@ -749,7 +749,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
     from app.domain.errors import ScheduleInfeasibleError
     from app.services.memory.memory_service import MemoryCandidate
 
-    clock.freeze(MONDAY_8AM, schedule_endpoint)
+    clock.freeze(MONDAY_8AM, scheduling)
     jarvis.db.table("behavioral_constraints").insert({
         "id": str(uuid4()), "user_id": "alice", "constraint_type": "habit",
         "raw_text": "I sleep from 11 PM to 7 AM",  # the id is the table's uuid default
@@ -766,7 +766,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
             memory_type="constraint", content="No study between 8 AM and 11 PM", confidence=0.9
         ),
     )
-    real_run_schedule = schedule_endpoint.run_schedule
+    real_run_schedule = scheduling.run_schedule
     horizons: list[int] = []
 
     def only_a_week_fits(graph, daily_context, horizon_minutes, **kwargs):
@@ -775,7 +775,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
             raise ScheduleInfeasibleError("Schedule infeasible")
         return real_run_schedule(graph, daily_context, horizon_minutes=horizon_minutes, **kwargs)
 
-    monkeypatch.setattr(schedule_endpoint, "run_schedule", only_a_week_fits)
+    monkeypatch.setattr(scheduling, "run_schedule", only_a_week_fits)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
 
     turn = await jarvis.say("Plan my DSA revision")
@@ -793,7 +793,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
 
 @pytest.mark.asyncio
 async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clock):
-    clock.freeze(datetime(2026, 11, 16, 3, 0, tzinfo=IST), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 3, 0, tzinfo=IST), scheduling)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
     planned = await jarvis.say("Plan my DSA revision")
 
@@ -811,7 +811,7 @@ async def test_late_day__plan_made_after_8am__nothing_scheduled_in_the_past(
     jarvis, llm, clock, hour
 ):
     made_at = datetime(2026, 11, 16, hour, 0, tzinfo=IST)
-    clock.freeze(made_at, schedule_endpoint)
+    clock.freeze(made_at, scheduling)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
     planned = await jarvis.say("Plan my DSA revision")
 

@@ -60,11 +60,6 @@ class ScheduleInfeasibleError(DomainError):
     http_status = 422
 
 
-class ConsentRequiredError(DomainError):
-    code = "consent_required"
-    http_status = 202
-
-
 class InfrastructureError(JarvisError):
     """Something Jarvis depends on (database, model) failed; the request was fine."""
 

@@ -1,8 +1,9 @@
 """Proactive Task Workspace endpoint — cache-first."""
 
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, Field
 
 from app.api.deps import container_of
 from app.domain import errors
@@ -13,6 +14,12 @@ from app.services.analytical.workspace_builder import (
 )
 
 router = APIRouter()
+
+
+class WorkspaceInvalidated(BaseModel):
+    status: Literal["invalidated"] = Field(
+        description="Always 'invalidated': the next GET rebuilds the workspace."
+    )
 
 
 @router.get("/{task_id}/workspace", response_model=TaskWorkspace)
@@ -31,7 +38,7 @@ async def get_task_workspace(
 ) -> TaskWorkspace:
     """Get cached workspace, or build + persist (24h TTL) if missing/stale/refresh."""
     if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+        raise errors.ValidationError("user_id is required.")
     # The goals the WOOP card reads, and the bus a web search is metered onto: the
     # composition root's; without one the card keeps the task's title and nothing is metered.
     container = container_of(http_request)
@@ -52,11 +59,11 @@ async def get_task_workspace(
         raise errors.JarvisError("Could not build the task workspace.") from exc
 
 
-@router.delete("/{task_id}/workspace")
+@router.delete("/{task_id}/workspace", response_model=WorkspaceInvalidated)
 async def clear_task_workspace(
     task_id: str,
     user_id: str = Query(..., description="User ID"),
-) -> dict:
+) -> WorkspaceInvalidated:
     """Invalidate the cached workspace for a task. Next GET will rebuild."""
     await invalidate_workspace_cache(user_id, task_id)
-    return {"status": "invalidated"}
+    return WorkspaceInvalidated(status="invalidated")

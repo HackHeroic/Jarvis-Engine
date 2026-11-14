@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.container import default_pattern_detectors
 from app.domain import errors
 from app.domain.anticipation import ConsentPolicy
@@ -305,7 +305,7 @@ async def test_brief__before_wake__not_due(pinned_world, pinned):
 
 @pytest.mark.asyncio
 async def test_brief__after_wake__pending_suggestion_with_draft_and_ask_reason(world, clock):
-    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    clock.freeze(MONDAY_7_05, scheduling)
     await _seed_tasks(world.repos, [_row("graphs"), _row("trees", difficulty_weight=0.8)])
 
     outcome = await _run_brief(world, MONDAY_7_05)
@@ -484,7 +484,7 @@ async def test_brief__replan_infeasible__read_only_suggestion_no_draft(fake, rep
 @pytest.mark.asyncio
 async def test_brief__automatic_at_07_01__todays_tasks_land_today_from_8am(world, clock):
     at = _ist(MONDAY, 7, 1)  # just after the default 07:00 wake, before the day starts
-    clock.freeze(at, schedule_endpoint)
+    clock.freeze(at, scheduling)
     await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c", "d")])  # 2 a day
 
     outcome = await _run_brief(world, at)
@@ -501,7 +501,7 @@ async def test_brief__automatic_at_07_01__todays_tasks_land_today_from_8am(world
 @pytest.mark.asyncio
 async def test_brief__run_at_10_30__nothing_before_10_30(world, clock):
     at = _ist(MONDAY, 10, 30)
-    clock.freeze(at, schedule_endpoint)
+    clock.freeze(at, scheduling)
     await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c", "d")])
 
     outcome = await _run_brief(world, at)
@@ -516,7 +516,7 @@ async def test_brief__run_at_10_30__nothing_before_10_30(world, clock):
 async def test_brief__every_task_overdue__drafted_and_left_pending(world, clock):
     import app.services.analytical.missed_deadlines as missed_deadlines
 
-    clock.freeze(MONDAY_7_05, schedule_endpoint, missed_deadlines)
+    clock.freeze(MONDAY_7_05, scheduling, missed_deadlines)
     yesterday = SUNDAY.isoformat()
     await _seed_tasks(world.repos, [
         _row("graphs", deadline_hint=yesterday), _row("trees", deadline_hint=yesterday),
@@ -615,13 +615,13 @@ async def test_brief__habits_could_not_be_read__tick_failed_nothing_settled_next
     invalidate_habit_cache()
     habits = _Habits()
     habits.install()
-    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    clock.freeze(MONDAY_7_05, scheduling)
     await world.repos.constraints.add(U, _choir_habit())
     await _seed_tasks(world.repos, [_row("graphs")])
 
     first = await world.service.run_due(U, MONDAY_7_05)
     habits.readable = True
-    clock.freeze(MONDAY_7_05 + timedelta(minutes=1), schedule_endpoint)
+    clock.freeze(MONDAY_7_05 + timedelta(minutes=1), scheduling)
     second = await world.service.run_due(U, MONDAY_7_05 + timedelta(minutes=1))
 
     assert first[0].status == "failed"  # the morning brief; nothing stored, nothing settled
@@ -640,7 +640,7 @@ async def test_brief__learned_evening_peak__hard_task_in_the_peak_and_due_today_
     yesterday's set-aside task, due today, takes the first slot of the day."""
     import app.modules.planning_graph as planning_graph
 
-    clock.freeze(MONDAY_7_05, schedule_endpoint, planning_graph)
+    clock.freeze(MONDAY_7_05, scheduling, planning_graph)
     world = _world(fake, repos)  # the replanner reads the focus profile through its planning
     history = []
     for day in range(1, 15):  # two weeks of evenings done, mornings set aside
@@ -687,7 +687,7 @@ async def test_brief__learned_evening_peak__hard_task_in_the_peak_and_due_today_
 
 @pytest.mark.asyncio
 async def test_brief__accept__tasks_written_and_rescheduled_events(world, clock):
-    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    clock.freeze(MONDAY_7_05, scheduling)
     yesterday_10 = _ist(SUNDAY, 10)
     await _seed_tasks(world.repos, [
         _row("graphs"), _row("trees"), _row("dp", status="missed", start=yesterday_10),
@@ -805,12 +805,12 @@ async def test_brief__accepted_three_hours_late__refreshed_from_now_and_nothing_
 ):
     """Accepting the 07:05 brief at 10:05 would write slots that have gone by, and the
     next sweep would set them aside as if the user had: it is re-planned from now."""
-    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    clock.freeze(MONDAY_7_05, scheduling)
     await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c")])
     suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
     late = _ist(MONDAY, 10, 5)
     world.clock.now = late
-    clock.freeze(late, schedule_endpoint)
+    clock.freeze(late, scheduling)
 
     _, result = await world.service.accept(U, suggestion.id)
 
@@ -948,7 +948,7 @@ async def test_pattern_rule__user_already_said_rule__denied_rule_match(pinned_wo
 async def test_pattern_rule__accept__constraint_with_semantic_slot_memory_confirmed_and_draft(
     world, clock, recording_llm
 ):
-    clock.freeze(_ist(MONDAY, 8), schedule_endpoint)
+    clock.freeze(_ist(MONDAY, 8), scheduling)
     await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c", "d", "e", "f")])
     await _set_aside_at(world, 9)
     suggestion = (await _run_rule(world)).suggestion
@@ -994,7 +994,7 @@ async def test_pattern_rule__over_the_api__details_carry_the_numbers_and_accept_
 
     from app.main import app
 
-    clock.freeze(_ist(MONDAY, 8), schedule_endpoint)
+    clock.freeze(_ist(MONDAY, 8), scheduling)
     await _seed_tasks(world.repos, [_row("graphs"), _row("trees")])
     await _set_aside_at(world, 9, times=4)
     await world.repos.task_events.append(U, _outcome(  # one of the five done after all

@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 from app.domain.entities import (
     BehavioralConstraint,
     DraftStatus,
@@ -34,7 +34,7 @@ MONDAY_8AM = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint)
+    clock.freeze(MONDAY_8AM, scheduling)
 
 
 @pytest.fixture
@@ -375,7 +375,7 @@ async def test_replan__every_task_overdue__drafted_and_left_pending(
 ):
     import app.services.analytical.missed_deadlines as missed_deadlines
 
-    clock.freeze(MONDAY_8AM, schedule_endpoint, missed_deadlines)  # the deadline scan's clock too
+    clock.freeze(MONDAY_8AM, scheduling, missed_deadlines)  # the deadline scan's clock too
     yesterday = (MONDAY_8AM - timedelta(days=1)).date().isoformat()
     await _seed_tasks(repos, [
         _row("graphs", deadline_hint=yesterday), _row("trees", deadline_hint=yesterday),

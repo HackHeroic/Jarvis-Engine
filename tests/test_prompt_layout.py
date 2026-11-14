@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.core.config as config
 import app.domain.clock as utc_clock
 from app.domain.entities import Memory, MemorySource
@@ -57,7 +57,7 @@ HOSTILE_DOCUMENT = (
 @pytest.fixture
 def frozen(clock):
     """Memory writes, recall and the note's clock read one frozen time: Monday 08:00 IST."""
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
     return clock
 
 
