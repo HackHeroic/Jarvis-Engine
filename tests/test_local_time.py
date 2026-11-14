@@ -45,8 +45,14 @@ def test_user_zone__default_misconfigured__utc_rather_than_a_crash(monkeypatch):
         (datetime(2026, 11, 15, 20, 0, tzinfo=timezone.utc), 15),
         # 07:59 IST: still yesterday's day.
         (datetime(2026, 11, 16, 2, 29, tzinfo=timezone.utc), 15),
-        # 23:00 IST on the 16th: today's day.
-        (datetime(2026, 11, 16, 17, 30, tzinfo=timezone.utc), 16),
+        # 21:59 IST on the 16th: still today's day.
+        (datetime(2026, 11, 16, 16, 29, tzinfo=timezone.utc), 16),
+        # 22:00 IST on the 16th: the evening cutoff, so tomorrow's day from 08:00.
+        (datetime(2026, 11, 16, 16, 30, tzinfo=timezone.utc), 17),
+        # 23:00 IST on the 16th: tomorrow's day; nothing is planned that night.
+        (datetime(2026, 11, 16, 17, 30, tzinfo=timezone.utc), 17),
+        # 23:30 IST on the 16th (18:00 UTC): tomorrow's day.
+        (datetime(2026, 11, 16, 18, 0, tzinfo=timezone.utc), 17),
     ],
 )
 def test_logical_day_start__india__eight_am_local_on_the_logical_day(utc_now, expected_local_day):
