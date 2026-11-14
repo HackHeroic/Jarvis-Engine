@@ -241,6 +241,16 @@ CHROMA_DATABASE: str = os.getenv("CHROMA_DATABASE", "Jarvis-Vector-Db")
 # match pasted into the prompt misleads the model — so err strict.
 RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE", "0.6"))
 
+# Memory (MemoryService), as cosine similarity under the memory embedder. A fact said or
+# noticed at least MEMORY_SUPPRESS_SIMILARITY close to one the user forgot or dismissed is
+# not stored again; one at least MEMORY_DEDUPE_SIMILARITY close to an active or faded
+# memory of the same type reinforces it instead of adding a copy. Below
+# MEMORY_RETENTION_FLOOR strength a memory leaves recall, and the daily decay sweep marks
+# it faded (a constraint excepted).
+MEMORY_SUPPRESS_SIMILARITY: float = 0.85
+MEMORY_DEDUPE_SIMILARITY: float = 0.85
+MEMORY_RETENTION_FLOOR: float = 0.1
+
 # AWS S3 (document storage)
 AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")

@@ -90,6 +90,16 @@ def _unique_violation(index: str) -> Exception:
     return Exception(f'duplicate key value violates unique constraint "{index}"')
 
 
+# NOT NULL column defaults the fake fills on insert when a row leaves them out, as {table:
+# {column: value}}, so a row written without them reads back through a repository as it
+# would from the real table. user_tasks: 20261114000001_capstone_lld.sql; user_memories:
+# 20261115000002_memory_lifecycle_and_vectors.sql (rows the legacy MemoryStore writes).
+_COLUMN_DEFAULTS = {
+    "user_tasks": {"difficulty_weight": 0.5},
+    "user_memories": {"status": "active", "provenance": "said"},
+}
+
+
 class _Query:
     def __init__(
         self,
@@ -198,6 +208,7 @@ class _Query:
                 # mutating its dict afterwards cannot reach the stored row.
                 stored = {
                     "created_at": datetime.now(timezone.utc).isoformat(),
+                    **_COLUMN_DEFAULTS.get(self._table, {}),
                     **copy.deepcopy(row),
                 }
                 self._rows.append(stored)

@@ -1,135 +1,160 @@
-"""Memory CRUD endpoints for Jarvis."""
+"""The memories API (the Memory panel): what Jarvis remembers, and the user's controls.
 
-from typing import Optional
+Routing and parsing only. Every route is a ``MemoryService`` move, taken from the
+composition root (``get_container``). Another user's memory reads as absent and
+answers 404, never 403, which would confirm it exists. Errors use the one envelope.
+"""
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field, field_validator
+from datetime import datetime, timezone
+from typing import Literal
 
-from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.domain.errors import PersistenceError
+from fastapi import APIRouter, Query, Request
+from pydantic import BaseModel, Field
+
+from app.api.deps import CurrentUser, get_container
+from app.domain.entities import Memory, MemorySource, MemoryType
+from app.services.memory.memory_service import MemoryService
 
 router = APIRouter()
 
-_VALID_MEMORY_TYPES = {
-    "constraint", "behavioral_pattern", "preference",
-    "temporal_event", "goal", "fact", "feedback", "observation",
-}
+
+class MemoryOut(BaseModel):
+    """One memory as the Memory panel shows it."""
+
+    memory_id: str = Field(description="The memory's id.")
+    memory_type: MemoryType = Field(description="What kind of thing is remembered.")
+    content: str = Field(description="The memory in words.")
+    confidence: float = Field(description="How sure Jarvis is that it holds, 0 to 1.")
+    provenance: MemorySource = Field(
+        description="'said': the user said it. 'inferred': Jarvis noticed it from what happened."
+    )
+    freshness: float = Field(
+        description="Strength now: 1 when just learned or confirmed, falling while unused."
+    )
+    noted_at: datetime = Field(description="When it was first stored.")
+    last_confirmed_at: datetime | None = Field(
+        description="When it was last said again or confirmed, if ever."
+    )
+    observation_count: int = Field(description="How many times it has been said or observed.")
+    pattern_key: str | None = Field(
+        description="Stable identity of a learned pattern, if it is one."
+    )
+
+    @classmethod
+    def of(cls, memory: Memory, now: datetime) -> "MemoryOut":
+        return cls(
+            memory_id=memory.id,
+            memory_type=memory.memory_type,
+            content=memory.content,
+            confidence=memory.confidence,
+            provenance=memory.provenance,
+            freshness=memory.strength_at(now),
+            noted_at=memory.created_at,
+            last_confirmed_at=memory.last_confirmed_at,
+            observation_count=memory.observation_count,
+            pattern_key=memory.pattern_key,
+        )
+
+
+class MemoryListResponse(BaseModel):
+    """The memories Jarvis is using for the user."""
+
+    memories: list[MemoryOut] = Field(description="Active memories, oldest first.")
+    count: int = Field(description="How many memories are listed.")
+
+
+class ForgetResponse(BaseModel):
+    """The memory is forgotten."""
+
+    status: Literal["forgotten"] = Field(description="Always 'forgotten'.")
 
 
 class MemoryEdit(BaseModel):
-    content: Optional[str] = Field(default=None, max_length=2000)
-    memory_type: Optional[str] = None
-    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    """New words or a new type for a memory; at least one."""
 
-    @field_validator("memory_type")
-    @classmethod
-    def _check_memory_type(cls, v):
-        if v is None:
-            return v
-        if v not in _VALID_MEMORY_TYPES:
-            raise ValueError(f"memory_type must be one of {sorted(_VALID_MEMORY_TYPES)}")
-        return v
+    content: str | None = Field(
+        default=None, min_length=1, max_length=2000, description="The memory's new words."
+    )
+    memory_type: MemoryType | None = Field(default=None, description="The memory's new type.")
 
 
-def _get_memory_store(request: Request):
-    store = getattr(request.app.state, "memory_store", None)
-    if not store:
-        raise HTTPException(status_code=503, detail="Memory store not available")
-    return store
+def _memories(request: Request) -> MemoryService:
+    return get_container(request).memory_service
 
 
-@router.get("/")
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@router.get(
+    "/",
+    response_model=MemoryListResponse,
+    summary="List what Jarvis remembers",
+    description=(
+        "The user's active memories: not dismissed, forgotten, faded, superseded or "
+        "expired, and still strong enough to be used."
+    ),
+)
 async def list_memories(
-    user_id: str = Query(..., description="User ID"),
-    memory_type: Optional[str] = Query(default=None, description="Filter by memory type"),
-    min_confidence: float = Query(default=0.0, description="Minimum confidence threshold"),
-    request: Request = None,
-) -> dict:
-    """List active memories for a user, optionally filtered by type."""
-    store = _get_memory_store(request)
-    if memory_type:
-        memories = store.get_memories_by_type(user_id, memory_type, min_confidence)
-    else:
-        memories = store.get_active_memories(user_id)
-    return {"memories": memories or [], "count": len(memories or [])}
+    request: Request,
+    user: CurrentUser,
+    memory_type: MemoryType | None = Query(default=None, description="Only this type."),
+) -> MemoryListResponse:
+    types = frozenset({memory_type}) if memory_type is not None else None
+    now = _now()
+    shown = [MemoryOut.of(m, now) for m in await _memories(request).list_active(user, types=types)]
+    return MemoryListResponse(memories=shown, count=len(shown))
 
 
-@router.patch("/{memory_id}")
+@router.patch(
+    "/{memory_id}",
+    response_model=MemoryOut,
+    summary="Edit a memory",
+    description="Change a memory's words or type. Unknown, forgotten or another user's: 404.",
+)
 async def edit_memory(
-    memory_id: str,
-    edit: MemoryEdit,
-    user_id: str = Query(..., description="User ID"),
-    request: Request = None,
-) -> dict:
-    """Edit a memory's content/type/confidence. Persists to user_memories table."""
-    store = _get_memory_store(request)
-    supabase = getattr(store, "_supabase", None) or getattr(store, "supabase_client", None)
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database unavailable")
-
-    update: dict = {}
-    if edit.content is not None:
-        update["content"] = edit.content
-    if edit.memory_type is not None:
-        update["memory_type"] = edit.memory_type
-    if edit.confidence is not None:
-        update["confidence"] = max(0.0, min(1.0, edit.confidence))
-    if not update:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    try:
-        result = supabase.table("user_memories") \
-            .update(update) \
-            .eq("id", memory_id) \
-            .eq("user_id", user_id) \
-            .execute()
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Memory not found")
-        return {"status": "updated", "memory": result.data[0]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Updating memory failed: {e!r}")
-        raise PersistenceError("Could not update the memory.") from e
+    memory_id: str, edit: MemoryEdit, request: Request, user: CurrentUser
+) -> MemoryOut:
+    memory = await _memories(request).edit(
+        user, memory_id, content=edit.content, memory_type=edit.memory_type
+    )
+    return MemoryOut.of(memory, _now())
 
 
-@router.delete("/{memory_id}")
-async def delete_memory(
-    memory_id: str,
-    user_id: str = Query(..., description="User ID"),
-    request: Request = None,
-) -> dict:
-    """Archive a memory (set strength to 0, excluded from active queries)."""
-    store = _get_memory_store(request)
-    success = store.archive_memory(memory_id, user_id=user_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    return {"status": "archived"}
+@router.delete(
+    "/{memory_id}",
+    response_model=ForgetResponse,
+    summary="Forget a memory for good",
+    description=(
+        "Erases the memory's words at once and removes it from every list. A tombstone "
+        "stays: its embedding and pattern key are kept, so when the same fact is said or "
+        "noticed again Jarvis recognises it and does not store it again. Another user's "
+        "memory: 404."
+    ),
+)
+async def forget_memory(memory_id: str, request: Request, user: CurrentUser) -> ForgetResponse:
+    await _memories(request).forget(user, memory_id)
+    return ForgetResponse(status="forgotten")
 
 
-@router.post("/{memory_id}/confirm")
-async def confirm_memory(
-    memory_id: str,
-    user_id: str = Query(..., description="User ID"),
-    request: Request = None,
-) -> dict:
-    """User confirms a PEARL pattern — reinforce it."""
-    store = _get_memory_store(request)
-    success = store.reinforce_memory(memory_id, user_id=user_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    return {"status": "reinforced"}
+@router.post(
+    "/{memory_id}/confirm",
+    response_model=MemoryOut,
+    summary="Confirm a memory",
+    description="The user says it holds: it is reinforced and Jarvis is at least 0.9 sure of it.",
+)
+async def confirm_memory(memory_id: str, request: Request, user: CurrentUser) -> MemoryOut:
+    return MemoryOut.of(await _memories(request).confirm(user, memory_id), _now())
 
 
-@router.post("/{memory_id}/dismiss")
-async def dismiss_memory(
-    memory_id: str,
-    user_id: str = Query(..., description="User ID"),
-    request: Request = None,
-) -> dict:
-    """User dismisses a pattern — reduce confidence."""
-    store = _get_memory_store(request)
-    success = store.weaken_memory(memory_id, user_id=user_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Memory not found")
-    return {"status": "weakened"}
+@router.post(
+    "/{memory_id}/dismiss",
+    response_model=MemoryOut,
+    summary="Dismiss a memory",
+    description=(
+        "The user says it does not hold: it is hidden for good, and the same fact said or "
+        "noticed again is not stored."
+    ),
+)
+async def dismiss_memory(memory_id: str, request: Request, user: CurrentUser) -> MemoryOut:
+    return MemoryOut.of(await _memories(request).dismiss(user, memory_id), _now())

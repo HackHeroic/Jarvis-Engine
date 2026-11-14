@@ -29,6 +29,15 @@ MAX_STABILITY = 20.0
 _UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly None"
 
 
+def _in_use(row: dict) -> bool:
+    """Whether a memory is still in use: dismissed, forgotten and faded ones are not.
+
+    Read off the row, not filtered in the query: a database without the status
+    column yet (before migration 20261115000002) holds only memories in use.
+    """
+    return row.get("status", "active") == "active"
+
+
 class MemoryStore:
     """CRUD for user_memories in Supabase."""
 
@@ -80,7 +89,7 @@ class MemoryStore:
         rows = result.data or []
         # Post-fetch: filter out memories whose time-decayed strength < 0.1
         now = datetime.now(timezone.utc)
-        return [m for m in rows if compute_memory_strength(m, now) >= 0.1]
+        return [m for m in rows if _in_use(m) and compute_memory_strength(m, now) >= 0.1]
 
     def get_memories_by_type(self, user_id: str, memory_type: str, min_confidence: float = 0.0) -> list[dict]:
         if not self._supabase:
@@ -98,7 +107,7 @@ class MemoryStore:
         rows = result.data or []
         # Post-fetch: apply time-decayed strength filter (consistent with get_active_memories)
         now = datetime.now(timezone.utc)
-        return [m for m in rows if compute_memory_strength(m, now) >= 0.1]
+        return [m for m in rows if _in_use(m) and compute_memory_strength(m, now) >= 0.1]
 
     def get_memory(self, memory_id: str, user_id: str = None) -> dict | None:
         """Get a single memory. Always filters by user_id when provided.

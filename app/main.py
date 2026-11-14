@@ -1,5 +1,7 @@
 """Entry point: initializes FastAPI and LiteLLM Router."""
 
+import asyncio
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 
 import httpx
@@ -17,6 +19,18 @@ from app.api.error_handlers import REQUEST_ID_HEADER, RequestIdMiddleware, regis
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
 from app.domain.errors import PersistenceError
+
+logger = logging.getLogger(__name__)
+
+
+def _log_warm_up_failure(task: asyncio.Task) -> None:
+    """Log why the embedder could not warm up; a memory write reports its own error later."""
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning(
+            "The memory embedder could not warm up (%s)",
+            type(task.exception()).__name__,
+            exc_info=task.exception(),
+        )
 
 
 @asynccontextmanager
@@ -120,6 +134,13 @@ async def lifespan(app: FastAPI):
     if supabase_client is not None:
         print(" ✅ Repositories: Supabase")
 
+    # Load the sentence model now, off the event loop, so the first memory a user
+    # shares is not kept waiting for it.
+    embedder_warm_up = asyncio.create_task(
+        asyncio.to_thread(container.embedder.embed, ["warm up"])
+    )
+    embedder_warm_up.add_done_callback(_log_warm_up_failure)
+
     # Which language models will answer, in the order they are tried. CLAUDE_PRIMARY
     # (like GEMINI_PRIMARY) makes the local provider report itself unavailable.
     live = [p.name for p in container.llm.providers if p.is_available()]
@@ -137,6 +158,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         print("Shutting down Jarvis Reasoning Engine.")
+        embedder_warm_up.cancel()  # a no-op once it is done
         # Bounded: in-flight usage records get a moment to land, never a hang.
         await container.usage_ledger.shutdown()
         await checkpoint_stack.aclose()

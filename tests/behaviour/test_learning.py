@@ -79,7 +79,7 @@ def _patterns(turn) -> list[dict]:
 async def _memory_api(jarvis, monkeypatch):
     from app.main import app
 
-    monkeypatch.setattr(app.state, "memory_store", jarvis.memory_store, raising=False)
+    monkeypatch.setattr(app.state, "container", jarvis.state.container, raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
@@ -197,12 +197,11 @@ async def test_bridge__learned_avoidance__next_plan_keeps_demanding_work_out_of_
     strict=True,
     raises=AssertionError,
     reason=(
-        "Dismissing a learned pattern does not hand the hour back. PEARL stores a skip "
-        "pattern at confidence 0.9; dismiss subtracts 0.3, leaving 0.6, which still meets "
-        "the bridge's 0.6 pattern gate (inclusive by design; 0.9-0.3 is "
-        "0.6000000000000001 > 0.6 in floats too). And with no record of the dismissal, "
-        "PEARL re-detects the same skips on the next turn and reinforces the memory "
-        "(+0.1). Making a dismissal stick needs a dismissed state PEARL respects."
+        "A dismissal hands the hour back for one plan only. Dismissing hides the pattern "
+        "(status dismissed), so the next plan uses 9 AM again. But PEARL re-detects the "
+        "same skips after that turn and, finding no pattern in use, stores a fresh one, "
+        "which blocks the hour in the plan after. Making a dismissal stick needs PEARL to "
+        "recognise the dismissed pattern (MemoryService.remember suppresses it)."
     ),
 )
 @pytest.mark.asyncio
@@ -217,9 +216,11 @@ async def test_bridge__dismissed_pattern__hands_the_hour_back(jarvis, llm, monke
             f"/api/v1/memories/{pattern['id']}/dismiss", params={"user_id": "alice"}
         )
     after = await jarvis.say("Plan my DSA revision")
+    again = await jarvis.say("Plan my DSA revision")
 
     assert dismissed.status_code == 200
     assert any(_touches(slot, 9, 10) for slot in _wall_clock(after))
+    assert any(_touches(slot, 9, 10) for slot in _wall_clock(again))
 
 
 # --- the focus profile: learned hours lean the plan, stated rules still win ---------

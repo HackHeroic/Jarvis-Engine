@@ -94,6 +94,26 @@ def test_container__installs_its_chain_for_route_llm_call():
     assert current_chain() is container.llm
 
 
+def test_container__memory_service_on_the_given_embedder__decay_sweep_listed_chain_left_alone():
+    from app.infrastructure.embedding import MiniLMEmbedder
+    from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
+    from tests.fakes import BagOfWordsEmbedder
+
+    installed = current_chain()
+    embedder = BagOfWordsEmbedder()
+
+    container = AppContainer.build(
+        supabase_client=None, cfg=_cfg, hooks=ActionHooks(), embedder=embedder, install_chain=False
+    )
+
+    assert isinstance(container.memory_service, MemoryService)
+    assert container.embedder is embedder
+    assert [sweep.name for sweep in container.sweeps] == ["slot_passed", "memory_decay"]
+    assert isinstance(container.sweeps[1], MemoryDecaySweep)
+    assert current_chain() is installed  # not replaced by container.llm
+    assert isinstance(_build().embedder, MiniLMEmbedder)  # the default: the local model
+
+
 @pytest.mark.asyncio
 async def test_container__route_llm_call__usage_recorded_for_the_attributed_user(monkeypatch):
     """End to end: the chain route_llm_call uses meters onto the container's bus."""
