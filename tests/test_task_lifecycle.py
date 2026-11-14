@@ -399,3 +399,69 @@ def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
     assert payload["replan_triggered"] is False
     assert [c for c in _REPLAN_CLAIMS if c in payload["message"].lower()] == []
     assert replans == []
+
+
+# --- the skip reason (spec 9.1), one error type, typed responses ----------------------
+
+
+def test_skip_endpoint__with_reason__kept_on_the_skipped_event_and_anti_guilt_reply(monkeypatch):
+    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+    client = _client_over(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/v1/tasks/t1/skip", json={"user_id": "u1", "reason": "Too tired after the lab"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "skipped"
+    assert resp.json()["message"].startswith("Life happened")
+    (event,) = fake.rows["task_events"]
+    assert (event["event_type"], event["metadata"]["reason"]) == (
+        "skipped", "Too tired after the lab"
+    )
+
+
+def test_skip_endpoint__reason_too_long__422_and_nothing_recorded(monkeypatch):
+    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+    client = _client_over(fake, monkeypatch)
+
+    resp = client.post("/api/v1/tasks/t1/skip", json={"user_id": "u1", "reason": "x" * 501})
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert fake.rows.get("task_events", []) == []
+    assert fake.rows["user_tasks"][0]["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "method, path, body",
+    [
+        ("patch", "/api/v1/tasks/nope", {"user_id": "u1", "title": "Renamed"}),
+        ("delete", "/api/v1/tasks/nope?user_id=u1", None),
+    ],
+)
+def test_task_endpoints__unknown_task__not_found_envelope(method, path, body, monkeypatch):
+    client = _client_over(FakeSupabase({"user_tasks": [_task_row("t1")]}), monkeypatch)
+
+    resp = client.request(method.upper(), path, json=body)
+
+    assert resp.status_code == 404
+    error = resp.json()["error"]
+    assert (error["code"], error["message"]) == ("not_found", "That task does not exist.")
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("get", "/api/v1/tasks/"),
+        ("delete", "/api/v1/tasks/"),
+        ("post", "/api/v1/drafts/{draft_id}/accept"),
+    ],
+)
+def test_openapi__task_and_draft_accept_routes__declare_a_response_model(method, path):
+    from app.main import app
+
+    response = app.openapi()["paths"][path][method]["responses"]["200"]
+    schema = response["content"]["application/json"]["schema"]
+
+    assert "$ref" in schema, schema

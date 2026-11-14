@@ -5,9 +5,9 @@ each one as a single append-only task event.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_container
@@ -63,6 +63,36 @@ class TaskDeleteRequest(BaseModel):
     user_id: str = Field(..., description="User ID (required for IDOR protection)")
 
 
+# The longest skip reason kept: a sentence or two, never an essay.
+SKIP_REASON_MAX_CHARS = 500
+
+
+class TaskSkipRequest(BaseModel):
+    """Skip a task, optionally saying why."""
+
+    user_id: str = Field(..., description="User ID (required for IDOR protection)")
+    reason: Optional[str] = Field(
+        default=None,
+        max_length=SKIP_REASON_MAX_CHARS,
+        description="Why it was set aside, in the user's words; kept on the skip's event.",
+    )
+
+
+class TaskListResponse(BaseModel):
+    """The user's tasks, newest first."""
+
+    tasks: list[dict] = Field(description="Task rows, newest first (at most 200).")
+    count: int = Field(ge=0, description="How many rows came back.")
+
+
+class TaskClearResponse(BaseModel):
+    """What a bulk delete removed."""
+
+    status: Literal["cleared"] = Field(description="Always 'cleared'.")
+    deleted_count: int = Field(ge=0, description="Tasks deleted.")
+    filter: str = Field(description="The status filter applied, or 'all'.")
+
+
 class TaskResponse(BaseModel):
     """Standard task response."""
 
@@ -96,8 +126,12 @@ def _require_supabase(request: Request) -> Any:
     """
     supabase = _get_supabase(request)
     if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise errors.PersistenceError("Database not available.")
     return supabase
+
+
+def _not_found(task_id: str) -> errors.NotFoundError:
+    return errors.NotFoundError("That task does not exist.", details={"task_id": task_id})
 
 
 # What a task that is no longer pending already is, in the user's words.
@@ -154,20 +188,20 @@ async def complete_task(
 )
 async def skip_task(
     task_id: str,
-    body: TaskDeleteRequest,
+    body: TaskSkipRequest,
     request: Request,
 ) -> TaskResponse:
     """Anti-guilt skip — 'Slippery Deadlines'.
 
-    Never says 'overdue' or 'failed'. A repeat skip, or a skip of a task that is
-    already done, records nothing.
+    Never says 'overdue' or 'failed'. The reason, if given, is kept on the skipped
+    event. A repeat skip, or a skip of a task that is already done, records nothing.
     """
     _require_supabase(request)
     container = get_container(request)
-    await container.task_service.skip(body.user_id, task_id)
+    await container.task_service.skip(body.user_id, task_id, reason=body.reason)
     task = await container.repos.tasks.get(body.user_id, task_id)
     if task is None:
-        raise errors.NotFoundError("That task does not exist.", details={"task_id": task_id})
+        raise _not_found(task_id)
     if task.status is not TaskStatus.SKIPPED:
         return TaskResponse(
             task_id=task_id,
@@ -239,7 +273,7 @@ async def update_task(
         .execute()
     )
     if not (result.data or []):
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found for this user")
+        raise _not_found(task_id)
 
     update_payload: dict[str, Any] = {}
     if body.title is not None:
@@ -293,7 +327,7 @@ async def delete_task(
         .execute()
     )
     if not (result.data or []):
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found for this user")
+        raise _not_found(task_id)
 
     supabase.table("user_tasks").delete().eq(
         "task_id", task_id
@@ -309,6 +343,7 @@ async def delete_task(
 
 @router.delete(
     "/",
+    response_model=TaskClearResponse,
     summary="Clear all tasks for a user",
     description="Delete all tasks (or only pending) for a user. Useful for testing/reset.",
 )
@@ -319,7 +354,7 @@ async def clear_all_tasks(
         description="Only delete tasks with this status (e.g. 'pending'). Omit to delete ALL.",
     ),
     request: Request = None,
-) -> dict:
+) -> TaskClearResponse:
     """Clear all tasks for a user, optionally filtered by status."""
     supabase = _require_supabase(request)
 
@@ -329,11 +364,14 @@ async def clear_all_tasks(
     result = query.execute()
     deleted_count = len(result.data or [])
 
-    return {"status": "cleared", "deleted_count": deleted_count, "filter": status_filter or "all"}
+    return TaskClearResponse(
+        status="cleared", deleted_count=deleted_count, filter=status_filter or "all"
+    )
 
 
 @router.get(
     "/",
+    response_model=TaskListResponse,
     summary="List tasks for a user",
     description="Returns pending, completed, and skipped tasks.",
 )
@@ -344,7 +382,7 @@ async def list_tasks(
         description="Filter by status: pending, completed, skipped, missed",
     ),
     request: Request = None,
-) -> dict:
+) -> TaskListResponse:
     """List all tasks for a user, optionally filtered by status."""
     supabase = _require_supabase(request)
 
@@ -359,7 +397,7 @@ async def list_tasks(
         query = query.eq("status", status)
 
     result = query.execute()
-    return {"tasks": result.data or [], "count": len(result.data or [])}
+    return TaskListResponse(tasks=result.data or [], count=len(result.data or []))
 
 
 # ---------------------------------------------------------------------------

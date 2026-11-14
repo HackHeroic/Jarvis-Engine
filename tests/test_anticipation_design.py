@@ -162,6 +162,47 @@ async def test_pattern_rule__new_detector_that_proposes_rules__offered_without_a
     assert offer.title == "A pattern around 11 PM"
 
 
+class _WordyDetector(_LateNightDetector):
+    """The same detector, with its own words for the brief's line."""
+
+    def noticed(self, pattern: Pattern) -> str:
+        return "I noticed late nights rarely go to plan."
+
+
+@pytest.mark.asyncio
+async def test_brief__noticed_line__in_the_detectors_own_words():
+    """The brief names no detector: the line about a pattern is its detector's."""
+    from app.services.anticipation.triggers import MorningBriefTrigger
+    from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
+
+    repos = RepositoryFactory.in_memory()
+    bus = EventBus()
+    patterns = PatternService(
+        repos.task_events, repos.memories, repos.profiles, bus,
+        detectors=[_WordyDetector()], clock=lambda: NOW,
+    )
+    await patterns.observe(U)
+    actions = build_action_factory(
+        drafts=DraftService(repos.drafts, bus, tasks=repos.tasks),
+        constraints=repos.constraints,
+        memory=MemoryService(repos.memories, BagOfWordsEmbedder()),
+        planner=_NoPlan(),
+    )
+    brief = MorningBriefTrigger(
+        repos.tasks, repos.task_events, _NoPlan(),
+        HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()), patterns,
+        actions, suggestions=repos.suggestions,
+    )
+    service = AnticipationService(
+        {brief.name: brief}, actions, ConsentPolicy.default(), repos.suggestions,
+        repos.profiles, repos.constraints, clock=lambda: NOW,
+    )
+
+    outcome = await service.run_trigger(U, brief.name, force=True, now=NOW)
+
+    assert outcome.suggestion.body == "I noticed late nights rarely go to plan."
+
+
 # --- one single-flight helper -------------------------------------------------------------
 
 

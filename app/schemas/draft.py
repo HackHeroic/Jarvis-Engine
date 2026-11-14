@@ -72,6 +72,16 @@ class DraftAcceptRequest(BaseModel):
     )
 
 
+class DraftAcceptResponse(BaseModel):
+    """What accepting a draft did."""
+
+    status: Literal["accepted", "empty"] = Field(
+        description="accepted: its tasks are on the plan; empty: it held nothing to schedule."
+    )
+    draft_id: str = Field(description="The draft accepted.")
+    task_count: int = Field(ge=0, description="Tasks written to the user's plan.")
+
+
 class DraftRejectRequest(BaseModel):
     """Reject a draft."""
 

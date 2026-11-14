@@ -236,18 +236,6 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
             },
         )
 
-    async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:
-        if utc(end) <= utc(start):
-            raise errors.ValidationError("A task must end after it starts.")
-        rows = await self._run(
-            lambda q: q.update({"scheduled_start": iso(start), "scheduled_end": iso(end)})
-            .eq("user_id", user_id)
-            .eq("task_id", task_id)
-        )
-        if not rows:
-            raise not_found("task", task_id)
-        return _read_task(rows[0])
-
 
 class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
     table = "task_events"
