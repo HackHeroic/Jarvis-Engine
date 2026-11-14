@@ -18,6 +18,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.domain import errors
 from app.domain.entities import (
+    EXPIRY_KEY,
     BehavioralConstraint,
     ChatMessage,
     ConsentDecision,
@@ -28,12 +29,14 @@ from app.domain.entities import (
     Memory,
     MemoryStatus,
     Suggestion,
+    SuggestionExpiry,
     SuggestionStatus,
     Task,
     TaskEvent,
     TaskEventType,
     TaskStatus,
     UserProfile,
+    made_that_day,
 )
 from app.domain.ports import (
     RECENT_SESSIONS_LIMIT,
@@ -107,6 +110,8 @@ _STATUS_CAS_ATTEMPTS = 3
 USAGE_PAGE_ROWS = 1000
 # Pages one summary may read (20,000 calls); past it the summary says it is truncated.
 USAGE_MAX_PAGES = 20
+# The most suggestions of one trigger a day is read back to judge "made today".
+_DAY_SUGGESTIONS_LIMIT = 50
 # Pattern keys one memory read asks for: each key matches at most one row, so a read
 # is bounded by its keys, and the request line stays short.
 PATTERN_KEYS_PER_READ = 100
@@ -554,10 +559,20 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         *,
         expected: SuggestionStatus | None = None,
         consent: ConsentDecision | None = None,
+        expired_because: SuggestionExpiry | None = None,
     ) -> Suggestion:
         if not is_uuid(suggestion_id):
             raise not_found("suggestion", suggestion_id)
         payload: dict = {"status": SuggestionStatus(to).value}
+        if expired_because is not None:
+            # The reason joins the action JSON: read it, then the guarded write below
+            # stores it with the status (an expiry, rare: one extra read).
+            current = await self.get(user_id, suggestion_id)
+            if current is None:
+                raise not_found("suggestion", suggestion_id)
+            payload["action"] = {
+                **current.action, EXPIRY_KEY: SuggestionExpiry(expired_because).value
+            }
         if consent is not None:
             payload |= {
                 "consent_behavior": consent.behavior,
@@ -582,16 +597,16 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         self, user_id: str, trigger: str, day: date, *, tz: str = "UTC"
     ) -> bool:
         start, end = day_bounds(day, tz)
+        # The day's suggestions of one trigger: a handful, bounded all the same.
         rows = await self._run(
-            lambda q: q.select("id")
+            lambda q: q.select("status, action")
             .eq("user_id", user_id)
             .eq("trigger", trigger)
-            .neq("status", SuggestionStatus.EXPIRED.value)
             .gte("created_at", start.isoformat())
             .lt("created_at", end.isoformat())
-            .limit(1)
+            .limit(_DAY_SUGGESTIONS_LIMIT)
         )
-        return bool(rows)
+        return any(made_that_day(r["status"], r.get("action")) for r in rows)
 
 
 class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):

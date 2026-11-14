@@ -144,7 +144,11 @@ async def test_accept__action_out_of_date__expired_and_409_plain_message(repos, 
 
     assert raised.value.http_status == 409
     assert raised.value.message == "This suggestion is out of date — a newer plan replaced it."
-    assert (await repos.suggestions.get(U1, suggestion_id)).status is SuggestionStatus.EXPIRED
+    stored = await repos.suggestions.get(U1, suggestion_id)
+    assert stored.status is SuggestionStatus.EXPIRED
+    assert stored.action["expired_because"] == "out_of_date"
+    # A newer plan replaced it: it was still made today (no second one after a restart).
+    assert await repos.suggestions.exists_today(U1, stored.trigger, NOW.date(), tz="UTC")
     assert log.runs == []
 
 
@@ -161,7 +165,11 @@ async def test_accept__action_conflict__expired_never_back_to_pending(repos, log
 
     assert raised.value.http_status == 409
     assert raised.value.message == "That plan clashes with tasks you already have."
-    assert (await repos.suggestions.get(U1, suggestion_id)).status is SuggestionStatus.EXPIRED
+    stored = await repos.suggestions.get(U1, suggestion_id)
+    assert stored.status is SuggestionStatus.EXPIRED
+    assert stored.action["expired_because"] == "no_fit"
+    # Its plan no longer fit: room for a fresh one today.
+    assert not await repos.suggestions.exists_today(U1, stored.trigger, NOW.date(), tz="UTC")
     with pytest.raises(errors.StaleVersionError):
         await service.accept(U1, suggestion_id)
     assert log.runs == []
@@ -346,6 +354,7 @@ async def test_accept__past_expires_at__expired_and_409_never_listed(repos, log)
     assert raised.value.message == "This suggestion is out of date — a newer plan replaced it."
     stored = await repos.suggestions.get(U1, outcome.suggestion.id)
     assert stored.status is SuggestionStatus.EXPIRED
+    assert stored.action["expired_because"] == "out_of_date"
     assert log.runs == []
 
 

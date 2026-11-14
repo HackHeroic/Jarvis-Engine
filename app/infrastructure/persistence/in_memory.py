@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from app.domain import errors
 from app.domain.entities import (
+    EXPIRY_KEY,
     BehavioralConstraint,
     ChatMessage,
     ConsentDecision,
@@ -28,12 +29,14 @@ from app.domain.entities import (
     Memory,
     MemoryStatus,
     Suggestion,
+    SuggestionExpiry,
     SuggestionStatus,
     Task,
     TaskEvent,
     TaskEventType,
     TaskStatus,
     UserProfile,
+    made_that_day,
 )
 from app.domain.ports import (
     RECENT_SESSIONS_LIMIT,
@@ -471,6 +474,7 @@ class InMemorySuggestionRepository(SuggestionRepository):
         *,
         expected: SuggestionStatus | None = None,
         consent: ConsentDecision | None = None,
+        expired_because: SuggestionExpiry | None = None,
     ) -> Suggestion:
         # No await between the check and the write: the compare-and-set is atomic.
         i = self._index(user_id, suggestion_id)
@@ -479,6 +483,11 @@ class InMemorySuggestionRepository(SuggestionRepository):
         if expected is not None and self._store.suggestions[i].status != expected:
             raise suggestion_changed(suggestion_id, expected)
         update: dict = {"status": SuggestionStatus(to)}
+        if expired_because is not None:
+            update["action"] = {
+                **self._store.suggestions[i].action,
+                EXPIRY_KEY: SuggestionExpiry(expired_because).value,
+            }
         if consent is not None:
             update |= {
                 "consent_behavior": consent.behavior,
@@ -495,7 +504,7 @@ class InMemorySuggestionRepository(SuggestionRepository):
         return any(
             s.user_id == user_id
             and s.trigger == trigger
-            and s.status is not SuggestionStatus.EXPIRED
+            and made_that_day(s.status, s.action)
             and start <= s.created_at < end
             for s in self._store.suggestions
         )

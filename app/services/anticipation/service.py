@@ -54,6 +54,7 @@ from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
     Suggestion,
+    SuggestionExpiry,
     SuggestionStatus,
 )
 from app.domain.ports import ConstraintRepository, ProfileRepository, SuggestionRepository
@@ -313,6 +314,7 @@ class AnticipationService:
             await move_suggestion(
                 self._suggestions, user_id, suggestion_id,
                 SuggestionStatus.PENDING, SuggestionStatus.EXPIRED,
+                expired_because=SuggestionExpiry.OUT_OF_DATE,
             )
             raise errors.InvalidStateTransition(
                 _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
@@ -325,13 +327,21 @@ class AnticipationService:
         try:
             result = await action.execute(user_id)
         except (errors.InvalidStateTransition, errors.NotFoundError) as exc:
-            await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.EXPIRED))
+            # A newer plan replaced it: it was still today's, and counts as made.
+            await asyncio.shield(self._release(
+                user_id, suggestion_id, SuggestionStatus.EXPIRED,
+                because=SuggestionExpiry.OUT_OF_DATE,
+            ))
             raise errors.InvalidStateTransition(
                 _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
             ) from exc
         except errors.ConflictError:
-            # Never handed back as pending: every tap would meet the same conflict.
-            await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.EXPIRED))
+            # Never handed back as pending: every tap would meet the same conflict. Its
+            # plan no longer fits, so a fresh one may be made today.
+            await asyncio.shield(self._release(
+                user_id, suggestion_id, SuggestionStatus.EXPIRED,
+                because=SuggestionExpiry.NO_FIT,
+            ))
             self._settled.pop((user_id, suggestion.trigger), None)
             raise
         except BaseException:
@@ -398,14 +408,23 @@ class AnticipationService:
             return None
         return settled.outcome
 
-    async def _release(self, user_id: str, suggestion_id: str, to: SuggestionStatus) -> None:
-        """Move a claimed suggestion whose action did not finish to ``to``.
+    async def _release(
+        self,
+        user_id: str,
+        suggestion_id: str,
+        to: SuggestionStatus,
+        *,
+        because: SuggestionExpiry | None = None,
+    ) -> None:
+        """Move a claimed suggestion whose action did not finish to ``to`` (an expiry with
+        its reason, ``because``).
 
         A failure is logged, never raised: the caller re-raises the action's own error.
         """
         try:
             await move_suggestion(
-                self._suggestions, user_id, suggestion_id, SuggestionStatus.ACCEPTED, to
+                self._suggestions, user_id, suggestion_id, SuggestionStatus.ACCEPTED, to,
+                expired_because=because,
             )
         except Exception as exc:
             logger.warning(
