@@ -1,0 +1,234 @@
+"""What accepting a proactive suggestion does: the actions behind the first move.
+
+``ApplyDraftAction`` puts a drafted plan in place (the morning brief).
+``AdoptRuleAction`` turns a habit Jarvis noticed into a standing rule, then drafts a
+plan that keeps it (a pattern proposal). ``ShareInsightAction`` changes nothing: it is
+something Jarvis noticed. ``build_action_factory`` registers each kind, so an accepted
+suggestion is rebuilt from its stored payload.
+"""
+
+import logging
+from typing import Any, ClassVar
+from uuid import uuid4
+
+from app.domain import errors
+from app.domain.anticipation import ActionResult, ActionRisk, ProactiveAction
+from app.domain.entities import HOURS_PER_DAY, BehavioralConstraint
+from app.domain.ports import ConstraintRepository, DraftPlanner
+from app.schemas.context import SemanticTimeSlot
+from app.services.anticipation.service import ActionFactory
+from app.services.draft_service import DraftService
+from app.services.memory.constraint_bridge import _to_horizon
+from app.services.memory.memory_service import MemoryService
+from app.services.memory.patterns import _clock_hour
+
+logger = logging.getLogger(__name__)
+
+
+class ApplyDraftAction(ProactiveAction):
+    """Accept a drafted plan: its tasks are written, each with its slot."""
+
+    kind: ClassVar[str] = "apply_plan"
+    risk: ClassVar[ActionRisk] = ActionRisk.SCHEDULE_CHANGE
+
+    def __init__(self, draft_id: str, *, drafts: DraftService) -> None:
+        self._draft_id = draft_id
+        self._drafts = drafts
+
+    def describe(self) -> str:
+        return "Put today's plan in place"
+
+    def dedupe_key(self) -> str:
+        return f"apply_plan:{self._draft_id}"
+
+    def to_payload(self) -> dict:
+        return {"kind": self.kind, "dedupe_key": self.dedupe_key(), "draft_id": self._draft_id}
+
+    async def execute(self, user_id: str) -> ActionResult:
+        """InvalidStateTransition when the draft closed meanwhile (a newer plan replaced it)."""
+        written = await self._drafts.accept(user_id, self._draft_id)
+        return ActionResult(
+            kind=self.kind,
+            message="Done — today's plan is in place.",
+            tasks_written=written,
+            draft_id=self._draft_id,
+        )
+
+
+class AdoptRuleAction(ProactiveAction):
+    """Keep an hour the user keeps setting aside free of demanding work, from now on.
+
+    It carries the pattern's numbers as they were when it was proposed (``confidence``
+    and ``occurrences``), for the suggestion to show.
+    """
+
+    kind: ClassVar[str] = "adopt_rule"
+    risk: ClassVar[ActionRisk] = ActionRisk.SCHEDULE_CHANGE
+
+    def __init__(
+        self,
+        pattern_key: str,
+        hour: int,
+        memory_id: str,
+        *,
+        confidence: float,
+        occurrences: int,
+        constraints: ConstraintRepository,
+        memory: MemoryService,
+        planner: DraftPlanner,
+    ) -> None:
+        if not 0 <= hour < HOURS_PER_DAY:
+            raise errors.ValidationError("An hour runs from 0 to 23.", details={"hour": hour})
+        self._pattern_key = pattern_key
+        self._hour = hour
+        self._memory_id = memory_id
+        self._confidence = float(confidence)
+        self._occurrences = occurrences
+        self._constraints = constraints
+        self._memory = memory
+        self._planner = planner
+
+    def describe(self) -> str:
+        return f"Keep {_clock_hour(self._hour)} free of demanding work"
+
+    def dedupe_key(self) -> str:
+        return f"pattern_rule:{self._pattern_key}"
+
+    def blocked_hours(self) -> tuple[int, int] | None:
+        return (self._hour, self._hour + 1)
+
+    def to_payload(self) -> dict:
+        return {
+            "kind": self.kind,
+            "dedupe_key": self.dedupe_key(),
+            "pattern_key": self._pattern_key,
+            "hour": self._hour,
+            "memory_id": self._memory_id,
+            "confidence": self._confidence,
+            "occurrences": self._occurrences,
+        }
+
+    async def execute(self, user_id: str) -> ActionResult:
+        """Store the rule (once, however often this runs), confirm the pattern, redraft.
+
+        The rule carries its blocked slot already worked out, so planning never spends a
+        model call translating it. Nothing to plan, or nothing that fits, is no draft:
+        the rule still holds for every plan after it.
+        """
+        if not await self._rule_stored(user_id):
+            await self._constraints.add(user_id, self._rule(user_id))
+        await self._memory.confirm(user_id, self._memory_id)
+        try:
+            draft = await self._planner.replan(user_id, reslot_task_ids=[])
+        except errors.ScheduleInfeasibleError:
+            draft = None
+        h12 = _clock_hour(self._hour)
+        if draft is None:
+            return ActionResult(
+                kind=self.kind, message=f"Saved. Every plan from now on keeps {h12} free."
+            )
+        return ActionResult(
+            kind=self.kind,
+            message=(
+                f"Saved. I've drafted a plan that keeps {h12} free"
+                " — accept it when it suits you."
+            ),
+            draft_id=draft.id,
+        )
+
+    async def _rule_stored(self, user_id: str) -> bool:
+        """Whether this pattern's rule is already stored (a retried accept)."""
+        for constraint in await self._constraints.list_active(user_id):
+            semantics = constraint.structured_semantics or {}
+            if semantics.get("pattern_key") == self._pattern_key:
+                return True
+        return False
+
+    def _rule(self, user_id: str) -> BehavioralConstraint:
+        h = self._hour
+        start = _to_horizon(h * 60)
+        slot = SemanticTimeSlot(
+            name=f"learned_rule_{h:02d}",
+            start_min=start,
+            end_min=start + 60,
+            availability="blocked",
+            recurrence="daily",
+        )
+        return BehavioralConstraint(
+            id=uuid4().hex,
+            user_id=user_id,
+            raw_text=f"No demanding work between {h:02d}:00 and {h + 1:02d}:00",
+            constraint_type="habit",
+            recurrence="daily",
+            source="inferred",
+            structured_semantics={
+                "pattern_key": self._pattern_key,
+                "semantic_slots": [slot.model_dump(mode="json")],
+            },
+        )
+
+
+class ShareInsightAction(ProactiveAction):
+    """Something Jarvis noticed. Accepting it changes nothing."""
+
+    kind: ClassVar[str] = "share_insight"
+    risk: ClassVar[ActionRisk] = ActionRisk.READ_ONLY
+
+    def __init__(self, insight: str) -> None:
+        self._insight = insight
+
+    def describe(self) -> str:
+        return self._insight
+
+    def dedupe_key(self) -> str:
+        """The words themselves: a dismissed insight is not shared again."""
+        return f"share_insight:{self._insight}"
+
+    def to_payload(self) -> dict:
+        return {"kind": self.kind, "dedupe_key": self.dedupe_key(), "insight": self._insight}
+
+    async def execute(self, user_id: str) -> ActionResult:
+        return ActionResult(kind=self.kind, message="Noted.")
+
+
+def _field(payload: dict, name: str, kind: type | tuple[type, ...]) -> Any:
+    """``payload[name]`` if it is a ``kind``; else the suggestion can't be carried out."""
+    value = payload.get(name)
+    if not isinstance(value, kind) or isinstance(value, bool):
+        raise errors.ValidationError(
+            "This suggestion can't be carried out.",
+            details={"kind": payload.get("kind"), "field": name},
+        )
+    return value
+
+
+def build_action_factory(
+    *,
+    drafts: DraftService,
+    constraints: ConstraintRepository,
+    memory: MemoryService,
+    planner: DraftPlanner,
+) -> ActionFactory:
+    """An ``ActionFactory`` that rebuilds every action the triggers propose."""
+    factory = ActionFactory()
+    factory.register(
+        ApplyDraftAction.kind,
+        lambda p: ApplyDraftAction(_field(p, "draft_id", str), drafts=drafts),
+    )
+    factory.register(
+        AdoptRuleAction.kind,
+        lambda p: AdoptRuleAction(
+            _field(p, "pattern_key", str),
+            _field(p, "hour", int),
+            _field(p, "memory_id", str),
+            confidence=_field(p, "confidence", (int, float)),
+            occurrences=_field(p, "occurrences", int),
+            constraints=constraints,
+            memory=memory,
+            planner=planner,
+        ),
+    )
+    factory.register(
+        ShareInsightAction.kind, lambda p: ShareInsightAction(_field(p, "insight", str))
+    )
+    return factory

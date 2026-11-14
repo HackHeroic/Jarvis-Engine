@@ -197,6 +197,8 @@ ANTICIPATION_TICK_SECONDS: int = 60
 # run of the same trigger for the same user within this many seconds gets the first
 # one's outcome instead, so repeated clicks cannot each spend a model call.
 ANTICIPATION_MANUAL_COOLDOWN_SECONDS: int = 10
+# The morning brief is due from the user's wake time for this many hours, on their clock.
+MORNING_BRIEF_WINDOW_HOURS: int = 6
 
 # The focus profile (app/services/energy.py) and the solver's energy term. Outcomes of
 # the last FOCUS_WINDOW_DAYS count for the local hour of their slot; each hour's score

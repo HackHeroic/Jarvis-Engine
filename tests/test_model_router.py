@@ -2,6 +2,8 @@ import pytest
 from pydantic import BaseModel
 
 from app.core.model_router import ModelRole, MODEL_ROUTING
+from app.domain.entities import LLMLocation
+from app.domain.ports import LLMProvider
 
 
 def test_routing_table_completeness():
@@ -241,3 +243,148 @@ async def test_route_llm_call__local_dict_fails_schema__falls_back_to_cloud(monk
     assert isinstance(result, _Tiny)
     assert result.color == "blue"
     assert attempts == [False, True]  # local first, then cloud
+
+
+# --- one PRIMARY-role call at a time ------------------------------------------
+# The heavy local model fits in memory once: a background brief's habit translation
+# and a user's planning turn must never run two PRIMARY calls at once.
+
+
+class _HeldModel(LLMProvider):
+    """A cloud model that counts the calls in flight, and holds each until released."""
+
+    name = "held"
+    location = LLMLocation.CLOUD
+
+    def __init__(self) -> None:
+        self.in_flight: list[str] = []
+        self.overlap = 0
+        self.started: list[str] = []
+        self.release = None  # an asyncio.Event; set by the test before calls begin
+
+    def is_available(self) -> bool:
+        return True
+
+    async def complete(self, req):
+        self.started.append(req.task)
+        self.in_flight.append(req.role)
+        self.overlap = max(self.overlap, self.in_flight.count("primary"))
+        try:
+            await self.release.wait()
+        finally:
+            self.in_flight.remove(req.role)
+        return "ok"
+
+    async def stream(self, req):
+        yield ("content", "ok")
+
+
+def _install(model) -> None:
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+
+    set_chain(FallbackChainProvider([model]))
+
+
+async def _until(predicate, timeout: float = 2.0) -> None:
+    import asyncio
+
+    async def wait() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout)
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__two_primary_calls__never_overlap():
+    import asyncio
+
+    from app.core.model_router import route_llm_call
+
+    model = _HeldModel()
+    model.release = asyncio.Event()
+    _install(model)
+
+    first = asyncio.create_task(route_llm_call(task="socratic_chunker", prompt="plan"))
+    second = asyncio.create_task(route_llm_call(task="habit_translation", prompt="habits"))
+    await _until(lambda: model.started)
+    for _ in range(20):  # the second call has every chance to start, and must not
+        await asyncio.sleep(0)
+    assert model.started == ["socratic_chunker"]
+
+    model.release.set()
+    assert await asyncio.gather(first, second) == ["ok", "ok"]
+    assert model.started == ["socratic_chunker", "habit_translation"]
+    assert model.overlap == 1
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__fast_call__not_blocked_by_primary():
+    import asyncio
+
+    from app.core.model_router import route_llm_call
+
+    model = _HeldModel()
+    model.release = asyncio.Event()
+    _install(model)
+
+    heavy = asyncio.create_task(route_llm_call(task="socratic_chunker", prompt="plan"))
+    await _until(lambda: model.started == ["socratic_chunker"])
+    quick = asyncio.create_task(route_llm_call(task="voice_of_jarvis", prompt="hello"))
+
+    await _until(lambda: model.started == ["socratic_chunker", "voice_of_jarvis"])
+    assert not heavy.done()  # the FAST call started while the PRIMARY one held the lock
+    model.release.set()
+    assert await asyncio.gather(heavy, quick) == ["ok", "ok"]
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__primary_call_cancelled__lock_released_for_the_next():
+    """A PRIMARY call cancelled mid-flight (a step timeout, a stopped turn) frees the lock."""
+    import asyncio
+
+    from app.core.model_router import route_llm_call
+
+    model = _HeldModel()
+    model.release = asyncio.Event()
+    _install(model)
+
+    stuck = asyncio.create_task(route_llm_call(task="socratic_chunker", prompt="plan"))
+    await _until(lambda: model.started == ["socratic_chunker"])
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(route_llm_call(task="habit_translation", prompt="h"), 0.05)
+    stuck.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stuck
+
+    model.release.set()
+    assert await asyncio.wait_for(route_llm_call(task="habit_translation", prompt="h"), 2) == "ok"
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__nested_primary_call__runs_under_the_outer_hold():
+    """A PRIMARY call made from inside one (same task, or a task it spawned) does not
+    wait for the lock its own caller holds: no deadlock."""
+    import asyncio
+
+    from app.core.model_router import route_llm_call
+
+    class _NestingModel(_HeldModel):
+        async def complete(self, req):
+            self.started.append(req.task)
+            if req.task == "socratic_chunker":
+                inner = await route_llm_call(task="habit_translation", prompt="inner")
+                spawned = await asyncio.create_task(
+                    route_llm_call(task="calendar_parsing", prompt="spawned")
+                )
+                return f"outer({inner},{spawned})"
+            return "ok"
+
+    model = _NestingModel()
+    _install(model)
+
+    result = await asyncio.wait_for(route_llm_call(task="socratic_chunker", prompt="p"), 2)
+
+    assert result == "outer(ok,ok)"
+    assert model.started == ["socratic_chunker", "habit_translation", "calendar_parsing"]

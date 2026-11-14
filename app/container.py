@@ -15,14 +15,28 @@ from typing import Any
 
 from app.core.model_router import build_chain
 from app.domain.anticipation import ConsentPolicy
-from app.domain.events import EventBus, LLMCallCompleted, TaskCompleted, TaskMissed, TaskSkipped
-from app.domain.ports import EnergyEstimator, Sweep, TextEmbedder
+from app.domain.events import (
+    EventBus,
+    LLMCallCompleted,
+    PatternDetected,
+    TaskCompleted,
+    TaskMissed,
+    TaskSkipped,
+)
+from app.domain.ports import DraftPlanner, EnergyEstimator, Sweep, TextEmbedder
 from app.infrastructure.embedding import MiniLMEmbedder
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
+from app.modules.planning_replan import PlanningGraphReplanner
 from app.orchestrator.hooks import ActionHooks
+from app.services.anticipation.actions import build_action_factory
 from app.services.anticipation.service import ActionFactory, AnticipationService
+from app.services.anticipation.triggers import (
+    AnticipationListener,
+    MorningBriefTrigger,
+    PatternRuleTrigger,
+)
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
@@ -51,8 +65,10 @@ class AppContainer:
     patterns: PatternService
     pattern_observer: PatternObserver
     consent: ConsentPolicy
+    planner: DraftPlanner
     actions: ActionFactory
     anticipation: AnticipationService
+    anticipation_listener: AnticipationListener
     user_model_service: UserModelService
 
     @classmethod
@@ -98,16 +114,35 @@ class AppContainer:
             events.subscribe(outcome, observer)
         # The focus profile: the solver leans on it, the You page shows it.
         energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
-        # Triggers register themselves with the service; each one's action kind with
-        # the factory, so an accepted suggestion can be rebuilt from its payload.
+        draft_service = DraftService(repos.drafts, events, task_events=repos.task_events)
+        # The first move. Each action kind is registered with the factory, so an
+        # accepted suggestion can be rebuilt from its payload; the triggers with the
+        # service. A skip window PEARL finds is offered as a rule right away.
         consent = ConsentPolicy.default()
-        actions = ActionFactory()
+        planner = PlanningGraphReplanner(repos.drafts)
+        actions = build_action_factory(
+            drafts=draft_service,
+            constraints=repos.constraints,
+            memory=memory_service,
+            planner=planner,
+        )
+        anticipation = AnticipationService(
+            {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints
+        )
+        anticipation.register_trigger(
+            MorningBriefTrigger(
+                repos.tasks, repos.task_events, planner, energy, patterns, actions
+            )
+        )
+        anticipation.register_trigger(PatternRuleTrigger(patterns, repos.suggestions, actions))
+        anticipation_listener = AnticipationListener(anticipation)
+        events.subscribe(PatternDetected, anticipation_listener)
 
         return cls(
             repos=repos,
             events=events,
             llm=llm,
-            draft_service=DraftService(repos.drafts, events, task_events=repos.task_events),
+            draft_service=draft_service,
             usage_ledger=usage_ledger,
             task_service=task_service,
             sweeps=[SlotPassedSweep(task_service), MemoryDecaySweep(memory_service)],
@@ -117,16 +152,17 @@ class AppContainer:
             patterns=patterns,
             pattern_observer=observer,
             consent=consent,
+            planner=planner,
             actions=actions,
-            anticipation=AnticipationService(
-                {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints
-            ),
+            anticipation=anticipation,
+            anticipation_listener=anticipation_listener,
             user_model_service=UserModelService(
                 repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
             ),
         )
 
     async def shutdown(self) -> None:
-        """Stop the background work the container owns: PEARL runs in flight get a
-        short grace to finish, then are cancelled."""
+        """Stop the background work the container owns: PEARL runs and the pattern
+        proposals they start get a short grace to finish, then are cancelled."""
         await self.pattern_observer.shutdown()
+        await self.anticipation_listener.shutdown()

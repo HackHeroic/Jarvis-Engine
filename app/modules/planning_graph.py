@@ -35,8 +35,15 @@ class PlanningState(TypedDict):
     # Missed tasks the user asked back this turn: pending again, and fuse_tasks
     # keeps them even when they belong to the goal being re-planned.
     restored_task_ids: list
+    # Replan mode (PlanningGraphReplanner): no goal to break down; the plan is the
+    # user's pending tasks plus the set-aside ones in reslot_task_ids.
+    replan_only: bool
+    reslot_task_ids: list
     anti_guilt_message: Optional[str]
     habits_text: str
+    # Slots of habits stored with them already worked out (a learned rule): they skip
+    # habit translation and join its output.
+    precomputed_slots: list
     semantic_slots: list
     time_slots: Annotated[list, _merge_lists]  # parallel nodes can both add slots
     constraints: list
@@ -170,6 +177,11 @@ async def fetch_constraints(state: PlanningState) -> dict:
     (which weekday is day 0) and every solve attempt must agree on minute 0. It is
     08:00 in the user's zone on their logical day, as an offset-aware ISO string.
     The focus profile is read here once too; every solve attempt reuses it.
+
+    A habit stored with its semantic slots already worked out (a learned rule) stays
+    out of ``habits_text``: its slots go to ``precomputed_slots`` instead, and are the
+    turn's semantic slots until habit translation adds its own, so the rule holds even
+    if translation times out.
     """
     from app.api.v1.endpoints import schedule as schedule_ep
 
@@ -179,12 +191,16 @@ async def fetch_constraints(state: PlanningState) -> dict:
     user_model = state["user_model"]
     if user_model:
         constraints = await user_model.get_behavioral_constraints()
+        habits = [c for c in constraints if c.get("constraint_type") == "habit"]
+        precomputed = [slot for c in habits for slot in _precomputed_slots(c)]
         habits_text = "\n".join(
-            c.get("raw_text", "") for c in constraints if c.get("constraint_type") == "habit"
+            c.get("raw_text", "") for c in habits if not _stored_slots(c)
         )
         return {
             "constraints": constraints,
             "habits_text": habits_text,
+            "precomputed_slots": precomputed,
+            "semantic_slots": precomputed,
             "horizon_start": horizon_start,
             "focus_by_hour": focus_by_hour,
             "_tool_detail": {"rows": len(constraints)},
@@ -192,23 +208,52 @@ async def fetch_constraints(state: PlanningState) -> dict:
     return {
         "constraints": [],
         "habits_text": "",
+        "precomputed_slots": [],
         "horizon_start": horizon_start,
         "focus_by_hour": focus_by_hour,
     }
 
 
+def _stored_slots(constraint: dict) -> list:
+    """The semantic slots a habit row was stored with, or [] for a free-text habit."""
+    semantics = constraint.get("structured_semantics")
+    slots = semantics.get("semantic_slots") if isinstance(semantics, dict) else None
+    return slots if isinstance(slots, list) else []
+
+
+def _precomputed_slots(constraint: dict) -> list[dict]:
+    """A habit row's stored semantic slots, validated; one that does not parse is skipped."""
+    from pydantic import ValidationError
+
+    from app.schemas.context import SemanticTimeSlot
+
+    slots = []
+    for raw in _stored_slots(constraint):
+        try:
+            slots.append(SemanticTimeSlot.model_validate(raw).model_dump(mode="json"))
+        except ValidationError:
+            logger.warning(f"Skipping an unreadable stored slot of habit {constraint.get('id')}")
+    return slots
+
+
 async def translate_habits(state: PlanningState) -> dict:
+    """Translate the free-text habits into semantic slots, joined by the precomputed ones.
+
+    With no free-text habit there is no model call: the precomputed slots are all.
+    """
     habits_text = state.get("habits_text", "")
+    precomputed = list(state.get("precomputed_slots") or [])
     if not habits_text.strip():
-        return {"semantic_slots": [], "_tool_detail": {"slots": 0}}
+        return {"semantic_slots": precomputed, "_tool_detail": {"slots": len(precomputed)}}
     try:
         from app.services.analytical.habit_translator import translate_habits_to_slots
         slots = await translate_habits_to_slots(habits_text)
         result = [s.model_dump() for s in slots] if slots else []
+        result += precomputed
         return {"semantic_slots": result, "_tool_detail": {"slots": len(result)}}
     except Exception as e:
         logger.warning(f"Habit translation failed: {e}")
-        return {"semantic_slots": []}
+        return {"semantic_slots": precomputed}
 
 
 async def expand_slots(state: PlanningState) -> dict:
@@ -328,10 +373,13 @@ async def validate_goal(state: PlanningState) -> dict:
 
 
 def is_goal_clear(state: PlanningState) -> bool:
-    return state.get("clarification_request") is None
+    """A replan has no goal to be clear about: it plans the tasks the user has."""
+    return bool(state.get("replan_only")) or state.get("clarification_request") is None
 
 
 async def decompose_goal(state: PlanningState) -> dict:
+    if state.get("replan_only"):  # nothing new to break down: no model call
+        return {"task_chunks": [], "goal_id": None}
     goal = state.get("planning_goal", "")
     system_prompt = (
         "You are a task decomposition expert. Break the user's goal into 5-8 concrete, "
@@ -435,18 +483,29 @@ async def fuse_tasks(state: PlanningState) -> dict:
     key existed) it falls back to the old id-based de-dupe: no namespace to
     reason with, but still never two chunks wearing one id — the solver and
     `_validate_master_chunk_dependencies` both require uniqueness.
+
+    The user's missed tasks named in ``reslot_task_ids`` join the pending ones, and
+    count as restored: accept re-slots each one on its own row.
     """
     user_model = state.get("user_model")
     pending = []
+    reslotted = []
     if user_model:
         pending = await user_model.get_pending_tasks()
+        reslot_ids = set(state.get("reslot_task_ids") or [])
+        if reslot_ids:
+            reslotted = [
+                m for m in await user_model.get_missed_tasks() if m.get("task_id") in reslot_ids
+            ]
 
     new_chunks = state.get("task_chunks", [])
     goal_id = state.get("goal_id")
-    restored = set(state.get("restored_task_ids") or [])
+    restored_ids = list(state.get("restored_task_ids") or [])
+    restored_ids += [m["task_id"] for m in reslotted if m["task_id"] not in restored_ids]
+    restored = set(restored_ids)
     new_ids = {c.get("task_id") for c in new_chunks if c.get("task_id")}
     merged = list(new_chunks)  # start with new tasks
-    for p in pending:
+    for p in [*pending, *reslotted]:
         pid = p.get("task_id")
         if not pid or pid in new_ids:
             continue
@@ -464,7 +523,10 @@ async def fuse_tasks(state: PlanningState) -> dict:
             "deadline_hint": p.get("deadline_hint"),
         })
 
-    return {"task_chunks": merged, "pending_tasks": pending}
+    out = {"task_chunks": merged, "pending_tasks": pending}
+    if reslotted:
+        out["restored_task_ids"] = restored_ids
+    return out
 
 
 async def solve_schedule(state: PlanningState) -> dict:
@@ -695,12 +757,15 @@ def planning_state_in(state) -> dict:
         "user_model": user_model,
         "user_message": state.get("user_message") or "",
         "restored_task_ids": [],
+        "replan_only": False,
+        "reslot_task_ids": [],
         "planning_goal": (
             brain_dump.planning_goal
             if brain_dump and hasattr(brain_dump, "planning_goal")
             else state.get("user_message", "")
         ),
         "habits_text": "",
+        "precomputed_slots": [],
         "semantic_slots": [],
         "time_slots": [],
         "constraints": [],

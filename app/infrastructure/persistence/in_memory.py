@@ -34,6 +34,7 @@ from app.domain.entities import (
     UserProfile,
 )
 from app.domain.ports import (
+    TASK_LIST_LIMIT,
     ConstraintRepository,
     DraftRepository,
     MemoryMatch,
@@ -107,6 +108,13 @@ class InMemoryTaskRepository(TaskRepository):
             for t in self._store.tasks
             if t.user_id == user_id and t.status == TaskStatus.PENDING
         ]
+
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        wanted = {TaskStatus(status) for status in statuses}
+        newest_first = [
+            t for t in reversed(self._store.tasks) if t.user_id == user_id and t.status in wanted
+        ]
+        return [t.model_copy(deep=True) for t in newest_first[:TASK_LIST_LIMIT]]
 
     async def get(self, user_id: str, task_id: str) -> Task | None:
         indexes = self._indexes(user_id, task_id)
