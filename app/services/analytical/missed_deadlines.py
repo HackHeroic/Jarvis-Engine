@@ -96,11 +96,21 @@ async def detect_and_mark_missed(
 
 
 # "Say the word and I'll work it into this plan": the word, deterministically (no
-# model call). The message must name the set-aside tasks ("missed", "set aside")
-# and ask for them back; a negation anywhere ("don't add the missed ones") is a no.
-_SET_ASIDE_RE = re.compile(r"\b(missed|set[- ]aside)\b", re.IGNORECASE)
+# model call). The message must name the set-aside tasks and ask for them back; a
+# negation anywhere ("don't add the missed ones") is a no. "Missed" has to name the
+# tasks ("the missed tasks", "the ones I missed", "what I missed"), not be a verb
+# about something else: "I missed the lecture, add a review session" is a new task.
+_SA = r"(missed|set[- ]aside)"
+_WHO = r"(i|i've|i have|you|you've|you have)"
+_SET_ASIDE_RE = re.compile(
+    rf"\b{_SA}\s+(tasks?|ones?|items?|work)\b"
+    rf"|\b(the|my|those|these|all)\s+{_SA}\b"
+    rf"|\b(what|tasks?|ones?|items?)\s+{_WHO}\s+{_SA}\b",
+    re.IGNORECASE,
+)
 _BRING_BACK_RE = re.compile(
-    r"\b(add|include|bring\b.*\bback|put\b.*\bback|restore|work (them|it) in(to)?)\b",
+    r"\b(add|include|reschedule|bring\b.*\bback|put\b.*\bback|restore"
+    r"|work (them|it) in(to)?)\b",
     re.IGNORECASE,
 )
 _NEGATION_RE = re.compile(r"\b(don'?t|do not|never|no need|skip)\b", re.IGNORECASE)
@@ -114,11 +124,29 @@ def asks_to_bring_back_missed(message: str | None) -> bool:
     )
 
 
+async def _clear_passed_deadline(user_id: str, task_id: str, supabase: Any) -> None:
+    """Drop a restored task's passed deadline (only while it is still pending)."""
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("user_tasks")
+            .update({"deadline_hint": None})
+            .eq("user_id", user_id)
+            .eq("task_id", task_id)
+            .eq("status", TaskStatus.PENDING.value)
+            .execute()
+        )
+    except Exception as e:
+        # Still back in this plan; a later scan may set it aside again.
+        logger.warning(f"Could not clear the passed deadline of task {task_id}: {e!r}")
+
+
 async def restore_missed(user_id: str, supabase: Any) -> list[dict]:
     """Flip the user's ``missed`` tasks back to ``pending``; return the ones flipped.
 
     Each move goes through ``TaskRepository.update_status`` as a compare-and-set
-    from MISSED, so a task that changed meanwhile is left alone. Returns
+    from MISSED, so a task that changed meanwhile is left alone. Bringing a task
+    back is durable: its passed ``deadline_hint`` is cleared, or the next scan
+    (``detect_and_mark_missed``) would set it straight aside again. Returns
     ``[{"task_id", "title"}]`` for the tasks that are pending again.
     """
     if not supabase:
@@ -148,6 +176,7 @@ async def restore_missed(user_id: str, supabase: Any) -> list[dict]:
         except errors.JarvisError as e:
             logger.warning(f"Could not bring task {row.get('task_id')} back: {e.code}")
             continue
+        await _clear_passed_deadline(user_id, row["task_id"], supabase)
         restored.append({"task_id": row["task_id"], "title": row.get("title")})
     if restored:
         logger.info(f"Brought {len(restored)} missed tasks back for user {user_id}")

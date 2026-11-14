@@ -1503,6 +1503,34 @@ async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
     assert result == {"missed_deadlines": [], "anti_guilt_message": None}
 
 
+@pytest.mark.asyncio
+async def test_mark_missed__asks_back_with_nothing_set_aside__skips_the_scan(monkeypatch):
+    """Asking for the missed tasks never sets anything aside that turn, restored or not."""
+    from app.modules.planning_graph import mark_missed
+
+    async def fake_restore(user_id, supabase):
+        return []
+
+    scans: list[str] = []
+
+    async def fake_detect(user_id, supabase, zone=None):
+        scans.append(user_id)
+        return [{"task_id": "t9", "title": "just restored", "deadline": "2026-08-01"}]
+
+    monkeypatch.setattr(
+        "app.services.analytical.missed_deadlines.restore_missed", fake_restore
+    )
+    monkeypatch.setattr(
+        "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
+    )
+    state = {"user_id": "u1", "user_model": None, "user_message": "add the missed tasks back"}
+
+    result = await mark_missed(state)
+
+    assert scans == []
+    assert result == {"missed_deadlines": [], "anti_guilt_message": None}
+
+
 def test_planning_module__mark_missed_wired_after_gate():
     from app.core.module_framework import build_module_graph
     from app.modules.planning_graph import planning_module
