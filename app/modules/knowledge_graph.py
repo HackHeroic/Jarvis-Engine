@@ -3,6 +3,7 @@
 from typing import Any, Optional, TypedDict
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.errors import public_message
 
 
 class KnowledgeState(TypedDict):
@@ -53,8 +54,9 @@ async def ingest_document(state: KnowledgeState) -> dict:
         )
         return {"ingestion_result": result.model_dump() if hasattr(result, "model_dump") else {"status": "ok"}}
     except Exception as e:
-        logger.error(f"Ingestion failed: {e}")
-        return {"error": str(e)}
+        logger.error(f"Ingestion failed: {e!r}")
+        # Narrated in the reply and saved with it: a safe text, never str(e).
+        return {"error": public_message(e, "the document could not be read")}
 
 
 async def link_to_tasks(state: KnowledgeState) -> dict:

@@ -5,6 +5,9 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.errors import PersistenceError
+
 router = APIRouter()
 
 _VALID_MEMORY_TYPES = {
@@ -86,7 +89,8 @@ async def edit_memory(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Update failed: {e}")
+        logger.error(f"Updating memory failed: {e!r}")
+        raise PersistenceError("Could not update the memory.") from e
 
 
 @router.delete("/{memory_id}")

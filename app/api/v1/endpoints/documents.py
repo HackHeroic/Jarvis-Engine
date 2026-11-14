@@ -2,7 +2,9 @@
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.jarvis_logger import log_step
+from app.domain.errors import PersistenceError
 
 router = APIRouter()
 
@@ -31,7 +33,8 @@ async def list_documents(
             .execute()
         )
     except Exception as exc:
-        raise HTTPException(500, f"Failed to query documents: {exc}") from exc
+        logger.error(f"Listing documents failed: {exc!r}")
+        raise PersistenceError("Could not load your documents.") from exc
 
     documents = docs_result.data or []
 
@@ -109,7 +112,8 @@ async def delete_document(
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(500, f"Failed to delete document record: {exc}") from exc
+        logger.error(f"Deleting the document record failed: {exc!r}")
+        raise PersistenceError("Could not delete the document.") from exc
 
     return {"status": "deleted", "source_id": source_id}
 
@@ -136,4 +140,5 @@ async def get_document_chunks(
         chunks = results.get("documents", []) if results else []
         return {"source_id": source_id, "chunks": chunks, "count": len(chunks)}
     except Exception as exc:
-        raise HTTPException(500, f"Failed to fetch chunks: {exc}") from exc
+        logger.error(f"Fetching document chunks failed: {exc!r}")
+        raise PersistenceError("Could not load the document's chunks.") from exc

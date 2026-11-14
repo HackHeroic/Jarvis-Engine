@@ -2,6 +2,7 @@
 
 from typing import Any, Optional, TypedDict
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.errors import public_message
 
 
 class ResearchState(TypedDict):
@@ -31,8 +32,13 @@ async def execute_search(state: ResearchState) -> dict:
             "iteration_count": state.get("iteration_count", 0) + 1,
         }
     except Exception as e:
-        logger.error(f"Search failed: {e}")
-        return {"error": str(e), "iteration_count": state.get("iteration_count", 0) + 1}
+        logger.error(f"Search failed: {e!r}")
+        # Narrated in the reply and saved with it: a safe text, never str(e). The
+        # web-search-unavailable message is a JarvisError's and is kept verbatim.
+        return {
+            "error": public_message(e, "the search could not run"),
+            "iteration_count": state.get("iteration_count", 0) + 1,
+        }
 
 
 def needs_more(state: ResearchState) -> bool:

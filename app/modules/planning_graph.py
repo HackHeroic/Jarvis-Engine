@@ -5,6 +5,7 @@ import operator
 from typing import Annotated, Any, Optional, TypedDict
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.errors import public_message
 
 # Shared with the orchestrator's draft_action node and the /drafts REST API —
 # the tasks this module hands the solver are the same tasks those two read back
@@ -273,8 +274,12 @@ async def decompose_goal(state: PlanningState) -> dict:
             "_tool_detail": {"task_count": len(chunks)},
         }
     except Exception as e:
-        logger.error(f"Decomposition failed: {e}")
-        return {"error": f"Decomposition failed: {e}", "task_chunks": []}
+        logger.error(f"Decomposition failed: {e!r}")
+        # Narrated in the reply: a safe text, never str(e).
+        return {
+            "error": public_message(e, "the goal could not be broken into steps"),
+            "task_chunks": [],
+        }
 
 
 async def fuse_tasks(state: PlanningState) -> dict:
@@ -359,8 +364,8 @@ async def solve_schedule(state: PlanningState) -> dict:
             },
         )
     except (ValidationError, TypeError, ValueError, KeyError) as exc:
-        logger.error(f"Could not build ExecutionGraph for scheduling: {exc}")
-        return {"error": f"Invalid tasks for scheduling: {exc}", "schedule": None}
+        logger.error(f"Could not build ExecutionGraph for scheduling: {exc!r}")
+        return {"error": "the tasks could not be scheduled", "schedule": None}
 
     # Fresh list: run_schedule appends the biological sleep fallback in place,
     # and PlanningState.time_slots is a reducer-managed list we must not mutate.
