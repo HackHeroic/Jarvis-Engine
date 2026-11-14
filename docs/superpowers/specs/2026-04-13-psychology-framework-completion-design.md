@@ -447,6 +447,8 @@ The IntelligentTrace (from the Intelligent Phase Progress plan) shows psychology
 
 **Script: `scripts/seed_psychology_demo.py`**
 
+> Removed on 2026-11-14: it still called the mastery tracker synchronously after that API became async. Seed demo data with `scripts/seed_demo_user.py`, which drives the live services (see its docstring).
+
 Creates a complete test scenario in one command:
 
 ```python

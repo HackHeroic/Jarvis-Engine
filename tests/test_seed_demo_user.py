@@ -7,15 +7,18 @@ by the real services and the real CP-SAT solver, never asserted from the seed it
 """
 
 import asyncio
+import http.server
 import random
+import re
+import threading
 from collections.abc import AsyncIterator
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import scripts.seed_demo_user as seed
-from app.domain.entities import LLMLocation, TaskEventType
+from app.domain.entities import LLMLocation, TaskEvent, TaskEventType
 from app.domain.events import EventBus
 from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
@@ -70,6 +73,23 @@ def failing_chain() -> _FailEveryCall:
     model = _FailEveryCall()
     set_chain(FallbackChainProvider([model]))
     return model
+
+
+# The real probe, kept before the fixture below replaces it.
+REAL_BACKEND_PROBE = getattr(seed, "_backend_answers", None)
+
+
+@pytest.fixture(autouse=True)
+def no_backend(monkeypatch) -> list[str]:
+    """No backend answers, whatever runs on this machine's port 8000; returns the URLs probed."""
+    probed: list[str] = []
+
+    def nothing_answers(base_url: str) -> bool:
+        probed.append(base_url)
+        return False
+
+    monkeypatch.setattr(seed, "_backend_answers", nothing_answers, raising=False)
+    return probed
 
 
 def _start_of(day: date) -> datetime:
@@ -143,13 +163,9 @@ async def test_seed__history__deadline_crunch_detected():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "today",
-    # Saturday: the 7 PM hour peaks. Wednesday: this week's OS chunks are still set
-    # aside, so 8 PM peaks and 7 PM scores lower.
-    [TODAY, TODAY + timedelta(days=4)],
-    ids=lambda d: f"{d:%a}",
-)
+# Whatever weekday the seed runs on. Run Tue-Fri, this week's OS chunks are still set
+# aside, so 8 PM peaks and 7 PM scores lower than when it runs Sat-Mon.
+@pytest.mark.parametrize("today", A_WEEK_OF_RUN_DAYS, ids=lambda d: f"{d:%a}")
 async def test_seed__history__vision_end_to_end__pattern_profile_and_plan_lean_evening(
     today, deterministic_solver,
 ):
@@ -204,21 +220,15 @@ async def test_seed__history__vision_end_to_end__pattern_profile_and_plan_lean_e
 @pytest.mark.asyncio
 @pytest.mark.parametrize("today", A_WEEK_OF_RUN_DAYS, ids=lambda d: f"{d:%a}")
 async def test_seed__any_run_day__regularities_hold(today):
-    """Whatever weekday it is run on, the seeded regularities are what the live
-    detectors and the focus profile find, and every event type but a deadline miss
-    is in the history."""
+    """Whatever weekday it is run on, the live detectors find the evening peak, the
+    Friday crunch and only one hour set aside, and every event type but a deadline miss
+    is in the history. (The end-to-end test covers the morning pattern and the profile.)"""
     repos, report = await _seed(today)
 
     views = _by_key(await _pearl(repos, today).current(DEMO))
-    skip = views["skip_time_window:9"].pattern
-    assert skip.occurrences >= 3 and skip.confidence >= 0.7
     assert [v.pattern.hour for v in views.values() if v.pattern.detector == "peak_hour"][0] in EVENING
     assert "deadline_crunch" in views
     assert [key for key in views if key.startswith("skip_time_window:")] == ["skip_time_window:9"]
-    profile = await _energy(repos).estimate(DEMO, IST, now=_start_of(today))
-    scores = profile.scores()
-    assert profile.source == "learned"
-    assert min(scores[19], scores[20]) > max(scores[h] for h in MORNING)
     assert set(report["events_by_type"]) == {t.value for t in TaskEventType} - {"deadline_missed"}
 
 
@@ -321,7 +331,9 @@ async def test_seed__no_llm_calls(failing_chain):
     assert store.usage == []
 
 
-def test_seed__dry_run__prints_the_report_without_touching_a_database(monkeypatch, capsys):
+def test_seed__dry_run__prints_the_report_without_touching_a_database(
+    monkeypatch, capsys, no_backend
+):
     def no_database():
         raise AssertionError("a dry run never connects")
 
@@ -332,6 +344,19 @@ def test_seed__dry_run__prints_the_report_without_touching_a_database(monkeypatc
     out = capsys.readouterr().out
     assert "21 days" in out
     assert "tasks" in out and "scheduled" in out
+    assert no_backend == []  # an in-memory run cannot be corrupted by a backend
+
+
+def test_seed__success__ends_with_the_operator_note(capsys):
+    yesterday = datetime.now(IST).date() - timedelta(days=1)
+
+    assert seed.main(["--dry-run"]) == 0
+
+    note = capsys.readouterr().out.split("Seeded through yesterday", 1)[1]
+    assert f"{yesterday:%a %d %b}" in note
+    assert "skip_time_window:9" in note and "deadline_crunch" in note
+    assert re.search(r"learned peak hour: (7|8) PM", note, flags=re.IGNORECASE)
+    assert "seed on the demo day; rerun with --reset to refresh" in note.lower()
 
 
 # --- the demo profile only -------------------------------------------------------------
@@ -385,3 +410,317 @@ def test_reset__deletes_only_the_demo_users_rows__usage_first_profile_last():
     assert first_open["user_profiles"] == max(first_open.values())
     for table in tables:
         assert [row["user_id"] for row in fake.rows[table]] == ["someone-else"], table
+
+
+def test_reset__a_row_the_cascade_should_have_taken_is_still_there__reported():
+    # FakeSupabase has no cascade: these stand in for rows a missing FK would leave.
+    fake = FakeSupabase({
+        "user_profiles": [{"user_id": DEMO}],
+        "chat_sessions": [{"user_id": DEMO}],
+        "goals": [{"user_id": DEMO}],
+    })
+
+    with pytest.raises(seed.SeedProblem) as raised:
+        seed.reset_user(fake, DEMO)
+
+    assert "chat_sessions" in str(raised.value) and "goals" in str(raised.value)
+    assert raised.value.exit_code == 1
+
+
+# --- a running backend, a broken database, a half-written seed --------------------------
+
+
+def _live(monkeypatch, fake: FakeSupabase) -> None:
+    """main's live path, over ``fake`` and a bag-of-words embedder."""
+    monkeypatch.setattr(seed, "_connect", lambda: fake)
+    monkeypatch.setattr(seed, "MiniLMEmbedder", BagOfWordsEmbedder)
+
+
+def _demo_rows(fake: FakeSupabase) -> dict:
+    """The demo user's rows, by table (tables a probe merely opened are left out)."""
+    rows = {table: [row for row in rows if row.get("user_id") == DEMO]
+            for table, rows in fake.rows.items()}
+    return {table: found for table, found in rows.items() if found}
+
+
+def _row_counts(fake: FakeSupabase) -> dict:
+    return {table: len(rows) for table, rows in fake.rows.items() if rows}
+
+
+def test_main__a_backend_answers__refused_with_exit_3_before_anything_is_touched(
+    monkeypatch, capsys, no_backend
+):
+    connected = []
+    monkeypatch.setattr(seed, "_connect", lambda: connected.append(True))
+    monkeypatch.setattr(seed, "_backend_answers", lambda base_url: True)
+
+    assert seed.main(["--user", "demo", "--reset"]) == 3
+
+    out = capsys.readouterr().out
+    assert connected == []
+    assert "JARVIS_ANTICIPATION=false" in out and "--allow-running-backend" in out
+
+
+def test_main__a_backend_answers_but_allowed__seeds(monkeypatch):
+    fake = FakeSupabase()
+    _live(monkeypatch, fake)
+    monkeypatch.setattr(seed, "_backend_answers", lambda base_url: True)
+
+    assert seed.main(["--user", "demo", "--allow-running-backend"]) == 0
+
+    assert fake.rows["task_events"]
+
+
+def test_main__probes_the_backend_health_url_it_is_given(monkeypatch, no_backend):
+    _live(monkeypatch, FakeSupabase())
+
+    assert seed.main(["--user", "demo", "--base-url", "http://127.0.0.1:8123"]) == 0
+
+    assert no_backend == ["http://127.0.0.1:8123"]
+
+
+class _Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - the stdlib's name
+        self.send_response(503)  # an unhealthy backend still answers, and still sweeps
+        self.end_headers()
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def test_backend_probe__answers_only_while_something_listens():
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Health)
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert REAL_BACKEND_PROBE(base_url) is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert REAL_BACKEND_PROBE(base_url) is False
+
+
+def test_run__a_backend_sweep_lands_mid_seed__exit_1_and_says_what_happened(
+    monkeypatch, capsys
+):
+    """The backend's minute tick, on the real clock, between an accept and its outcomes.
+    Two days ago is inside its 7-day lookback and the day's slots are long past, so it
+    sets every pending task aside at real now."""
+    accept = seed._accept_plan
+    accepted = []
+
+    async def racing_accept(s, user_id, slots, horizon, *, at):
+        await accept(s, user_id, slots, horizon, at=at)
+        accepted.append(at)
+        if len(accepted) == seed.DEFAULT_DAYS - 1:
+            await s.tasks.sweep_passed_slots(user_id, datetime.now(timezone.utc))
+
+    monkeypatch.setattr(seed, "_accept_plan", racing_accept)
+
+    assert seed.main(["--dry-run"]) == 1
+
+    out = capsys.readouterr().out
+    assert "--reset" in out and "backend" in out
+    assert "Seeded through yesterday" not in out
+
+
+def _real_now_outcome(today):
+    return TaskEvent(user_id=DEMO, task_id="rogue", event_type=TaskEventType.COMPLETED,
+                     occurred_at=datetime.now(timezone.utc))
+
+
+def _outcome_dated_today(today):
+    return TaskEvent(user_id=DEMO, task_id="rogue", event_type=TaskEventType.MISSED,
+                     occurred_at=datetime.combine(today, time(0, 30), IST))
+
+
+def _extra_scheduled(today):
+    slot = datetime.combine(today - timedelta(days=1), time(9), IST)
+    return TaskEvent(user_id=DEMO, task_id="rogue", event_type=TaskEventType.SCHEDULED,
+                     occurred_at=slot - timedelta(hours=2), scheduled_start=slot,
+                     scheduled_end=slot + timedelta(minutes=25))
+
+
+@pytest.mark.parametrize(
+    ("stray_event", "summary"),
+    [
+        (_real_now_outcome, "real clock"),
+        (_outcome_dated_today, "dated today"),
+        (_extra_scheduled, "scheduled events for"),
+    ],
+    ids=["outcome_at_real_now", "event_dated_today", "extra_scheduled_event"],
+)
+def test_run__self_check__stray_event__exit_1_with_a_plain_summary(
+    monkeypatch, capsys, stray_event, summary
+):
+    real_seed = seed.seed_history
+
+    async def seed_then_stray(s, user_id, **kwargs):
+        report = await real_seed(s, user_id, **kwargs)
+        await s.task_events.append(user_id, stray_event(kwargs["today"]))
+        return report
+
+    monkeypatch.setattr(seed, "seed_history", seed_then_stray)
+
+    assert seed.main(["--dry-run"]) == 1
+
+    out = capsys.readouterr().out
+    assert summary in out and "--reset" in out
+
+
+def test_run__self_check__no_closing_pattern_memory__exit_1(monkeypatch, capsys):
+    async def looks_away(self, user_id):
+        return []
+
+    monkeypatch.setattr(PatternService, "observe", looks_away)
+
+    assert seed.main(["--dry-run"]) == 1
+
+    assert "closing pattern memory" in capsys.readouterr().out
+
+
+class _SchemaGap(FakeSupabase):
+    """FakeSupabase over a database that lacks one column, table or function."""
+
+    def __init__(self, rows: dict, *, column: tuple[str, str] | None = None,
+                 function: str | None = None) -> None:
+        super().__init__(rows)
+        self._column = column
+        self._function = function
+
+    def table(self, name: str):
+        query = super().table(name)
+        if self._column is not None and name == self._column[0]:
+            select = query.select
+
+            def select_or_fail(*columns: str):
+                if any(self._column[1] in c for c in columns):
+                    raise Exception(f"column {name}.{self._column[1]} does not exist")
+                return select(*columns)
+
+            query.select = select_or_fail
+        return query
+
+    def rpc(self, name: str, params: dict):
+        if name == self._function:
+            raise Exception(f"PGRST202 Could not find the function public.{name}")
+        return super().rpc(name, params)
+
+
+DEMO_LEFTOVERS = {
+    "user_tasks": [{"user_id": DEMO, "task_id": "t1", "title": "t", "status": "pending"}],
+    "task_events": [{"user_id": DEMO, "task_id": "t1", "event_type": "scheduled"}],
+    "user_profiles": [{"user_id": DEMO}],
+}
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        {"column": ("task_events", "event_type")},
+        {"column": ("user_memories", "pattern_key")},
+        {"column": ("user_memories", "provenance")},
+        {"column": ("proactive_suggestions", "consent_kind")},
+        {"function": "accept_draft"},
+        {"function": "match_memories"},
+    ],
+    ids=lambda gap: ".".join(gap.get("column") or (gap.get("function"),)),
+)
+def test_main__database_not_migrated__exit_2_before_the_reset_deletes_anything(
+    monkeypatch, capsys, gap
+):
+    fake = _SchemaGap({t: [dict(r) for r in rows] for t, rows in DEMO_LEFTOVERS.items()}, **gap)
+    _live(monkeypatch, fake)
+    before = _demo_rows(fake)
+
+    assert seed.main(["--user", "demo", "--reset"]) == 2
+
+    assert "apply the migrations first" in capsys.readouterr().out
+    assert _demo_rows(fake) == before
+
+
+def test_main__embedder_not_working__exit_2_before_the_reset_deletes_anything(
+    monkeypatch, capsys
+):
+    from app.domain.errors import EmbeddingUnavailableError
+
+    class _NoModel(BagOfWordsEmbedder):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            raise EmbeddingUnavailableError("Text embeddings are unavailable.")
+
+    fake = FakeSupabase({t: [dict(r) for r in rows] for t, rows in DEMO_LEFTOVERS.items()})
+    monkeypatch.setattr(seed, "_connect", lambda: fake)
+    monkeypatch.setattr(seed, "MiniLMEmbedder", _NoModel)
+    before = _demo_rows(fake)
+
+    assert seed.main(["--user", "demo", "--reset"]) == 2
+
+    assert "embedder" in capsys.readouterr().out
+    assert _demo_rows(fake) == before
+
+
+def test_guard__events_but_no_closing_memory__partial_seed_exit_1(monkeypatch, capsys):
+    """A run that died before PEARL looked: its history is there, its patterns are not."""
+    fake = FakeSupabase()
+    _live(monkeypatch, fake)
+    assert seed.main(["--user", "demo"]) == 0
+    fake.rows["user_memories"] = [r for r in fake.rows["user_memories"]
+                                  if r.get("source") != "behavior"]
+    seeded = _row_counts(fake)
+    capsys.readouterr()
+
+    assert seed.main(["--user", "demo"]) == 1
+
+    assert "partial seed found — rerun with --reset" in capsys.readouterr().out
+    assert _row_counts(fake) == seeded
+
+
+async def _leave_task(repos) -> None:
+    """A demo task with no history: a plan accepted when no event store was wired."""
+    from app.services.draft_service import DraftService
+
+    draft = await repos.drafts.create(
+        DEMO,
+        tasks=[{"task_id": "reading_a1b2c3_task_1", "title": "Read the OS paper",
+                "duration_minutes": 25, "difficulty_weight": 0.5,
+                "completion_criteria": "Write a three-line summary", "goal_id": "reading"}],
+        horizon_start=datetime.combine(TODAY, time(8), IST).isoformat(),
+        goal_id=None, schedule=None,
+    )
+    await DraftService(repos.drafts, EventBus()).accept(DEMO, draft.id)
+
+
+async def _leave_memory(repos) -> None:
+    from app.services.memory.memory_service import MemoryCandidate, MemoryService
+
+    await MemoryService(repos.memories, BagOfWordsEmbedder()).remember(
+        DEMO, MemoryCandidate(memory_type="fact", content="I play the violin on Sundays.")
+    )
+
+
+async def _leave_suggestion(repos) -> None:
+    from app.domain.entities import Suggestion, SuggestionStatus
+
+    await repos.suggestions.add(DEMO, Suggestion(
+        user_id=DEMO, trigger="morning_brief", kind="reslot", title="A new slot",
+        body="I found a new slot for this.", status=SuggestionStatus.PENDING,
+        consent_behavior="ask", consent_reason="You asked to be asked first.",
+        created_at=datetime.now(timezone.utc),
+    ))
+
+
+@pytest.mark.parametrize("leave", [_leave_task, _leave_memory, _leave_suggestion],
+                         ids=["user_tasks", "user_memories", "proactive_suggestions"])
+def test_guard__demo_rows_but_no_history__partial_seed_exit_1_never_a_merge(
+    monkeypatch, capsys, leave
+):
+    fake = FakeSupabase()
+    asyncio.run(leave(RepositoryFactory.supabase(fake)))
+    _live(monkeypatch, fake)
+    before = _row_counts(fake)
+
+    assert seed.main(["--user", "demo"]) == 1
+
+    assert "partial seed found — rerun with --reset" in capsys.readouterr().out
+    assert _row_counts(fake) == before
