@@ -145,8 +145,21 @@ async def test_voj_synthesis__model_down__returns_the_deterministic_reply(llm):
 
     message, thinking = await synthesize_jarvis_response({"schedule_generated": True})
 
-    assert message == "Here's your schedule."
-    assert thinking and "CP-SAT" in thinking
+    # A proposed schedule is a draft under review, not a plan already set.
+    assert message == "A proposed schedule is ready for your review, sir."
+    assert thinking is None  # no model reasoning exists, so none is invented
+
+
+@pytest.mark.asyncio
+async def test_voj_synthesis__reply_without_think_block__full_message_and_no_thinking(llm):
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
+
+    llm(voice_of_jarvis_synthesis="Your draft is ready, sir. Six tasks, none before nine.")
+
+    message, thinking = await synthesize_jarvis_response({"schedule_generated": True})
+
+    assert message == "Your draft is ready, sir. Six tasks, none before nine."
+    assert thinking is None
 
 
 @pytest.mark.asyncio
@@ -178,8 +191,66 @@ async def test_voj_stream__model_down__yields_the_fallback_events(llm):
 
     events = [e async for e in synthesize_jarvis_response_stream({"schedule_generated": True})]
 
-    assert [kind for kind, _ in events] == ["thinking", "message"]
-    assert events[-1] == ("message", "Your schedule is set, sir.")
+    assert events == [("message", "A proposed schedule is ready for your review, sir.")]
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__model_down_and_no_schedule__claims_nothing_was_done(llm):
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    llm(voice_of_jarvis_synthesis=_down())
+
+    events = [
+        e async for e in synthesize_jarvis_response_stream({"search_done": True, "schedule_generated": False})
+    ]
+
+    (kind, reply), = events
+    assert kind == "message"
+    assert "schedule" not in reply.lower() and "plan" not in reply.lower()
+    assert "sorted" not in reply.lower()  # the old fallback claimed everything was done
+    assert reply.endswith("sir. Shall we try again shortly?")
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__reply_without_think_block__message_only(llm):
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    llm(voice_of_jarvis_synthesis="Your draft is ready, sir.")
+
+    events = [e async for e in synthesize_jarvis_response_stream({"schedule_generated": True})]
+
+    assert {kind for kind, _ in events} == {"message"}
+    assert "".join(t for _, t in events) == "Your draft is ready, sir."
+
+
+def test_prompts__every_prompt_constant__never_asks_the_model_to_write_out_its_reasoning():
+    """Asking a model to emit its reasoning in tags is declined by Claude's safeguards
+    (the live reply synthesis came back refused), so no prompt may ask for it. A local
+    model that emits a think block anyway is still parsed (tests above)."""
+    import importlib
+    import pkgutil
+
+    import app
+
+    prompts: dict[str, str] = {}
+    for info in pkgutil.walk_packages(app.__path__, "app."):
+        if info.name.startswith(("app.models.", "app.main")):
+            continue  # ML stubs with heavy optional imports; no prompts live there
+        try:
+            module = importlib.import_module(info.name)
+        except ImportError:
+            continue  # an optional dependency (docling, chromadb...) is not installed
+        for attr, value in vars(module).items():
+            if "PROMPT" in attr and isinstance(value, str):
+                prompts[f"{info.name}.{attr}"] = value
+
+    assert "app.services.analytical.voice_of_jarvis.VOICE_OF_JARVIS_PROMPT" in prompts
+    assert "app.modules.conversation.JARVIS_CHAT_PROMPT" in prompts
+    for name, text in prompts.items():
+        assert "<think" not in text.lower() and "think>" not in text.lower(), name
+    voice = prompts["app.services.analytical.voice_of_jarvis.VOICE_OF_JARVIS_PROMPT"]
+    for asks_for_reasoning in ("thinking", "reasoning", "internally"):
+        assert asks_for_reasoning not in voice.lower(), asks_for_reasoning
 
 
 # --- habit translation ----------------------------------------------------------------

@@ -1573,13 +1573,17 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 thinking_clean = thinking_extracted or ""
 
             _assistant_msg = message_clean or final_state.get("response_message") or "Standing by, sir."
+            # A draft id belongs to the turn that proposed it: only a turn that
+            # produced a schedule did. Any other turn (an accept, an edit request)
+            # would otherwise re-announce the thread's draft as if it were new.
+            _turn_draft_id = final_state.get("draft_id") if _has_schedule else None
 
             # --- Save assistant message ---
             _msg_id = await save_assistant_message(
                 session_id, request.user_id, _assistant_msg, _intent,
                 {
                     "schedule": final_state.get("schedule"),
-                    "draft_id": final_state.get("draft_id"),
+                    "draft_id": _turn_draft_id,
                     "intent": _intent,
                 },
                 supabase,
@@ -1603,7 +1607,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 "thinking_process": thinking_clean or final_state.get("thinking_process"),
                 "awaiting_task_confirmation": False,
                 "schedule_status": "draft" if _has_schedule else None,
-                "draft_id": final_state.get("draft_id"),
+                "draft_id": _turn_draft_id,
                 "saved_constraints": final_state.get("saved_constraints"),
                 "conversation_id": session_id,
                 "message_id": _msg_id,

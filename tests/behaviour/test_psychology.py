@@ -15,6 +15,7 @@ contract at the model boundary (what the model is told, and with which data) and
 the deterministic fallbacks a user sees when the model is unavailable.
 """
 
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -178,13 +179,15 @@ async def test_clt__high_intrinsic_load__the_plan_gets_the_lower_cap_and_a_light
     assert max(_minutes_per_day(hard).values()) < max(_minutes_per_day(ordinary).values())
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
 async def test_planning__solve_runs_to_the_solver_time_cap__best_schedule_still_delivered(
     jarvis, llm, monday_morning
 ):
-    """Slow on purpose (~35 s): ten tasks of graded difficulty keep CP-SAT busy for its
-    whole SOLVER_MAX_TIME_SECONDS budget, after which it returns the best schedule it
-    found. Ten tasks is an ordinary plan once other goals' pending tasks are fused in."""
+    """Slow on purpose (about SOLVER_MAX_TIME_SECONDS, 10 s by default), so it runs only
+    under ``pytest -m slow``: ten tasks of graded difficulty keep CP-SAT busy for its
+    whole time budget, after which it returns the best schedule it found. Ten tasks is
+    an ordinary plan once other goals' pending tasks are fused in."""
     titles = [f"Topic {i}" for i in range(1, 11)]
     graded = decomposition(titles)
     for i in range(1, 11):
@@ -217,14 +220,29 @@ async def test_woop__every_planned_task__keeps_its_if_then_plan_into_the_task_li
         assert plan["behavioral_response"].startswith("then ")
 
 
+@pytest.mark.asyncio
+async def test_woop__decomposition_prompt__asks_for_an_if_then_plan_on_every_task(
+    jarvis, llm, monday_morning
+):
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+
+    await jarvis.say("Plan my DSA revision")
+
+    (chunker,) = llm.calls_for("socratic_chunker")
+    instruction = chunker.system_prompt
+    assert "implementation_intention" in instruction
+    assert "obstacle_trigger" in instruction and "behavioral_response" in instruction
+    assert "every task" in instruction.lower()
+
+
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
     reason=(
-        "WOOP is optional on the v2 planning path: TaskChunk.implementation_intention is "
-        "Optional, planning_graph.decompose_goal's prompt never asks for one, and no "
-        "default if-then is filled in, so a decomposition without intentions is "
-        "proposed as is. Needs a decision on the default plan's content."
+        "The decomposition prompt asks for an if-then plan on every task, but when the "
+        "model leaves one out nothing fills it in: TaskChunk.implementation_intention is "
+        "Optional and there is no default if-then. Needs a decision on the default "
+        "plan's content."
     ),
 )
 @pytest.mark.asyncio
@@ -273,6 +291,46 @@ def test_anti_guilt__missed_task_framing__has_no_blame(overdue):
     message = missed_deadlines.build_anti_guilt_message(tasks)
 
     assert message and blame_phrases_in(message) == []
+
+
+REQUEUE_CLAIMS = ("recalibrated", "folded", "planning queue", "rescheduled", "back into")
+
+
+@pytest.mark.parametrize("overdue", [1, 2, 5])
+def test_anti_guilt__overdue_message__says_set_aside_and_claims_no_requeue(overdue):
+    tasks = [{"task_id": f"t{i}", "title": f"Problem set {i}"} for i in range(overdue)]
+
+    message = missed_deadlines.build_anti_guilt_message(tasks).lower()
+
+    assert [claim for claim in REQUEUE_CLAIMS if claim in message] == []
+    assert re.search(r"set (it|them) aside", message) and "nothing is lost" in message
+    assert "say the word" in message and "this plan" in message
+
+
+@pytest.mark.asyncio
+async def test_anti_guilt__overdue_tasks__are_left_out_of_the_plan_as_the_message_says(
+    jarvis, llm, monday_morning
+):
+    for i, title in enumerate(["Problem set 3", "Read chapter 2"]):
+        jarvis.db.table("user_tasks").insert({
+            "id": f"row-{i}", "user_id": "alice", "task_id": f"old_task_{i}", "goal_id": "old",
+            "title": title, "status": "pending", "duration_minutes": 25,
+            "deadline_hint": _day(-3),
+        }).execute()
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    calls_before = len(llm.calls)
+
+    turn = await jarvis.say("Plan my DSA revision")
+
+    # The tasks really are set aside: neither the draft nor the schedule carries them.
+    draft_titles = {t["title"] for t in jarvis.draft(turn.draft_id)["tasks"]}
+    scheduled_titles = {t["title"] for t in turn.payload["schedule"]["schedule"].values()}
+    assert not {"Problem set 3", "Read chapter 2"} & (draft_titles | scheduled_titles)
+    # And the user is told exactly that, not that they were re-queued.
+    (synthesis,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis_synthesis"]
+    (framing,) = [line for line in synthesis.prompt.splitlines() if line.startswith("anti_guilt:")]
+    assert re.search(r"set (it|them) aside", framing)
+    assert [claim for claim in REQUEUE_CLAIMS if claim in framing.lower()] == []
 
 
 @pytest.mark.asyncio
@@ -584,21 +642,12 @@ async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clo
     assert not [s for s in starts if s.hour < 8]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "v2 planning can schedule into the past: solve_schedule lets run_schedule anchor "
-        "minute 0 at 08:00 of today (UTC) whatever the time, and v1's 'past' hard block "
-        "(control_policy, minutes elapsed since horizon_start) was never ported, so a plan "
-        "made at 22:00 puts its first tasks at 08:00 the same day — 14 hours ago. Porting "
-        "it shifts every planning test with the wall clock, so it needs an injectable "
-        "'now' through solve_schedule: a design change, not a local fix."
-    ),
-)
+@pytest.mark.parametrize("hour", [14, 22])
 @pytest.mark.asyncio
-async def test_late_night__plan_made_at_10pm__nothing_scheduled_in_the_past(jarvis, llm, clock):
-    made_at = datetime(2026, 11, 16, 22, 0, tzinfo=timezone.utc)
+async def test_late_day__plan_made_after_8am__nothing_scheduled_in_the_past(
+    jarvis, llm, clock, hour
+):
+    made_at = datetime(2026, 11, 16, hour, 0, tzinfo=timezone.utc)
     clock.freeze(made_at, schedule_endpoint)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
     planned = await jarvis.say("Plan my DSA revision")

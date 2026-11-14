@@ -142,8 +142,8 @@ def _on_every_day(slots: list[dict]) -> list[dict]:
     nothing downstream expands it, so "no study before 11 AM" held on the first day
     only and day two started at 08:00. Repeated out to MAX_HORIZON_MINUTES, not the
     first attempt's horizon: the INFEASIBLE ladder can stretch a plan to 30 days and
-    these slots are not rebuilt per attempt. Copies past an attempt's horizon
-    constrain nothing.
+    these slots are not rebuilt per attempt. ``solve_schedule`` drops the copies
+    that start past the attempt's horizon before the solver sees them.
     """
     days = MAX_HORIZON_MINUTES // 1440
     return [
@@ -201,7 +201,10 @@ async def decompose_goal(state: PlanningState) -> dict:
     goal = state.get("planning_goal", "")
     system_prompt = (
         "You are a task decomposition expert. Break the user's goal into 5-8 concrete, "
-        "actionable micro-tasks of 15-25 minutes each. Each task must have clear completion criteria."
+        "actionable micro-tasks of 15-25 minutes each. Each task must have clear completion criteria. "
+        "Every task must also carry an implementation_intention, an if-then plan for the "
+        "obstacle most likely to stall it: obstacle_trigger is the concrete 'If ...' situation "
+        "and behavioral_response is the concrete 'then ...' action the user takes."
     )
 
     # Query ChromaDB for relevant knowledge to augment decomposition
@@ -364,11 +367,16 @@ async def solve_schedule(state: PlanningState) -> dict:
     daily_context: list[TimeSlot] = []
     for slot in state.get("time_slots", []):
         try:
-            daily_context.append(
-                slot if isinstance(slot, TimeSlot) else TimeSlot.model_validate(slot)
-            )
+            parsed = slot if isinstance(slot, TimeSlot) else TimeSlot.model_validate(slot)
         except (ValidationError, TypeError, ValueError) as exc:
             logger.warning(f"Skipping unparseable time slot {slot}: {exc}")
+            continue
+        # Standing rules arrive repeated out to 30 days (_on_every_day). A copy that
+        # starts past this attempt's horizon constrains nothing the solver places,
+        # but it would still be modelled — soft blocks add variables per task.
+        if parsed.start_min >= horizon:
+            continue
+        daily_context.append(parsed)
 
     try:
         # horizon_start is left to run_schedule (Optional[datetime], never a
@@ -491,9 +499,35 @@ async def handle_infeasible(state: PlanningState) -> dict:
     }
 
 
+# What the user reads when the solve step ends without a schedule for any reason
+# other than infeasibility: the step ran past its timeout, or there was nothing it
+# could schedule. Honest and blame-free; nothing was proposed or written.
+UNSOLVED_MESSAGE = (
+    "I couldn't work out a schedule for this just now, sir — nothing has been proposed "
+    "or saved. Shall we try again?"
+)
+
+
+async def report_unsolved(state: PlanningState) -> dict:
+    """End a planning turn whose solve produced no schedule, saying so.
+
+    A step timeout returns nothing at all, so without this the turn carried no
+    schedule, no error and no clarification, and synthesis narrated a plan that
+    did not exist. The clarification takes the honesty gate in synthesis: the
+    reply is this message verbatim, with no model call.
+    """
+    return {
+        "error": state.get("error") or "SOLVE_FAILED",
+        "clarification_request": UNSOLVED_MESSAGE,
+        "_tool_detail": {"status": "UNSOLVED"},
+    }
+
+
 def check_feasibility(state: PlanningState) -> str:
     if state.get("error") == "INFEASIBLE":
         return "INFEASIBLE"
+    if not state.get("schedule"):
+        return "UNSOLVED"
     return "OPTIMAL"
 
 
@@ -565,9 +599,6 @@ def planning_state_out(result: dict, module_name: str) -> dict:
         "clarification_request": clarification,
         "error": error,
         "draft_id": draft_id,
-        # NOTE: anti_guilt_message and missed_deadlines are not yet computed in
-        # the v2 sub-graph — placeholder for the upcoming port of
-        # detect_and_mark_missed (currently lives in control_policy._run_plan_day_flow).
         "anti_guilt_message": result.get("anti_guilt_message"),
         "missed_deadlines": result.get("missed_deadlines"),
     }
@@ -626,10 +657,16 @@ planning_module = ModuleDefinition(
         ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
         ModuleStep(name="solve_schedule", handler=solve_schedule,
                    depends_on=["fuse_tasks"], timeout_ms=SOLVE_STEP_TIMEOUT_MS,
-                   routes_to={check_feasibility: {"OPTIMAL": "create_draft", "INFEASIBLE": "handle_infeasible"}}),
+                   routes_to={check_feasibility: {
+                       "OPTIMAL": "create_draft",
+                       "INFEASIBLE": "handle_infeasible",
+                       "UNSOLVED": "report_unsolved",
+                   }}),
         # No depends_on: reached only via solve_schedule's OPTIMAL branch, the
-        # same way handle_infeasible is reached via INFEASIBLE.
+        # same way handle_infeasible is reached via INFEASIBLE and
+        # report_unsolved via UNSOLVED.
         ModuleStep(name="create_draft", handler=create_draft),
+        ModuleStep(name="report_unsolved", handler=report_unsolved, read_only=True),
         ModuleStep(name="handle_infeasible", handler=handle_infeasible,
                    routes_to={can_retry: {"retry": "solve_schedule", "exhausted": "__END__"}}),
     ],

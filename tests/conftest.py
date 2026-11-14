@@ -1,6 +1,8 @@
 """Shared test fixtures for Jarvis Engine tests."""
 
 import socket
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 from unittest.mock import MagicMock
@@ -232,3 +234,41 @@ def sample_tasks():
             "deadline_hint": None,
         },
     ]
+
+
+# --- time ----------------------------------------------------------------------
+
+
+class Clock:
+    """Freezes ``datetime.now`` inside chosen modules; ``advance`` moves it on.
+
+    Shared by every suite: planning reads "now" (``run_schedule`` blocks the part of
+    today already gone by), so a test that plans must freeze it to be repeatable.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self._monkeypatch = monkeypatch
+        self.now: datetime | None = None
+
+    def freeze(self, when: datetime, *modules: Any) -> None:
+        self.now = when
+        clock = self
+
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: D401 - mirrors datetime.now
+                current = clock.now
+                if tz is not None:
+                    return current.astimezone(tz)
+                return current.astimezone(timezone.utc).replace(tzinfo=None)
+
+        for module in modules:
+            self._monkeypatch.setattr(module, "datetime", _Frozen)
+
+    def advance(self, **delta: float) -> None:
+        self.now = self.now + timedelta(**delta)
+
+
+@pytest.fixture
+def clock(monkeypatch) -> Clock:
+    return Clock(monkeypatch)

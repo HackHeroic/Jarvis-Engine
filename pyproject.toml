@@ -63,3 +63,7 @@ include = ["app*"]
 # and `app` is not installed into the venv, so it relies on the same accident.
 # Resolved relative to rootdir, so the CWD it is invoked from does not matter.
 pythonpath = ["."]
+# `slow` tests (the solver run to its full time cap) are left out of the default
+# run; `pytest -m slow` runs them.
+markers = ["slow: takes seconds of wall clock on purpose; run with `pytest -m slow`"]
+addopts = '-m "not slow"'

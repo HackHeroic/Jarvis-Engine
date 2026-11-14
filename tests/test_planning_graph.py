@@ -2,7 +2,7 @@
 
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +13,18 @@ from app.core.module_framework import build_module_graph
 # Captured at import, before any fixture can swap it out: the decomposition
 # tests below want the REAL router in the loop and fake one layer lower.
 from app.core.model_router import route_llm_call as _real_route_llm_call
+
+
+@pytest.fixture
+def before_the_horizon(clock):
+    """Plans made at 07:30 UTC: the 08:00 horizon is still ahead, so none of it is past.
+
+    Planning reads the wall clock (run_schedule blocks the part of today already
+    gone by), so a real solve is only repeatable with "now" frozen.
+    """
+    import app.api.v1.endpoints.schedule as schedule_endpoint
+
+    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), schedule_endpoint)
 
 
 def _chunk(task_id: str = "t1", **overrides) -> dict:
@@ -43,6 +55,7 @@ def test_planning_graph_has_expected_steps():
         "memory_to_constraints", "validate_goal",
         "mark_missed", "decompose_goal",
         "fuse_tasks", "solve_schedule", "handle_infeasible", "create_draft",
+        "report_unsolved",
     }
     actual = {s.name for s in planning_module.steps}
     assert actual == expected
@@ -147,7 +160,7 @@ async def test_solve_schedule__horizon_start_comes_from_run_schedule():
 
 
 @pytest.mark.asyncio
-async def test_solve_schedule__real_solver__horizon_start_is_parseable_iso():
+async def test_solve_schedule__real_solver__horizon_start_is_parseable_iso(before_the_horizon):
     """End-to-end: the echoed horizon_start round-trips through fromisoformat."""
     from app.modules.planning_graph import solve_schedule
 
@@ -300,7 +313,7 @@ async def test_solve_schedule__no_tasks__returns_error_without_calling_solver():
 
 
 @pytest.mark.asyncio
-async def test_solve_schedule__real_solver__applies_biological_sleep_fallback():
+async def test_solve_schedule__real_solver__applies_biological_sleep_fallback(before_the_horizon):
     """End-to-end through the REAL run_schedule + real CP-SAT (never mocked).
 
     With no sleep habit in time_slots, run_schedule injects the Midnight-8 AM
@@ -602,6 +615,94 @@ def test_planning_graph__optimal_solve_routes_through_create_draft():
     assert destinations["INFEASIBLE"] == "handle_infeasible"
 
 
+def test_check_feasibility__solve_ended_without_a_schedule__routes_to_report_unsolved():
+    """A step timeout leaves no schedule and no error: that must not read as OPTIMAL."""
+    from app.modules.planning_graph import check_feasibility
+
+    solve = next(s for s in planning_module.steps if s.name == "solve_schedule")
+    destinations = next(iter(solve.routes_to.values()))
+
+    assert check_feasibility({"schedule": None, "error": None}) == "UNSOLVED"
+    assert check_feasibility({"schedule": None, "error": "No tasks to schedule"}) == "UNSOLVED"
+    assert check_feasibility({"schedule": None, "error": "INFEASIBLE"}) == "INFEASIBLE"
+    assert check_feasibility({"schedule": {"schedule": {}}, "error": None}) == "OPTIMAL"
+    assert destinations["UNSOLVED"] == "report_unsolved"
+
+
+@pytest.mark.asyncio
+async def test_report_unsolved__no_schedule__asks_to_try_again_without_blame():
+    from app.modules.planning_graph import report_unsolved
+
+    out = await report_unsolved({"schedule": None, "error": None})
+
+    assert out["error"] == "SOLVE_FAILED"
+    assert "try again" in out["clarification_request"]
+    assert "fail" not in out["clarification_request"].lower()
+
+
+def test_solve_step_timeout__outlives_the_solver_cap():
+    """The step must outlast CP-SAT's own cap, or the best schedule found is thrown away."""
+    from app.core.config import SOLVER_MAX_TIME_SECONDS
+    from app.modules.planning_graph import SOLVE_STEP_TIMEOUT_MS
+
+    solve = next(s for s in planning_module.steps if s.name == "solve_schedule")
+
+    assert SOLVE_STEP_TIMEOUT_MS > SOLVER_MAX_TIME_SECONDS * 1000
+    assert solve.timeout_ms == SOLVE_STEP_TIMEOUT_MS
+
+
+def test_solver_cap__default__is_ten_seconds():
+    """A demo-length wait: 10 s by default, still overridable through the env var."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "JARVIS_SOLVER_MAX_TIME_SECONDS"}
+    probe = "import app.core.config as c; print(c.SOLVER_MAX_TIME_SECONDS)"
+
+    def cap_with(extra_env: dict) -> str:
+        return subprocess.run(
+            [sys.executable, "-c", probe], env={**env, **extra_env}, cwd=repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    default = cap_with({})
+    overridden = cap_with({"JARVIS_SOLVER_MAX_TIME_SECONDS": "4"})
+
+    assert float(default) == 10.0
+    assert float(overridden) == 4.0
+
+
+@pytest.mark.asyncio
+async def test_solve_schedule__rule_copies_past_the_horizon__never_reach_the_solver():
+    """_on_every_day repeats a standing rule for 30 days; only this attempt's days matter."""
+    from app.modules.planning_graph import _on_every_day, solve_schedule
+
+    rule = {"name": "no_study_before_11", "start_min": 0, "end_min": 180,
+            "availability": "minimal_work", "recurring": True}
+    with patch(
+        "app.api.v1.endpoints.schedule.run_schedule", return_value=MagicMock()
+    ) as m:
+        await solve_schedule(
+            {
+                "task_chunks": [_chunk()],
+                "time_slots": _on_every_day([rule]),
+                "horizon_minutes": 2880,
+                "user_id": "u1",
+            }
+        )
+
+    daily_context = m.call_args.args[1]
+    assert all(slot.start_min < 2880 for slot in daily_context)
+    # The rule still holds on every day inside the horizon.
+    assert sorted((s.name, s.start_min) for s in daily_context) == [
+        ("no_study_before_11_d0", 0),
+        ("no_study_before_11_d1", 1440),
+    ]
+
+
 def test_planning_state_in__carries_the_draft_store_into_the_subgraph():
     from app.modules.planning_graph import planning_state_in
 
@@ -780,7 +881,7 @@ def _count_invocations(monkeypatch, module, *names) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(monkeypatch):
+async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(monkeypatch, before_the_horizon):
     """One goal, one decomposition. The fan-in is a barrier, not two triggers.
 
     Wired as independent edges, `expand_slots` and `memory_to_constraints`

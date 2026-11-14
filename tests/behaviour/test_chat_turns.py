@@ -61,7 +61,7 @@ async def test_chat__brain_dump__proposes_a_draft_and_writes_no_tasks(jarvis, ll
 
 
 @pytest.mark.asyncio
-async def test_chat__looks_good_after_a_draft__locks_it_in_without_a_model_call(jarvis, llm):
+async def test_chat__looks_good_after_a_draft__locks_it_in_without_a_reply_model_call(jarvis, llm):
     planned = await _plan(jarvis, llm)
     draft_task_ids = [t["task_id"] for t in jarvis.draft(planned.draft_id)["tasks"]]
     calls_before = len(llm.calls)
@@ -111,6 +111,75 @@ async def test_chat__looks_good_sent_twice__second_one_writes_and_proposes_nothi
     assert jarvis.rows("user_tasks", user_id="alice") == rows_after_accept
     assert jarvis.rows("draft_schedules", user_id="alice") == drafts_after_accept
     assert "Locked in, sir" not in turn.reply  # no second claim of a fresh commit
+    assert "already locked in" in turn.reply
+    assert turn.draft_id is None
+
+
+@pytest.mark.asyncio
+async def test_chat__looks_good_twice_with_another_draft_pending__the_other_draft_stays_open(
+    jarvis, llm
+):
+    planned = await _plan(jarvis, llm)
+    await jarvis.say("looks good", session=planned.conversation_id)
+    other = await _plan(jarvis, llm)  # a fresh conversation proposes a second draft
+    rows_before = jarvis.rows("user_tasks", user_id="alice")
+
+    turn = await jarvis.say("looks good", session=planned.conversation_id)
+
+    # "looks good" here is about the plan this conversation already locked in.
+    assert "already locked in" in turn.reply
+    assert jarvis.draft(other.draft_id)["status"] == "pending"
+    assert jarvis.rows("user_tasks", user_id="alice") == rows_before
+
+
+@pytest.mark.asyncio
+async def test_chat__solve_outlasts_its_step_timeout__no_plan_claimed_and_no_draft(
+    jarvis, llm, monkeypatch
+):
+    import threading
+
+    from app.modules.planning_graph import planning_module
+
+    release = threading.Event()
+
+    def stuck_solver(*_args, **_kwargs):
+        release.wait(timeout=5)
+        raise AssertionError("the solve should have been abandoned at the step timeout")
+
+    solve_step = next(s for s in planning_module.steps if s.name == "solve_schedule")
+    monkeypatch.setattr(solve_step, "timeout_ms", 50)
+    monkeypatch.setattr(schedule_endpoint, "run_schedule", stuck_solver)
+    _script_dsa_plan(llm)
+    calls_before = len(llm.calls)
+
+    try:
+        turn = await jarvis.say(DSA_DUMP)
+    finally:
+        release.set()
+
+    assert turn.draft_id is None
+    assert turn.payload["schedule"] is None
+    assert jarvis.rows("draft_schedules") == []
+    assert "try again" in turn.reply
+    # The honest path is a template: no model gets to narrate this turn as a plan.
+    assert "voice_of_jarvis_synthesis" not in llm.tasks(since=calls_before)
+
+
+@pytest.mark.asyncio
+async def test_chat__turn_that_proposes_no_draft__reports_no_draft_id(jarvis, llm):
+    planned = await _plan(jarvis, llm)
+
+    turn = await jarvis.say("move the mock problems later", session=planned.conversation_id)
+
+    assert turn.intent == "REARRANGE"
+    assert turn.draft_id is None
+    (saved,) = [
+        m for m in jarvis.rows("chat_messages", session_id=planned.conversation_id)
+        if m["role"] == "assistant" and m["content"] == turn.reply
+    ]
+    assert saved["metadata"]["draft_id"] is None
+    # The planning turn itself still reported its draft.
+    assert planned.draft_id is not None
 
 
 @pytest.mark.asyncio

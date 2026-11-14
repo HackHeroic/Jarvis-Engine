@@ -28,7 +28,6 @@ import math
 import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -319,40 +318,6 @@ async def jarvis(tmp_path) -> Jarvis:
         set_shared_clients(db=app.state.db_client, memory_store=app.memory_store)
         yield app
         await settle_background_tasks()
-
-
-# --- time ----------------------------------------------------------------------
-
-
-class Clock:
-    """Freezes ``datetime.now`` inside chosen modules; ``advance`` moves it on."""
-
-    def __init__(self, monkeypatch) -> None:
-        self._monkeypatch = monkeypatch
-        self.now: datetime | None = None
-
-    def freeze(self, when: datetime, *modules: Any) -> None:
-        self.now = when
-        clock = self
-
-        class _Frozen(datetime):
-            @classmethod
-            def now(cls, tz=None):  # noqa: D401 - mirrors datetime.now
-                current = clock.now
-                if tz is not None:
-                    return current.astimezone(tz)
-                return current.astimezone(timezone.utc).replace(tzinfo=None)
-
-        for module in modules:
-            self._monkeypatch.setattr(module, "datetime", _Frozen)
-
-    def advance(self, **delta: float) -> None:
-        self.now = self.now + timedelta(**delta)
-
-
-@pytest.fixture
-def clock(monkeypatch) -> Clock:
-    return Clock(monkeypatch)
 
 
 # --- anti-guilt ----------------------------------------------------------------

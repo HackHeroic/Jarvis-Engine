@@ -318,6 +318,18 @@ async def _classify_intent(state: JarvisState) -> dict:
         if draft_intent is not None:
             return {"intent": draft_intent}
 
+    # A second "looks good" after this thread's draft was accepted is about that
+    # same draft. It goes back to draft_action, which finds the draft closed and
+    # says it is already locked in — writing nothing. Only with the accepted
+    # draft's id in hand: without one, draft_action would fall back to the
+    # user's newest pending draft, which may belong to another conversation.
+    if (
+        state.get("negotiation_state") == NegotiationPhase.ACCEPTED
+        and state.get("draft_id")
+        and _match_draft_intent(state.get("user_message") or "") == IntentType.ACCEPT_DRAFT
+    ):
+        return {"intent": IntentType.ACCEPT_DRAFT}
+
     bd = state.get("brain_dump")
     if not bd:
         return {"intent": IntentType.CHAT}
@@ -548,7 +560,9 @@ async def _apply_draft_action(state: JarvisState) -> dict:
                 else f"Locked in, sir — {count} tasks are on your schedule."
             ),
             "negotiation_state": NegotiationPhase.ACCEPTED,
-            "draft_id": None,
+            # Kept, not cleared: a repeated "looks good" on this thread must find
+            # this draft (closed) rather than the user's newest pending one.
+            "draft_id": draft_id,
         }
 
     if intent_value == IntentType.REJECT_DRAFT.value:
@@ -589,7 +603,7 @@ async def _closed_draft_reply(draft_store: Any, user_id: str, draft_id: str | No
         return {
             "response_message": "That plan is already locked in, sir.",
             "negotiation_state": NegotiationPhase.ACCEPTED,
-            "draft_id": None,
+            "draft_id": draft_id,  # so the next "looks good" finds it again
         }
     return {
         "response_message": (
