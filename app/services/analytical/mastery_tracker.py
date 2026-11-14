@@ -9,20 +9,39 @@ start). Every history read stays inside a time window, under the store's row cap
 A streak's days are dates on the user's clock.
 """
 
-from datetime import date, timedelta
+from collections.abc import Iterable
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import app.core.config as config
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.domain.entities import TaskEvent, TaskEventType
-from app.services.memory.patterns import _aware, _settled_outcomes
 from app.services.task_service import utc_now
 
 # The outcomes a slot can come to: scheduled and rescheduled events are not outcomes.
 OUTCOME_TYPES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
 # How far back a streak is counted: a longer run reads as this many days.
 STREAK_WINDOW_DAYS = 60
+
+
+def _aware(moment: datetime) -> datetime:
+    """Stored instants are UTC: a naive one is read as such."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _latest_outcomes(events: Iterable[TaskEvent]) -> list[TaskEvent]:
+    """The last outcome of each slot (task, scheduled start); events that are not outcomes dropped.
+
+    A slot can have more than one outcome (skipped, then completed after all); it
+    counts once, as what happened last.
+    """
+    latest: dict[tuple[str, datetime | None], TaskEvent] = {}
+    for event in sorted(events, key=lambda e: _aware(e.occurred_at)):
+        if event.event_type in OUTCOME_TYPES:
+            start = _aware(event.scheduled_start) if event.scheduled_start is not None else None
+            latest[(event.task_id, start)] = event
+    return list(latest.values())
 
 
 def _calculate_sr(user_id: str, goal_id: Optional[str], db) -> float:
@@ -96,7 +115,7 @@ def _get_reschedule_count(user_id: str, goal_id: Optional[str], db) -> int:
         return 0
     return sum(
         1
-        for event in _settled_outcomes(events)
+        for event in _latest_outcomes(events)
         if event.event_type is TaskEventType.SKIPPED
         and (goal_id is None or event.metadata.get("goal_id") == goal_id)
     )
@@ -224,7 +243,7 @@ def compute_streak_from_events(events: list[TaskEvent], zone: ZoneInfo, today: d
     """
     days = {
         _aware(event.occurred_at).astimezone(zone).date()
-        for event in _settled_outcomes(events)
+        for event in _latest_outcomes(events)
         if event.event_type is TaskEventType.COMPLETED
     }
     streak = 0
