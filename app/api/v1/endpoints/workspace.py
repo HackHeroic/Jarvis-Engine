@@ -40,7 +40,8 @@ async def get_task_workspace(
     if not user_id:
         raise errors.ValidationError("user_id is required.")
     # The goals the WOOP card reads, and the bus a web search is metered onto: the
-    # composition root's; without one the card keeps the task's title and nothing is metered.
+    # composition root's. Without one the card keeps the task's title, and no web search
+    # is made (an unmetered cloud send is refused, never made silently).
     container = container_of(http_request)
     try:
         return await get_or_build_task_workspace(

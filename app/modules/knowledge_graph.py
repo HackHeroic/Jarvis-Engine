@@ -51,9 +51,16 @@ async def ingest_document(state: KnowledgeState) -> dict:
         from app.services.extraction.orchestrator import process_ingestion
 
         # The user's rules and tasks through the repositories of the turn's composition
-        # root; without one (tests, scripts) none is read or stored.
+        # root; without one (tests, scripts) none is read or stored, and the log says so.
+        # Without the turn's database the document cannot be kept: process_ingestion
+        # refuses it (PersistenceError, DOCUMENT_NOT_SAVED), narrated below.
         container = state.get("container")
         repos = container.repos if container is not None else None
+        if container is None:
+            logger.warning(
+                "knowledge module: no composition root in the turn's state, so the user's "
+                "rules are not read and the document is linked to no task"
+            )
         result = await process_ingestion(
             payload=state.get("content"),
             file_bytes=state.get("file_bytes"),

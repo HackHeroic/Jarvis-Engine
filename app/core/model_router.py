@@ -104,7 +104,7 @@ def build_chain(cfg: ModuleType, hooks: ActionHooks, bus: EventBus) -> FallbackC
 
 
 async def metered_web_search(
-    search: Callable[[], Awaitable[str]], *, bus: EventBus | None, pii_redactions: int = 0
+    search: Callable[[], Awaitable[str]], *, bus: EventBus, pii_redactions: int = 0
 ) -> str:
     """Run a grounded web search and meter it into the usage ledger like any chain call.
 
@@ -114,7 +114,11 @@ async def metered_web_search(
     the usage ledger listens on), with the tokens the transport reported (zero when it
     reported none) and this turn's attribution. An empty answer — the search failed or
     never ran — publishes nothing: no answer, and no billed tokens anyone could see.
-    Without a bus (no composition root: tests, scripts) nothing is published.
+
+    ``bus`` is required: a search with nowhere to meter it is refused (``TypeError``)
+    before anything is sent, so the ledger — the You page's privacy receipt — can never
+    silently under-count cloud sends. A test that wants no ledger passes a
+    ``NullEventBus`` explicitly.
     """
     from datetime import datetime, timezone
 
@@ -122,11 +126,16 @@ async def metered_web_search(
     from app.domain.events import LLMCallCompleted
     from app.infrastructure.llm.transport import TokenTally, collecting_tokens
 
+    if bus is None:
+        raise TypeError(
+            "metered_web_search needs the composition root's event bus; without one the "
+            "search would be an unmetered cloud send, so none is made"
+        )
     tally = TokenTally()
     started = time.perf_counter()
     with collecting_tokens(tally):
         result = await search()
-    if not result or not result.strip() or bus is None:
+    if not result or not result.strip():
         return result
     now = datetime.now(timezone.utc)
     usage = LLMUsageEvent(

@@ -36,7 +36,7 @@ class WebSearchUnavailableError(LLMUnavailableError):
     code = "web_search_unavailable"
 
 
-async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus | None) -> str:
+async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) -> str:
     """Run the grounded web search, raising ``WebSearchUnavailableError`` when it fails.
 
     Still Gemini-only: no other provider in the LLM chain has search grounding, so a
@@ -128,12 +128,12 @@ async def fetch_chunks_for_task(
 
 
 async def perform_learning_style_search(
-    task_title: str, learning_style: str, *, bus: EventBus | None = None
+    task_title: str, learning_style: str, *, bus: EventBus
 ) -> list[StudyAsset]:
     """Use Gemini + Google Search to find learning-style-curated links (YouTube or articles).
 
     Raises ``WebSearchUnavailableError`` when the search could not run. The search is
-    metered onto ``bus`` (the composition root's); None meters nothing.
+    metered onto ``bus`` (the composition root's), which is required.
     """
     assets: list[StudyAsset] = []
     if not task_title.strip():
@@ -199,7 +199,7 @@ async def generate_practice_assets(
     learning_style: str = "reader",
     user_prompt: Optional[str] = None,
     *,
-    bus: EventBus | None = None,
+    bus: EventBus,
 ) -> list[StudyAsset]:
     """Generate context-aware practice assets.
 
@@ -298,12 +298,13 @@ async def build_task_workspace(
     user_prompt: Optional[str] = None,
     *,
     goals: GoalRepository | None = None,
-    bus: EventBus | None = None,
+    bus: EventBus,
 ) -> TaskWorkspace:
     """Assemble proactive workspace: RAG chunks, web links, practice assets. Target <5s.
 
     ``goals`` (the composition root's repository) gives the WOOP card its wish and
-    outcome; None leaves them at the task's title. Web searches are metered onto ``bus``.
+    outcome; None leaves them at the task's title. Web searches are metered onto ``bus``,
+    the composition root's, which is required (``metered_web_search``).
     """
     supabase = _get_supabase()
     task_title = ""
@@ -510,7 +511,7 @@ async def get_or_build_task_workspace(
     refresh: bool = False,
     *,
     goals: GoalRepository | None = None,
-    bus: EventBus | None = None,
+    bus: EventBus,
 ) -> TaskWorkspace:
     """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
 
