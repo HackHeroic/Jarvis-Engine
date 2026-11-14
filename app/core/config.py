@@ -192,7 +192,12 @@ SLOT_SWEEP_LOOKBACK_DAYS: int = 7
 # steers the solver: each task not due today leans toward high-focus hours with weight
 # ENERGY_OBJECTIVE_WEIGHT x difficulty. JARVIS_ENERGY_OBJECTIVE=false turns the term off.
 ENERGY_OBJECTIVE_ENABLED: bool = os.getenv("JARVIS_ENERGY_OBJECTIVE", "true").lower() != "false"
-ENERGY_OBJECTIVE_WEIGHT: int = 40
+# Scaled to the solver's makespan weight (15 per minute): 15 x 60, so one focus-penalty
+# point on the hardest task is worth an hour of plan length. Enough to carry a hard task
+# from the morning to the evening peak of a day the plan already uses (a TMT cost of up
+# to ~2,000); not enough to stretch the plan for it. Weights of 750-1,200 behave alike;
+# from ~2,000 easy tasks drift into the peak too, and each day idles until the evening.
+ENERGY_OBJECTIVE_WEIGHT: int = 900
 FOCUS_WINDOW_DAYS: int = 28
 FOCUS_PRIOR_STRENGTH: float = 3.0
 MIN_FOCUS_OBSERVATIONS: int = 10
@@ -206,6 +211,11 @@ MIN_FOCUS_OBSERVATIONS: int = 10
 # watching the plan form is not left waiting. Raise it for pathological plans
 # via the env var.
 SOLVER_MAX_TIME_SECONDS: float = float(os.getenv("JARVIS_SOLVER_MAX_TIME_SECONDS", "10"))
+# Inside that cap, the search stops once no better schedule has turned up for this many
+# seconds. The best schedule usually arrives in a fraction of a second; the rest of the
+# search goes to proving nothing beats it. The wait starts at the first schedule found,
+# so a search that has found none yet still runs to the cap.
+SOLVER_IDLE_STOP_SECONDS: float = float(os.getenv("JARVIS_SOLVER_IDLE_STOP_SECONDS", "0.75"))
 
 # Mental-health safeguard: max scheduled deep-work minutes per day to avoid cramming
 MAX_DEEP_WORK_MINUTES_PER_DAY: int = 360  # 6 hours (legacy; pacing module takes precedence)

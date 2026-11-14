@@ -340,6 +340,9 @@ class Pattern(BaseModel):
     )
 
 
+HOURS_PER_DAY = 24
+
+
 class HourFocus(BaseModel):
     """How well the user gets things done in one local hour of their day."""
 
@@ -364,7 +367,9 @@ class FocusProfile(BaseModel):
     )
     observations: int = Field(ge=0, description="Outcomes with a slot the profile was built from.")
     hours: list[HourFocus] = Field(
-        min_length=24, max_length=24, description="One entry per local hour; index == hour."
+        min_length=HOURS_PER_DAY,
+        max_length=HOURS_PER_DAY,
+        description="One entry per local hour; index == hour.",
     )
 
     @field_validator("hours")

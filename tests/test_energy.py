@@ -96,6 +96,22 @@ async def test_history_estimator__other_users_events__ignored():
 
 
 @pytest.mark.asyncio
+async def test_history_estimator__missed_then_completed_same_slot__counts_once_as_done():
+    # The sweep set the slot aside, then the user said they did it after all:
+    # one slot, one outcome, and the latest one is what happened.
+    slot = _slot(3, 19)
+    missed = _event("alice", TaskEventType.MISSED, slot)
+    done = _event("alice", TaskEventType.COMPLETED, slot).model_copy(
+        update={"task_id": missed.task_id, "occurred_at": slot + timedelta(hours=2)}
+    )
+
+    profile = await (await _estimator_with(missed, done)).estimate("alice", IST, now=NOW)
+
+    assert (profile.hours[19].done, profile.hours[19].not_done) == (1, 0)
+    assert profile.observations == 1
+
+
+@pytest.mark.asyncio
 async def test_history_estimator__sparse_hour__pulled_toward_prior():
     prior = HeuristicEnergyEstimator()
 

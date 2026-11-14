@@ -1255,9 +1255,21 @@ async def _run_schedule_modify_flow(
         plan_start=horizon_start,
     )
 
-    # Apply the modification
+    # Apply the modification. The re-solve leans on the learned focus profile.
+    from app.core.runtime import registered_container
+    from app.services.energy import solver_focus
+    from app.services.planning.local_time import user_zone
+
+    container = registered_container()
+    focus_by_hour = await solver_focus(
+        container.energy if container is not None else None,
+        user_id,
+        user_zone(),
+        now=datetime.now(timezone.utc),
+    )
     modified_graph, modified_schedule = apply_modification(
         modification, execution_graph, schedule_data, time_slots, horizon_start,
+        focus_by_hour=focus_by_hour,
     )
 
     action_desc = modification.action.replace("_", " ")

@@ -5,7 +5,6 @@ import operator
 from datetime import datetime, timezone
 from typing import Annotated, Any, Optional, TypedDict
 
-import app.core.config as config
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
@@ -152,21 +151,16 @@ async def mark_missed(state: PlanningState) -> dict:
 
 
 async def _learned_focus(user_id: str, zone: Any) -> Optional[list]:
-    """The user's focus by local hour when it is learned and the energy term is on, else None.
+    """The user's learned focus by local hour, or None (see ``solver_focus``)."""
+    from app.services.energy import solver_focus
 
-    A profile that is still the prior never steers the solver. Without a registered
-    composition root (tests, scripts) there is no history to read. A failed read
-    means a plan on TMT alone, never a failed plan.
-    """
     container = registered_container()
-    if container is None or not config.ENERGY_OBJECTIVE_ENABLED:
-        return None
-    try:
-        profile = await container.energy.estimate(user_id, zone, now=datetime.now(timezone.utc))
-    except Exception as e:
-        logger.warning(f"Focus profile read failed (planning on TMT alone): {e!r}")
-        return None
-    return profile.scores() if profile.source == "learned" else None
+    return await solver_focus(
+        container.energy if container is not None else None,
+        user_id,
+        zone,
+        now=datetime.now(timezone.utc),
+    )
 
 
 async def fetch_constraints(state: PlanningState) -> dict:
