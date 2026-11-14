@@ -119,7 +119,9 @@ class AppContainer:
             events.subscribe(outcome, observer)
         # The focus profile: the solver leans on it, the You page shows it.
         energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
-        draft_service = DraftService(repos.drafts, events, task_events=repos.task_events)
+        draft_service = DraftService(
+            repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
+        )
         # The first move. Each action kind is registered with the factory, so an
         # accepted suggestion can be rebuilt from its payload; the triggers with the
         # service. A skip window PEARL finds is offered as a rule right away.

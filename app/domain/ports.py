@@ -262,9 +262,10 @@ class SuggestionRepository(ABC):
     ) -> bool:
         """Return whether ``trigger`` already made the user a suggestion on ``day``.
 
-        ``day`` is a calendar day on the clock of ``tz`` (an IANA zone name), so
-        00:30 in India is the new day there while still yesterday in UTC. An unknown
-        zone raises ValidationError.
+        An expired suggestion does not count: one whose action no longer fit leaves
+        room for a fresh one. ``day`` is a calendar day on the clock of ``tz`` (an IANA
+        zone name), so 00:30 in India is the new day there while still yesterday in
+        UTC. An unknown zone raises ValidationError.
         """
 
 

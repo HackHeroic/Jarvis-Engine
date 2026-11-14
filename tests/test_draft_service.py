@@ -19,6 +19,7 @@ from app.domain.ports import TaskEventRepository
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryStore
 from app.services.draft_service import DraftService
+from tests.behaviour.conftest import blame_phrases_in
 from tests.fakes import FakeSupabase
 
 U1 = "u1"
@@ -339,6 +340,60 @@ async def test_accept__event_store_down__accept_still_succeeds_and_logs(repos, c
 
 
 # --- reject -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accept__every_slot_already_started__draft_outdated_and_nothing_written(repos):
+    """Accepting a plan whose every time has gone by would only hand the slot sweep
+    tasks to set aside: refused, with words that say so, and nothing written."""
+    draft = await _draft(repos, schedule=_slots(g_t1=0, g_t2=30))
+    service = DraftService(repos.drafts, NullEventBus(), clock=lambda: _at(30))  # g_t2 starts now
+
+    with pytest.raises(errors.DraftOutdatedError) as raised:
+        await service.accept(U1, draft.id)
+
+    assert raised.value.http_status == 409
+    assert raised.value.message == (
+        "Every time in this plan has already gone by, so I didn't put it in place."
+        " Ask me for a fresh plan and I'll fit it around now."
+    )
+    assert blame_phrases_in(raised.value.message) == []
+    assert await repos.tasks.list_pending(U1) == []
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_accept__some_slots_already_started__accepted_as_drafted(repos):
+    draft = await _draft(repos, schedule=_slots(g_t1=0, g_t2=60))
+    service = DraftService(repos.drafts, NullEventBus(), clock=lambda: _at(30))
+
+    assert await service.accept(U1, draft.id) == 2
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_currency__started_slot_and_finished_task__reported(repos):
+    """What makes a drafted plan out of date: a slot that has begun, and a task in it
+    that is no longer pending or set aside (done or skipped since)."""
+    first = await _draft(repos, tasks=_tasks("g_t1", "g_t2", "g_t3"))
+    await DraftService(repos.drafts, NullEventBus()).accept(U1, first.id)
+    await repos.tasks.update_status(U1, "g_t2", TaskStatus.COMPLETED)
+    await repos.tasks.update_status(U1, "g_t3", TaskStatus.MISSED)
+    draft = await _draft(
+        repos, tasks=_tasks("g_t1", "g_t2", "g_t3"), schedule=_slots(g_t1=0, g_t2=60, g_t3=90)
+    )
+    service = DraftService(
+        repos.drafts, NullEventBus(), tasks=repos.tasks, clock=lambda: _at(10)
+    )
+
+    currency = await service.currency(U1, draft)
+
+    assert currency.started == frozenset({"g_t1"})
+    assert currency.not_open == frozenset({"g_t2"})
+    assert currency.set_aside == frozenset({"g_t3"})
+    assert currency.current is False
+    later = await service.currency(U1, draft.model_copy(update={"tasks": _tasks("g_t3")}))
+    assert later.started == frozenset() and later.current is True  # g_t3's slot is still ahead
 
 
 @pytest.mark.asyncio

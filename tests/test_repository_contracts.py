@@ -931,6 +931,19 @@ async def test_suggestions__exists_today__true_after_add(repos):
 
 
 @pytest.mark.asyncio
+async def test_suggestions__exists_today__expired_suggestion_does_not_count(repos):
+    """A brief that expired (its plan no longer fit) leaves room for a fresh one that day."""
+    stored = await repos.suggestions.add(U1, _suggestion(U1, trigger="morning_brief"))
+    await repos.suggestions.set_status(
+        U1, stored.id, SuggestionStatus.EXPIRED, expected=SuggestionStatus.PENDING
+    )
+
+    assert await repos.suggestions.exists_today(U1, "morning_brief", T0.date()) is False
+    await repos.suggestions.add(U1, _suggestion(U1, trigger="morning_brief"))
+    assert await repos.suggestions.exists_today(U1, "morning_brief", T0.date()) is True
+
+
+@pytest.mark.asyncio
 async def test_suggestions__exists_today__ist_half_past_midnight_is_new_local_day(repos):
     """00:30 on 15 November in India is 19:00 on 14 November in UTC.
 

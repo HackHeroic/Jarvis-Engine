@@ -8,6 +8,7 @@ Both run through the real ``AnticipationService`` over the Supabase repositories
 where a test pins times, with a planner that places tasks where the test says.
 """
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -129,7 +130,9 @@ def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None
     )
     patterns = PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
     energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
-    drafts = DraftService(repos.drafts, bus, task_events=repos.task_events, clock=clock)
+    drafts = DraftService(
+        repos.drafts, bus, task_events=repos.task_events, tasks=repos.tasks, clock=clock
+    )
     memory = MemoryService(repos.memories, BagOfWordsEmbedder())
     actions = build_action_factory(
         drafts=drafts, constraints=repos.constraints, memory=memory, planner=planner
@@ -723,6 +726,141 @@ async def test_brief__accept_after_newer_plan_accepted__409_and_expired_tasks_un
     )
 
 
+def _task_service(world: _World):
+    from app.services.task_service import TaskService
+
+    return TaskService(world.repos.tasks, world.repos.task_events, world.bus, clock=world.clock)
+
+
+REFRESHED = "I refreshed the plan first — it's in place now."
+
+
+@pytest.mark.asyncio
+async def test_brief__task_done_before_accept__plan_refreshed_and_accepted(pinned_world, pinned):
+    """The user finishes a task the brief planned, then taps Accept: the brief is no longer
+    current, so it is drafted again from what is still open and put in place, once."""
+    world = pinned_world
+    await _seed_tasks(world.repos, [_row("graphs", difficulty_weight=0.9), _row("trees")])
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await _task_service(world).complete(U, "graphs")
+
+    accepted, result = await world.service.accept(U, suggestion.id)
+    again = await asyncio.gather(world.service.accept(U, suggestion.id), return_exceptions=True)
+
+    assert accepted.status is SuggestionStatus.ACCEPTED
+    assert result.message == REFRESHED
+    assert result.tasks_written == 1 and result.draft_id != suggestion.action["draft_id"]
+    assert pinned.calls == [[], []]  # the brief, then the refresh
+    assert (await world.repos.tasks.get(U, "graphs")).status is TaskStatus.COMPLETED
+    trees = await world.repos.tasks.get(U, "trees")
+    assert trees.status is TaskStatus.PENDING and trees.scheduled_start == _ist(MONDAY, 9)
+    assert (await world.repos.drafts.get(U, suggestion.action["draft_id"])).status is (
+        DraftStatus.SUPERSEDED
+    )
+    assert isinstance(again[0], errors.StaleVersionError)  # done: a second tap is a 409
+    _no_blame(result.message)
+
+
+@pytest.mark.asyncio
+async def test_brief__everything_done_before_accept__nothing_left_and_done(pinned_world, pinned):
+    world = pinned_world
+    await _seed_tasks(world.repos, [_row("graphs")])
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await _task_service(world).complete(U, "graphs")
+
+    accepted, result = await world.service.accept(U, suggestion.id)
+
+    assert accepted.status is SuggestionStatus.ACCEPTED
+    assert (result.message, result.tasks_written, result.draft_id) == (
+        "Nothing left to place today.", None, None
+    )
+    assert (await world.repos.tasks.get(U, "graphs")).status is TaskStatus.COMPLETED
+    assert (await world.repos.drafts.get(U, suggestion.action["draft_id"])).status is (
+        DraftStatus.EXPIRED
+    )
+
+
+@pytest.mark.asyncio
+async def test_brief__accepted_three_hours_late__refreshed_from_now_and_nothing_set_aside(
+    world, clock, deterministic_solver
+):
+    """Accepting the 07:05 brief at 10:05 would write slots that have gone by, and the
+    next sweep would set them aside as if the user had: it is re-planned from now."""
+    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c")])
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+    late = _ist(MONDAY, 10, 5)
+    world.clock.now = late
+    clock.freeze(late, schedule_endpoint)
+
+    _, result = await world.service.accept(U, suggestion.id)
+
+    assert result.message == REFRESHED
+    for task_id in ("a", "b", "c"):
+        task = await world.repos.tasks.get(U, task_id)
+        assert task.status is TaskStatus.PENDING and task.scheduled_start >= late, task
+    swept = await _task_service(world).sweep_passed_slots(U, late + timedelta(minutes=1))
+    assert swept == []
+
+
+@pytest.mark.asyncio
+async def test_brief__stale_double_click__refreshed_once_and_second_409(
+    pinned_world, pinned, fake
+):
+    world = pinned_world
+    await _seed_tasks(world.repos, [_row("graphs"), _row("trees")])
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await _task_service(world).complete(U, "graphs")
+
+    results = await asyncio.gather(
+        world.service.accept(U, suggestion.id), world.service.accept(U, suggestion.id),
+        return_exceptions=True,
+    )
+
+    refused = [r for r in results if isinstance(r, Exception)]
+    assert len(refused) == 1 and isinstance(refused[0], errors.StaleVersionError)
+    assert pinned.calls == [[], []]  # one refresh, not two
+    accepted = [r for r in fake.rows["draft_schedules"] if r["status"] == "accepted"]
+    assert len(accepted) == 2  # the seeding draft, and the refresh
+
+
+class _ClashingPlanner(_PinnedPlanner):
+    """A refresh that still clashes: it drafts a task id the user has finished."""
+
+    async def replan(self, user_id: str, *, reslot_task_ids: list[str]) -> DraftSchedule | None:
+        self.calls.append(list(reslot_task_ids))
+        if len(self.calls) == 1:
+            return await super().replan(user_id, reslot_task_ids=reslot_task_ids)
+        return await self._repos.drafts.create(
+            user_id, tasks=[{"task_id": "graphs", "title": "Revise graphs"}],
+            horizon_start=_ist(MONDAY, 8).isoformat(), goal_id=None,
+            schedule={"graphs": {"start_min": 60, "end_min": 85}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_brief__accept_still_clashes__expired_never_pending_and_a_fresh_brief_today(
+    fake, repos
+):
+    planner = _ClashingPlanner(repos)
+    world = _world(fake, repos, planner)
+    await _seed_tasks(repos, [_row("graphs"), _row("trees")])
+    first = await world.service.run_due(U, MONDAY_7_05)
+    suggestion = first[0].suggestion
+    await _task_service(world).complete(U, "graphs")
+
+    with pytest.raises(errors.ConflictError) as raised:
+        await world.service.accept(U, suggestion.id)
+
+    assert raised.value.http_status == 409
+    assert (await repos.suggestions.get(U, suggestion.id)).status is SuggestionStatus.EXPIRED
+    assert (await repos.tasks.get(U, "graphs")).status is TaskStatus.COMPLETED
+    world.clock.now = MONDAY_7_05 + timedelta(minutes=2)
+    planner.calls.clear()  # the next brief drafts like the first
+    fresh = await world.service.run_due(U, world.clock.now)
+    assert fresh[0].status == "created" and fresh[0].suggestion.id != suggestion.id
+
+
 # --- PatternRule ------------------------------------------------------------------------
 
 
@@ -867,6 +1005,33 @@ async def test_pattern_rule__over_the_api__details_carry_the_numbers_and_accept_
     draft = await world.repos.drafts.get(U, draft_id)
     assert draft.status is DraftStatus.PENDING
     assert {t["task_id"] for t in draft.tasks} == {"graphs", "trees"}
+
+
+@pytest.mark.asyncio
+async def test_pattern_rule__accept_after_pattern_dismissed__no_rule_stored_and_expired(
+    pinned_world, pinned
+):
+    """The user dismisses the pattern on the You page, then taps Accept on the older
+    proposal: no rule is stored, no plan drafted, and the proposal is expired."""
+    world = pinned_world
+    await _set_aside_at(world, 9)
+    suggestion = (await _run_rule(world)).suggestion
+    memory = MemoryService(world.repos.memories, BagOfWordsEmbedder())
+    await memory.dismiss(U, suggestion.action["memory_id"])
+
+    with pytest.raises(errors.ConflictError) as raised:
+        await world.service.accept(U, suggestion.id)
+
+    assert raised.value.http_status == 409
+    assert raised.value.message == (
+        "You told me this pattern doesn't fit, so I haven't made it a rule."
+    )
+    assert await world.repos.constraints.list_active(U) == []
+    assert pinned.calls == []
+    assert (await world.repos.suggestions.get(U, suggestion.id)).status is (
+        SuggestionStatus.EXPIRED
+    )
+    _no_blame(raised.value.message)
 
 
 @pytest.mark.asyncio

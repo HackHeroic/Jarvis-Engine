@@ -149,6 +149,25 @@ async def test_accept__action_out_of_date__expired_and_409_plain_message(repos, 
 
 
 @pytest.mark.asyncio
+async def test_accept__action_conflict__expired_never_back_to_pending(repos, log):
+    """A conflict no retry can fix (the plan clashes with tasks the user has): the
+    suggestion is expired, never handed back as pending to 409 on every tap."""
+    service = _service(repos, log, CountingTrigger(action=FakeAction(log)))
+    suggestion_id = await _pending(service)
+    log.errors.append(errors.ConflictError("That plan clashes with tasks you already have."))
+
+    with pytest.raises(errors.ConflictError) as raised:
+        await service.accept(U1, suggestion_id)
+
+    assert raised.value.http_status == 409
+    assert raised.value.message == "That plan clashes with tasks you already have."
+    assert (await repos.suggestions.get(U1, suggestion_id)).status is SuggestionStatus.EXPIRED
+    with pytest.raises(errors.StaleVersionError):
+        await service.accept(U1, suggestion_id)
+    assert log.runs == []
+
+
+@pytest.mark.asyncio
 async def test_accept__store_down__back_to_pending_and_503(repos, log):
     service = _service(repos, log, CountingTrigger(action=FakeAction(log)))
     suggestion_id = await _pending(service)

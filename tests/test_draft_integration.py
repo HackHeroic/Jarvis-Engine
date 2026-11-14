@@ -193,7 +193,8 @@ async def test_accept__persists_wall_clock_times(store):
         tasks=[{"task_id": "t1", "title": "x", "duration_minutes": 25,
                 "difficulty_weight": 0.5, "dependencies": [],
                 "completion_criteria": "done"}],
-        horizon_start="2026-08-13T08:00:00+00:00",
+        # Ahead of the real clock: a plan whose every slot has gone by is never accepted.
+        horizon_start="2036-08-13T08:00:00+00:00",
         schedule={"t1": {"start_min": 200, "end_min": 225}},
     )
     draft = store.get_pending_draft("u1")

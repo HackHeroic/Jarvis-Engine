@@ -60,7 +60,14 @@ async def _three_mornings_at_nine(jarvis) -> list[str]:
             for day, task_id in enumerate(task_ids)
         },
     )
-    await container.draft_service.accept("alice", draft.id)
+    # Accepted then, last week: a plan whose every slot has gone by is never accepted now.
+    from app.services.draft_service import DraftService
+
+    accepted_then = DraftService(
+        container.repos.drafts, container.events, task_events=container.repos.task_events,
+        tasks=container.repos.tasks, clock=lambda: first_day,
+    )
+    await accepted_then.accept("alice", draft.id)
     return task_ids
 
 

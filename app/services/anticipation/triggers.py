@@ -47,7 +47,7 @@ from app.services.anticipation.service import (
     AnticipationService,
     stated_blocks,
 )
-from app.services.draft_service import _slot_map
+from app.services.draft_service import slot_map
 from app.services.memory.patterns import (
     INSIGHT_CONFIDENCE,
     MIN_OCCURRENCES,
@@ -236,7 +236,7 @@ def _reslot_lines(
 ) -> list[str]:
     """How many set-aside tasks the draft found a new slot for: those whose slot passed
     on an earlier day ("from yesterday"), and those whose slot passed today."""
-    placed = set(_slot_map(draft.schedule) or {})
+    placed = set(slot_map(draft.schedule) or {})
     earlier_days = today = 0
     for task in reslot:
         if task.task_id not in placed:
@@ -261,7 +261,7 @@ def _planned_line(
 
     When none lands today (what is left of it is taken), when the first one does.
     """
-    slots = _slot_map(draft.schedule) or {}
+    slots = slot_map(draft.schedule) or {}
     origin = datetime.fromisoformat(draft.horizon_start) if draft.horizon_start else None
     placed: list[tuple[dict, datetime]] = []
     for task in draft.tasks:
