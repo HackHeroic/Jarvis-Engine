@@ -45,12 +45,13 @@ def generate_session_title(first_message: str) -> str:
 
     candidate = text[:min(sentence_end, 60)]
 
-    if len(candidate) < sentence_end and sentence_end <= len(text):
-        # Sentence was longer than 60 chars; we already capped at 60
-        candidate = text[:60] + "..."
-    elif sentence_end > 60:
-        # No sentence boundary found within 60 chars
-        candidate = text[:60] + "..."
+    if sentence_end > 60:
+        # The first sentence is longer than 60 characters: cut at the last whole word,
+        # so a title never ends mid-word ("...and a compiler de").
+        cut = text[:60]
+        if not text[60:61].isspace() and " " in cut:
+            cut = cut[: cut.rindex(" ")]
+        candidate = cut.rstrip(" ,;:-") + "..."
 
     return candidate.strip()
 

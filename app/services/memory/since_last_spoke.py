@@ -133,9 +133,12 @@ class SinceLastSpoke:
                 return None
             if clean.sentences or clean.threads:
                 return clean
-        title = " ".join((previous.title or "").split()).rstrip(" .!?")
+        whole = " ".join((previous.title or "").split())
+        title = whole.rstrip(" .!?")
         if not title:
             return None
+        if whole.endswith("..."):  # a shortened title says so
+            title += "…"
         checked = await self._summaries.clean(user_id, title, let_go_ids=let_go_ids)
         if checked is None or checked.dropped:
             return None

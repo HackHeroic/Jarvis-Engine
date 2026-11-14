@@ -1,7 +1,15 @@
 """PDF and image extraction using Docling (L6). Preserves table structure for timetables."""
 
+import asyncio
 import tempfile
+import weakref
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
+
+from app.domain.errors import DocumentReadTimeoutError
+
+T = TypeVar("T")
 
 try:
     from docling.document_converter import DocumentConverter
@@ -159,3 +167,47 @@ def extract_document_with_provenance(
         })
 
     return items
+
+
+# --- Reading a document from async code ---------------------------------------------
+
+# Docling parses on worker threads of its own and can take tens of seconds on a first
+# use (models load). Run on the event loop it stops every other request for that time,
+# and a parse that never returns stops the server for good.
+DOCUMENT_READ_TIMEOUT_S = 120.0
+DOCUMENT_READ_TIMED_OUT = "That document took too long to read. Try again, or a smaller file."
+
+_read_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _read_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _read_locks.get(loop)
+    if lock is None:
+        lock = _read_locks[loop] = asyncio.Lock()
+    return lock
+
+
+async def _read_off_the_loop(read: Callable[..., T], file_bytes: bytes, media_type: str) -> T:
+    """``read(file_bytes, media_type)`` on a worker thread: one document at a time (the
+    reader's models are loaded once and are not built for two parses at once), and never
+    longer than ``DOCUMENT_READ_TIMEOUT_S`` (``DocumentReadTimeoutError``, a 503)."""
+    async with _read_lock():
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(read, file_bytes, media_type), DOCUMENT_READ_TIMEOUT_S
+            )
+        except asyncio.TimeoutError as exc:
+            raise DocumentReadTimeoutError(DOCUMENT_READ_TIMED_OUT) from exc
+
+
+async def read_document(file_bytes: bytes, media_type: str) -> str:
+    """``extract_document`` for async callers: off the event loop, bounded."""
+    return await _read_off_the_loop(extract_document, file_bytes, media_type)
+
+
+async def read_document_with_provenance(file_bytes: bytes, media_type: str) -> list[dict]:
+    """``extract_document_with_provenance`` for async callers: off the event loop, bounded."""
+    return await _read_off_the_loop(extract_document_with_provenance, file_bytes, media_type)

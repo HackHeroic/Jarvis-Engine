@@ -18,7 +18,7 @@ from app.domain import errors
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
 from app.schemas.upload import UploadMediaType, within_upload_limit
 from app.services.extraction.orchestrator import process_ingestion
-from app.utils.docling_helper import extract_document
+from app.utils.docling_helper import read_document
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +99,14 @@ class PendingCalendarRejected(BaseModel):
     status: Literal["rejected"] = Field(description="Always 'rejected'.")
 
 
-def _get_text_for_classification(request: IngestionRequest) -> str:
+async def _get_text_for_classification(request: IngestionRequest) -> str:
     """Extract or combine text for SLM classification."""
     parts = []
     if request.payload:
         parts.append(request.payload.strip())
     if request.file_base64 and request.media_type:
         raw_bytes = _decoded(request.file_base64)
-        extracted = extract_document(raw_bytes, request.media_type)
+        extracted = await read_document(raw_bytes, request.media_type)
         parts.append(extracted)
     combined = "\n\n".join(p for p in parts if p)
     if not combined:
@@ -136,7 +136,7 @@ async def ingest(request: IngestionRequest) -> IntentClassification:
     """Classify incoming unstructured data via the Semantic Router (SLM)."""
     if request.file_base64 and not request.media_type:
         raise errors.ValidationError(_MEDIA_TYPE_REQUIRED)
-    text = _get_text_for_classification(request)
+    text = await _get_text_for_classification(request)
     try:
         from app.core.model_router import route_llm_call
 

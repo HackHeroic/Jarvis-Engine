@@ -541,7 +541,10 @@ async def test_knowledge_module__no_database_in_the_turn__honest_couldnt_save_re
         )
 
     monkeypatch.setattr(orchestrator, "_classify", classified)
-    monkeypatch.setattr(orchestrator, "_extract_text", lambda *a: ("lecture notes", None))
+    async def extracted(*_a):
+        return "lecture notes", None
+
+    monkeypatch.setattr(orchestrator, "_extract_text", extracted)
 
     result = await _run_module_in_turn("knowledge_module", _turn_state(
         build_test_container(), None, user_prompt="here are my notes",

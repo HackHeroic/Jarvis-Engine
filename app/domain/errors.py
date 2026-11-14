@@ -83,6 +83,13 @@ class EmbeddingUnavailableError(InfrastructureError):
     http_status = 503
 
 
+class DocumentReadTimeoutError(InfrastructureError):
+    """The document reader did not finish in time; the request was fine."""
+
+    code = "document_read_timeout"
+    http_status = 503
+
+
 class LLMError(InfrastructureError):
     code = "llm_error"
     http_status = 503

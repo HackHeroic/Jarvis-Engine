@@ -21,7 +21,7 @@ from app.services.extraction.behavioral_store import get_behavioral_context_for_
 from app.services.extraction.calendar_extractor import extract_calendar_slots
 from app.services.extraction.knowledge_ingester import ingest_knowledge
 from app.services.extraction.task_material_linker import link_document_to_tasks
-from app.utils.docling_helper import extract_document, extract_document_with_provenance
+from app.utils.docling_helper import read_document_with_provenance
 
 SEMANTIC_ROUTER_SYSTEM_PROMPT = (
     "You are the Jarvis Semantic Router. You process data for CEOs, students, "
@@ -47,7 +47,7 @@ DOCUMENT_NOT_SAVED = "I couldn't save that document, so nothing from it was kept
 _KEPT_IN_THE_DATABASE = frozenset({IntentType.CALENDAR_SYNC, IntentType.KNOWLEDGE_INGESTION})
 
 
-def _extract_text(
+async def _extract_text(
     payload: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     media_type: Optional[str] = None,
@@ -59,7 +59,7 @@ def _extract_text(
     if payload and payload.strip():
         parts.append(payload.strip())
     if file_bytes and media_type:
-        items = extract_document_with_provenance(file_bytes, media_type)
+        items = await read_document_with_provenance(file_bytes, media_type)
         text_from_file = "\n\n".join(i.get("text", "") or "" for i in items)
         parts.append(text_from_file)
         provenance_items = items
@@ -138,7 +138,7 @@ async def process_ingestion(
             Refused before anything is read into the knowledge store, never reported
             as kept.
     """
-    text, provenance_items = _extract_text(payload, file_bytes, media_type)
+    text, provenance_items = await _extract_text(payload, file_bytes, media_type)
     if not text:
         return IngestionPipelineResult(
             intent=IntentType.BEHAVIORAL_CONSTRAINT,
