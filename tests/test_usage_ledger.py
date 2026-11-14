@@ -144,3 +144,85 @@ async def test_usage_ledger__storage_hangs__handle_returns_at_once():
 
     usage.release.set()
     await ledger.drain()
+
+
+class _CountingSlowUsage(_SlowUsage):
+    """A database that answers only when released, and counts what it stored."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stored = 0
+
+    async def record(self, event: LLMUsageEvent) -> None:
+        await self.release.wait()
+        self.stored += 1
+
+
+@pytest.mark.asyncio
+async def test_usage_ledger__more_than_8_writes_in_flight__extras_dropped_and_counted():
+    usage = _CountingSlowUsage()
+    ledger = UsageLedger(usage)
+
+    for _ in range(11):
+        await ledger.handle(_completed(_usage()))
+    usage.release.set()
+    await ledger.drain()
+
+    assert usage.stored == 8
+    assert ledger.dropped == 3
+    # A slot frees up once a write finishes: recording carries on.
+    await ledger.handle(_completed(_usage()))
+    await ledger.drain()
+    assert usage.stored == 9
+
+
+@pytest.mark.asyncio
+async def test_usage_ledger__shutdown__waits_at_most_its_timeout_and_logs_the_loss_once(caplog):
+    usage = _CountingSlowUsage()  # never released before shutdown
+    ledger = UsageLedger(usage)
+    for _ in range(10):
+        await ledger.handle(_completed(_usage()))
+
+    with caplog.at_level(logging.WARNING, logger="app.services.usage_ledger"):
+        await asyncio.wait_for(ledger.shutdown(timeout_s=0.05), timeout=1.0)
+        await ledger.shutdown(timeout_s=0.05)
+
+    lines = [r.getMessage() for r in caplog.records if r.name == "app.services.usage_ledger"]
+    assert len(lines) == 1
+    assert "10" in lines[0]  # 2 over the cap + 8 still unwritten at shutdown
+    usage.release.set()
+    await ledger.drain()
+
+
+@pytest.mark.asyncio
+async def test_usage_ledger__shutdown__nothing_lost__logs_nothing(caplog):
+    ledger = UsageLedger(RepositoryFactory.in_memory().usage)
+    await ledger.handle(_completed(_usage()))
+
+    with caplog.at_level(logging.WARNING, logger="app.services.usage_ledger"):
+        await ledger.shutdown()
+
+    assert [r for r in caplog.records if r.name == "app.services.usage_ledger"] == []
+
+
+@pytest.mark.asyncio
+async def test_usage_ledger__storage_unreachable__the_warning_names_the_exception_class(caplog):
+    ledger = UsageLedger(_UnreachableUsage())
+
+    with caplog.at_level(logging.WARNING, logger="app.services.usage_ledger"):
+        await ledger.handle(_completed(_usage()))
+        await ledger.drain()
+
+    (warning,) = [r for r in caplog.records if r.name == "app.services.usage_ledger"]
+    assert "PersistenceError" in warning.getMessage()
+
+
+def test_lifespan__shutdown__drains_the_usage_ledger_with_a_timeout():
+    """The process waits for in-flight ledger writes on the way out, but not forever."""
+    import inspect
+
+    from app.main import lifespan
+
+    source = inspect.getsource(lifespan)
+    shutdown = source[source.index("finally:"):]
+    assert "usage_ledger.shutdown(" in shutdown
