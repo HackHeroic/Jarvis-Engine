@@ -314,3 +314,33 @@ async def test_you_api__pattern_write_lost_to_another_process__200_not_503(monke
     assert resp.status_code == 200
     (pattern,) = resp.json()["patterns"]
     assert pattern["pattern_key"] == "skip_time_window:9"
+
+
+@pytest.mark.asyncio
+async def test_you_api__steady_page_load__each_table_read_once(monkeypatch):
+    """The profile and the 28-day history are read once, and shared by PEARL's look and
+    the focus profile; the patterns' memories in one read."""
+    from collections import Counter
+
+    from tests.behaviour.conftest import settle_background_tasks
+
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    await _skips_at_nine(container)
+
+    async with _api(monkeypatch, container, supabase) as api:
+        first = await api.get("/api/v1/you", params={"user_id": "alice"})
+        await settle_background_tasks()  # what the first sight set going (a rule proposal)
+        supabase.selects.clear()
+        again = await api.get("/api/v1/you", params={"user_id": "alice"})
+
+    assert first.status_code == again.status_code == 200
+    assert again.json()["patterns"] == first.json()["patterns"]
+    reads = Counter(table for table, _ in supabase.selects)
+    assert reads == {
+        "user_profiles": 1,
+        "task_events": 1,
+        "user_memories": 2,  # the patterns' memories, and the memories in use
+        "behavioral_constraints": 1,
+        "llm_usage_events": 1,
+    }

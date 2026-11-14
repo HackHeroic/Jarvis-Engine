@@ -40,7 +40,7 @@ from app.domain.entities import MemorySource
 from app.domain.errors import EmbeddingUnavailableError
 from app.schemas.memory import ExtractedMemory
 from app.services.memory.memory_service import MemoryCandidate, RememberOutcome
-from app.services.memory.patterns import PatternChange
+from app.services.memory.patterns import PatternChange, PatternLook
 from app.services.planning.local_time import end_of_local_day, user_zone
 
 # No new memory write starts once this much of the turn has gone to remembering.
@@ -369,22 +369,31 @@ def _pattern_frame(change: PatternChange) -> dict:
     }
 
 
-async def look_for_patterns(state: dict) -> None:
-    """PEARL's look at the outcome history for this turn (``PatternService.observe``).
+async def look_for_patterns(state: dict) -> PatternLook | None:
+    """PEARL's look at the outcome history for this turn (``PatternService.look``).
 
-    What it learns is held for the user (``drain_pending``), as it lands: a look cut
-    short by the turn's cap still holds every write that finished, and a write in
-    flight finishes and is held for the next turn. A failed look is logged by its type.
-    No composition root: nothing.
+    On the user's clock from the turn's own profile read (``UserModel.get_profile``,
+    cached for the turn), so PEARL reads no profile of its own. What it learns is held
+    for the user (``drain_pending``), as it lands: a look cut short by the turn's cap
+    still holds every write that finished, and the look itself runs on to its end and
+    holds the rest for the next turn. A failed look is logged by its type: None, as
+    without a composition root.
     """
     container = registered_container()
     user_id = _user_of(state)
     if container is None or not user_id:
-        return
+        return None
+    zone = None
+    if getattr(state.get("user_model"), "get_profile", None) is not None:
+        try:
+            zone = await _user_zone_of(state, PEARL_INLINE_TIMEOUT_S)
+        except Exception as e:  # PEARL reads the profile itself then
+            logger.warning(f"Profile unread for PEARL's look ({type(e).__name__})")
     try:
-        await container.patterns.observe(user_id)
+        return await container.patterns.look(user_id, zone=zone)
     except Exception as e:
         logger.warning(f"PEARL pattern detection failed (non-fatal): {type(e).__name__}")
+        return None
 
 
 def drain_pattern_frames(state: dict) -> list[dict]:
@@ -454,11 +463,14 @@ async def run_observation_loop(state: dict) -> dict:
     for frame in frames:
         _emit_event(state, "memory_extracted", frame)
 
-    # PEARL + cognitive state are cheap stats/math; run inline with a REAL cap.
-    # No asyncio.shield — we want the work cancelled when the cap fires, not leaked.
+    # PEARL + cognitive state are cheap stats/math; run inline with a REAL cap. (PEARL's
+    # look itself is shared and runs to its end; the turn just stops waiting for it.)
     timed_out = False
+    look: PatternLook | None = None
     try:
-        await asyncio.wait_for(_run_inline_observation(state), timeout=PEARL_INLINE_TIMEOUT_S)
+        look = await asyncio.wait_for(
+            _run_inline_observation(state), timeout=PEARL_INLINE_TIMEOUT_S
+        )
     except asyncio.TimeoutError:
         timed_out = True
         logger.warning(
@@ -471,14 +483,22 @@ async def run_observation_loop(state: dict) -> dict:
     for frame in patterns:
         _emit_event(state, "pattern_detected", frame)
     _emit_event(state, "phase_end", {"phase": "learning", **({"timeout": True} if timed_out else {})})
+    container = registered_container()
     return {
         "needs_followup": False,
         "memories_extracted_count": len(frames),
         "patterns_detected_count": len(patterns),
+        # The complete frame's insights, from this same look: PEARL looks once a turn.
+        "pearl_insights": (
+            container.patterns.insights_of(look.views)
+            if look is not None and container is not None
+            else None
+        ),
     }
 
 
-async def _run_inline_observation(state: dict) -> None:
+async def _run_inline_observation(state: dict) -> PatternLook | None:
     """Cheap inline work — PEARL's look + cognitive math, under the caller's cap."""
-    await look_for_patterns(state)
+    look = await look_for_patterns(state)
     await update_cognitive_state(state)
+    return look

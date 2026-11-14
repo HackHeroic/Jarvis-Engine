@@ -100,6 +100,11 @@ class JarvisState(TypedDict):
     session_id: Optional[str]
     user_message_id: Optional[str]
     memory_handles: dict[str, str]
+    # The user's memories as the turn read them once (MemorySnapshot); transient.
+    memory_snapshot: Any
+    # PEARL's insights from the turn's own look, for the complete frame; None when the
+    # look did not finish (the frame then asks PEARL itself).
+    pearl_insights: Optional[list[dict]]
 
     # Per-turn flags
     trivial_input: Optional[bool]            # set when greeting/emotional fast-path fires

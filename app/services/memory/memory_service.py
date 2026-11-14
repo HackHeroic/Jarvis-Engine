@@ -20,6 +20,7 @@ import logging
 import re
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import ClassVar, Literal
 
@@ -135,6 +136,33 @@ def _reinforcement(memory: Memory, now: datetime) -> dict:
         "observation_count": memory.observation_count + 1,
         "confidence": min(1.0, memory.confidence + 0.1),
     }
+
+
+@dataclass(frozen=True)
+class MemorySnapshot:
+    """The user's memories as one read found them: every status, superseded left out.
+
+    A turn reads them once (``MemoryService.snapshot``) and hands the same snapshot to
+    recall, the extraction's known memories and the forget check, instead of each
+    listing the table again.
+    """
+
+    memories: tuple[Memory, ...]
+
+    def in_use(self, now: datetime, *, types: frozenset[str] | None = None) -> list[Memory]:
+        """What ``MemoryService.list_active`` would return at ``now``, oldest first."""
+        return [
+            m
+            for m in self.memories
+            if m.status is MemoryStatus.ACTIVE
+            and (types is None or m.memory_type in types)
+            and _in_use_at(m, now)
+        ]
+
+    @property
+    def let_go(self) -> list[Memory]:
+        """The memories the user forgot or dismissed."""
+        return [m for m in self.memories if m.status in SUPPRESSING_STATUSES]
 
 
 class MemoryService:
@@ -314,8 +342,20 @@ class MemoryService:
             if _in_use_at(memory, now)
         ]
 
+    async def snapshot(self, user_id: str) -> MemorySnapshot:
+        """The user's memories in every status but superseded, in one read, oldest first."""
+        return MemorySnapshot(
+            tuple(await self._memories.list(user_id, statuses=frozenset(MemoryStatus)))
+        )
+
     async def recall(
-        self, user_id: str, query: str, *, trivial: bool = False, now: datetime | None = None
+        self,
+        user_id: str,
+        query: str,
+        *,
+        trivial: bool = False,
+        now: datetime | None = None,
+        snapshot: MemorySnapshot | None = None,
     ) -> Recall:
         """What to tell the model about the user for the message ``query``, within budget.
 
@@ -330,10 +370,16 @@ class MemoryService:
         any memory the user let go of or another user's.
 
         A ``trivial`` message, or one with no words, gets the profile only, without an
-        embedding call. An embedder that is down leaves the profile only, logged.
+        embedding call. An embedder that is down leaves the profile only, logged. The
+        profile comes from ``snapshot`` when the caller has one (no read of its own).
         """
         now = now if now is not None else self._clock()
-        active = await self.list_active(user_id, types=frozenset(_PROFILE_TYPES), now=now)
+        types = frozenset(_PROFILE_TYPES)
+        active = (
+            snapshot.in_use(now, types=types)
+            if snapshot is not None
+            else await self.list_active(user_id, types=types, now=now)
+        )
         standing = [m for m in active if m.confidence >= _PROFILE_MIN_CONFIDENCE]
         # The id breaks ties, so the same memories always give the same note (and the
         # same cacheable bytes), whatever order the store returns them in.
@@ -385,6 +431,7 @@ class MemoryService:
         texts: list[str],
         *,
         min_similarity: float = config.SUMMARY_SUPPRESS_SIMILARITY,
+        let_go: list[Memory] | None = None,
     ) -> list[str]:
         """``texts``, in order, less each one close to a memory the user forgot or dismissed.
 
@@ -395,13 +442,17 @@ class MemoryService:
         answer is kept for the same texts and the same set of let-go memories (their
         embeddings never change), so a summary shown on every turn is checked once.
 
+        ``let_go`` is the user's forgotten and dismissed memories when the caller has
+        already read them (``MemorySnapshot.let_go``); otherwise they are read here.
+
         Raises EmbeddingUnavailableError when there is something to check against and
         the embedder is down: the caller must not show the texts unchecked.
         """
         texts = list(texts)
         if not texts:
             return []
-        let_go = await self._memories.list(user_id, statuses=SUPPRESSING_STATUSES)
+        if let_go is None:
+            let_go = await self._memories.list(user_id, statuses=SUPPRESSING_STATUSES)
         if not let_go:
             return texts
         key = (user_id, tuple(texts), frozenset(m.id for m in let_go), min_similarity)

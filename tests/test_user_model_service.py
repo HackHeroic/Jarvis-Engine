@@ -124,6 +124,7 @@ def service(repos, memory, clock) -> UserModelService:
         repos.constraints,
         HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
         UsageLedger(repos.usage),
+        repos.task_events,
         clock=clock,
     )
 

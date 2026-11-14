@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.domain.anti_guilt import blame_phrases_in
+from app.domain.entities import Memory
 from app.schemas.memory import SessionSummary
 from app.services.memory.context import as_data, estimate_tokens
 from app.services.memory.memory_service import MemoryService
@@ -149,9 +150,12 @@ class SummaryFilter:
         """Without ``memory`` only blame is checked."""
         self._memory = memory
 
-    async def clean(self, user_id: str, summary: str) -> CleanSummary | None:
+    async def clean(
+        self, user_id: str, summary: str, *, let_go: list[Memory] | None = None
+    ) -> CleanSummary | None:
         """``summary``'s units less any the user let go of or that blame; None if the
-        forget check could not run (the caller must then show and store nothing of it)."""
+        forget check could not run (the caller must then show and store nothing of it).
+        ``let_go``: the user's forgotten and dismissed memories, if already read."""
         sentences, threads = summary_parts(summary)
         units = [*sentences, *threads]
         kept = {unit for unit in units if not _blames(unit)}
@@ -159,7 +163,9 @@ class SummaryFilter:
             pieces = {unit: check_pieces(unit) for unit in kept}
             checked = list(dict.fromkeys(p for unit_pieces in pieces.values() for p in unit_pieces))
             try:
-                survived = set(await self._memory.drop_suppressed(user_id, checked))
+                survived = set(
+                    await self._memory.drop_suppressed(user_id, checked, let_go=let_go)
+                )
             except Exception as exc:  # fail closed: unchecked text is never shown
                 logger.warning(
                     "Summary withheld: it could not be checked against forgotten memories (%s)",

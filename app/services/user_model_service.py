@@ -32,11 +32,17 @@ from app.domain.entities import (
     TaskEventType,
     UserProfile,
 )
-from app.domain.ports import ConstraintRepository, EnergyEstimator, ProfileRepository
+import app.core.config as config
+from app.domain.ports import (
+    ConstraintRepository,
+    EnergyEstimator,
+    ProfileRepository,
+    TaskEventRepository,
+)
 from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import PatternService, PatternView
 from app.services.planning.local_time import user_zone
-from app.services.task_service import utc_now
+from app.services.task_service import SLOT_OUTCOMES, utc_now
 from app.services.usage_ledger import UsageLedger
 
 # How each outcome reads on the page: never "missed", "skipped" or "failed".
@@ -156,9 +162,11 @@ class UserModelService:
         constraints: ConstraintRepository,
         energy: EnergyEstimator,
         usage: UsageLedger,
+        task_events: TaskEventRepository,
         *,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        self._task_events = task_events
         self._profiles = profiles
         self._memory = memory
         self._patterns = patterns
@@ -170,21 +178,31 @@ class UserModelService:
     async def snapshot(self, user_id: str) -> YouView:
         """The You page for ``user_id``: PEARL looks first, then every section is read.
 
-        The sections are independent reads, made concurrently. Any store failure
-        propagates (PersistenceError): an outage is never an empty page.
+        The profile and the outcome history of the last FOCUS_WINDOW_DAYS are read
+        once: PEARL's look (``PatternService.look``: idempotent, nothing new is nothing
+        written) and the focus profile share them. The other sections are independent
+        reads, made concurrently with the look. Any store failure propagates
+        (PersistenceError): an outage is never an empty page.
         """
-        await self._patterns.observe(user_id)  # idempotent: nothing new, nothing written
         now = self._clock()
-        profile = await self._profiles.get_or_create(user_id)
+        profile, events = await asyncio.gather(
+            self._profiles.get_or_create(user_id),
+            self._task_events.list_for_user(
+                user_id,
+                since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
+                types=set(SLOT_OUTCOMES),
+            ),
+        )
+        zone = user_zone(profile)
         since = now - timedelta(days=RECEIPT_WINDOW_DAYS)
-        views, rules, active, focus, receipt = await asyncio.gather(
-            self._patterns.current(user_id),
+        look, rules, active, focus, receipt = await asyncio.gather(
+            self._patterns.look(user_id, events=events, zone=zone),
             self._constraints.list_active(user_id),
             self._memory.list_active(user_id, now=now),
-            self._energy.estimate(user_id, user_zone(profile), now=now),
+            self._energy.estimate(user_id, zone, now=now, events=events),
             self._usage.receipt(user_id, since=since),
         )
-        patterns = [PatternShown.of(view) for view in views]
+        patterns = [PatternShown.of(view) for view in look.views]
         shown = {pattern.pattern_key for pattern in patterns}
         return YouView(
             as_of=now,

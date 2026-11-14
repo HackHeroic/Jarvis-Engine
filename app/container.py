@@ -179,7 +179,8 @@ class AppContainer:
             anticipation=anticipation,
             anticipation_listener=anticipation_listener,
             user_model_service=UserModelService(
-                repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
+                repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger,
+                repos.task_events,
             ),
             conversation_memory=conversation_memory,
             # A stated rule and the memory of stating it: letting go of one lets go of both.

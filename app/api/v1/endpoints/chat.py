@@ -1318,6 +1318,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "session_id": session_id,
         "user_message_id": None,
         "memory_handles": {},
+        # The user's memories, read once by _read_conversation for the whole turn; and
+        # the insights of PEARL's look in the observation loop. Both per turn.
+        "memory_snapshot": None,
+        "pearl_insights": None,
         # When user picks Gemini in the model selector, force every LLM call
         # in this turn to route to cloud — not local Gemma.
         "force_cloud_request": force_cloud_request,
@@ -1376,17 +1380,37 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             return
         conversations = container.conversation_memory
 
+        async def _snapshot():
+            try:
+                return await container.memory_service.snapshot(request.user_id)
+            except Exception as exc:  # each reader reads for itself, never a failed turn
+                logger.warning(f"Memories unread for the turn ({type(exc).__name__})")
+                return None
+
+        # The user's memories, read once for the whole turn: recall, the extraction's
+        # known memories and every forget check share this one read.
+        snapshot_read = asyncio.ensure_future(_snapshot())
+
+        async def _let_go():
+            snapshot = await snapshot_read
+            return snapshot.let_go if snapshot is not None else None
+
         async def _window():
             try:
-                return await conversations.build_history(request.user_id, session_id)
+                return await conversations.build_history(
+                    request.user_id, session_id, let_go=_let_go
+                )
             except Exception as exc:  # the plain newest-ten window, never a failed turn
                 logger.warning(
                     f"Conversation history unavailable this turn ({type(exc).__name__})"
                 )
                 return None
 
-        # Stage 1, before this message is saved: the window, and the profile with it.
-        window, profile = await asyncio.gather(_window(), user_model.get_profile())
+        # Stage 1, before this message is saved: the window, the profile and the memories.
+        window, profile, snapshot = await asyncio.gather(
+            _window(), user_model.get_profile(), snapshot_read
+        )
+        initial_state["memory_snapshot"] = snapshot
         if window is not None:
             initial_state["conversation_history"] = window.history
         else:
@@ -1402,7 +1426,8 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 return None
             try:  # the window found no messages: "since" need not read them again
                 return await conversations.since_last_spoke(
-                    request.user_id, session_id, zone=zone, known_empty=True
+                    request.user_id, session_id, zone=zone, known_empty=True,
+                    snapshot=snapshot,
                 )
             except Exception as exc:  # nothing to pick up this turn, never a failed turn
                 logger.warning(f"'Since we last spoke' unavailable ({type(exc).__name__})")
@@ -1415,6 +1440,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     request.user_prompt,
                     trivial=_is_trivial_input(request.user_prompt),
                     now=now,
+                    snapshot=snapshot,
                 )
             except Exception as exc:  # no memories this turn, never a failed turn
                 logger.warning(f"Recall unavailable this turn ({type(exc).__name__})")
@@ -1763,7 +1789,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             # moment arrives before complete, and nothing is left running after it.
             # The turn's learning, for the complete frame: PEARL's insights (a bounded
             # read), a re-plan hint, and the honest status of a plan that did not fit.
-            _insights = await pearl_insights(request.user_id)
+            # The observation loop's own look holds them; asked of PEARL only when that
+            # look did not run or finish (a greeting, a slow store).
+            _insights = final_state.get("pearl_insights")
+            if _insights is None:
+                _insights = await pearl_insights(request.user_id)
+            _insights = _insights or None
             _infeasible = final_state.get("error") == "INFEASIBLE_EXHAUSTED"
             _schedule_status = "draft" if _has_schedule else ("infeasible" if _infeasible else None)
             _suggested_action = (
