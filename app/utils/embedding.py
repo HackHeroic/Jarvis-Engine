@@ -32,17 +32,6 @@ def get_embedding_function():
         return None
 
 
-def embed_text(text: str) -> Optional[list[float]]:
-    """Embed a single text string. Returns None if embedding unavailable."""
-    ef = get_embedding_function()
-    if ef is None:
-        return None
-    results = ef([text])
-    if results and len(results) > 0:
-        return list(results[0])
-    return None
-
-
 def embed_texts(texts: list[str]) -> list[Optional[list[float]]]:
     """Embed multiple texts in a batch. Returns list of embeddings."""
     ef = get_embedding_function()

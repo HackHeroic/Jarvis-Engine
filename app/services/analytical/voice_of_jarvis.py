@@ -1,18 +1,10 @@
 """Voice of Jarvis: synthesize a single warm message from execution summary."""
 
-import contextvars
 import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from app.services.memory.context import with_context_note
-
-# ContextVar used by /stream endpoint to capture execution_summary without calling VoJ.
-# When set to a dict, synthesize_jarvis_response writes the summary into it and returns
-# empty placeholders instead of calling the LLM.
-summary_capture: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "summary_capture", default=None
-)
 
 VOICE_OF_JARVIS_PROMPT = (
     "You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), the user's personal AI. "
@@ -225,16 +217,7 @@ async def synthesize_jarvis_response(
     execution_summary: dict[str, Any],
     conversation_history: list[dict] | None = None,
 ) -> tuple[str, str | None]:
-    """Generate message and extract thinking process. Returns (message, thinking_process).
-
-    When summary_capture ContextVar is set (streaming mode), captures the summary
-    and returns empty placeholders instead of calling the LLM.
-    """
-    capture = summary_capture.get()
-    if capture is not None:
-        capture.update(execution_summary)
-        return ("", None)
-
+    """Generate message and extract thinking process. Returns (message, thinking_process)."""
     if execution_summary.get("spread_across_days"):
         thinking = build_thinking_fallback(execution_summary)
         return (

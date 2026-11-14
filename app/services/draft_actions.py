@@ -102,10 +102,21 @@ async def accept_on_time(
 async def accept_draft_on_time(
     drafts: DraftService, planner: DraftPlanner, user_id: str, draft: DraftSchedule
 ) -> Optional[AcceptOutcome]:
-    """``accept_draft_and_persist``, also saying whether passed times were moved.
+    """Accept the draft from chat: write its tasks to ``user_tasks`` and mark it accepted,
+    atomically, saying whether passed times were moved (``accept_on_time``).
 
-    ``written`` 0: nothing schedulable, nothing written. None: the write did not land
-    (the draft is still open). Raises as ``accept_on_time``.
+    Returns:
+        ``written > 0`` — that many tasks were written and the draft is now 'accepted'.
+        ``written == 0`` — the draft held nothing schedulable. Nothing was written and
+        the status is untouched; there is nothing here to accept.
+        ``None`` — the write did not land. The draft is still open, so
+        ``resolve_draft`` can find it and the user can retry; the caller must not
+        report success.
+
+    Raises as ``accept_on_time``: InvalidStateTransition when the draft is no longer
+    open (nothing written; it must not be re-persisted), NotFoundError when the user has
+    no such draft, ConflictError when a task id is already held by one of the user's
+    finished tasks (nothing written, and a retry cannot succeed).
     """
     try:
         return await accept_on_time(drafts, planner, user_id, draft.id)
@@ -115,36 +126,6 @@ async def accept_draft_on_time(
     except errors.PersistenceError:
         logger.error(f"Draft {draft.id} accept did not land — left open for retry")
         return None
-
-
-async def accept_draft_and_persist(
-    drafts: DraftService, planner: DraftPlanner, user_id: str, draft: DraftSchedule
-) -> Optional[int]:
-    """Accept the draft: write its tasks to ``user_tasks`` and mark it accepted, atomically.
-
-    Returns:
-        ``n > 0`` — that many tasks were written and the draft is now 'accepted'.
-        ``0`` — the draft held nothing schedulable. Nothing was written and the
-        status is untouched; there is nothing here to accept.
-        ``None`` — the write did not land. The draft is still open, so
-        ``resolve_draft`` can find it and the user can retry; the caller
-        must not report success.
-
-    Raises:
-        InvalidStateTransition: the draft is no longer open (already accepted,
-            rejected or expired). Nothing was written; it must not be re-persisted.
-        NotFoundError: the user has no such draft.
-        ConflictError: a task id in the draft is already held by one of the
-            user's finished tasks, or repeated. Nothing was written, and a retry
-            cannot succeed.
-
-    ``DraftService.accept`` writes the tasks and flips the status in one
-    transaction, so they land together or not at all. A second accept therefore
-    finds the draft closed instead of writing every task again. A draft some of whose
-    slots have begun is re-solved from now first (``accept_on_time``).
-    """
-    outcome = await accept_draft_on_time(drafts, planner, user_id, draft)
-    return outcome.written if outcome is not None else None
 
 
 async def reject_draft(

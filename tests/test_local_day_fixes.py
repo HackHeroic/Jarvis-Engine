@@ -13,9 +13,13 @@ import pytest
 from app.domain.entities import TaskEvent, TaskEventType
 from app.domain.errors import PersistenceError
 from app.domain.ports import TaskEventRepository
+import app.core.config as config
 from app.services.analytical.mastery_tracker import (
-    _get_reschedule_count,
+    NEUTRAL_SUCCESS_RATIO,
+    OUTCOME_TYPES,
+    calculate_success_ratio,
     compute_streak_from_events,
+    reschedule_count_of,
     streak_as_of,
 )
 from app.services.analytical.sm2_engine import get_due_trackers
@@ -180,11 +184,17 @@ async def test_reschedule_count__counts_skipped_events_for_goal():
 
     reads_before = len(supabase.selects)
 
-    assert await _get_reschedule_count("alice", "g1", events) == 2
-    assert await _get_reschedule_count("alice", "g2", events) == 1
-    assert await _get_reschedule_count("alice", None, events) == 3
-    assert await _get_reschedule_count("carol", "g1", events) == 0
-    assert await _get_reschedule_count("alice", "g1", None) == 0  # no history to read
+    async def recent(user: str) -> list[TaskEvent]:
+        """The outcomes the mastery summary counts pushes over: the focus window's."""
+        return await events.list_for_user(
+            user, since=now - timedelta(days=config.FOCUS_WINDOW_DAYS), types=set(OUTCOME_TYPES)
+        )
+
+    alice = await recent("alice")
+    assert reschedule_count_of(alice, "g1") == 2
+    assert reschedule_count_of(alice, "g2") == 1
+    assert reschedule_count_of(alice) == 3
+    assert reschedule_count_of(await recent("carol"), "g1") == 0
     # Through the repository: task_events only, never the old user_tasks column.
     assert {table for table, _ in supabase.selects[reads_before:]} == {"task_events"}
 
@@ -201,9 +211,13 @@ class _EventsUnreachable(TaskEventRepository):
 
 
 @pytest.mark.asyncio
-async def test_reschedule_count__history_unreadable__logged_and_zero(caplog):
-    assert await _get_reschedule_count("alice", "g1", _EventsUnreachable()) == 0
-    assert "Reschedule count" in caplog.text
+async def test_success_ratio__history_unreadable__logged_and_neutral(caplog):
+    """An outcome history that cannot be read is logged and read as none: the signal
+    takes its neutral value (the coach's success ratio, as every mastery signal)."""
+    assert await calculate_success_ratio("alice", "g1", _EventsUnreachable()) == (
+        NEUTRAL_SUCCESS_RATIO
+    )
+    assert "Success ratio" in caplog.text
 
 
 @pytest.mark.asyncio

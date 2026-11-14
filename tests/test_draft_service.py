@@ -572,24 +572,24 @@ async def _container_with_draft(supabase: FakeSupabase) -> tuple:
 
 
 @pytest.mark.asyncio
-async def test_accept_draft_and_persist__already_accepted__raises_invalid_state_transition():
-    from app.services.draft_actions import accept_draft_and_persist
+async def test_accept_draft_on_time__already_accepted__raises_invalid_state_transition():
+    from app.services.draft_actions import accept_draft_on_time
 
     supabase = FakeSupabase()
     container, draft = await _container_with_draft(supabase)
     drafts, planner = container.draft_service, container.planner
-    assert await accept_draft_and_persist(drafts, planner, U1, draft) == 2
+    assert (await accept_draft_on_time(drafts, planner, U1, draft)).written == 2
 
     with pytest.raises(errors.InvalidStateTransition):
-        await accept_draft_and_persist(drafts, planner, U1, draft)
+        await accept_draft_on_time(drafts, planner, U1, draft)
 
     assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == ["g_t1", "g_t2"]
 
 
 @pytest.mark.asyncio
-async def test_accept_draft_and_persist__database_unreachable__returns_none_and_leaves_draft_open():
+async def test_accept_draft_on_time__database_unreachable__returns_none_and_leaves_draft_open():
     """None is the "retry" answer, so the draft has to still be open for the retry."""
-    from app.services.draft_actions import accept_draft_and_persist
+    from app.services.draft_actions import accept_draft_on_time
 
     class _RpcDown(FakeSupabase):
         def rpc(self, name, params):
@@ -598,7 +598,7 @@ async def test_accept_draft_and_persist__database_unreachable__returns_none_and_
     supabase = _RpcDown()
     container, draft = await _container_with_draft(supabase)
 
-    assert await accept_draft_and_persist(
+    assert await accept_draft_on_time(
         container.draft_service, container.planner, U1, draft
     ) is None
     (row,) = supabase.rows["draft_schedules"]

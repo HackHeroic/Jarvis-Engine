@@ -145,27 +145,16 @@ async def compute_quality_trend(user_id: str, task_events: TaskEventRepository) 
     )
 
 
-def _skips(events: list[TaskEvent], goal_id: Optional[str]) -> int:
-    """Slots of the goal (all goals when None) whose latest outcome is a skip."""
+def reschedule_count_of(events: list[TaskEvent], goal_id: Optional[str] = None) -> int:
+    """How many of the goal's slots (every goal's when None) were set aside by a skip.
+
+    A slot counts once, as what happened last: skipped, then completed after all, is not
+    a push. Slots that passed unattended are not counted (nobody pushed them). The
+    mastery summary hands it the outcomes of the last FOCUS_WINDOW_DAYS.
+    """
     return sum(
         1 for event in _slots_of(events, goal_id) if event.event_type is TaskEventType.SKIPPED
     )
-
-
-async def _get_reschedule_count(
-    user_id: str, goal_id: Optional[str], task_events: TaskEventRepository | None
-) -> int:
-    """How many of the goal's slots were set aside by a skip (all goals when None).
-
-    Read from the user's outcome events of the last FOCUS_WINDOW_DAYS. A slot counts
-    once, as what happened last: skipped, then completed after all, is not a push.
-    Slots that passed unattended are not counted (nobody pushed them). An unreadable
-    history is logged and counts 0.
-    """
-    events = await _outcomes(
-        user_id, task_events, config.FOCUS_WINDOW_DAYS, "Reschedule count"
-    )
-    return _skips(events, goal_id)
 
 
 def _mastery_target(context: Optional[str]) -> Optional[float]:
@@ -229,7 +218,7 @@ async def get_mastery_summary(
             summary[gid] = compute_mastery(
                 average_quality_of(outcomes, gid),
                 success_ratio_of(outcomes, gid),
-                reschedule_count=_skips(recent, gid),
+                reschedule_count=reschedule_count_of(recent, gid),
                 target=_mastery_target(await goals.latest_context(user_id, gid)),
             )
         return summary

@@ -5,6 +5,7 @@
 """
 
 import ast
+import importlib
 import importlib.util
 from pathlib import Path
 
@@ -86,3 +87,24 @@ def test_off_turn_resolve__only_the_replanner_calls_resolve_from_now():
     the planning module's own time slots. The draft-edit re-solves that rebuilt their
     constraints from habit text alone (/chat/modify-schedule, the v1 modify flow) are gone."""
     assert _callers_of("resolve_from_now") == ["modules/planning_replan.py"]
+
+
+# Production code that only tests called (or nothing read), removed with the wave that
+# found it: (module, name). A live reader would bring it back; these have none.
+REMOVED_DEAD_CODE = [
+    ("app.services.draft_actions", "accept_draft_and_persist"),
+    ("app.services.analytical.mastery_tracker", "_get_reschedule_count"),
+    ("app.services.analytical.voice_of_jarvis", "summary_capture"),
+    ("app.utils.deadline_parser", "compute_horizon_from_deadlines"),
+    ("app.utils.embedding", "embed_text"),
+    ("app.core.config", "MAX_DEEP_WORK_MINUTES_PER_DAY"),
+    ("app.core.config", "LM_STUDIO_NATIVE_URL"),
+    ("app.core.config", "AWS_ACCESS_KEY_ID"),
+    ("app.core.config", "AWS_SECRET_ACCESS_KEY"),
+]
+
+
+@pytest.mark.parametrize(("module", "name"), REMOVED_DEAD_CODE)
+def test_dead_code__removed__absent_and_called_nowhere(module, name):
+    assert not hasattr(importlib.import_module(module), name)
+    assert _callers_of(name) == []

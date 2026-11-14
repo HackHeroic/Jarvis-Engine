@@ -170,7 +170,7 @@ class ChatTurn:
             intent = intent_str(final_state.get("intent", "CHAT"))
             has_schedule = bool(final_state.get("schedule"))
             yield SseEncoder.frame(SseEvent.STEP, StepFrame(
-                intent=intent, stage="pipeline_done", model_mode=request.model_mode or "auto",
+                intent=intent, stage="pipeline_done", model_mode=request.model_mode,
                 synthesis_model=self._answering_model(), force_cloud=force_cloud_var.get(),
             ))
             async with aclosing(reply_frames(final_state, text, intent=intent,
@@ -260,7 +260,7 @@ class ChatTurnService:
         """Open one turn in the caller's context: the cloud flag (when the model picker
         chose a cloud model), the session, and the usage attribution every LLM call of
         the turn is metered under. ``ChatTurn.finish`` ends them."""
-        model_mode = request.model_mode or "auto"
+        model_mode = request.model_mode  # a Literal, "auto" by default: never empty
         force_cloud_request = model_mode in CLOUD_MODEL_MODES
         force_cloud_token = None
         if force_cloud_request:
