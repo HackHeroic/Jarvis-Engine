@@ -317,3 +317,22 @@ def test_rules_linked_to__forgetting_the_memory_takes_exactly_these_rules():
     You page, and r4 (linked to nothing) is not expected to go."""
     assert live_e2e.rules_linked_to(_RULE_ROWS, "m2") == ["r1", "r2"]
     assert live_e2e.rules_linked_to(_RULE_ROWS, "m1") == []
+
+
+def test_forgotten_rules__the_rules_linked_before_went__their_ids():
+    assert live_e2e.forgotten_rules({"forgotten_rule_ids": ["r2", "r1"]}, ["r1", "r2"]) == [
+        "r2", "r1",
+    ]
+
+
+@pytest.mark.parametrize(
+    "body, linked",
+    [
+        ({"status": "forgotten", "forgotten_rule_ids": []}, []),  # no rule was ever linked
+        ({"status": "forgotten"}, ["r1"]),  # a backend that does not say
+        ({"forgotten_rule_ids": ["r1"]}, ["r1", "r2"]),  # one linked rule stayed
+    ],
+)
+def test_forgotten_rules__none_or_not_the_linked_ones__step_8_fails(body, linked):
+    with pytest.raises(AssertionError):
+        live_e2e.forgotten_rules(body, linked)

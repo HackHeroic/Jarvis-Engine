@@ -75,6 +75,12 @@ class ForgetResponse(BaseModel):
     """The memory is forgotten."""
 
     status: Literal["forgotten"] = Field(description="Always 'forgotten'.")
+    forgotten_rule_ids: list[str] = Field(
+        default_factory=list,
+        description="The rules that went with it: every rule the memory was the saying "
+        "of (a memory of saying two rules at once takes both). Empty for a memory no rule "
+        "rests on.",
+    )
 
 
 class MemoryEdit(BaseModel):
@@ -145,14 +151,14 @@ async def edit_memory(
         "Erases the memory's words at once and removes it from every list. A tombstone "
         "stays: its embedding and pattern key are kept, so when the same fact is said or "
         "noticed again Jarvis recognises it and does not store it again. A dismissed memory "
-        "can be forgotten too. The memory of stating a rule takes the rule with it: plans "
-        "stop applying it. Another user's memory: 404."
+        "can be forgotten too. The memory of stating a rule takes the rule with it (named "
+        "in forgotten_rule_ids): plans stop applying it. Another user's memory: 404."
     ),
 )
 async def forget_memory(memory_id: str, request: Request, user: CurrentUser) -> ForgetResponse:
     _memories(request)  # the database first (503), as on every route
-    await get_container(request).stated_rules.forget_memory(user, memory_id)
-    return ForgetResponse(status="forgotten")
+    gone = await get_container(request).stated_rules.forget_memory(user, memory_id)
+    return ForgetResponse(status="forgotten", forgotten_rule_ids=gone)
 
 
 @router.post(

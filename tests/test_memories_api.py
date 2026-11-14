@@ -94,7 +94,7 @@ async def test_memories_api__forget_then_list__gone(monkeypatch, supabase, conta
         forgot = await api.delete(f"/api/v1/memories/{marathon.id}", params={"user_id": "alice"})
         panel = await api.get("/api/v1/memories/", params={"user_id": "alice"})
 
-    assert (forgot.status_code, forgot.json()) == (200, {"status": "forgotten"})
+    assert (forgot.status_code, forgot.json()) == (200, {"status": "forgotten", "forgotten_rule_ids": []})
     assert panel.status_code == 200
     body = panel.json()
     assert body["count"] == 1
@@ -268,6 +268,7 @@ async def test_memories_api__forget_a_stated_rules_memory__the_rule_is_gone_too(
         rules = await client.get("/api/v1/habits/constraints?user_id=alice")
 
     assert forgotten.status_code == 200
+    assert forgotten.json() == {"status": "forgotten", "forgotten_rule_ids": [rule.id]}
     assert rules.json()["constraints"] == []
     assert await container.repos.constraints.list_active("alice") == []
 

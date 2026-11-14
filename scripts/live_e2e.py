@@ -166,6 +166,17 @@ def rules_linked_to(rule_rows: list[dict], memory_id: str) -> list[str]:
     return [str(row["id"]) for row in rule_rows if linked_memory_id(row) == memory_id]
 
 
+def forgotten_rules(forget_body: dict, linked_before: list[str]) -> list[str]:
+    """The rule ids ``DELETE /memories/{id}`` says went with the memory: at least one (the
+    taught rule was stored linked to it), and exactly the rules linked before."""
+    gone = [str(rule_id) for rule_id in forget_body.get("forgotten_rule_ids") or []]
+    assert gone, f"no rule went with the rule's memory (linked before: {linked_before})"
+    assert sorted(gone) == sorted(linked_before), (
+        f"forgot rules {sorted(gone)}, but {sorted(linked_before)} were linked"
+    )
+    return gone
+
+
 def matches_fact(text: str | None) -> bool:
     """Whether ``text`` states the night-owl fact of FACT_PROMPT, in any wording."""
     return bool(text and NIGHT_OWL.search(text))
@@ -553,13 +564,14 @@ def _core_loop(run: Run, client: Client, db: Any, user_id: str, state: dict) -> 
 
     def forget() -> str:
         memory = state["rule_memory"]
-        state["forgotten_rule_ids"] = rules_linked_to(_rule_rows(), memory["memory_id"])
+        linked = rules_linked_to(_rule_rows(), memory["memory_id"])
         response = client.forget(memory["memory_id"])
         assert response.status_code == 200, said(response)
+        state["forgotten_rule_ids"] = forgotten_rules(response.json(), linked)
         assert memory["memory_id"] not in [m["memory_id"] for m in client.memories()], "still in the panel"
         left = [r["id"] for r in _rule_rows() if str(r["id"]) in state["forgotten_rule_ids"]]
         assert not left, f"the rule stored with the forgotten memory is still a rule: {left}"
-        return f"forgot {memory['content']!r} and {len(state['forgotten_rule_ids'])} rule(s) with it"
+        return f"forgot {memory['content']!r} and rule(s) {state['forgotten_rule_ids']} with it"
 
     def usage() -> str:
         last: dict = {}
@@ -690,11 +702,12 @@ def _vision_core(run: Run, client: Client, db: Any, user_id: str, state: dict) -
             f"focus is {focus['source']} from {focus['observations']} outcomes; "
             "a new user has the prior"
         )
-        # Step 8 forgot the rule's memory, which takes the rule with it: plans stop
-        # applying it, and the page stops listing it.
+        # Step 8 forgot the rule's memory, which took the rule with it (step 8 checked at
+        # least one went): plans stop applying it, and the page stops listing that id.
         gone = state.get("forgotten_rule_ids") or []
-        still = [r["text"] for r in rules if r["id"] in gone]
-        assert not still, f"step 8 forgot the rule's memory, yet it is under rules: {still}"
+        if gone:
+            still = [r["text"] for r in rules if str(r["id"]) in gone]
+            assert not still, f"step 8 forgot rules {gone}, yet they are under rules: {still}"
         assert receipt["cloud_calls"] > 0, f"no cloud calls in the receipt: {receipt}"
         now = datetime.now(timezone.utc)
         since = datetime.fromisoformat(receipt["since"])
