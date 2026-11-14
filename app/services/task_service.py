@@ -15,6 +15,7 @@ from typing import ClassVar
 
 import app.core.config as config
 from app.domain import errors
+from app.domain.clock import utc_now  # noqa: F401  (re-exported: older imports use it here)
 from app.domain.entities import Task, TaskEvent, TaskEventType, TaskStatus
 from app.domain.events import (
     DeadlineMissed,
@@ -34,11 +35,6 @@ _CAS_ATTEMPTS = 3
 # Outcomes that settle a slot: completed, skipped, or missed (the slot passed). One
 # recorded since the slot began keeps the sweep away; learning counts only these.
 SLOT_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
-
-
-def utc_now() -> datetime:
-    """The current instant, in UTC."""
-    return datetime.now(timezone.utc)
 
 
 def as_aware(moment: datetime) -> datetime:

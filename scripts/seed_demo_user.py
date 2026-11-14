@@ -69,7 +69,7 @@ import httpx
 
 import app.core.config as config  # loads .env the way the app does
 from app.api.v1.endpoints.reasoning import TaskChunk
-from app.container import AppContainer
+from app.container import AppContainer, default_pattern_detectors
 from app.domain.entities import (
     AutonomyMode,
     MemorySource,
@@ -370,7 +370,8 @@ def build_seed_services(
         memory=MemoryService(repos.memories, embedder, clock=clock),
         clock=clock,
         patterns=PatternService(
-            repos.task_events, repos.memories, repos.profiles, bus, clock=clock
+            repos.task_events, repos.memories, repos.profiles, bus,
+            detectors=default_pattern_detectors(), clock=clock,
         ),
         task_events=repos.task_events,
     )

@@ -203,7 +203,7 @@ def _match_draft_intent(text: str):
     return None
 
 
-def _is_trivial_input(text: str) -> bool:
+def is_trivial_input(text: str) -> bool:
     """Return True for inputs that should bypass 26B brain-dump extraction.
 
     Three categories route straight to CHAT (which DOES call the LLM via
@@ -277,7 +277,7 @@ async def _known_memories(user_id: str | None, snapshot: Any = None) -> list:
     own. Otherwise a slow or failing read gives none: the turn is extracted without them.
     """
     from app.core.runtime import registered_container
-    from app.services.task_service import utc_now
+    from app.domain.clock import utc_now
 
     if snapshot is not None:
         memories = snapshot.in_use(utc_now())
@@ -331,7 +331,7 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     user_msg = state.get("user_message", "")
 
     # Greeting / ack fast path — no LLM call, returns null brain_dump → CHAT intent
-    if _is_trivial_input(user_msg):
+    if is_trivial_input(user_msg):
         return {"brain_dump": None, "trivial_input": True}
 
     # Decided fresh every turn: the checkpointer persists this flag, and a

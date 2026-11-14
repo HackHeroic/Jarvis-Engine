@@ -124,10 +124,10 @@ async def test_chat__new_conversation__starts_with_no_history_and_no_draft_under
 @pytest.mark.asyncio
 async def test_short_term__new_session__model_told_since_we_last_spoke(jarvis, llm, clock):
     import app.services.chat_history as chat_history
-    import app.services.task_service as task_service
+    import app.domain.clock as utc_clock
 
     ist = ZoneInfo("Asia/Kolkata")
-    clock.freeze(datetime(2026, 11, 15, 20, 0, tzinfo=ist), chat_history, task_service)
+    clock.freeze(datetime(2026, 11, 15, 20, 0, tzinfo=ist), chat_history, utc_clock)
     first = await jarvis.say("I'm revising graph algorithms this week")
     assert first.payload["since_last_spoke"] is None  # a first conversation: nothing to pick up
     clock.advance(hours=13)  # 09:00 the next morning

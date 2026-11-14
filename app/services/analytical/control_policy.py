@@ -20,7 +20,8 @@ from fastapi import HTTPException
 from app.core.jarvis_logger import log_step
 from pydantic import ValidationError
 
-from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk, SYSTEM_PROMPT, _sanitize_llm_json
+from app.api.v1.endpoints.reasoning import SYSTEM_PROMPT, _sanitize_llm_json
+from app.schemas.decomposition import ExecutionGraph, TaskChunk
 from app.api.v1.endpoints.schedule import run_schedule
 import app.core.config as _cfg
 from app.core.config import (
@@ -46,7 +47,7 @@ from app.services.analytical.habit_translator import translate_habits_to_slots
 from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
 from app.services.analytical.task_retrieval import get_all_pending_tasks_with_goals
 from app.services.analytical.voice_of_jarvis import (
-    _build_thinking_fallback,
+    build_thinking_fallback,
     synthesize_jarvis_response,
 )
 from app.services.extraction.behavioral_store import (
@@ -331,7 +332,7 @@ def mint_run_token() -> str:
     return uuid.uuid4().hex[:6]
 
 
-def _namespace_chunk(chunk: TaskChunk, goal_id: str, run: str) -> TaskChunk:
+def namespace_chunk(chunk: TaskChunk, goal_id: str, run: str) -> TaskChunk:
     """Prefix task_id and dependencies with ``{goal_id}_{run}_`` for multi-goal fusion.
 
     ``run`` comes from ``mint_run_token``, once per planning run. The ids stay
@@ -596,8 +597,8 @@ async def _direct_qa_response(
         msg = msg.strip() if msg else "I couldn't generate a response."
 
         # Extract thinking if present
-        from app.services.analytical.voice_of_jarvis import _extract_thinking_process
-        message, thinking_process = _extract_thinking_process(msg)
+        from app.services.analytical.voice_of_jarvis import extract_thinking_process
+        message, thinking_process = extract_thinking_process(msg)
 
         return ChatResponse(
             intent=IntentType.GENERAL_QA.value,
@@ -622,8 +623,8 @@ async def _direct_qa_response(
                 )
                 msg = result if isinstance(result, str) else str(result)
                 msg = msg.strip() if msg else "I couldn't generate a response."
-                from app.services.analytical.voice_of_jarvis import _extract_thinking_process
-                message, thinking_process = _extract_thinking_process(msg)
+                from app.services.analytical.voice_of_jarvis import extract_thinking_process
+                message, thinking_process = extract_thinking_process(msg)
                 return ChatResponse(
                     intent=IntentType.GENERAL_QA.value,
                     message=message,
@@ -1010,9 +1011,9 @@ async def _run_plan_day_flow(
 
     goal_id = derive_goal_id(graph.goal_metadata, planning_goal)
 
-    # Ensure dependencies are prefixed; _namespace_chunk does this
+    # Ensure dependencies are prefixed; namespace_chunk does this
     run = mint_run_token()
-    new_prefixed = [_namespace_chunk(c, goal_id, run) for c in graph.decomposition]
+    new_prefixed = [namespace_chunk(c, goal_id, run) for c in graph.decomposition]
     all_pending = get_all_pending_tasks_with_goals(user_id, supabase)
     # Keep tasks from OTHER goals, drop tasks from THIS goal (will be replaced by new decomposition)
     pending_chunks = [
@@ -1143,7 +1144,7 @@ async def _run_plan_day_flow(
         # VoJ was adding 5-10s for a message the user doesn't read when they can
         # see the visual schedule. Use deterministic fallback instead.
         message = "Here's your schedule."
-        thinking_process = _build_thinking_fallback(summary)
+        thinking_process = build_thinking_fallback(summary)
         sched_dict = schedule_response.model_dump(mode='json')
         applied_constraints_data = [
             {"name": c.name, "start_min": c.start_min, "end_min": c.end_min,

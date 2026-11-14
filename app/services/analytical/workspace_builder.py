@@ -21,7 +21,7 @@ from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
 from app.services.user_preferences import get_learning_style
-from supabase import create_client
+from app.db.supabase_py import build_supabase_client
 
 WORKSPACE_TTL_HOURS = 24
 
@@ -64,7 +64,7 @@ async def _search_web(user_prompt: str, system_prompt: str) -> str:
 def _get_supabase():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 async def fetch_chunks_for_task(

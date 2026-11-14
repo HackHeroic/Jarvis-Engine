@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.services.analytical.habit_translator import invalidate_habit_cache
-from supabase import create_client
+from app.db.supabase_py import build_supabase_client
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ def _get_supabase():
     """Get Supabase client. Uses config env vars."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 async def store_behavioral_constraint(

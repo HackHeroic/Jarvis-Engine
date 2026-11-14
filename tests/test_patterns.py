@@ -22,7 +22,7 @@ import pytest
 import pytest_asyncio
 
 import app.core.config as _cfg
-from app.container import AppContainer
+from app.container import AppContainer, default_pattern_detectors
 from app.domain.entities import (
     Memory,
     MemorySource,
@@ -187,7 +187,10 @@ def detected(bus) -> _Recorder:
 
 @pytest.fixture
 def service(repos, bus, clock) -> PatternService:
-    return PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
+    return PatternService(
+        repos.task_events, repos.memories, repos.profiles, bus,
+        detectors=default_pattern_detectors(), clock=clock,
+    )
 
 
 @dataclass
@@ -207,7 +210,10 @@ async def wired(clock):
     store = InMemoryStore()
     repos = RepositoryFactory.in_memory(store)
     bus = EventBus()
-    patterns = PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
+    patterns = PatternService(
+        repos.task_events, repos.memories, repos.profiles, bus,
+        detectors=default_pattern_detectors(), clock=clock,
+    )
     observer = PatternObserver(patterns)
     for outcome in OUTCOMES:
         bus.subscribe(outcome, observer)
@@ -678,7 +684,10 @@ async def test_drain_pending__time_cap_cancels_after_the_write__moment_kept(bus,
     store = InMemoryStore()
     repos = RepositoryFactory.in_memory(store)
     memories = _SlowAnswers(store)
-    service = PatternService(repos.task_events, memories, repos.profiles, bus, clock=clock)
+    service = PatternService(
+        repos.task_events, memories, repos.profiles, bus,
+        detectors=default_pattern_detectors(), clock=clock,
+    )
     await _seed(repos, *_skips_at_nine(3, 2, 1))
 
     turn = asyncio.create_task(service.observe("alice"))
@@ -820,13 +829,13 @@ async def test_pattern_observer__observe_fails__logged_by_type_and_the_next_outc
 
     monkeypatch.setattr(wired.patterns, "observe", failing)
 
-    with caplog.at_level(logging.WARNING, logger="app.services.memory.patterns"):
+    with caplog.at_level(logging.WARNING, logger="app.services.background"):
         for task_id in ("t1", "t2"):
             await wired.bus.publish(TaskSkipped(occurred_at=NOW, user_id="alice", task_id=task_id))
             await wired.observer.settle()
 
     assert calls == ["alice", "alice"]
-    logged = [r.getMessage() for r in caplog.records if r.name == "app.services.memory.patterns"]
+    logged = [r.getMessage() for r in caplog.records if r.name == "app.services.background"]
     assert len(logged) == 2
     assert all("RuntimeError" in line and "words the user wrote" not in line for line in logged)
 

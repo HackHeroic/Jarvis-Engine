@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import app.api.v1.endpoints.schedule as schedule_endpoint
+from app.container import default_pattern_detectors
 from app.domain import errors
 from app.domain.anticipation import ConsentPolicy
 from app.domain.entities import (
@@ -128,7 +129,10 @@ def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None
     planner = planner or PlanningGraphReplanner(
         repos.drafts, db_provider=lambda: FakeDBClient(fake), memory_provider=lambda: None
     )
-    patterns = PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
+    patterns = PatternService(
+        repos.task_events, repos.memories, repos.profiles, bus,
+        detectors=default_pattern_detectors(), clock=clock,
+    )
     energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
     drafts = DraftService(
         repos.drafts, bus, task_events=repos.task_events, tasks=repos.tasks, clock=clock

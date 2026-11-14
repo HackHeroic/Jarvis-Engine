@@ -7,8 +7,10 @@ reading that history, with hours on the user's clock. It owns everything particu
 to its pattern: the pattern's stable ``pattern_key`` (such as
 ``skip_time_window:9``), how planning applies it, and the words: descriptions and
 insights speak to the user ("You tend to set work aside around 9 AM"), with a human
-time and no blame. Adding a detector touches no other code.
+time and no blame. Adding a detector is a new class here and one line in the composition
+root; no other code changes.
 
+The composition root chooses the detectors (``app.container.default_pattern_detectors``).
 ``PatternService.observe`` remembers patterns as inferred behavioural memories, looked
 up by key. A new pattern is created. One with an observation newer than its memory is
 strengthened. Anything else is left alone, so looking at the same history again
@@ -31,6 +33,7 @@ from pydantic import BaseModel, Field
 
 import app.core.config as config
 from app.domain import errors
+from app.domain.clock import utc_now
 from app.domain.entities import (
     SUPPRESSING_STATUSES,
     Memory,
@@ -39,24 +42,22 @@ from app.domain.entities import (
     Pattern,
     TaskEvent,
     TaskEventType,
+    memory_moves_to,
 )
 from app.domain.events import DomainEvent, EventBus, EventListener, PatternDetected
 from app.domain.ports import MemoryRepository, ProfileRepository, TaskEventRepository
-from app.services.analytical.missed_deadlines import _parse_deadline
+from app.services.background import PerUserSingleFlight
+from app.services.analytical.missed_deadlines import parse_deadline
 from app.services.planning.local_time import user_zone
-from app.services.task_service import (
-    SLOT_OUTCOMES,
-    as_aware,
-    latest_outcome_per_slot,
-    utc_now,
-)
+from app.services.task_service import SLOT_OUTCOMES, as_aware, latest_outcome_per_slot
 
 logger = logging.getLogger(__name__)
 
 _SET_ASIDE = frozenset({TaskEventType.SKIPPED, TaskEventType.MISSED})
-# A remembered pattern can be strengthened from these states; dismissed and forgotten stick,
-# also when the user lets go of it while PEARL is looking (a compare-and-set on status).
-_STRENGTHENABLE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+# A remembered pattern can be strengthened (made ACTIVE) from these states, per the
+# domain's MEMORY_TRANSITIONS; dismissed and forgotten stick, also when the user lets go
+# of it while PEARL is looking (a compare-and-set on status).
+_STRENGTHENABLE = memory_moves_to(MemoryStatus.ACTIVE)
 # How an outcome reads in evidence: the user's words, never "skipped" or "missed".
 _EVIDENCE_LABELS = {
     TaskEventType.COMPLETED: "done",
@@ -283,7 +284,7 @@ class DeadlineCrunchDetector(PatternDetector):
         deadlined = []
         for event in latest_outcome_per_slot(events):
             if event.event_type is TaskEventType.COMPLETED:
-                deadline = _parse_deadline(event.metadata.get("deadline_hint"), zone)
+                deadline = parse_deadline(event.metadata.get("deadline_hint"), zone)
                 if deadline is not None:
                     deadlined.append((event, deadline))
         last_day = [
@@ -405,23 +406,16 @@ class PatternService:
         profiles: ProfileRepository,
         bus: EventBus,
         *,
-        detectors: list[PatternDetector] | None = None,
+        detectors: list[PatternDetector],
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        """``detectors``: the strategies PEARL reads the history with, chosen by the
+        composition root (``app.container.default_pattern_detectors``)."""
         self._task_events = task_events
         self._memories = memories
         self._profiles = profiles
         self._bus = bus
-        self._detectors = (
-            detectors
-            if detectors is not None
-            else [
-                SkipTimeWindowDetector(),
-                PeakHourDetector(),
-                DeadlineCrunchDetector(),
-                RepeatedSkipDetector(),
-            ]
-        )
+        self._detectors = list(detectors)
         self._by_name = {detector.name: detector for detector in self._detectors}
         self._clock = clock
         self._pending: dict[str, deque[PatternChange]] = {}
@@ -702,50 +696,26 @@ class PatternObserver(EventListener):
 
     The Complete, Skip or sweep that published the outcome never waits for it. At
     most one run per user is in flight; outcomes that arrive meanwhile ask for one
-    more run after it, however many there were. A failed run is logged by its type.
+    more run after it, however many there were (``PerUserSingleFlight``, shared with
+    the anticipation listener). A failed run is logged by its type.
     """
 
     def __init__(self, patterns: PatternService) -> None:
         self._patterns = patterns
-        self._running: dict[str, asyncio.Task] = {}
-        self._dirty: set[str] = set()
-        self._closed = False
+        self._flight = PerUserSingleFlight(self._observe, label="PEARL run")
 
     async def handle(self, event: DomainEvent) -> None:
-        user_id = event.user_id
-        if user_id is None or self._closed:
-            return
-        if user_id in self._running:
-            self._dirty.add(user_id)
-            return
-        self._running[user_id] = asyncio.create_task(self._run(user_id))
+        if event.user_id is not None:
+            self._flight.request(event.user_id)
 
     async def settle(self) -> None:
         """Wait until no run is in flight."""
-        while self._running:
-            await asyncio.wait(set(self._running.values()))
+        await self._flight.settle()
 
     async def shutdown(self, grace_s: float = OBSERVER_SHUTDOWN_GRACE_S) -> None:
         """Take no more outcomes; give the runs in flight ``grace_s`` to finish, then
         cancel the rest and wait for them to end."""
-        self._closed = True
-        runs = set(self._running.values())
-        if not runs:
-            return
-        _, unfinished = await asyncio.wait(runs, timeout=grace_s)
-        for run in unfinished:
-            run.cancel()
-        await asyncio.gather(*unfinished, return_exceptions=True)
+        await self._flight.shutdown(grace_s)
 
-    async def _run(self, user_id: str) -> None:
-        try:
-            while True:
-                self._dirty.discard(user_id)
-                try:
-                    await self._patterns.observe(user_id)
-                except Exception as exc:  # never the outcome's problem; the next run retries
-                    logger.warning("PEARL run failed (%s)", type(exc).__name__)
-                if user_id not in self._dirty:
-                    return
-        finally:
-            self._running.pop(user_id, None)
+    async def _observe(self, user_id: str) -> None:
+        await self._patterns.observe(user_id)

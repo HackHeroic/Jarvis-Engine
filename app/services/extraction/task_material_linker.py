@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.utils.embedding import cosine_similarity as _cosine_similarity, get_embedding_function as _get_embedding_function
-from supabase import create_client
+from app.db.supabase_py import build_supabase_client
 
 SIMILARITY_THRESHOLD = 0.65  # 0.6–0.8 recommended to avoid noisy links
 
@@ -12,7 +12,7 @@ SIMILARITY_THRESHOLD = 0.65  # 0.6–0.8 recommended to avoid noisy links
 def _get_supabase():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 async def link_document_to_tasks(

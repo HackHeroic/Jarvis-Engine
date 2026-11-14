@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import scripts.seed_demo_user as seed
+from app.container import default_pattern_detectors
 from app.domain.entities import LLMLocation, TaskEvent, TaskEventType, TaskStatus
 from app.domain.events import EventBus
 from app.domain.ports import LLMProvider, LLMRequest
@@ -112,7 +113,8 @@ def _pearl(repos, today: date = TODAY) -> PatternService:
     """The real PEARL over the seeded history, looking at it on the morning of ``today``."""
     at = _start_of(today)
     return PatternService(
-        repos.task_events, repos.memories, repos.profiles, EventBus(), clock=lambda: at
+        repos.task_events, repos.memories, repos.profiles, EventBus(),
+        detectors=default_pattern_detectors(), clock=lambda: at,
     )
 
 
@@ -782,7 +784,10 @@ def _brief_world(fake, repos, now: datetime):
     planner = PlanningGraphReplanner(
         repos.drafts, db_provider=lambda: FakeDBClient(fake), memory_provider=lambda: None
     )
-    patterns = PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
+    patterns = PatternService(
+        repos.task_events, repos.memories, repos.profiles, bus,
+        detectors=default_pattern_detectors(), clock=clock,
+    )
     drafts = DraftService(repos.drafts, bus, task_events=repos.task_events, tasks=repos.tasks,
                           clock=clock)
     actions = build_action_factory(

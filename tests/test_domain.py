@@ -291,3 +291,114 @@ def test_memory__blank_content__allowed_only_when_forgotten():
             _memory(content="", status=status)
     with pytest.raises(ValidationError):
         _memory(content="x" * 2001)
+
+
+# --- the memory lifecycle: one transition table ------------------------------------
+
+
+def test_memory_transitions__table__the_legal_moves():
+    from app.domain.entities import MEMORY_TRANSITIONS, MemoryStatus as S
+
+    assert MEMORY_TRANSITIONS == {
+        S.ACTIVE: {S.ACTIVE, S.FADED, S.DISMISSED, S.FORGOTTEN},
+        S.FADED: {S.ACTIVE, S.DISMISSED, S.FORGOTTEN},  # a mention brings a faded one back
+        S.DISMISSED: {S.FORGOTTEN},  # the user's forget is the one way out
+        S.FORGOTTEN: set(),  # a forgotten memory never changes again
+    }
+
+
+def test_memory_moves_to__the_compare_and_set_guard_for_each_target():
+    from app.domain.entities import MemoryStatus as S, memory_moves_to
+
+    assert memory_moves_to(S.ACTIVE) == {S.ACTIVE, S.FADED}  # reinforce, confirm, edit
+    assert memory_moves_to(S.DISMISSED) == {S.ACTIVE, S.FADED}
+    assert memory_moves_to(S.FADED) == {S.ACTIVE}  # the decay sweep
+    assert memory_moves_to(S.FORGOTTEN) == {S.ACTIVE, S.FADED, S.DISMISSED}
+
+
+@pytest.mark.parametrize(
+    "frm, to", [("forgotten", "active"), ("dismissed", "active"), ("faded", "faded")]
+)
+def test_check_memory_move__not_in_the_table__invalid_state_transition(frm, to):
+    from app.domain.entities import check_memory_move
+
+    with pytest.raises(InvalidStateTransition) as raised:
+        check_memory_move("m1", frm, to)
+
+    assert raised.value.details == {"memory_id": "m1", "from": frm, "to": to}
+
+
+def test_check_memory_move__legal__returns_the_target():
+    from app.domain.entities import MemoryStatus, check_memory_move
+
+    assert check_memory_move("m1", "dismissed", "forgotten") is MemoryStatus.FORGOTTEN
+
+
+# --- one definition of each vocabulary -----------------------------------------------
+
+
+def test_vocabularies__defined_once_in_the_domain__reused_by_schemas_and_api():
+    """Memory types, said/inferred, allow/ask/deny and draft statuses each have one
+    definition (the domain's); no schema, service or route spells its own."""
+    import re
+    import typing
+    from pathlib import Path
+
+    from app.api.v1.endpoints.anticipation import ConsentOut, SuggestionOut
+    from app.domain.entities import (
+        BehavioralConstraint,
+        ConsentBehavior,
+        ConsentDecision,
+        DraftStatus,
+        MemorySource,
+        MemoryType,
+        Suggestion,
+    )
+    from app.schemas import memory as memory_schemas
+    from app.schemas.draft import DraftSchedule as LegacyDraft
+    from app.schemas.draft import DraftStateResponse
+    from app.services.user_model_service import RuleShown
+
+    def annotation(model, field):
+        return model.model_fields[field].annotation
+
+    assert memory_schemas.MemoryType is MemoryType
+    assert annotation(BehavioralConstraint, "source") is MemorySource
+    assert annotation(RuleShown, "provenance") is MemorySource
+    assert typing.get_args(ConsentBehavior) == ("allow", "ask", "deny")
+    for model, field in (
+        (ConsentDecision, "behavior"), (Suggestion, "consent_behavior"),
+        (ConsentOut, "behavior"), (SuggestionOut, "consent_behavior"),
+    ):
+        assert annotation(model, field) == ConsentBehavior, (model, field)
+    assert annotation(DraftStateResponse, "status") is DraftStatus
+    assert annotation(LegacyDraft, "status") is DraftStatus
+
+    spelled = re.compile(
+        r'Literal\[\s*"(allow", "ask", "deny|said", "inferred|fact", "preference")"'
+    )
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    elsewhere = [
+        str(p.relative_to(app_dir))
+        for p in app_dir.rglob("*.py")
+        if spelled.search(p.read_text()) and p != app_dir / "domain" / "entities.py"
+    ]
+    assert elsewhere == []
+
+
+def test_clock__utc_now_defined_once__older_imports_still_work():
+    import re
+    from pathlib import Path
+
+    import app.services.task_service as task_service
+    from app.domain import clock
+
+    assert task_service.utc_now is clock.utc_now
+    assert clock.utc_now().utcoffset().total_seconds() == 0
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    defined = [
+        str(p.relative_to(app_dir))
+        for p in app_dir.rglob("*.py")
+        if re.search(r"^def utc_now\(", p.read_text(), re.M)
+    ]
+    assert defined == ["domain/clock.py"]

@@ -503,7 +503,7 @@ async def decompose_goal(state: PlanningState) -> dict:
         # the plan. The helpers are imported from the v1 flow, never
         # re-implemented, so the two pipelines cannot drift.
         from app.services.analytical.control_policy import (
-            _namespace_chunk,
+            namespace_chunk,
             derive_goal_id,
             mint_run_token,
         )
@@ -513,7 +513,7 @@ async def decompose_goal(state: PlanningState) -> dict:
         # goal_id rides on every chunk, so no reader has to parse it back out of
         # the id (which reads goal `learn_dsa` as `learn`).
         chunks = [
-            {**_namespace_chunk(tc, goal_id, run).model_dump(), "goal_id": goal_id}
+            {**namespace_chunk(tc, goal_id, run).model_dump(), "goal_id": goal_id}
             for tc in graph.decomposition
         ]
         return {

@@ -19,9 +19,9 @@ from app.core.jarvis_logger import log_step
 from app.schemas.context import ChatResponse
 from app.services.analytical.control_policy import execute_agentic_flow
 from app.services.analytical.voice_of_jarvis import (
-    _build_thinking_fallback,
-    _extract_thinking_process,
-    _summary_capture,
+    build_thinking_fallback,
+    extract_thinking_process,
+    summary_capture,
     synthesize_jarvis_response_stream,
 )
 from app.models.brain.litellm_conf import hybrid_route_query
@@ -330,9 +330,9 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 _primary_model.append(detail["model"])
             await progress_queue.put((phase, detail))
 
-        # Step 1: Run full pipeline with _summary_capture + progress_callback
+        # Step 1: Run full pipeline with summary_capture + progress_callback
         captured_summary: dict = {}
-        ctx_token = _summary_capture.set(captured_summary)
+        ctx_token = summary_capture.set(captured_summary)
         pipeline_error: Exception | None = None
         partial: ChatResponse | None = None
 
@@ -374,7 +374,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                 break
             yield f"event: phase\ndata: {json.dumps({'phase': phase, **detail})}\n\n"
 
-        _summary_capture.reset(ctx_token)
+        summary_capture.reset(ctx_token)
 
         if pipeline_error is not None:
             yield f"event: error\ndata: {json.dumps({'error': str(pipeline_error)})}\n\n"
@@ -470,7 +470,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
 
             # If no separate reasoning, try regex extraction
             if not thinking_clean and message_clean:
-                message_clean, thinking_extracted = _extract_thinking_process(message_clean)
+                message_clean, thinking_extracted = extract_thinking_process(message_clean)
                 thinking_clean = thinking_extracted or ""
 
             partial_dict = partial.model_dump()
@@ -552,7 +552,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
         if partial.schedule and partial.intent == "PLAN_DAY":
             partial_dict = partial.model_dump()
             partial_dict["message"] = partial.message or "Here's your schedule."
-            partial_dict["thinking_process"] = partial.thinking_process or _build_thinking_fallback(captured_summary)
+            partial_dict["thinking_process"] = partial.thinking_process or build_thinking_fallback(captured_summary)
             partial_dict["generation_metrics"] = {
                 "total_tokens": 0, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
                 "model": "none (structured response)",
@@ -618,7 +618,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
                     yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
             except Exception as exc:
                 print(f"[Stream] VoJ streaming failed: {exc}")
-                fallback_thinking = _build_thinking_fallback(captured_summary)
+                fallback_thinking = build_thinking_fallback(captured_summary)
                 if fallback_thinking:
                     yield f"event: thinking\ndata: {json.dumps({'token': fallback_thinking})}\n\n"
                     thinking_full = fallback_thinking
@@ -632,7 +632,7 @@ async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingR
 
         partial_dict = partial.model_dump()
         partial_dict["message"] = message_clean or partial.message or "Standing by, sir."
-        partial_dict["thinking_process"] = thinking_clean or partial.thinking_process or _build_thinking_fallback(captured_summary)
+        partial_dict["thinking_process"] = thinking_clean or partial.thinking_process or build_thinking_fallback(captured_summary)
         # Add generation metrics
         partial_dict["generation_metrics"] = {
             "total_tokens": _voj_token_count,
@@ -724,7 +724,7 @@ async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str 
 
     # If no separate reasoning, try regex extraction
     if not thinking_clean:
-        message_clean, thinking_extracted = _extract_thinking_process(message_clean or message_full)
+        message_clean, thinking_extracted = extract_thinking_process(message_clean or message_full)
         thinking_clean = thinking_extracted or ""
 
     # Save assistant response and attach session info
@@ -935,7 +935,7 @@ async def confirm_schedule_stream(
 
             # Step 2: Stream Voice of Jarvis
             captured_summary = execution_summary
-            ctx_token = _summary_capture.set(captured_summary)
+            ctx_token = summary_capture.set(captured_summary)
             thinking_full = ""
             message_full = ""
             try:
@@ -947,14 +947,14 @@ async def confirm_schedule_stream(
                     yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
             except Exception as exc:
                 print(f"[ConfirmSchedule] VoJ streaming failed: {exc}")
-                fallback_thinking = _build_thinking_fallback(captured_summary)
+                fallback_thinking = build_thinking_fallback(captured_summary)
                 if fallback_thinking:
                     yield f"event: thinking\ndata: {json.dumps({'token': fallback_thinking})}\n\n"
                     thinking_full = fallback_thinking
                 message_full = "Here's your schedule."
                 yield f"event: message\ndata: {json.dumps({'token': message_full})}\n\n"
 
-            _summary_capture.reset(ctx_token)
+            summary_capture.reset(ctx_token)
 
             # Clean and emit complete
             message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
@@ -965,7 +965,7 @@ async def confirm_schedule_stream(
                 "message": message_clean or "Here's your schedule.",
                 "schedule": schedule_response.model_dump(mode='json') if hasattr(schedule_response, "model_dump") else schedule_response,
                 "execution_graph": synthetic_graph.model_dump(mode='json') if hasattr(synthetic_graph, "model_dump") else None,
-                "thinking_process": thinking_clean or _build_thinking_fallback(captured_summary),
+                "thinking_process": thinking_clean or build_thinking_fallback(captured_summary),
                 "awaiting_task_confirmation": False,
                 "schedule_status": "draft",
             }
@@ -1080,10 +1080,10 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
     # Fire-and-forget: detect behavioral patterns from task history — only without the
     # composition root. With it, PEARL runs on task outcomes (PatternService); the
     # legacy detectors read user_tasks and would bring back a pattern the user dismissed.
-    from app.core.runtime import registered_container
+    from app.api.deps import container_of
 
     memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store and registered_container() is None:
+    if memory_store and container_of(http_request) is None:
         from app.services.memory.pearl import detect_patterns
         _sb = getattr(db_client, "supabase", db_client) if db_client else None
         if _sb:
@@ -1220,13 +1220,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     )
     from contextlib import AsyncExitStack
 
+    from app.api.deps import container_of
     from app.api.error_handlers import error_envelope, request_id_of
-    from app.core.runtime import registered_container
     from app.domain.errors import JarvisError
-    from app.orchestrator.graph import _is_trivial_input
+    from app.orchestrator.graph import is_trivial_input
     from app.services.memory.context import Recall, note_line, render_context_note
     from app.services.planning.local_time import user_zone
-    from app.services.task_service import utc_now
+    from app.domain.clock import utc_now
     from app.services.turn_locks import thread_lock
 
     jarvis_graph = http_request.app.state.jarvis_graph
@@ -1372,7 +1372,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         the history is the plain newest-ten window, as it is when the window cannot be
         read (for one, before the summary columns' migration is applied).
         """
-        container = registered_container()
+        container = container_of(http_request)
         if container is None:
             initial_state["conversation_history"] = await build_context_messages(
                 session_id, request.user_id, max_messages=10, max_chars_per_message=500,
@@ -1442,7 +1442,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 return await container.memory_service.recall(
                     request.user_id,
                     request.user_prompt,
-                    trivial=_is_trivial_input(request.user_prompt),
+                    trivial=is_trivial_input(request.user_prompt),
                     now=now,
                     snapshot=snapshot,
                 )
@@ -1768,7 +1768,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
             # If no separate reasoning, try regex extraction
             if not thinking_clean and message_clean:
-                message_clean, thinking_extracted = _extract_thinking_process(message_clean)
+                message_clean, thinking_extracted = extract_thinking_process(message_clean)
                 thinking_clean = thinking_extracted or ""
 
             _assistant_msg = message_clean or final_state.get("response_message") or "Standing by, sir."
@@ -1845,7 +1845,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             # Compaction: a tracked background task the turn never waits for. It starts
             # once this frame is on its way; created before the yield, so a client that
             # leaves at the frame cannot skip it.
-            _container = registered_container()
+            _container = container_of(http_request)
             if _container is not None:
                 _container.conversation_memory.compact_in_background(request.user_id, session_id)
             yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"

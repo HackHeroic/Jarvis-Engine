@@ -28,7 +28,7 @@ def to_task_chunk(raw: dict, index: int) -> Any:
     when the dict cannot become a chunk.
     """
     # TaskChunk is defined in the API layer; imported here, lazily, as before.
-    from app.api.v1.endpoints.reasoning import TaskChunk
+    from app.schemas.decomposition import TaskChunk
 
     data = dict(raw)
     data.setdefault("task_id", f"t{index}")

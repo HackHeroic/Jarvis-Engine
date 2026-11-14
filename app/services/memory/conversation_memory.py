@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 
 import app.core.config as config
 from app.core.model_router import attribute_llm_calls, route_llm_call
+from app.domain.clock import utc_now
 from app.domain.entities import ChatMessage, ConversationSession, Memory
 from app.domain.ports import (
     ConversationRepository,
@@ -67,7 +68,6 @@ from app.services.memory.summary_text import (  # noqa: F401  (stored_summary: r
     stored_summary,
     summary_text,
 )
-from app.services.task_service import utc_now
 
 logger = logging.getLogger(__name__)
 

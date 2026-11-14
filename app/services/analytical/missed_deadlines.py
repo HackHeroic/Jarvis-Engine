@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from app.services.task_service import TaskService
 
 
-def _parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
+def parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
     """Parse a deadline into an aware datetime, or None.
 
     Deadlines are the user's: a plain date passes at the end of that day on their
@@ -81,7 +81,7 @@ async def detect_and_mark_missed(
 
     overdue: list[dict] = []
     for row in rows:
-        dl = _parse_deadline(row.get("deadline_hint"), zone)
+        dl = parse_deadline(row.get("deadline_hint"), zone)
         if dl and dl < now:
             overdue.append({
                 "id": row.get("id"),

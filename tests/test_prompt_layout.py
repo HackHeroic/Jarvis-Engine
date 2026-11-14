@@ -20,7 +20,7 @@ import pytest
 
 import app.api.v1.endpoints.schedule as schedule_endpoint
 import app.core.config as config
-import app.services.task_service as task_service
+import app.domain.clock as utc_clock
 from app.domain.entities import Memory, MemorySource
 from app.infrastructure.llm.claude import ClaudeProvider
 from app.modules.conversation import JARVIS_CHAT_PROMPT
@@ -58,7 +58,7 @@ HOSTILE_DOCUMENT = (
 @pytest.fixture
 def frozen(clock):
     """Memory writes, recall and the note's clock read one frozen time: Monday 08:00 IST."""
-    clock.freeze(MONDAY_8AM, schedule_endpoint, task_service)
+    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
     return clock
 
 

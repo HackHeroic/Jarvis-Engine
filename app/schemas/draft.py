@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field
 
+from app.domain.entities import DraftStatus
+
 
 class DraftSlot(BaseModel):
     """One task's solved slot, in minutes from horizon_start and on the user's clock."""
@@ -49,7 +51,12 @@ class DraftStateResponse(BaseModel):
     horizon_start: Optional[str] = Field(
         default=None, description="ISO-8601 minute-0 of the scheduling horizon"
     )
-    status: str = Field(description="pending, accepted, rejected, modified, expired")
+    status: DraftStatus = Field(
+        description=(
+            "Where the draft is: pending or modified (open, under review); accepted,"
+            " rejected, expired or superseded (closed)."
+        )
+    )
     rejection_reason: Optional[str] = None
     created_at: Optional[str] = None
     schedule: Optional[DraftScheduleView] = Field(
@@ -125,7 +132,7 @@ class DraftSchedule(BaseModel):
     goal_id: str | None = None
     tasks: list[DraftTask]
     horizon_start: datetime
-    status: Literal["pending", "accepted", "rejected", "modified", "expired"] = "pending"
+    status: DraftStatus = DraftStatus.PENDING
     rejection_reason: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

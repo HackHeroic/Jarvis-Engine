@@ -2,14 +2,11 @@
 
 import math
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-MemoryType = Literal[
-    "fact", "preference", "behavioral_pattern",
-    "temporal_event", "goal", "feedback", "constraint",
-]
+from app.domain.entities import MemoryType  # noqa: F401  (the one definition; re-exported)
 
 
 class MemoryRecord(BaseModel):

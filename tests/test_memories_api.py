@@ -232,7 +232,7 @@ async def test_memories_api__confirm_after_dismiss__409_envelope(monkeypatch, su
         resp = await api.post(f"/api/v1/memories/{memory.id}/confirm", params={"user_id": "alice"})
 
     assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "conflict"
+    assert resp.json()["error"]["code"] == "invalid_state_transition"
     assert _row(supabase, memory.id)["status"] == "dismissed"
 
 

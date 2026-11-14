@@ -204,3 +204,23 @@ def test_runtime__reset_shared_clients__forgets_the_container():
     assert runtime.registered_container() is None
     # One name per meaning: get_container is the request-scoped dependency in app.api.deps.
     assert not hasattr(runtime, "get_container")
+
+
+def test_container__pearl_detectors__chosen_here_and_only_here():
+    """The composition root picks the strategies PEARL reads the history with; the
+    service has no list of its own (a new detector is a class and one line here)."""
+    import inspect
+
+    from app.container import default_pattern_detectors
+    from app.services.memory.patterns import PatternService
+
+    container = _build()
+
+    assert [type(d).__name__ for d in container.patterns._detectors] == [
+        type(d).__name__ for d in default_pattern_detectors()
+    ] == [
+        "SkipTimeWindowDetector", "PeakHourDetector", "DeadlineCrunchDetector",
+        "RepeatedSkipDetector",
+    ]
+    detectors = inspect.signature(PatternService).parameters["detectors"]
+    assert detectors.default is inspect.Parameter.empty
