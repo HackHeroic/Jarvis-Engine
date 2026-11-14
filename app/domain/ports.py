@@ -306,8 +306,19 @@ class MemoryRepository(ABC):
         """
 
     @abstractmethod
-    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+    async def update(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        only_if_status: frozenset[MemoryStatus] | None = None,
+        **fields: Any,
+    ) -> Memory:
         """Set the given fields and return the memory; ``embedding`` may be one of them.
+
+        With ``only_if_status`` the write is a compare-and-set: it happens only while
+        the memory's status is one of them, checked in the same step as the write, and
+        otherwise raises StaleVersionError and changes nothing.
 
         Raises NotFoundError if the user has no such memory, ValidationError for an
         unknown field (``id`` and ``user_id`` included), a value the memory rejects or

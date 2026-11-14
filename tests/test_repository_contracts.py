@@ -1251,6 +1251,59 @@ async def test_memories__update__other_user__raises_not_found(repos):
         await repos.memories.update(U1, mine.id, favourite_colour="red")
 
 
+IN_USE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+
+
+@pytest.mark.asyncio
+async def test_memories__update_only_if_status__status_allowed__updated(repos):
+    faded = await repos.memories.add(U1, _memory(U1, "Likes tea", status=MemoryStatus.FADED))
+
+    updated = await repos.memories.update(
+        U1, faded.id, only_if_status=IN_USE, status=MemoryStatus.ACTIVE, strength=1.0
+    )
+
+    assert (updated.status, updated.strength) == (MemoryStatus.ACTIVE, 1.0)
+    assert await repos.memories.get(U1, faded.id) == updated
+
+
+@pytest.mark.asyncio
+async def test_memories__update_only_if_status__status_moved__stale_and_unchanged(repos):
+    forgotten = await repos.memories.add(U1, _memory(U1, "", status=MemoryStatus.FORGOTTEN))
+
+    with pytest.raises(errors.StaleVersionError) as info:
+        await repos.memories.update(
+            U1, forgotten.id, only_if_status=IN_USE, status=MemoryStatus.ACTIVE, content="Back"
+        )
+
+    assert info.value.details["status"] == "forgotten"
+    assert await repos.memories.get(U1, forgotten.id) == forgotten
+    with pytest.raises(errors.NotFoundError):
+        await repos.memories.update(U2, forgotten.id, only_if_status=IN_USE, strength=1.0)
+
+
+@pytest.mark.asyncio
+async def test_memories__guarded_update__forgotten_after_the_read__stale_and_kept(fake_client):
+    """Supabase family: the status guard is part of the one UPDATE statement, so a
+    forget that lands after the repository read the row still wins."""
+    memories = RepositoryFactory.supabase(fake_client).memories
+    mine = await memories.add(U1, _memory(U1, "Likes tea"))
+    read = memories.get
+
+    async def read_then_forget(user_id, memory_id):
+        snapshot = await read(user_id, memory_id)
+        (row,) = fake_client.rows["user_memories"]
+        row.update(status="forgotten", content="")  # another request, between read and write
+        return snapshot
+
+    memories.get = read_then_forget
+
+    with pytest.raises(errors.StaleVersionError):
+        await memories.update(U1, mine.id, only_if_status=IN_USE, strength=1.0, confidence=0.9)
+
+    (row,) = fake_client.rows["user_memories"]
+    assert (row["status"], row["content"], row["confidence"]) == ("forgotten", "", 0.5)
+
+
 # --- Supabase family only: transport failures ---------------------------------
 
 

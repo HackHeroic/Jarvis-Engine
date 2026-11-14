@@ -80,6 +80,7 @@ async def _memory_api(jarvis, monkeypatch):
     from app.main import app
 
     monkeypatch.setattr(app.state, "container", jarvis.state.container, raising=False)
+    monkeypatch.setattr(app.state, "db_client", jarvis.state.db_client, raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client

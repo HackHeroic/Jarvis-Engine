@@ -6,10 +6,10 @@ Called at the START of every /chat request to inject relevant
 memories into the LLM system prompt.
 """
 
-import math
 from datetime import datetime, timezone
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.entities import Memory
 from app.utils.embedding import cosine_similarity
 
 # Type-based importance weights (higher = more important to surface)
@@ -27,41 +27,38 @@ IMPORTANCE_WEIGHTS: dict[str, float] = {
 ALWAYS_INCLUDE_TYPES = {"constraint", "goal", "behavioral_pattern"}
 ALWAYS_INCLUDE_MIN_CONFIDENCE = 0.6
 
-# Base half-life in hours (1 week)
-BASE_HALFLIFE_HOURS = 7 * 24
+def _instant(value: str | datetime | None) -> datetime | None:
+    """A stored timestamp as an aware instant (naive reads as UTC); None stays None."""
+    if not value:
+        return None
+    instant = datetime.fromisoformat(value) if isinstance(value, str) else value
+    return instant if instant.tzinfo is not None else instant.replace(tzinfo=timezone.utc)
 
 
 def compute_memory_strength(memory: dict, current_time: datetime) -> float:
-    """SM-2 inspired decay function.
+    """A memory row's strength at ``current_time``, by ``Memory.strength_at``.
 
-    Memory_Strength(t) = strength × e^(-t / (stability × base_halflife))
-
-    - stability starts at 1.0, increases on each reinforcement (capped at 20)
-    - base_halflife = 168 hours (1 week)
-    - At stability=1: half-life = 1 week
-    - At stability=5: half-life = 5 weeks
-    - At stability=20 (cap): half-life = 140 days
+    Strength(t) = strength × e^(-t / (stability × 1 week)), t measured from the instant
+    the stored strength was measured at: the later of ``last_reinforced`` (written by
+    this v1 path) and ``strength_as_of`` (written by MemoryService and its decay sweep,
+    which stores the decayed strength). Measuring from the earlier one would decay the
+    same hours twice. A row with neither timestamp has not decayed.
     """
-    last_reinforced_str = memory.get("last_reinforced")
-    if not last_reinforced_str:
-        return memory.get("strength", 1.0)
-
-    if isinstance(last_reinforced_str, str):
-        last_reinforced = datetime.fromisoformat(last_reinforced_str)
-    else:
-        last_reinforced = last_reinforced_str
-
-    # Ensure timezone-aware
-    if last_reinforced.tzinfo is None:
-        last_reinforced = last_reinforced.replace(tzinfo=timezone.utc)
-
-    hours_since = (current_time - last_reinforced).total_seconds() / 3600
-    hours_since = max(0.0, hours_since)
-    stability = max(0.01, memory.get("stability", 1.0))
-    effective_halflife = stability * BASE_HALFLIFE_HOURS
-    strength = memory.get("strength", 1.0)
-
-    return strength * math.exp(-hours_since / effective_halflife)
+    strength = memory.get("strength")
+    strength = 1.0 if strength is None else strength
+    measured = [
+        instant
+        for instant in (_instant(memory.get("last_reinforced")), _instant(memory.get("strength_as_of")))
+        if instant is not None
+    ]
+    if not measured:
+        return strength
+    stability = max(0.01, memory.get("stability") or 1.0)
+    # Only the three fields strength_at reads; the row may be a legacy one.
+    decaying = Memory.model_construct(
+        strength=strength, stability=stability, strength_as_of=max(measured)
+    )
+    return decaying.strength_at(current_time)
 
 
 def score_memory(

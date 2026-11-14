@@ -52,12 +52,15 @@ class MemoryStore:
         content = memory.get("content", "")
         embedding = embed_text(content)
         now = datetime.now(timezone.utc).isoformat()
+        source = memory.get("source", "conversation")
         row = {
             "id": str(uuid.uuid4()),
             "user_id": user_id,
             "memory_type": memory.get("type", "fact"),
             "content": content,
-            "source": memory.get("source", "conversation"),
+            "source": source,
+            # PEARL writes what it noticed in behaviour; everything else is the user's words.
+            "provenance": "inferred" if source == "behavior" else "said",
             "source_id": memory.get("source_id"),
             "confidence": memory.get("confidence", 0.5),
             "strength": 1.0,
@@ -168,6 +171,8 @@ class MemoryStore:
             "confidence": new_confidence,
             "strength": 1.0,
             "last_reinforced": now,
+            # The instant MemoryService (and its decay sweep) measures strength from.
+            "strength_as_of": now,
         }, user_id=user_id)
 
     def find_similar_memory(self, user_id: str, content: str, threshold: float = 0.85, memory_type: str | None = None) -> dict | None:

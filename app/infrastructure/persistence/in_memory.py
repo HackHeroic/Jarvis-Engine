@@ -57,6 +57,7 @@ from app.infrastructure.persistence._mapping import (
     normalized,
     not_found,
     now_utc,
+    memory_changed,
     memory_id_taken,
     pattern_key_taken,
     prepare_new,
@@ -541,10 +542,20 @@ class InMemoryMemoryRepository(MemoryRepository):
         scored.sort(key=lambda match: match.similarity, reverse=True)
         return scored[:limit]
 
-    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+    async def update(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        only_if_status: frozenset[MemoryStatus] | None = None,
+        **fields: Any,
+    ) -> Memory:
         i = self._index(user_id, memory_id)
         if i is None:
             raise not_found("memory", memory_id)
+        status = self._store.memories[i].status
+        if only_if_status is not None and status not in only_if_status:
+            raise memory_changed(memory_id, status)
         updated = apply_memory_update(self._store.memories[i], fields)
         values = embedding_values(fields.get(EMBEDDING))
         if "pattern_key" in fields and self._key_taken(
