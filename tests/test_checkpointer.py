@@ -633,7 +633,7 @@ class _CapturingGraph:
         return _Snapshot()
 
 
-async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
+async def _run_chat_stream(monkeypatch, graph, user_id="u1", session_id="sess-1"):
     """Drive chat_stream with every I/O boundary stubbed."""
     from types import SimpleNamespace
 
@@ -666,10 +666,10 @@ async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__thread_id_is_scoped_to_the_user(no_llm, monkeypatch):
+async def test_chat_stream__thread_id_is_scoped_to_the_user(no_llm, monkeypatch):
     graph = _CapturingGraph()
 
-    await _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1")
+    await _run_chat_stream(monkeypatch, graph, user_id="u1", session_id="sess-1")
 
     _state, config = graph.astream_calls[0]
     assert config["configurable"]["thread_id"] == "u1:sess-1"
@@ -677,10 +677,10 @@ async def test_chat_v2__thread_id_is_scoped_to_the_user(no_llm, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__fresh_thread__seeds_the_phase_fields(no_llm, monkeypatch):
+async def test_chat_stream__fresh_thread__seeds_the_phase_fields(no_llm, monkeypatch):
     graph = _CapturingGraph(existing_values={})
 
-    await _run_chat_v2(monkeypatch, graph)
+    await _run_chat_stream(monkeypatch, graph)
 
     state, _config = graph.astream_calls[0]
     assert state["conversation_phase"] == ConversationPhase.GREETING
@@ -688,7 +688,7 @@ async def test_chat_v2__fresh_thread__seeds_the_phase_fields(no_llm, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__resumed_thread__does_not_reset_the_phase_fields(no_llm, monkeypatch):
+async def test_chat_stream__resumed_thread__does_not_reset_the_phase_fields(no_llm, monkeypatch):
     """The bug this task exists to fix: hardcoding NONE killed the shortcut."""
     graph = _CapturingGraph(
         existing_values={
@@ -697,7 +697,7 @@ async def test_chat_v2__resumed_thread__does_not_reset_the_phase_fields(no_llm, 
         }
     )
 
-    await _run_chat_v2(monkeypatch, graph)
+    await _run_chat_stream(monkeypatch, graph)
 
     state, _config = graph.astream_calls[0]
     assert "negotiation_state" not in state

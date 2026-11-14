@@ -125,7 +125,7 @@ async def test_ingest_knowledge__vector_store_fails__result_carries_a_fixed_code
 
 
 def test_process__vector_store_fails__body_carries_no_exception_text(client, monkeypatch):
-    """The ingester's result reaches the /ingestion/process body (and the v2 complete frame)."""
+    """The ingester's result reaches the /ingestion/process body (and the complete frame)."""
     from app.schemas.context import IntentClassification, IntentType
 
     async def classify(_text):
@@ -217,7 +217,7 @@ class _ExplodingGraph:
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_exception_text(
+async def test_chat_stream__graph_crashes__error_frame_is_the_envelope_without_exception_text(
     no_llm, monkeypatch
 ):
     import json

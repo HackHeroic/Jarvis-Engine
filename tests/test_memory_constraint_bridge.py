@@ -64,7 +64,7 @@ class TestHorizonAnchoredParsing:
         assert parse_time_range("wants to finish the report tomorrow morning") is None
 
 
-# --- memory_slots: the v2 bridge, over Memory entities ----------------------------------
+# --- memory_slots: the bridge, over Memory entities -------------------------------------
 
 
 def _memory(memory_type: str, content: str, **fields):

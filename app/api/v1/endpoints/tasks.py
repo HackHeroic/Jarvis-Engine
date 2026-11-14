@@ -71,8 +71,8 @@ class TaskResponse(BaseModel):
     task_id: str
     status: str
     message: str
-    # Always False: no task endpoint starts a replan (the v1 background replan was
-    # retired with the v1 chat). Kept because the frontend reads it.
+    # Always False: no task endpoint starts a replan (the background replan that once
+    # followed a task outcome was retired). Kept because the frontend reads it.
     replan_triggered: bool = False
 
 

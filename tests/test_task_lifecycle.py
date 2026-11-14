@@ -293,7 +293,7 @@ def test_complete_and_skip__no_database__same_503_envelope_as_list(monkeypatch):
     assert shape(skipped) == shape(listed)
 
 
-# No task endpoint starts a replan (the v1 background replan is retired), so none may
+# No task endpoint starts a replan (the background replan is retired), so none may
 # tell the user their schedule was updated. The response keys stay: the frontend
 # reads them.
 _REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to", "rescheduled")

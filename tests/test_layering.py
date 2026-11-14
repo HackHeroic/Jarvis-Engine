@@ -223,7 +223,7 @@ def test_layering__services__do_not_import_the_supabase_driver():
     assert stale == []
 
 
-# What Plan 2 built is held to every rule: none of it may sit on an allow-list.
+# What Plan 2 and Plan 3 built is held to every rule: none of it may sit on an allow-list.
 _PLAN_2 = (
     "services/anticipation/",
     "services/memory/",  # MemoryService, PEARL, conversation memory, "since we last spoke"
@@ -232,9 +232,20 @@ _PLAN_2 = (
     "infrastructure/llm/messages.py",
     "services/user_model_service.py",
 )
+_PLAN_3 = (
+    "services/chat_turn/",  # ChatTurnService: the turn, out of the router
+    "services/planning/scheduling.py",  # run_schedule's home
+    "services/planning/services.py",  # PlanningServices
+    "core/settings.py",  # the settings records the composition root builds
+    "api/sse.py",
+    "api/request_limits.py",
+    "schemas/chat_stream.py",
+    "schemas/errors.py",
+    "schemas/schedule.py",
+)
 
 
-def test_layering__plan_2_code__is_on_no_allow_list():
+def test_layering__plan_2_and_plan_3_code__is_on_no_allow_list():
     listed = [
         *_INFRASTRUCTURE_IMPORTS_ALLOWED,
         *_API_IMPORTS_ALLOWED,
@@ -244,7 +255,9 @@ def test_layering__plan_2_code__is_on_no_allow_list():
         *(file for file, _owner in _WEB_SEARCH_CALLS_ALLOWED),
     ]
 
-    assert [f for f in listed if f.startswith(_PLAN_2)] == []
+    assert [f for f in listed if f.startswith(_PLAN_2 + _PLAN_3)] == []
+    # Each guarded path is where the code is: a move would leave the guard guarding nothing.
+    assert [p for p in _PLAN_2 + _PLAN_3 if not (_APP_DIR / p).exists()] == []
     assert (_APP_DIR / "services" / "memory" / "since_last_spoke.py").exists()
 
 

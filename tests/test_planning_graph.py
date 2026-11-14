@@ -440,7 +440,7 @@ async def test_solve_schedule__real_solver__single_small_task__is_feasible():
 
 
 # --- create_draft: a feasible solve becomes a reviewable draft ---------------
-# v1 parity: the schedule is proposed, never silently committed. Persistence
+# The schedule is proposed, never silently committed. Persistence
 # (DraftService.accept) happens on accept only — never in this node.
 
 
@@ -1020,7 +1020,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
         "decompose_goal": 1, "fuse_tasks": 1, "solve_schedule": 3,
         "handle_infeasible": 2, "create_draft": 1,
     }
-    # Each retry widened the horizon along the v1 ladder.
+    # Each retry widened the horizon along the ladder.
     assert attempts == [2880, 4320, 7200]
     assert result["schedule"] is not None
 
@@ -1032,9 +1032,9 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
 # delete-then-replace then deleted them from user_tasks for good — six of the
 # demo user's pending tasks vanished on a plain "plan X" → "accept".
 #
-# v1 never had this hole: it namespaces every fresh chunk as `{goal_id}_{task_id}`
-# before fusion (the retired v1 planner), which is the only thing that
-# makes "tasks belonging to THIS goal" decidable. These tests port that rule.
+# The retired planner never had this hole: it namespaced every fresh chunk as
+# `{goal_id}_{task_id}` before fusion, which is the only thing that makes
+# "tasks belonging to THIS goal" decidable. These tests pin that rule.
 
 
 def _run_token(task_id: str, goal_id: str) -> str:
@@ -1089,7 +1089,7 @@ async def test_decompose_goal__namespaces_task_ids_and_dependencies(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_decompose_goal__goal_metadata_carries_an_id__it_wins_over_the_slug(monkeypatch):
-    """v1 derivation order: goal_metadata.goal_id → slugified objective → uuid."""
+    """Derivation order: goal_metadata.goal_id → slugified objective → uuid."""
     from app.schemas.decomposition import GoalMetadata
     from app.modules.planning_graph import decompose_goal
 
@@ -1110,7 +1110,7 @@ async def test_decompose_goal__goal_metadata_carries_an_id__it_wins_over_the_slu
 
 @pytest.mark.asyncio
 async def test_fuse_tasks__prior_plans_positional_ids__survive_the_new_decomposition():
-    """v1 parity: keep tasks from OTHER goals, drop tasks from THIS goal.
+    """Keep tasks from OTHER goals, drop tasks from THIS goal.
 
     The legacy `task_1` row is the F5 collision itself — pre-fix the new chunks
     carried that same id, so the row was silently dropped from the fusion.
@@ -1216,9 +1216,9 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
 
 @pytest.mark.asyncio
 async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft(no_llm, monkeypatch):
-    """The longer ids must travel the whole v2 chain unchanged.
+    """The longer ids must travel the whole planning chain unchanged.
 
-    `_to_task_chunk` → `run_schedule` → `create_draft` is newer than v1's path,
+    `_to_task_chunk` → `run_schedule` → `create_draft` is newer than the retired path,
     and the solver keys its output map by task_id — `DraftService.accept` then
     looks `scheduled_start` up by that key. An id regenerated or truncated
     anywhere in between would silently drop every wall-clock time, so this drives
@@ -1485,7 +1485,7 @@ def test_belongs_to_goal__own_goal_id_decides__prefix_only_for_legacy_rows(
 
 
 # ---------------------------------------------------------------------------
-# mark_missed step — overdue tasks marked at PLAN_DAY entry (v1 parity)
+# mark_missed step — overdue tasks marked at PLAN_DAY entry
 # ---------------------------------------------------------------------------
 
 
@@ -1603,7 +1603,7 @@ def test_planning_module__mark_missed_wired_after_gate():
 
 @pytest.mark.asyncio
 async def test_expand_slots__daily_blocked_habit__recurs_across_horizon():
-    """v2 called the expander without plan_start — TypeError was swallowed and
+    """The planning graph once called the expander without plan_start — TypeError was swallowed and
     EVERY habit block silently vanished. Blocks must recur on day 1+."""
     from app.modules.planning_graph import expand_slots
 

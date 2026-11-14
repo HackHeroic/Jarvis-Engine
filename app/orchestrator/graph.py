@@ -82,7 +82,7 @@ _PLANNING_VERBS_RE = re.compile(
 # Short imperative replies to a proposed schedule ("accept", "scrap that",
 # "move the calculus block"). Rules beat an LLM here: the vocabulary is tiny,
 # the latency budget on a one-word reply is ~0, and a misfire is expensive —
-# ACCEPT_DRAFT is the only intent in v2 that writes to user_tasks, and
+# ACCEPT_DRAFT is the only intent that writes to user_tasks, and
 # accepting *replaces every pending row* with the draft's tasks. A false
 # positive therefore destroys the user's task list; false negatives merely cost
 # a re-plan. The matcher is tuned hard in that direction.
@@ -557,7 +557,7 @@ async def handle_draft_action(state: JarvisState) -> dict:
     REVIEWING on failure would lock the thread into re-planning forever via
     ``check_negotiation_shortcut``.
 
-    Accept is also the only place v2 writes to ``user_tasks``: the planning
+    Accept is also the only place a turn writes to ``user_tasks``: the planning
     sub-graph proposes and persists nothing.
     """
     import logging

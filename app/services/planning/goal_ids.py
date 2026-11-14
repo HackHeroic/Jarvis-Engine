@@ -15,15 +15,13 @@ from app.schemas.decomposition import TaskChunk
 def derive_goal_id(goal_metadata: Any, fallback_objective: str = "") -> str:
     """The namespace every chunk of one goal is prefixed with.
 
-    Order matters and is the same in both pipelines: the model's own
-    ``goal_metadata.goal_id`` wins, else the objective (or the raw planning goal
-    when the model left it blank) is slugified, else a uuid so two goals can
-    never share a namespace by accident.
+    Order matters: the model's own ``goal_metadata.goal_id`` wins, else the
+    objective (or the raw planning goal when the model left it blank) is
+    slugified, else a uuid so two goals can never share a namespace by accident.
 
-    Extracted from ``_run_plan_day_flow`` so the v2 planning sub-graph derives it
-    identically — a second copy would drift and re-open F5, where un-namespaced
-    positional ids let a new plan shadow (and then delete) the previous one's
-    pending rows.
+    The one derivation, which the planning sub-graph calls: a second copy would
+    drift and re-open F5, where un-namespaced positional ids let a new plan
+    shadow (and then delete) the previous one's pending rows.
     """
     goal_id = getattr(goal_metadata, "goal_id", None) if goal_metadata else None
     if goal_id:

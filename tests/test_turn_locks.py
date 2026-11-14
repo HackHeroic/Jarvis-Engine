@@ -121,7 +121,7 @@ async def test_thread_lock__nobody_holds_or_waits__registry_forgets_the_thread()
     assert "u1:s1" not in turn_locks._locks
 
 
-# --- the v2 chat stream: lock around the graph run, usage attributed ---------------
+# --- the chat stream: lock around the graph run, usage attributed ------------------
 
 
 class _Snapshot:
@@ -189,7 +189,7 @@ async def _drain(response) -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__two_tabs_one_session__turns_run_in_order(no_llm, monkeypatch):
+async def test_chat_stream__two_tabs_one_session__turns_run_in_order(no_llm, monkeypatch):
     _stub_chat_io(monkeypatch)
     graph = _TwoTabGraph()
     first = asyncio.create_task(_drain(await _open_turn(graph, "first")))
@@ -206,7 +206,7 @@ async def test_chat_v2__two_tabs_one_session__turns_run_in_order(no_llm, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__queued_turn__sees_the_checkpoint_the_first_turn_left(no_llm, monkeypatch):
+async def test_chat_stream__queued_turn__sees_the_checkpoint_the_first_turn_left(no_llm, monkeypatch):
     """Decided before the wait, the queued turn would seed NONE over the first's draft review."""
     _stub_chat_io(monkeypatch)
     graph = _TwoTabGraph()
@@ -272,7 +272,7 @@ async def _serve_over_asgi(graph, prompt: str, disconnect: asyncio.Event) -> Non
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__client_disconnects_mid_turn__lock_released_once_the_run_unwound(
+async def test_chat_stream__client_disconnects_mid_turn__lock_released_once_the_run_unwound(
     no_llm, monkeypatch
 ):
     """anyio re-delivers the cancellation at every await of the stream's cleanup; an
@@ -291,7 +291,7 @@ async def test_chat_v2__client_disconnects_mid_turn__lock_released_once_the_run_
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__client_disconnects_mid_turn__queued_turn_starts_after_the_cleanup(
+async def test_chat_stream__client_disconnects_mid_turn__queued_turn_starts_after_the_cleanup(
     no_llm, monkeypatch
 ):
     _stub_chat_io(monkeypatch)
@@ -327,7 +327,7 @@ class _AttributionGraph:
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__graph_run__llm_calls_attributed_to_user_and_session(no_llm, monkeypatch):
+async def test_chat_stream__graph_run__llm_calls_attributed_to_user_and_session(no_llm, monkeypatch):
     from app.core.model_router import current_session_var, current_user_var
 
     _stub_chat_io(monkeypatch, session_id="sess-9")
@@ -344,7 +344,7 @@ async def test_chat_v2__graph_run__llm_calls_attributed_to_user_and_session(no_l
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__through_starlette__attribution_ends_cleanly_after_the_stream(
+async def test_chat_stream__through_starlette__attribution_ends_cleanly_after_the_stream(
     no_llm, monkeypatch
 ):
     """The real response path: the stream runs in a task after the handler returned.
@@ -418,7 +418,7 @@ async def _frames(response) -> list[tuple[str, object]]:
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__turn_queued_past_the_wait_limit__honest_conflict_frame(
+async def test_chat_stream__turn_queued_past_the_wait_limit__honest_conflict_frame(
     no_llm, monkeypatch
 ):
     monkeypatch.setattr(turn_locks, "TURN_LOCK_WAIT_SECONDS", 0.05)
@@ -441,7 +441,7 @@ async def test_chat_v2__turn_queued_past_the_wait_limit__honest_conflict_frame(
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__queued_turn__history_includes_the_reply_it_waited_for(
+async def test_chat_stream__queued_turn__history_includes_the_reply_it_waited_for(
     no_llm, monkeypatch
 ):
     saved: list[dict] = []
@@ -487,7 +487,7 @@ class _ForceCloudGraph(_AttributionGraph):
 
 
 @pytest.mark.asyncio
-async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_llm, monkeypatch):
+async def test_chat_stream__cloud_model_picked__force_cloud_ends_with_the_turn(no_llm, monkeypatch):
     from app.api.v1.endpoints.chat import chat_stream
     from app.schemas.chat_stream import ChatStreamRequest
     from app.core.model_router import force_cloud_var
