@@ -545,6 +545,47 @@ async def test_turn__habit_also_extracted_as_a_memory__one_frame_and_one_row(jar
     assert [f["content"] for f in _frames(turn, "memory_extracted")] == [rule["content"]]
 
 
+def _rules(jarvis, user: str = "alice") -> list[dict]:
+    return jarvis.rows("behavioral_constraints", user_id=user)
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_stated__the_rule_carries_the_id_of_its_memory(jarvis, llm):
+    """The turn stores a rule and a constraint memory: linked, so planning plans from the
+    rule alone and letting go of either lets go of both."""
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))
+
+    await jarvis.say(RULE)
+
+    (memory,) = _memories(jarvis)
+    (rule,) = _rules(jarvis)
+    assert rule["raw_text"] == RULE
+    assert rule["structured_semantics"]["memory_id"] == memory["id"]
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_also_extracted_as_a_memory__linked_to_that_memory(jarvis, llm):
+    rule = {"type": "constraint", "content": "Never schedule study before 11 AM", "confidence": 0.9}
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE], memories=[rule]))
+
+    await jarvis.say(RULE)
+
+    (memory,) = _memories(jarvis)
+    (stored,) = _rules(jarvis)
+    assert stored["structured_semantics"]["memory_id"] == memory["id"]
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_said_twice__both_rules_linked_to_the_one_memory(jarvis, llm):
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))
+    await jarvis.say(RULE)
+
+    await jarvis.say(RULE)
+
+    (memory,) = _memories(jarvis)
+    assert [r["structured_semantics"]["memory_id"] for r in _rules(jarvis)] == [memory["id"]] * 2
+
+
 @pytest.mark.asyncio
 async def test_turn__rule_said_again_as_a_habit__reinforced_not_stored_twice(jarvis, llm):
     llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))

@@ -366,6 +366,16 @@ class InMemoryConstraintRepository(ConstraintRepository):
         ]
         return len(self._store.constraints) < before
 
+    async def set_semantics(
+        self, user_id: str, constraint_id: str, structured_semantics: dict
+    ) -> BehavioralConstraint | None:
+        for i, c in enumerate(self._store.constraints):
+            if c.id == constraint_id and c.user_id == user_id:
+                updated = c.model_copy(update={"structured_semantics": dict(structured_semantics)})
+                self._store.constraints[i] = updated
+                return updated.model_copy(deep=True)
+        return None
+
 
 class InMemoryProfileRepository(ProfileRepository):
     def __init__(self, store: InMemoryStore) -> None:

@@ -854,6 +854,24 @@ async def test_constraints__add_list_delete__user_scoped(repos):
 
 
 @pytest.mark.asyncio
+async def test_constraints__set_semantics__replaces_only_the_users_rule(repos):
+    rule = await repos.constraints.add(U1, _constraint(U1))
+    other = await repos.constraints.add(U1, _constraint(U1))
+    semantics = {"start_min": 1320, "end_min": 1440, "memory_id": str(uuid4())}
+
+    updated = await repos.constraints.set_semantics(U1, rule.id, semantics)
+
+    assert updated == rule.model_copy(update={"structured_semantics": semantics})
+    listed = {c.id: c for c in await repos.constraints.list_active(U1)}
+    assert listed[rule.id].structured_semantics == semantics
+    assert listed[other.id] == other
+    assert await repos.constraints.set_semantics(U2, rule.id, {}) is None  # another user's
+    assert await repos.constraints.set_semantics(U1, str(uuid4()), {}) is None
+    assert await repos.constraints.set_semantics(U1, "not-a-uuid", {}) is None
+    assert {c.id: c for c in await repos.constraints.list_active(U1)}[rule.id] == updated
+
+
+@pytest.mark.asyncio
 async def test_constraints__add__store_stamps_created_at(repos):
     before = datetime.now(timezone.utc)
 

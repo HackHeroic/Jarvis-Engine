@@ -1284,6 +1284,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         # here would overwrite it (accepting the user's newest draft instead).
         "draft_store": getattr(http_request.app.state, "draft_store", None),
         "saved_constraints": None,
+        "saved_rule_ids": None,
         "draft_response": None,
         "research_results": None,
         "ingestion_result": None,

@@ -283,3 +283,37 @@ def test_cleanup__e2e_id__deletes_only_its_rows_everywhere_and_tolerates_an_abse
             "behavioral_constraints", "draft_schedules", "llm_usage_events",
             "chat_sessions", "chat_messages"} <= set(live_e2e.USER_TABLES)
     assert "all rows deleted" in detail
+
+
+# --- the taught rule and the memory of stating it ------------------------------------
+
+_RULE_ROWS = [
+    {"id": "r1", "raw_text": "never schedule study before 11 AM",
+     "structured_semantics": {"memory_id": "m2"}},
+    {"id": "r2", "raw_text": "never schedule study before 11 AM",
+     "structured_semantics": {"memory_id": "m2"}},
+    {"id": "r3", "raw_text": "gym on Mondays", "structured_semantics": {"memory_id": "m9"}},
+    {"id": "r4", "raw_text": "no calls in the morning", "structured_semantics": {}},
+]
+_PANEL = [
+    {"memory_id": "m1", "content": "Useless in the mornings"},
+    {"memory_id": "m2", "content": "Never schedule study before 11 AM"},
+]
+
+
+def test_rule_memory__a_rule_is_linked__that_memory_not_the_first_that_reads_alike():
+    assert live_e2e.rule_memory(_PANEL, _RULE_ROWS)["memory_id"] == "m2"
+
+
+def test_rule_memory__no_rule_linked__the_first_memory_that_reads_as_the_rule():
+    unlinked = [{**row, "structured_semantics": None} for row in _RULE_ROWS]
+
+    assert live_e2e.rule_memory(_PANEL, unlinked)["memory_id"] == "m1"
+    assert live_e2e.rule_memory([], unlinked) is None
+
+
+def test_rules_linked_to__forgetting_the_memory_takes_exactly_these_rules():
+    """Step 11b's expectation: after step 8 forgets m2, rules r1 and r2 are gone from the
+    You page, and r4 (linked to nothing) is not expected to go."""
+    assert live_e2e.rules_linked_to(_RULE_ROWS, "m2") == ["r1", "r2"]
+    assert live_e2e.rules_linked_to(_RULE_ROWS, "m1") == []

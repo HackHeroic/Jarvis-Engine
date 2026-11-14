@@ -341,22 +341,21 @@ async def _memory_slots(state: PlanningState) -> list:
     Through ``MemoryService`` when the composition root is registered: active
     constraint and behavioural-pattern memories, so a dismissed or forgotten one never
     blocks time, with the user's habits (fetched by ``fetch_constraints``), so an
-    hour they keep for focused work is never soft-blocked by a learned pattern.
-    Otherwise (tests, scripts) the legacy memory store and bridge.
+    hour they keep for focused work is never soft-blocked by a learned pattern. A
+    constraint memory a stored rule is linked to adds nothing: the plan has that rule
+    from the rules already. Otherwise (tests, scripts) the legacy memory store and bridge.
     """
     container = registered_container()
     if container is not None:
         from app.services.memory.constraint_bridge import memory_slots
+        from app.services.memory.stated_rules import covered_memory_ids
 
         memories = await container.memory_service.list_active(
             state.get("user_id", "demo"), types=frozenset({"constraint", "behavioral_pattern"})
         )
-        habits = [
-            c.get("raw_text", "")
-            for c in state.get("constraints") or []
-            if c.get("constraint_type") == "habit"
-        ]
-        return memory_slots(memories, habits=habits)
+        rules = state.get("constraints") or []
+        habits = [c.get("raw_text", "") for c in rules if c.get("constraint_type") == "habit"]
+        return memory_slots(memories, habits=habits, covered=covered_memory_ids(rules))
     user_model = state.get("user_model")
     memory_store = await user_model.get_memory_store() if user_model else None
     if not memory_store:
