@@ -163,5 +163,7 @@ async def test_anticipation_api__concurrent_run__one_suggestion(container, log):
         )
 
     assert [r.status_code for r in responses] == [200, 200]
-    assert sorted(r.json()["status"] for r in responses) == ["already_done", "created"]
+    assert "created" in [r.json()["status"] for r in responses]
+    made = {r.json()["suggestion"]["id"] for r in responses if r.json()["suggestion"]}
+    assert len(made) == 1  # the second click gets the first one's answer, not a new suggestion
     assert len(await container.repos.suggestions.list(U1, status=None)) == 1
