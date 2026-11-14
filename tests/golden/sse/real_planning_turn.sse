@@ -1,0 +1,99 @@
+event: phase
+data: {"phase": "loading_context", "verb": "<loading_context>", "detail": {"memories_count": 0, "conversation_turns": 0}}
+
+event: phase
+data: {"phase": "brain_dump_extraction", "verb": "<brain_dump_extraction>"}
+
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "PLAN_DAY", "method": "rule-based"}}
+
+event: step
+data: {"intent": "PLAN_DAY", "stage": "intent_classified"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "validate_goal", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "validate_goal", "status": "done"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "mark_missed", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "mark_missed", "status": "done"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "fetch_constraints", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "fetch_constraints", "status": "done", "detail": {"rows": 0}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "memory_to_constraints", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "translate_habits", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "translate_habits", "status": "done", "detail": {"slots": 0}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "memory_to_constraints", "status": "done", "detail": {"formula": "quality\u00d70.5 + SR\u00d70.3 + reschedule_penalty\u00d70.2"}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "expand_slots", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "expand_slots", "status": "done"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "decompose_goal", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "decompose_goal", "status": "done", "detail": {"task_count": 2}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "fuse_tasks", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "fuse_tasks", "status": "done"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "solve_schedule", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "solve_schedule", "status": "done", "detail": {"status": "OPTIMAL", "task_count": 2, "horizon_h": 48, "tmt_applied": true, "formula": "canonical_steel_konig"}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "create_draft", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "create_draft", "status": "done", "detail": {"draft_id": "<uuid>"}}
+
+event: phase
+data: {"phase": "planning", "verb": "<planning>", "detail": {"module": "planning_module"}}
+
+event: message
+data: {"token": "Don"}
+
+event: message
+data: {"token": "e, sir."}
+
+event: phase
+data: {"phase": "synthesizing", "verb": "<synthesizing>"}
+
+event: phase
+data: {"phase": "learning"}
+
+event: phase
+data: {"phase": "learning", "status": "done"}
+
+event: phase
+data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 0, "patterns_detected": 0}}
+
+event: step
+data: {"intent": "PLAN_DAY", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}
+
+event: complete
+data: {"intent": "PLAN_DAY", "message": "Done, sir.", "schedule": {"status": "OPTIMAL", "schedule": {"revise_dsa_for_fridays_exam_<run>_task_1": {"start_min": 0, "end_min": 25, "tmt_score": 0.032432432432432434, "title": "Graph traversal"}, "revise_dsa_for_fridays_exam_<run>_task_2": {"start_min": 1440, "end_min": 1465, "tmt_score": 0.032432432432432434, "title": "DP on sequences"}}, "goal_metadata": {"goal_id": "", "objective": "", "outcome_visualization": "", "mastery_level_target": 3}, "horizon_start": "2026-11-16T08:00:00+05:30"}, "execution_graph": {"decomposition": [{"task_id": "revise_dsa_for_fridays_exam_<run>_task_1", "title": "Graph traversal", "duration_minutes": 25, "difficulty_weight": 0.5, "dependencies": [], "completion_criteria": "Explain graph traversal from memory in two minutes", "implementation_intention": {"obstacle_trigger": "If I stall on graph traversal", "behavioral_response": "then I write down the one step I am stuck on and do it"}, "deadline_hint": null, "goal_id": "revise_dsa_for_fridays_exam"}, {"task_id": "revise_dsa_for_fridays_exam_<run>_task_2", "title": "DP on sequences", "duration_minutes": 25, "difficulty_weight": 0.5, "dependencies": [], "completion_criteria": "Explain dp on sequences from memory in two minutes", "implementation_intention": {"obstacle_trigger": "If I stall on dp on sequences", "behavioral_response": "then I write down the one step I am stuck on and do it"}, "deadline_hint": null, "goal_id": "revise_dsa_for_fridays_exam"}]}, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": null, "thinking_process": null, "schedule_status": "draft", "conflict_summary": null, "draft_id": "<uuid>", "saved_constraints": null, "conversation_id": "<uuid>", "message_id": "<uuid>", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": null, "generation_metrics": {"total_tokens": 2, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": "<n>", "model": "local"}}
+

@@ -145,6 +145,23 @@ async def test_observation__stated_memory__frame_queued_and_no_task_left_running
 
 
 @pytest.mark.asyncio
+async def test_observation__learning_phase__end_frame_distinct_from_start():
+    """The start and end of the learning step reach the browser as ``phase`` frames with
+    ``_event_type`` stripped: identical bodies made the end indistinguishable from the start.
+    The end says ``status: done``, as a tool step's last frame does."""
+    _register(_SpyEmbedder())
+    state, queue = _turn(MORNINGS)
+
+    await run_observation_loop(state)
+
+    events = _drain(queue)
+    (start,) = [e for e in events if e["_event_type"] == "phase_start"]
+    (end,) = [e for e in events if e["_event_type"] == "phase_end"]
+    wire = [{k: v for k, v in e.items() if k != "_event_type"} for e in (start, end)]
+    assert wire == [{"phase": "learning"}, {"phase": "learning", "status": "done"}]
+
+
+@pytest.mark.asyncio
 async def test_observation__embedder_unavailable__turn_goes_on_with_no_memory_frame():
     embedder = _DownEmbedder()
     _register(embedder)

@@ -4,6 +4,8 @@ Every error response has one shape — ``{"error": {"code", "message", "details"
 "request_id"}}`` — whether it came from a ``JarvisError``, request validation, an
 ``HTTPException`` or an exception nobody caught. The last kind is logged with its
 request id and answered with a fixed message: exception text never goes on the wire.
+The envelope's model is ``app/schemas/errors.py::ErrorResponse``, which the chat stream
+also sends as its ``error`` frame.
 """
 
 import logging
@@ -13,31 +15,18 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.domain import errors
+from app.schemas.errors import ErrorBody, ErrorResponse
 
 logger = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 _INTERNAL_ERROR_MESSAGE = "Something went wrong on our side."
 _VALIDATION_MESSAGE = "The request is invalid."
-
-
-class ErrorBody(BaseModel):
-    code: str = Field(description="Stable machine-readable error code, e.g. 'not_found'.")
-    message: str = Field(description="Human-readable explanation, safe to show the user.")
-    details: dict | None = Field(
-        default=None, description="Structured context, e.g. field errors; null when none."
-    )
-    request_id: str = Field(description="This request's id, also sent as the X-Request-ID header.")
-
-
-class ErrorResponse(BaseModel):
-    error: ErrorBody = Field(description="The error that ended the request.")
 
 
 class RequestIdMiddleware:
@@ -75,20 +64,6 @@ def _request_id(request: Request) -> str:
 def request_id_of(request: object) -> str:
     """The id ``RequestIdMiddleware`` gave this request; a fresh one if it has none."""
     return getattr(getattr(request, "state", None), "request_id", None) or uuid4().hex
-
-
-def error_envelope(
-    request_id: str, code: str, message: str, details: dict | None = None
-) -> dict:
-    """The error envelope as data, for an error no HTTP response can carry.
-
-    A streamed (SSE) response has already sent its 200 when the error happens, so
-    the error goes out as a frame — in the same shape as every error response.
-    """
-    body = ErrorResponse(
-        error=ErrorBody(code=code, message=message, details=details, request_id=request_id)
-    )
-    return body.model_dump(mode="json")
 
 
 def _envelope(

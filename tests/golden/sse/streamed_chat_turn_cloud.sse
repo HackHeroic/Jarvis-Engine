@@ -1,0 +1,36 @@
+event: phase
+data: {"phase": "loading_context", "verb": "<loading_context>", "detail": {"memories_count": 0, "conversation_turns": 0}}
+
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "CHAT", "method": "rule-based"}}
+
+event: step
+data: {"intent": "CHAT", "stage": "intent_classified"}
+
+event: thinking
+data: {"token": "Hmm, "}
+
+event: thinking
+data: {"token": "a greeting."}
+
+event: message
+data: {"token": "Good "}
+
+event: message
+data: {"token": "evening, \"sir\" \u2014 caf\u00e9."}
+
+event: phase
+data: {"phase": "responding", "verb": "<responding>", "detail": {"module": "conversation_module"}}
+
+event: phase
+data: {"phase": "learning", "skipped": true}
+
+event: phase
+data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 0, "patterns_detected": 0}}
+
+event: step
+data: {"intent": "CHAT", "stage": "pipeline_done", "model_mode": "cloud", "synthesis_model": "cloud", "force_cloud": true}
+
+event: complete
+data: {"intent": "CHAT", "message": "Good evening, \"sir\" \u2014 caf\u00e9.", "schedule": null, "execution_graph": null, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": null, "thinking_process": "Hmm, a greeting.", "schedule_status": null, "conflict_summary": null, "draft_id": null, "saved_constraints": null, "conversation_id": "sess-1", "message_id": "msg-reply", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": null, "generation_metrics": {"total_tokens": 4, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": "<n>", "model": "cloud"}}
+

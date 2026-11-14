@@ -1,0 +1,6 @@
+event: phase
+data: {"phase": "loading_context", "verb": "<loading_context>", "detail": {"memories_count": 0, "conversation_turns": 0}}
+
+event: error
+data: {"error": {"code": "internal_error", "message": "Something went wrong on our side.", "details": null, "request_id": "<request_id>"}}
+
