@@ -21,9 +21,9 @@ def get_all_pending_tasks(
 ) -> list[TaskChunk]:
     """Fetch all pending tasks from user_tasks, hydrating to TaskChunk format.
 
-    Returns chunks with prefixed task_ids (goal_id_task_id). Dependencies are
-    already prefixed from the last fusion persist. Deduplicates by task_id
-    (keeps latest per task_id).
+    Task ids come back exactly as stored: namespaced ``{goal_id}_{run}_{task_id}``
+    by planning (rows written before the run token read ``{goal_id}_{task_id}``),
+    dependencies likewise. Deduplicates by task_id, keeping the newest row.
 
     TaskChunk has no goal_id field, so the goal is lost here. A caller that writes
     the tasks back, or decides which goal a task belongs to, uses

@@ -344,7 +344,7 @@ async def test_retrying__parse_error__not_retried():
 
 
 @pytest.mark.asyncio
-async def test_retrying__gives_up_after_max_attempts():
+async def test_retrying__keeps_failing__gives_up_after_max_attempts():
     inner = FakeProvider(outcomes=[LLMUnavailableError(f"503 #{i}") for i in range(5)])
     sleeps: list[float] = []
 
@@ -474,7 +474,7 @@ async def test_redacting__email_in_history_and_system_prompt__redacted():
 
 
 @pytest.mark.asyncio
-async def test_redacting__counts_redactions():
+async def test_redacting__pii_in_the_request__counts_redactions():
     inner = FakeProvider(location=LLMLocation.CLOUD)
     bus, recorder = _recording_bus()
     provider = RedactingProvider(
@@ -514,7 +514,7 @@ def test_redacting__local_provider__refused():
 
 
 @pytest.mark.asyncio
-async def test_metered__publishes_llm_call_completed_with_location_and_latency():
+async def test_metered__call_answers__publishes_llm_call_completed_with_location_and_latency():
     inner = FakeProvider("local", LLMLocation.LOCAL, ["answer"], delay_s=0.02)
     bus, recorder = _recording_bus()
     provider = MeteredProvider(inner, bus, lambda role: f"model-for-{role}")
@@ -582,7 +582,7 @@ def test_report_token_usage__outside_a_metered_call__is_a_no_op():
 
 
 @pytest.mark.asyncio
-async def test_local__passes_role_model_and_coerces_dict_into_schema(monkeypatch, offline_cfg):
+async def test_local__structured_request__passes_role_model_and_coerces_dict_into_schema(monkeypatch, offline_cfg):
     seen: dict = {}
 
     async def transport(**kwargs):
@@ -856,7 +856,7 @@ async def test_hybrid_route__usage_on_response__reaches_the_meter(monkeypatch, o
 
 
 @pytest.mark.asyncio
-async def test_factory__order_is_local_extra_cloud_gemini(offline_cfg):
+async def test_factory__extra_cloud_provider__order_is_local_extra_cloud_gemini(offline_cfg):
     extra = FakeProvider("claude", LLMLocation.CLOUD)
 
     chain = LLMProviderFactory.build(offline_cfg, _pii_redactor(), NullEventBus(), extra_cloud=[extra])
@@ -914,7 +914,7 @@ def test_get_chain__set_and_reset__override_then_rebuild():
 # --- route_llm_call delegates to the chain ------------------------------------
 
 
-def test_route_llm_call__signature_unchanged():
+def test_route_llm_call__public_signature__unchanged():
     from app.core.model_router import route_llm_call
     from app.orchestrator.hooks import ActionHooks as _Hooks
 
@@ -938,7 +938,7 @@ def test_route_llm_call__signature_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_route_llm_call__delegates_to_chain(offline_cfg):
+async def test_route_llm_call__any_call__delegates_to_the_chain(offline_cfg):
     from app.core.model_router import route_llm_call
 
     local = FakeProvider("local", LLMLocation.LOCAL, [_Tiny(color="blue")])
@@ -1433,4 +1433,60 @@ async def test_metered__stream_fails_without_tokens__publishes_nothing():
     with pytest.raises(LLMUnavailableError):
         await _collect(MeteredProvider(inner, bus, lambda role: "m").stream(_req()))
 
+    assert recorder.events == []
+
+
+# --- one policy for cancellation: a billed call that is cancelled is still metered ---
+
+
+class _BilledThenHangs(FakeProvider):
+    """Reports tokens (the request was billed), then never finishes."""
+
+    def __init__(self) -> None:
+        super().__init__("claude", LLMLocation.CLOUD, tokens=(70, 5, 0))
+        self.billed = asyncio.Event()
+
+    async def complete(self, req: LLMRequest) -> str | BaseModel:
+        report_token_usage(*self._tokens)
+        self.billed.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
+        report_token_usage(*self._tokens)
+        yield ("content", "first")
+        self.billed.set()
+        await asyncio.Event().wait()
+        yield ("content", "unreachable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["complete", "stream"])
+async def test_metered__billed_call_cancelled__usage_published_and_cancellation_kept(path):
+    inner = _BilledThenHangs()
+    bus, recorder = _recording_bus()
+    provider = MeteredProvider(inner, bus, lambda role: "m")
+    call = provider.complete(_req()) if path == "complete" else _collect(provider.stream(_req()))
+
+    task = asyncio.create_task(call)
+    await asyncio.wait_for(inner.billed.wait(), timeout=1)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (event,) = recorder.events
+    assert (event.usage.input_tokens, event.usage.output_tokens) == (70, 5)
+
+
+@pytest.mark.asyncio
+async def test_metered__unbilled_call_cancelled__publishes_nothing():
+    inner = HangingProvider()
+    bus, recorder = _recording_bus()
+    task = asyncio.create_task(MeteredProvider(inner, bus, lambda role: "m").complete(_req()))
+    await asyncio.sleep(0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert recorder.events == []

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.domain.errors import PersistenceError
 from supabase import create_client
 
 logger = logging.getLogger(__name__)
@@ -128,23 +129,24 @@ async def get_due_trackers(
             .eq("user_id", user_id)
             .execute()
         )
-        due = []
-        for row in result.data or []:
-            last = row.get("last_done_at")
+    except Exception as exc:
+        # Not []: "nothing is due" would be a false answer to a database outage.
+        raise PersistenceError("Could not reach the database.") from exc
+    due = []
+    for row in result.data or []:
+        last = row.get("last_done_at")
+        if not last:
+            # Never done: treat as due
+            due.append(row)
+            continue
+        try:
             interval = int(row.get("next_interval_days") or 1)
-            if not last:
-                # Never done: treat as due
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if last_dt.tzinfo:
+                last_dt = last_dt.astimezone(timezone.utc)
+            next_due = (last_dt + timedelta(days=interval)).date()
+            if next_due <= ref_date:
                 due.append(row)
-                continue
-            try:
-                last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-                if last_dt.tzinfo:
-                    last_dt = last_dt.astimezone(timezone.utc)
-                next_due = (last_dt + timedelta(days=interval)).date()
-                if next_due <= ref_date:
-                    due.append(row)
-            except (ValueError, TypeError):
-                due.append(row)
-        return due
-    except Exception:
-        return []
+        except (ValueError, TypeError):
+            due.append(row)
+    return due

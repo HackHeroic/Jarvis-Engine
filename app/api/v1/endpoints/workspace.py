@@ -37,6 +37,8 @@ async def get_task_workspace(
             user_prompt=prompt,
             refresh=refresh,
         )
+    except errors.JarvisError:
+        raise  # already says what went wrong, with its own status
     except Exception as exc:
         # Not only a database call (RAG, web search and an LLM run here too), so
         # a plain 500. The handler logs the chained cause; its text stays off the wire.

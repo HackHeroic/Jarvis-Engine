@@ -9,6 +9,7 @@ probabilistic LLM reasoning layer and the deterministic Python backend.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Dict, List, Optional
 
@@ -17,6 +18,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMOutputParseError, LLMUnavailableError
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas — the JSON contract
@@ -321,11 +324,12 @@ async def decompose_goal(
             ),
         ) from exc
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
+        logger.warning("Decomposition reply did not parse as an ExecutionGraph", exc_info=exc)
         raise HTTPException(
             status_code=502,
             detail=(
-                f"LLM Reasoning Error: the model returned content that "
-                f"could not be parsed into a valid ExecutionGraph. {exc}"
+                "LLM Reasoning Error: the model returned content that "
+                "could not be parsed into a valid ExecutionGraph."
             ),
         ) from exc
 

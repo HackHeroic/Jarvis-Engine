@@ -116,7 +116,7 @@ def test_task__difficulty_out_of_range__rejected():
 # --- Ports ------------------------------------------------------------------
 
 
-def test_ports__are_abstract():
+def test_ports__instantiated_directly__raise_type_error():
     with pytest.raises(TypeError):
         TaskRepository()
     with pytest.raises(TypeError):
@@ -146,7 +146,7 @@ async def test_event_bus__failing_listener__others_still_run(caplog):
 
 
 @pytest.mark.asyncio
-async def test_event_bus__only_subscribed_type_delivered():
+async def test_event_bus__other_event_type__not_delivered():
     bus = EventBus()
     completed, skipped = _RecordingListener(), _RecordingListener()
     bus.subscribe(TaskCompleted, completed)
@@ -160,6 +160,22 @@ async def test_event_bus__only_subscribed_type_delivered():
 
 
 @pytest.mark.asyncio
+async def test_event_bus__base_type_subscription__receives_every_event_once():
+    bus = EventBus()
+    everything, completed = _RecordingListener(), _RecordingListener()
+    bus.subscribe(DomainEvent, everything)
+    bus.subscribe(TaskCompleted, completed)
+    done = TaskCompleted(occurred_at=_NOW, user_id="u1", task_id="t1")
+    skipped = TaskSkipped(occurred_at=_NOW, user_id="u1", task_id="t2", reason="tired")
+
+    await bus.publish(done)
+    await bus.publish(skipped)
+
+    assert everything.received == [done, skipped]
+    assert completed.received == [done]
+
+
+@pytest.mark.asyncio
 async def test_null_event_bus__publish__no_error():
     bus = NullEventBus()
     listener = _RecordingListener()
@@ -168,3 +184,42 @@ async def test_null_event_bus__publish__no_error():
     await bus.publish(TaskCompleted(occurred_at=_NOW, user_id="u1", task_id="t1"))
 
     assert listener.received == []
+
+
+# --- value ranges -----------------------------------------------------------------
+
+
+def _pattern(**overrides):
+    from app.domain.entities import Pattern
+
+    fields = {"detector": "skip_hour", "description": "Skips 9 AM", "occurrences": 3, "confidence": 0.7}
+    fields.update(overrides)
+    return Pattern(**fields)
+
+
+@pytest.mark.parametrize("bad", [{"confidence": -0.1}, {"confidence": 1.01}, {"occurrences": 0}])
+def test_pattern__out_of_range__rejected(bad):
+    with pytest.raises(ValidationError):
+        _pattern(**bad)
+
+
+def test_pattern__range_edges__accepted():
+    assert _pattern(confidence=0.0, occurrences=1).confidence == 0.0
+    assert _pattern(confidence=1.0).confidence == 1.0
+
+
+@pytest.mark.parametrize(
+    "field", ["input_tokens", "output_tokens", "cache_read_tokens", "latency_ms"]
+)
+def test_llm_usage_event__negative_count__rejected(field):
+    from app.domain.entities import LLMLocation, LLMUsageEvent
+
+    fields = {
+        "task": "voice_of_jarvis", "role": "fast", "provider": "local", "model": "m",
+        "location": LLMLocation.LOCAL, "input_tokens": 0, "output_tokens": 0,
+        "latency_ms": 0, "created_at": _NOW,
+    }
+
+    assert LLMUsageEvent(**fields).input_tokens == 0  # zero is a real count
+    with pytest.raises(ValidationError):
+        LLMUsageEvent(**{**fields, field: -1})
