@@ -273,7 +273,9 @@ async def _memory_slots(state: PlanningState) -> list:
 
     Through ``MemoryService`` when the composition root is registered: active
     constraint and behavioural-pattern memories, so a dismissed or forgotten one never
-    blocks time. Otherwise (tests, scripts) the legacy memory store and bridge.
+    blocks time, with the user's habits (fetched by ``fetch_constraints``), so an
+    hour they keep for focused work is never soft-blocked by a learned pattern.
+    Otherwise (tests, scripts) the legacy memory store and bridge.
     """
     container = registered_container()
     if container is not None:
@@ -282,7 +284,12 @@ async def _memory_slots(state: PlanningState) -> list:
         memories = await container.memory_service.list_active(
             state.get("user_id", "demo"), types=frozenset({"constraint", "behavioral_pattern"})
         )
-        return memory_slots(memories)
+        habits = [
+            c.get("raw_text", "")
+            for c in state.get("constraints") or []
+            if c.get("constraint_type") == "habit"
+        ]
+        return memory_slots(memories, habits=habits)
     user_model = state.get("user_model")
     memory_store = await user_model.get_memory_store() if user_model else None
     if not memory_store:

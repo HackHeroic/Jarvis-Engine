@@ -1,24 +1,29 @@
 """PEARL: Jarvis notices what the user keeps doing, from what happened to their tasks.
 
 The only input is the outcome history (``task_events``): each completed, skipped or
-missed slot of the last ``FOCUS_WINDOW_DAYS``. A slot can have more than one outcome
-(the sweep marks it missed, then the user completes it after all); it counts once, as
-what happened last. Each ``PatternDetector`` is one strategy for reading that history,
-with hours on the user's clock. Every pattern it finds carries a stable
-``pattern_key``, such as ``skip_time_window:9``.
+missed slot of the last ``FOCUS_WINDOW_DAYS``, each slot counted once as its latest
+outcome (``latest_outcome_per_slot``). Each ``PatternDetector`` is one strategy for
+reading that history, with hours on the user's clock. It owns everything particular
+to its pattern: the pattern's stable ``pattern_key`` (such as
+``skip_time_window:9``), how planning applies it, and what Jarvis tells the user
+about it. Adding a detector touches no other code.
 
 ``PatternService.observe`` remembers patterns as inferred behavioural memories, looked
-up by key. A new pattern is created. One seen on more evidence than its memory holds
-is strengthened. Anything else is left alone, so looking again teaches nothing twice.
-A pattern the user dismissed or forgot is never learned again. Every change is
-announced (``PatternDetected``), and ``PatternObserver`` runs PEARL after each outcome.
+up by key. A new pattern is created. One with an observation newer than its memory is
+strengthened. Anything else is left alone, so looking at the same history again
+changes nothing. A pattern the user dismissed or forgot is never learned again.
+Every change is announced (``PatternDetected``) and held for the user's next turn
+(``drain_pending``), whoever ran PEARL. ``PatternObserver`` runs PEARL in the
+background after each outcome, never in the user's way.
 """
 
+import asyncio
+import logging
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from collections.abc import Callable, Iterable
-from datetime import datetime, timedelta, timezone
-from typing import ClassVar, Literal
+from collections import defaultdict, deque
+from collections.abc import Callable, Coroutine
+from datetime import datetime, timedelta
+from typing import Any, ClassVar, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
@@ -38,14 +43,25 @@ from app.domain.events import DomainEvent, EventBus, EventListener, PatternDetec
 from app.domain.ports import MemoryRepository, ProfileRepository, TaskEventRepository
 from app.services.analytical.missed_deadlines import _parse_deadline
 from app.services.planning.local_time import user_zone
-from app.services.task_service import utc_now
+from app.services.task_service import (
+    SLOT_OUTCOMES,
+    as_aware,
+    latest_outcome_per_slot,
+    utc_now,
+)
 
-# What a slot can come to. Skipped and missed (the slot passed) are both "set aside".
-_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
+logger = logging.getLogger(__name__)
+
 _SET_ASIDE = frozenset({TaskEventType.SKIPPED, TaskEventType.MISSED})
 # A remembered pattern can be strengthened from these states; dismissed and forgotten stick,
 # also when the user lets go of it while PEARL is looking (a compare-and-set on status).
 _STRENGTHENABLE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+# How an outcome reads in evidence: the user's words, never "skipped" or "missed".
+_EVIDENCE_LABELS = {
+    TaskEventType.COMPLETED: "done",
+    TaskEventType.SKIPPED: "set aside",
+    TaskEventType.MISSED: "set aside",
+}
 
 MIN_OCCURRENCES = 3  # never a pattern from fewer outcomes
 SKIP_RATE = 0.7
@@ -55,33 +71,21 @@ CRUNCH_WINDOW = timedelta(hours=24)
 MAX_EVIDENCE = 5
 MAX_PATTERN_CONFIDENCE = 0.9  # an inferred pattern is never remembered as certain
 INSIGHT_CONFIDENCE = 0.7
-
-
-def _aware(moment: datetime) -> datetime:
-    """Stored instants are UTC: a naive one is read as such."""
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+PENDING_PER_USER = 10  # learning moments held for a user's next turn, newest kept
+OBSERVER_SHUTDOWN_GRACE_S = 2.0
 
 
 def _slot_time(event: TaskEvent) -> datetime:
-    return _aware(event.scheduled_start or event.occurred_at)
+    return as_aware(event.scheduled_start or event.occurred_at)
 
 
 def _done_time(event: TaskEvent) -> datetime:
-    return _aware(event.occurred_at)
+    return as_aware(event.occurred_at)
 
 
-def _settled_outcomes(events: Iterable[TaskEvent]) -> list[TaskEvent]:
-    """The last outcome of each slot (task, scheduled start), oldest first.
-
-    Events that are not outcomes are dropped, and so is every outcome of a slot but
-    its latest. Outcomes with no slot are grouped per task.
-    """
-    latest: dict[tuple[str, datetime | None], TaskEvent] = {}
-    for event in sorted(events, key=_done_time):
-        if event.event_type in _OUTCOMES:
-            start = _aware(event.scheduled_start) if event.scheduled_start is not None else None
-            latest[(event.task_id, start)] = event
-    return sorted(latest.values(), key=_done_time)
+def _newest(events: list[TaskEvent]) -> datetime:
+    """When the newest of ``events`` was recorded."""
+    return max(_done_time(e) for e in events)
 
 
 def _by_local_hour(events: list[TaskEvent], zone: ZoneInfo) -> dict[int, list[TaskEvent]]:
@@ -89,7 +93,7 @@ def _by_local_hour(events: list[TaskEvent], zone: ZoneInfo) -> dict[int, list[Ta
     buckets: dict[int, list[TaskEvent]] = defaultdict(list)
     for event in events:
         if event.scheduled_start is not None:
-            buckets[_aware(event.scheduled_start).astimezone(zone).hour].append(event)
+            buckets[as_aware(event.scheduled_start).astimezone(zone).hour].append(event)
     return dict(sorted(buckets.items()))
 
 
@@ -103,29 +107,50 @@ def _evidence(
     """Up to MAX_EVIDENCE observations, newest first: what happened, when (local), to what."""
     newest = sorted(events, key=at, reverse=True)[:MAX_EVIDENCE]
     return [
-        f"{e.event_type.value} {at(e).astimezone(zone):%a %d %b %H:%M} · {_title(e)}"
+        f"{_EVIDENCE_LABELS[e.event_type]} {at(e).astimezone(zone):%a %d %b %H:%M} · {_title(e)}"
         for e in newest
     ]
 
 
+def _clock_hour(hour: int) -> str:
+    """A 24-hour ``hour`` as the user reads it: 0 is 12 AM, 9 is 9 AM, 19 is 7 PM."""
+    return f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
+
+
 class PatternDetector(ABC):
-    """One way of reading the outcome history for a recurring behaviour (Strategy)."""
+    """One way of reading the outcome history for a recurring behaviour (Strategy).
+
+    A detector owns its pattern: the key, the words, how planning applies it
+    (``applied_as``) and what Jarvis tells the user about it (``insight``).
+    """
 
     name: ClassVar[str]
+    # How planning applies a remembered pattern of this kind; None when it does not.
+    applied_as: ClassVar[str | None] = None
 
     @abstractmethod
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
-        """The patterns in ``events``, hours read on ``zone``'s clock, each with a pattern_key."""
+        """The patterns in ``events``, hours read on ``zone``'s clock.
+
+        Each carries a ``pattern_key`` and ``last_observed_at`` (when the newest
+        observation behind it was recorded). ``events`` may hold more than one
+        outcome per slot; read them through ``latest_outcome_per_slot``.
+        """
+
+    def insight(self, pattern: Pattern) -> str:
+        """What Jarvis tells the user about ``pattern``, from its live numbers."""
+        return pattern.description
 
 
 class SkipTimeWindowDetector(PatternDetector):
     """An hour the user keeps setting aside: 3 or more outcomes, at least 70% skipped or missed."""
 
     name: ClassVar[str] = "skip_time_window"
+    applied_as: ClassVar[str | None] = "soft_preference"
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         patterns = []
-        for hour, outcomes in _by_local_hour(_settled_outcomes(events), zone).items():
+        for hour, outcomes in _by_local_hour(latest_outcome_per_slot(events), zone).items():
             set_aside = [e for e in outcomes if e.event_type in _SET_ASIDE]
             n, total = len(set_aside), len(outcomes)
             if total < MIN_OCCURRENCES or n / total < SKIP_RATE:
@@ -138,8 +163,16 @@ class SkipTimeWindowDetector(PatternDetector):
                 evidence=_evidence(set_aside, zone),
                 pattern_key=f"{self.name}:{hour}",
                 hour=hour,
+                last_observed_at=_newest(set_aside),
             ))
         return patterns
+
+    def insight(self, pattern: Pattern) -> str:
+        n = round(pattern.confidence * pattern.occurrences)
+        return (
+            f"I keep demanding work out of the {_clock_hour(pattern.hour)} hour"
+            f" — you've set aside {n} of {pattern.occurrences} there."
+        )
 
 
 class PeakHourDetector(PatternDetector):
@@ -152,7 +185,7 @@ class PeakHourDetector(PatternDetector):
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         best: tuple[tuple[float, int], int, list[TaskEvent]] | None = None
-        for hour, outcomes in _by_local_hour(_settled_outcomes(events), zone).items():
+        for hour, outcomes in _by_local_hour(latest_outcome_per_slot(events), zone).items():
             if len(outcomes) < MIN_OCCURRENCES:
                 continue
             done = [e for e in outcomes if e.event_type is TaskEventType.COMPLETED]
@@ -172,7 +205,11 @@ class PeakHourDetector(PatternDetector):
             evidence=_evidence(done, zone),
             pattern_key=f"{self.name}:{hour}",
             hour=hour,
+            last_observed_at=_newest(done),
         )]
+
+    def insight(self, pattern: Pattern) -> str:
+        return f"You do your best work around {_clock_hour(pattern.hour)}."
 
 
 class DeadlineCrunchDetector(PatternDetector):
@@ -185,7 +222,7 @@ class DeadlineCrunchDetector(PatternDetector):
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         deadlined = []
-        for event in _settled_outcomes(events):
+        for event in latest_outcome_per_slot(events):
             if event.event_type is TaskEventType.COMPLETED:
                 deadline = _parse_deadline(event.metadata.get("deadline_hint"), zone)
                 if deadline is not None:
@@ -205,20 +242,25 @@ class DeadlineCrunchDetector(PatternDetector):
             confidence=k / n,
             evidence=_evidence(last_day, zone, at=_done_time),
             pattern_key=self.name,
+            last_observed_at=_newest(last_day),
         )]
+
+    def insight(self, pattern: Pattern) -> str:
+        return "You tend to finish deadlined work on the last day."
 
 
 class RepeatedSkipDetector(PatternDetector):
     """One task set aside again and again: skipped 3 or more times.
 
-    Confidence is the share of the task's outcomes that were skips.
+    Confidence is the share of the task's outcomes that were skips. Jarvis tells the
+    user the description itself.
     """
 
     name: ClassVar[str] = "repeated_skip"
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         by_task: dict[str, list[TaskEvent]] = defaultdict(list)
-        for event in _settled_outcomes(events):
+        for event in latest_outcome_per_slot(events):
             by_task[event.task_id].append(event)
         patterns = []
         for task_id, outcomes in by_task.items():
@@ -236,6 +278,7 @@ class RepeatedSkipDetector(PatternDetector):
                 confidence=n / len(outcomes),
                 evidence=_evidence(skipped, zone),
                 pattern_key=f"{self.name}:{task_id}",
+                last_observed_at=_newest(skipped),
             ))
         return patterns
 
@@ -246,7 +289,7 @@ class PatternChange(BaseModel):
     pattern: Pattern = Field(description="The pattern as detected now.")
     memory_id: str = Field(description="Id of the memory that holds the pattern.")
     action: Literal["created", "strengthened"] = Field(
-        description="created: newly remembered; strengthened: seen on more evidence than before."
+        description="created: newly remembered; strengthened: seen again since last remembered."
     )
 
 
@@ -260,24 +303,16 @@ class PatternView(BaseModel):
     confirmed: bool = Field(description="Whether the user has confirmed the remembered pattern.")
 
 
-def _clock_hour(hour: int) -> str:
-    """A 24-hour ``hour`` as the user reads it: 0 is 12 AM, 9 is 9 AM, 19 is 7 PM."""
-    return f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
-
-
-def _insight(pattern: Pattern) -> str:
-    """What Jarvis tells the user about ``pattern``, from its live numbers."""
-    if pattern.detector == SkipTimeWindowDetector.name:
-        n = round(pattern.confidence * pattern.occurrences)
-        return (
-            f"I keep demanding work out of the {_clock_hour(pattern.hour)} hour"
-            f" — you've set aside {n} of {pattern.occurrences} there."
-        )
-    if pattern.detector == PeakHourDetector.name:
-        return f"You do your best work around {_clock_hour(pattern.hour)}."
-    if pattern.detector == DeadlineCrunchDetector.name:
-        return "You tend to finish deadlined work on the last day."
-    return pattern.description
+async def _to_the_end(
+    write: Coroutine[Any, Any, "PatternChange | None"],
+) -> "PatternChange | None":
+    """Await ``write`` (a memory write and its pending moment), which finishes even if the
+    caller is cancelled meanwhile (a time cap): the change is then held, never lost."""
+    task = asyncio.ensure_future(write)
+    # Retrieve the outcome, so a write left running by a cancelled caller that then
+    # fails is not reported as an unretrieved task exception.
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())
+    return await asyncio.shield(task)
 
 
 class PatternService:
@@ -307,13 +342,16 @@ class PatternService:
                 RepeatedSkipDetector(),
             ]
         )
+        self._by_name = {detector.name: detector for detector in self._detectors}
         self._clock = clock
+        self._pending: dict[str, deque[PatternChange]] = {}
 
     async def observe(self, user_id: str) -> list[PatternChange]:
         """Remember what the detectors find now; return what changed, each one announced.
 
-        Looking again with no new evidence changes nothing: a memory is strengthened
-        only when the pattern has more occurrences than the memory holds.
+        Looking at the same history again changes nothing: a memory is strengthened
+        only by an observation recorded after it was last renewed. Every change is
+        also held for the user's next turn (``drain_pending``).
         """
         now = self._clock()
         changes = []
@@ -325,6 +363,15 @@ class PatternService:
                     PatternDetected(occurred_at=now, user_id=user_id, pattern=pattern)
                 )
         return changes
+
+    def drain_pending(self, user_id: str) -> list[PatternChange]:
+        """The learning moments held for the user since the last drain, oldest first; cleared.
+
+        Whoever ran PEARL (a Complete, a Skip, the slot sweep, a turn) held them here,
+        so the next turn can tell the user. One moment per pattern, with its latest
+        numbers; at most PENDING_PER_USER, the newest.
+        """
+        return list(self._pending.pop(user_id, ()))
 
     async def current(self, user_id: str) -> list[PatternView]:
         """The patterns detected now, each with its memory; dismissed and forgotten left out."""
@@ -343,12 +390,13 @@ class PatternService:
     async def insights(self, user_id: str) -> list[dict]:
         """What to tell the user: remembered patterns seen 3+ times at confidence 0.7 or more.
 
-        The words and numbers are the live pattern's, never the memory's capped confidence.
-        Each is ``{"insight", "confidence", "occurrences", "memory_id"}``.
+        The words are the detector's, from the live pattern's numbers, never the
+        memory's capped confidence. Each is ``{"insight", "confidence", "occurrences",
+        "memory_id"}``.
         """
         return [
             {
-                "insight": _insight(view.pattern),
+                "insight": self._by_name[view.pattern.detector].insight(view.pattern),
                 "confidence": view.pattern.confidence,
                 "occurrences": view.pattern.occurrences,
                 "memory_id": view.memory_id,
@@ -363,7 +411,9 @@ class PatternService:
         """Every detector over the user's outcomes of the last FOCUS_WINDOW_DAYS, their clock."""
         zone = user_zone(await self._profiles.get_or_create(user_id))
         events = await self._task_events.list_for_user(
-            user_id, since=now - timedelta(days=config.FOCUS_WINDOW_DAYS), types=set(_OUTCOMES)
+            user_id,
+            since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
+            types=set(SLOT_OUTCOMES),
         )
         return [p for detector in self._detectors for p in detector.detect(events, zone)]
 
@@ -372,55 +422,123 @@ class PatternService:
     ) -> PatternChange | None:
         """Create or strengthen the pattern's memory; None when nothing changed."""
         existing = await self._memories.find_by_pattern_key(user_id, pattern.pattern_key)
-        confidence = min(MAX_PATTERN_CONFIDENCE, pattern.confidence)
         if existing is None:
-            memory = Memory(
-                user_id=user_id,
-                memory_type="behavioral_pattern",
-                content=pattern.description,
-                provenance=MemorySource.INFERRED,
-                origin="behavior",
-                pattern_key=pattern.pattern_key,
-                confidence=confidence,
-                observation_count=pattern.occurrences,
-                strength_as_of=now,
-                created_at=now,
-                applied_as=(
-                    "soft_preference" if pattern.detector == SkipTimeWindowDetector.name else None
-                ),
-            )
-            try:
-                stored = await self._memories.add(user_id, memory)
-            except errors.ConflictError:  # a concurrent observe remembered it first
-                return None
-            return PatternChange(pattern=pattern, memory_id=stored.id, action="created")
-        if existing.status in SUPPRESSING_STATUSES:  # the user let it go: never again
+            return await _to_the_end(self._create(user_id, pattern, now))
+        if existing.status not in _STRENGTHENABLE:  # dismissed or forgotten: never again
             return None
-        if existing.status in _STRENGTHENABLE and existing.observation_count < pattern.occurrences:
-            try:
-                await self._memories.update(
-                    user_id,
-                    existing.id,
-                    only_if_status=_STRENGTHENABLE,
-                    content=pattern.description,
-                    confidence=confidence,
-                    observation_count=pattern.occurrences,
-                    status=MemoryStatus.ACTIVE,
-                    strength=1.0,
-                    strength_as_of=now,
-                )
-            except errors.StaleVersionError:  # dismissed or forgotten since it was read
-                return None
-            return PatternChange(pattern=pattern, memory_id=existing.id, action="strengthened")
-        return None
+        seen = pattern.last_observed_at
+        if seen is None or seen <= existing.strength_as_of:  # nothing new behind it
+            return None
+        return await _to_the_end(self._strengthen(user_id, existing, pattern, now))
+
+    async def _create(
+        self, user_id: str, pattern: Pattern, now: datetime
+    ) -> PatternChange | None:
+        memory = Memory(
+            user_id=user_id,
+            memory_type="behavioral_pattern",
+            content=pattern.description,
+            provenance=MemorySource.INFERRED,
+            origin="behavior",
+            pattern_key=pattern.pattern_key,
+            confidence=min(MAX_PATTERN_CONFIDENCE, pattern.confidence),
+            observation_count=pattern.occurrences,
+            strength_as_of=now,
+            created_at=now,
+            applied_as=self._by_name[pattern.detector].applied_as,
+        )
+        try:
+            stored = await self._memories.add(user_id, memory)
+        except errors.ConflictError:  # a concurrent observe remembered it first
+            return None
+        change = PatternChange(pattern=pattern, memory_id=stored.id, action="created")
+        self._hold(user_id, change)
+        return change
+
+    async def _strengthen(
+        self, user_id: str, existing: Memory, pattern: Pattern, now: datetime
+    ) -> PatternChange | None:
+        try:
+            await self._memories.update(
+                user_id,
+                existing.id,
+                only_if_status=_STRENGTHENABLE,
+                content=pattern.description,
+                confidence=min(MAX_PATTERN_CONFIDENCE, pattern.confidence),
+                observation_count=pattern.occurrences,
+                status=MemoryStatus.ACTIVE,
+                strength=1.0,
+                strength_as_of=now,
+            )
+        except errors.StaleVersionError:  # dismissed or forgotten since it was read
+            return None
+        change = PatternChange(pattern=pattern, memory_id=existing.id, action="strengthened")
+        self._hold(user_id, change)
+        return change
+
+    def _hold(self, user_id: str, change: PatternChange) -> None:
+        """Keep ``change`` for the user's next turn: one moment per pattern, the newest ten.
+
+        A pattern the user has not been told about yet is still news ("created") when
+        it is strengthened again before they are.
+        """
+        held = self._pending.setdefault(user_id, deque(maxlen=PENDING_PER_USER))
+        for earlier in [c for c in held if c.pattern.pattern_key == change.pattern.pattern_key]:
+            held.remove(earlier)
+            if earlier.action == "created":
+                change = change.model_copy(update={"action": "created"})
+        held.append(change)
 
 
 class PatternObserver(EventListener):
-    """Runs PEARL for the user after each of their task outcomes."""
+    """Runs PEARL for the user after each of their task outcomes, in the background.
+
+    The Complete, Skip or sweep that published the outcome never waits for it. At
+    most one run per user is in flight; outcomes that arrive meanwhile ask for one
+    more run after it, however many there were. A failed run is logged by its type.
+    """
 
     def __init__(self, patterns: PatternService) -> None:
         self._patterns = patterns
+        self._running: dict[str, asyncio.Task] = {}
+        self._dirty: set[str] = set()
+        self._closed = False
 
     async def handle(self, event: DomainEvent) -> None:
-        if event.user_id is not None:
-            await self._patterns.observe(event.user_id)
+        user_id = event.user_id
+        if user_id is None or self._closed:
+            return
+        if user_id in self._running:
+            self._dirty.add(user_id)
+            return
+        self._running[user_id] = asyncio.create_task(self._run(user_id))
+
+    async def settle(self) -> None:
+        """Wait until no run is in flight."""
+        while self._running:
+            await asyncio.wait(set(self._running.values()))
+
+    async def shutdown(self, grace_s: float = OBSERVER_SHUTDOWN_GRACE_S) -> None:
+        """Take no more outcomes; give the runs in flight ``grace_s`` to finish, then
+        cancel the rest and wait for them to end."""
+        self._closed = True
+        runs = set(self._running.values())
+        if not runs:
+            return
+        _, unfinished = await asyncio.wait(runs, timeout=grace_s)
+        for run in unfinished:
+            run.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+
+    async def _run(self, user_id: str) -> None:
+        try:
+            while True:
+                self._dirty.discard(user_id)
+                try:
+                    await self._patterns.observe(user_id)
+                except Exception as exc:  # never the outcome's problem; the next run retries
+                    logger.warning("PEARL run failed (%s)", type(exc).__name__)
+                if user_id not in self._dirty:
+                    return
+        finally:
+            self._running.pop(user_id, None)

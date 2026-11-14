@@ -181,6 +181,8 @@ async def lifespan(app: FastAPI):
         embedder_warm_up.cancel()  # a no-op once it is done
         # First: a tick in progress may still be recording model calls.
         await anticipation_scheduler.stop()
+        # Then the container's own background work (PEARL runs after outcomes).
+        await container.shutdown()
         # Bounded: in-flight usage records get a moment to land, never a hang.
         await container.usage_ledger.shutdown()
         await checkpoint_stack.aclose()

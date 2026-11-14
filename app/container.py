@@ -49,6 +49,7 @@ class AppContainer:
     embedder: TextEmbedder
     memory_service: MemoryService
     patterns: PatternService
+    pattern_observer: PatternObserver
     consent: ConsentPolicy
     actions: ActionFactory
     anticipation: AnticipationService
@@ -114,6 +115,7 @@ class AppContainer:
             embedder=embedder,
             memory_service=memory_service,
             patterns=patterns,
+            pattern_observer=observer,
             consent=consent,
             actions=actions,
             anticipation=AnticipationService(
@@ -123,3 +125,8 @@ class AppContainer:
                 repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
             ),
         )
+
+    async def shutdown(self) -> None:
+        """Stop the background work the container owns: PEARL runs in flight get a
+        short grace to finish, then are cancelled."""
+        await self.pattern_observer.shutdown()

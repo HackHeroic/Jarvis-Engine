@@ -276,3 +276,72 @@ def test_memory_slots__constraint_memory__hard_block():
     assert slot.availability == "blocked"
     assert (slot.recurring, slot.source) == (True, "user")
     assert slot.name == f"memory_constraint_{rule.id}"
+
+
+def test_memory_slots__habit_claims_the_hour_for_deep_work__no_skip_block_there():
+    """The user's own rule beats what Jarvis inferred: an hour they keep for deep work is
+    never made a minimal-work hour because of past set-asides there."""
+    from app.services.memory.constraint_bridge import memory_slots
+
+    skips_9 = _memory(
+        "behavioral_pattern", "User avoids tasks during hour 9 (3 of 3 set aside)",
+        pattern_key="skip_time_window:9", confidence=0.9,
+    )
+    skips_14 = _memory(
+        "behavioral_pattern", "User avoids tasks during hour 14 (3 of 3 set aside)",
+        pattern_key="skip_time_window:14", confidence=0.9,
+    )
+
+    (slot,) = memory_slots([skips_9, skips_14], habits=["Deep work 9-10 every morning"])
+
+    assert (slot.start_min, slot.end_min, slot.availability) == (360, 420, "minimal_work")
+
+
+def test_memory_slots__said_rule_claims_the_hour__neither_blocked_nor_soft_blocked():
+    from app.domain.entities import MemorySource
+    from app.services.memory.constraint_bridge import memory_slots
+
+    claim = _memory(
+        "constraint", "Deep work from 9 AM to 10 AM, phone off", provenance=MemorySource.SAID
+    )
+    no_study = _memory("constraint", "No study before 11 AM", provenance=MemorySource.SAID)
+    skips_9 = _memory(
+        "behavioral_pattern", "User avoids tasks during hour 9 (3 of 3 set aside)",
+        pattern_key="skip_time_window:9", confidence=0.9,
+    )
+
+    assert memory_slots([claim, skips_9]) == []
+    # A rule that keeps study out of the morning claims nothing: both still apply.
+    assert [(s.availability, s.start_min, s.end_min) for s in memory_slots([no_study, skips_9])] == [
+        ("blocked", 0, 180),
+        ("minimal_work", 60, 120),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_planning_memory_to_constraints__habit_keeps_the_hour__no_skip_block_in_the_plan():
+    """The planning node hands the bridge the user's habits along with their memories."""
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.modules.planning_graph import memory_to_constraints
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder
+
+    container = AppContainer.build(
+        supabase_client=None, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+    runtime.set_container(container)  # conftest resets the registry afterwards
+    skips_9 = _memory(
+        "behavioral_pattern", "User avoids tasks during hour 9 (3 of 3 set aside)",
+        pattern_key="skip_time_window:9", confidence=0.9,
+    )
+    await container.repos.memories.add("u1", skips_9)
+    deep_work = {"raw_text": "Deep work 9-10 every morning", "constraint_type": "habit"}
+
+    without = await memory_to_constraints({"user_id": "u1", "constraints": []})
+    with_habit = await memory_to_constraints({"user_id": "u1", "constraints": [deep_work]})
+
+    assert {s["start_min"] % 1440 for s in without["time_slots"]} == {60}
+    assert "time_slots" not in with_habit

@@ -10,38 +10,16 @@ the prior. Below ``MIN_FOCUS_OBSERVATIONS`` outcomes the profile is labelled
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import app.core.config as config
 from app.core.config import FOCUS_PRIOR_STRENGTH, FOCUS_WINDOW_DAYS, MIN_FOCUS_OBSERVATIONS
-from app.domain.entities import HOURS_PER_DAY, FocusProfile, HourFocus, TaskEvent, TaskEventType
+from app.domain.entities import HOURS_PER_DAY, FocusProfile, HourFocus, TaskEventType
 from app.domain.ports import EnergyEstimator, TaskEventRepository
+from app.services.task_service import SLOT_OUTCOMES, as_aware, latest_outcome_per_slot
 
 logger = logging.getLogger(__name__)
-
-# The outcomes a slot can have. Skipped and missed (the slot passed) both count as
-# "not done"; a deadline miss is about a date, not an hour, so it is not one of them.
-_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
-
-
-def _latest_outcome_per_slot(events: list[TaskEvent]) -> list[tuple[datetime, TaskEvent]]:
-    """The last outcome of each slot (task, scheduled start), with the slot's aware start.
-
-    A slot can have more than one outcome: the sweep marks it missed, then the user
-    completes it after all. It still counts once, as what happened last. ``events``
-    come oldest first, so a later event replaces an earlier one. Events without a slot
-    have no hour to learn about and are left out.
-    """
-    latest: dict[tuple[str, datetime], TaskEvent] = {}
-    for event in events:
-        start = event.scheduled_start
-        if start is None:
-            continue
-        if start.tzinfo is None:  # stored instants are UTC
-            start = start.replace(tzinfo=timezone.utc)
-        latest[(event.task_id, start)] = event
-    return [(start, event) for (_, start), event in latest.items()]
 
 
 class HeuristicEnergyEstimator(EnergyEstimator):
@@ -92,13 +70,17 @@ class HistoryEnergyEstimator(EnergyEstimator):
         self._min_observations = min_observations
 
     async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
+        # Skipped and missed (the slot passed) both count as "not done". A deadline miss
+        # is about a date, not an hour, so it is not an outcome.
         events = await self._task_events.list_for_user(
-            user_id, since=now - timedelta(days=self._window_days), types=set(_OUTCOMES)
+            user_id, since=now - timedelta(days=self._window_days), types=set(SLOT_OUTCOMES)
         )
         done = [0] * HOURS_PER_DAY
         not_done = [0] * HOURS_PER_DAY
-        for start, event in _latest_outcome_per_slot(events):
-            hour = start.astimezone(zone).hour
+        for event in latest_outcome_per_slot(events):
+            if event.scheduled_start is None:  # no slot, no hour to learn about
+                continue
+            hour = as_aware(event.scheduled_start).astimezone(zone).hour
             if event.event_type == TaskEventType.COMPLETED:
                 done[hour] += 1
             else:

@@ -360,6 +360,13 @@ class Pattern(BaseModel):
     hour: int | None = Field(
         default=None, ge=0, le=23, description="Local hour of the day it is about, if any."
     )
+    last_observed_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the newest observation behind it was recorded; a remembered pattern is"
+            " strengthened only by an observation newer than the memory."
+        ),
+    )
 
 
 HOURS_PER_DAY = 24
