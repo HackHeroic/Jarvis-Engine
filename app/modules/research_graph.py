@@ -8,6 +8,9 @@ from app.domain.errors import public_message
 class ResearchState(TypedDict):
     user_id: str
     user_model: Any
+    # The turn's composition root (AppContainer), or None: a web search is metered onto
+    # its event bus. Transient, never checkpointed.
+    container: Any
     query: str
     search_results: list
     iteration_count: int
@@ -26,7 +29,8 @@ async def execute_search(state: ResearchState) -> dict:
     query = state.get("query", "")
     try:
         from app.services.analytical.workspace_builder import perform_learning_style_search
-        results = await perform_learning_style_search(query, "reader")
+        bus = getattr(state.get("container"), "events", None)
+        results = await perform_learning_style_search(query, "reader", bus=bus)
         return {
             "search_results": state.get("search_results", []) + [r.model_dump() for r in results],
             "iteration_count": state.get("iteration_count", 0) + 1,
@@ -76,8 +80,9 @@ from app.core.module_framework import ModuleStep, ModuleDefinition
 def research_state_in(state) -> dict:
     user_model = state.get("user_model")
     return {
-        "user_id": user_model.user_id if user_model else "demo",
+        "user_id": user_model.user_id if user_model else state.get("user_id") or "demo",
         "user_model": user_model,
+        "container": state.get("container"),
         "query": state.get("user_message", ""),
         "search_results": [],
         "iteration_count": 0,

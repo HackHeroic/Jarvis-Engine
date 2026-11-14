@@ -137,21 +137,6 @@ def _registered_modules():
 
 
 @pytest.fixture(autouse=True)
-def _clean_runtime_registry():
-    """Keep the process-wide shared-client registry from leaking between tests.
-
-    ``app.core.runtime`` holds the db / memory-store singletons that lifespan
-    startup registers; a test that registers a fake must not change what the
-    next test sees.
-    """
-    from app.core import runtime
-
-    runtime.reset_shared_clients()
-    yield
-    runtime.reset_shared_clients()
-
-
-@pytest.fixture(autouse=True)
 def _fresh_llm_chain():
     """Keep the process-wide LLM chain from leaking between tests.
 

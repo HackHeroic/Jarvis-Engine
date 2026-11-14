@@ -9,7 +9,12 @@ from app.domain.errors import public_message
 class KnowledgeState(TypedDict):
     user_id: str
     user_model: Any
-    db_client: Any  # DatabaseClient — needed for ingested_documents persistence
+    # The turn's composition root (AppContainer), or None: the user's rules are read and
+    # stored through its repositories. Transient, never checkpointed.
+    container: Any
+    # The turn's DatabaseClient, for the document and pending-calendar rows that have no
+    # repository yet (Plan 3 cut Task 6). Transient, never checkpointed.
+    db_client: Any
     content: Optional[str]
     file_bytes: Optional[bytes]
     media_type: Optional[str]
@@ -43,12 +48,12 @@ async def extract_calendar(state: KnowledgeState) -> dict:
 
 async def ingest_document(state: KnowledgeState) -> dict:
     try:
-        from app.core.runtime import registered_container
         from app.services.extraction.orchestrator import process_ingestion
 
-        # The user's rules through the composition root's repository; without one
-        # (tests, scripts) no rule is read or stored.
-        container = registered_container()
+        # The user's rules and tasks through the repositories of the turn's composition
+        # root; without one (tests, scripts) none is read or stored.
+        container = state.get("container")
+        repos = container.repos if container is not None else None
         result = await process_ingestion(
             payload=state.get("content"),
             file_bytes=state.get("file_bytes"),
@@ -56,7 +61,9 @@ async def ingest_document(state: KnowledgeState) -> dict:
             user_id=state.get("user_id"),
             file_name=state.get("file_name"),
             db_client=state.get("db_client"),
-            constraints=container.repos.constraints if container is not None else None,
+            constraints=repos.constraints if repos is not None else None,
+            tasks=repos.tasks if repos is not None else None,
+            goals=repos.goals if repos is not None else None,
         )
         return {"ingestion_result": result.model_dump() if hasattr(result, "model_dump") else {"status": "ok"}}
     except Exception as e:
@@ -87,11 +94,11 @@ def knowledge_state_in(state) -> dict:
     if _file_b64:
         import base64
         _file_bytes = base64.b64decode(_file_b64)
-    _db_client = getattr(user_model, "_db", None) if user_model else None
     return {
-        "user_id": user_model.user_id if user_model else "demo",
+        "user_id": user_model.user_id if user_model else state.get("user_id") or "demo",
         "user_model": user_model,
-        "db_client": _db_client,
+        "container": state.get("container"),
+        "db_client": state.get("db_client"),
         "content": state.get("user_message", ""),
         "file_bytes": _file_bytes,
         "media_type": state.get("file_media_type"),

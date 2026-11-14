@@ -39,9 +39,9 @@ class JarvisState(TypedDict):
     # Serializable identity — the checkpointer persists this, never the facade
     user_id: str
 
-    # User Model (lazy facade, loaded once per session)
-    # NOT serializable: dropped by the checkpointer, rehydrated from user_id
-    # by _load_context on resumed turns.
+    # User Model (a facade over the repository ports, read once per turn)
+    # NOT serializable: dropped by the checkpointer; each turn brings its own, and
+    # _load_context builds one from the turn's container when it did not.
     user_model: Any  # UserModel — Any to avoid circular import
 
     # Current turn
@@ -93,6 +93,9 @@ class JarvisState(TypedDict):
     # The composition root (AppContainer) the turn was opened with, or None (unit tests,
     # scripts: a feature that needs it is then off). Transient, set fresh every turn.
     container: Any
+    # The turn's DatabaseClient, for the rows with no repository yet (the knowledge
+    # module's document record: Plan 3 cut Task 6). Transient, set fresh every turn.
+    db_client: Any
 
     # Per-turn learning context, set fresh each turn by ChatTurnService: the conversation and
     # the user's saved message (what this turn's memories cite as their source), and

@@ -812,21 +812,14 @@ async def test_seed__demo_morning__brief_plans_today_reslots_and_leans_on_the_ev
     peak; its words claim the strongest hour only when the hardest of today is there.
     The real pattern-rule trigger offers the 9 AM window."""
     import app.api.v1.endpoints.schedule as schedule_endpoint
-    import app.core.config as config
     import app.modules.planning_graph as planning_graph
-    from app.container import AppContainer
-    from app.core import runtime
-    from app.orchestrator.hooks import ActionHooks
     from app.services.anticipation.triggers import PEAK_CLAIM_MIN_SCORE
 
     fake = FakeSupabase()
     repos, _ = await _seed(repos=RepositoryFactory.supabase(fake))
     now = datetime.combine(TODAY, at, IST)
     clock.freeze(now, schedule_endpoint, planning_graph)
-    runtime.set_container(AppContainer.build(  # planning reads the focus profile through it
-        supabase_client=fake, cfg=config, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
-        install_chain=False,
-    ))
+    # The replanner reads the focus profile through its own planning services.
     set_aside = {t.task_id for t in await _set_aside_yesterday(repos, TODAY)}
     pending = await repos.tasks.list_by_status(DEMO, frozenset({TaskStatus.PENDING}))
     not_due_today = [t for t in pending if _deadline(t) != TODAY]

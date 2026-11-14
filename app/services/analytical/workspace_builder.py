@@ -16,6 +16,8 @@ from typing import Optional
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.core.model_router import PreCloudLLMRedactor, metered_web_search
 from app.domain.errors import LLMUnavailableError
+from app.domain.events import EventBus
+from app.domain.ports import GoalRepository
 from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -34,7 +36,7 @@ class WebSearchUnavailableError(LLMUnavailableError):
     code = "web_search_unavailable"
 
 
-async def _search_web(user_prompt: str, system_prompt: str) -> str:
+async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus | None) -> str:
     """Run the grounded web search, raising ``WebSearchUnavailableError`` when it fails.
 
     Still Gemini-only: no other provider in the LLM chain has search grounding, so a
@@ -43,7 +45,8 @@ async def _search_web(user_prompt: str, system_prompt: str) -> str:
 
     The query carries user text (a task title, the chat message) and goes to the
     cloud outside the provider chain, so the chain's PII gate is run here first. A
-    gate that denies the send, or wants to ask, means no search is made.
+    gate that denies the send, or wants to ask, means no search is made. An answered
+    search is metered onto ``bus``, the composition root's (``metered_web_search``).
     """
     redactor = PreCloudLLMRedactor(get_hooks())
     try:
@@ -54,6 +57,7 @@ async def _search_web(user_prompt: str, system_prompt: str) -> str:
     # Metered into the usage ledger like a chain call: the chain never sees a search.
     raw = await metered_web_search(
         lambda: gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt),
+        bus=bus,
         pii_redactions=redacted_in_prompt + redacted_in_system,
     )
     if not raw or not raw.strip():
@@ -123,10 +127,13 @@ async def fetch_chunks_for_task(
     return chunks
 
 
-async def perform_learning_style_search(task_title: str, learning_style: str) -> list[StudyAsset]:
+async def perform_learning_style_search(
+    task_title: str, learning_style: str, *, bus: EventBus | None = None
+) -> list[StudyAsset]:
     """Use Gemini + Google Search to find learning-style-curated links (YouTube or articles).
 
-    Raises ``WebSearchUnavailableError`` when the search could not run.
+    Raises ``WebSearchUnavailableError`` when the search could not run. The search is
+    metered onto ``bus`` (the composition root's); None meters nothing.
     """
     assets: list[StudyAsset] = []
     if not task_title.strip():
@@ -151,7 +158,7 @@ async def perform_learning_style_search(task_title: str, learning_style: str) ->
         )
         sys = "You are a tutor. Return YouTube and Article lines with URL | Title"
 
-    raw = await _search_web(prompt, sys)
+    raw = await _search_web(prompt, sys, bus=bus)
 
     # Parse URL | Title lines
     url_re = re.compile(r"https?://[^\s|]+")
@@ -191,6 +198,8 @@ async def generate_practice_assets(
     topic_keywords: list[str],
     learning_style: str = "reader",
     user_prompt: Optional[str] = None,
+    *,
+    bus: EventBus | None = None,
 ) -> list[StudyAsset]:
     """Generate context-aware practice assets.
 
@@ -253,6 +262,7 @@ Return a JSON object: {{"assets": [{{"asset_type": "generated_quiz", "title": "Q
         raw = await _search_web(
             prompt,
             "You are a tutor. Find real LeetCode, Codeforces, and YouTube URLs. Return URL | Title per line.",
+            bus=bus,
         )
         if raw:
             url_re = re.compile(r"https?://[^\s|]+")
@@ -286,8 +296,15 @@ async def build_task_workspace(
     user_id: str,
     task_id: str,
     user_prompt: Optional[str] = None,
+    *,
+    goals: GoalRepository | None = None,
+    bus: EventBus | None = None,
 ) -> TaskWorkspace:
-    """Assemble proactive workspace: RAG chunks, web links, practice assets. Target <5s."""
+    """Assemble proactive workspace: RAG chunks, web links, practice assets. Target <5s.
+
+    ``goals`` (the composition root's repository) gives the WOOP card its wish and
+    outcome; None leaves them at the task's title. Web searches are metered onto ``bus``.
+    """
     supabase = _get_supabase()
     task_title = ""
     topic_keywords: list[str] = []
@@ -322,9 +339,9 @@ async def build_task_workspace(
 
     chunks, learning_style = await asyncio.gather(chunks_task, style_task)
 
-    web_task = perform_learning_style_search(task_title, learning_style)
+    web_task = perform_learning_style_search(task_title, learning_style, bus=bus)
     practice_task = generate_practice_assets(
-        chunks, task_title, topic_keywords, learning_style, user_prompt
+        chunks, task_title, topic_keywords, learning_style, user_prompt, bus=bus
     )
 
     web_assets, practice_assets = await asyncio.gather(
@@ -358,7 +375,6 @@ async def build_task_workspace(
                 task_data = task_result.data[0]
                 intention = task_data.get("implementation_intention") or {}
                 if isinstance(intention, str):
-                    import json
                     try:
                         intention = json.loads(intention)
                     except (json.JSONDecodeError, TypeError):
@@ -370,27 +386,23 @@ async def build_task_workspace(
                     goal_id = task_data.get("goal_id", "")
                     wish = task_title
                     outcome = ""
-                    if goal_id:
-                        # goal_metadata is stored inside context_snippet (JSONB)
-                        goal_result = sb.table("user_plan_updates").select("context_snippet").eq("user_id", user_id).eq("goal_id", goal_id).limit(1).execute()
-                        if goal_result.data:
-                            snippet = goal_result.data[0].get("context_snippet") or {}
-                            if isinstance(snippet, str):
-                                import json
+                    if goal_id and goals is not None:
+                        # goal_metadata is stored inside the update's context_snippet
+                        snippet = await goals.latest_context(user_id, goal_id) or {}
+                        if isinstance(snippet, str):
+                            try:
+                                snippet = json.loads(snippet)
+                            except (json.JSONDecodeError, TypeError):
+                                snippet = {}
+                        if isinstance(snippet, dict):
+                            wish = snippet.get("planning_goal", task_title)
+                            meta = snippet.get("goal_metadata") or {}
+                            if isinstance(meta, str):
                                 try:
-                                    snippet = json.loads(snippet)
+                                    meta = json.loads(meta)
                                 except (json.JSONDecodeError, TypeError):
-                                    snippet = {}
-                            if isinstance(snippet, dict):
-                                wish = snippet.get("planning_goal", task_title)
-                                meta = snippet.get("goal_metadata") or {}
-                                if isinstance(meta, str):
-                                    import json
-                                    try:
-                                        meta = json.loads(meta)
-                                    except (json.JSONDecodeError, TypeError):
-                                        meta = {}
-                                outcome = meta.get("outcome_visualization", "") if isinstance(meta, dict) else ""
+                                    meta = {}
+                            outcome = meta.get("outcome_visualization", "") if isinstance(meta, dict) else ""
                     woop_card = WoopCard(wish=wish, outcome=outcome, obstacle=obstacle, plan=plan)
     except Exception as e:
         logger.warning(f"WOOP card construction failed (non-fatal): {e}")
@@ -496,14 +508,22 @@ async def get_or_build_task_workspace(
     task_id: str,
     user_prompt: Optional[str] = None,
     refresh: bool = False,
+    *,
+    goals: GoalRepository | None = None,
+    bus: EventBus | None = None,
 ) -> TaskWorkspace:
-    """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True."""
+    """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
+
+    ``goals`` and ``bus`` are the composition root's (see ``build_task_workspace``).
+    """
     if not refresh:
         cached = await _read_cached_workspace(user_id, task_id)
         if cached is not None:
             return cached
 
-    ws = await build_task_workspace(user_id=user_id, task_id=task_id, user_prompt=user_prompt)
+    ws = await build_task_workspace(
+        user_id=user_id, task_id=task_id, user_prompt=user_prompt, goals=goals, bus=bus
+    )
     if not ws.notices:
         # A workspace missing its web results is not cached: once search is back,
         # the next open rebuilds it instead of repeating the notice for a day.

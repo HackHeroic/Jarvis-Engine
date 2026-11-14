@@ -10,7 +10,6 @@ CRITICAL CONSTRAINTS (from research):
 import json
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.runtime import registered_container
 
 MASTERY_COACHING_SYSTEM_PROMPT = """You are Jarvis's coaching module. Your responses MUST follow these rules:
 
@@ -100,9 +99,9 @@ async def run_coaching_response(state: dict) -> dict:
         )
 
         user_id = user_model.user_id
-        # The mastery numbers come from the composition root's repositories. Without
-        # one (tests, scripts) there is no history to read: neutral numbers.
-        container = registered_container()
+        # The mastery numbers come from the repositories of the composition root in the
+        # turn's state. Without one (tests, scripts) there is no history: neutral numbers.
+        container = state.get("container")
         if container is not None:
             repos = container.repos
             mastery = await get_mastery_summary(
@@ -112,7 +111,7 @@ async def run_coaching_response(state: dict) -> dict:
             trend = await compute_quality_trend(user_id, repos.task_events)
             streak = await _completion_streak(container, user_id)
         else:
-            logger.debug("Coach: no container registered, so no mastery history to read")
+            logger.debug("Coach: no container in the turn's state, so no mastery history")
             mastery, sr, trend, streak = {}, NEUTRAL_SUCCESS_RATIO, "stable", 0
         energy = await user_model.get_estimated_energy()
 

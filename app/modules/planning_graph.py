@@ -7,7 +7,6 @@ from typing import Annotated, Any, Optional, TypedDict
 
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.runtime import registered_container
 from app.domain.errors import ScheduleInfeasibleError, public_message
 from app.services.memory.context import with_context_note, with_documents
 
@@ -121,20 +120,21 @@ async def mark_missed(state: PlanningState) -> dict:
     no task's status, and a task whose deadline passed stays as it is until the user
     plans or asks for it.
 
-    Every status change goes through the composition root's ``TaskService`` (setting
-    aside records a deadline_missed event). Without a container (tests, scripts)
-    neither the scan nor the bring-back runs: there is no second write path.
+    Every status change goes through the sub-graph's ``PlanningServices.tasks``
+    (setting aside records a deadline_missed event). Without planning services (no
+    container: tests, scripts) neither the scan nor the bring-back runs: there is no
+    second write path.
     """
     if state.get("replan_only"):
         return {"missed_deadlines": [], "anti_guilt_message": None}
     from app.services.analytical import missed_deadlines as md
 
-    container = registered_container()
-    if container is None:
-        logger.debug("No container registered: no deadline scan or bring-back this turn")
+    planning = state.get("planning")
+    if planning is None:
+        logger.debug("No planning services in the state: no deadline scan or bring-back")
         return {"missed_deadlines": [], "anti_guilt_message": None}
     user_id = state.get("user_id", "demo")
-    tasks, task_service = container.repos.tasks, container.task_service
+    tasks, task_service = planning.task_repo, planning.tasks
     if md.asks_to_bring_back_missed(state.get("user_message")):
         # The overdue message's offer ("say the word and I'll work it into this
         # plan"), kept: the set-aside tasks are pending again before fusion reads
@@ -168,13 +168,13 @@ async def mark_missed(state: PlanningState) -> dict:
     }
 
 
-async def _learned_focus(user_id: str, zone: Any) -> Optional[list]:
-    """The user's learned focus by local hour, or None (see ``solver_focus``)."""
+async def _learned_focus(planning: Any, user_id: str, zone: Any) -> Optional[list]:
+    """The user's learned focus by local hour, or None (see ``solver_focus``): read
+    through ``planning.energy``; None without planning services."""
     from app.services.energy import solver_focus
 
-    container = registered_container()
     return await solver_focus(
-        container.energy if container is not None else None,
+        planning.energy if planning is not None else None,
         user_id,
         zone,
         now=datetime.now(timezone.utc),
@@ -204,7 +204,9 @@ async def fetch_constraints(state: PlanningState) -> dict:
         # tomorrow's.
         start = max(start, schedule_ep._compute_horizon_start(zone=zone))
     horizon_start = start.isoformat()
-    focus_by_hour = await _learned_focus(state.get("user_id", "demo"), zone)
+    focus_by_hour = await _learned_focus(
+        state.get("planning"), state.get("user_id", "demo"), zone
+    )
     rules = await _rules_of(state.get("user_model"))
     return {
         **rules,
@@ -379,20 +381,20 @@ def _on_every_day(slots: list[dict]) -> list[dict]:
 async def _memory_slots(state: PlanningState) -> list:
     """The user's stated rules and learned skip windows, as time slots.
 
-    Through ``MemoryService`` when the composition root is registered: active
-    constraint and behavioural-pattern memories, so a dismissed or forgotten one never
-    blocks time, with the user's habits (fetched by ``fetch_constraints``), so an
-    hour they keep for focused work is never soft-blocked by a learned pattern. A
-    constraint memory a stored rule is linked to adds nothing: the plan has that rule
-    from the rules already. Without a composition root (tests, scripts) there are no
+    Through the sub-graph's ``PlanningServices.memory``: active constraint and
+    behavioural-pattern memories, so a dismissed or forgotten one never blocks time,
+    with the user's habits (fetched by ``fetch_constraints``), so an hour they keep for
+    focused work is never soft-blocked by a learned pattern. A constraint memory a
+    stored rule is linked to adds nothing: the plan has that rule from the rules
+    already. Without planning services (no container: tests, scripts) there are no
     memories to read: no slots.
     """
-    container = registered_container()
-    if container is not None:
+    planning = state.get("planning")
+    if planning is not None:
         from app.services.memory.constraint_bridge import memory_slots
         from app.services.memory.stated_rules import covered_memory_ids
 
-        memories = await container.memory_service.list_active(
+        memories = await planning.memory.list_active(
             state.get("user_id", "demo"), types=frozenset({"constraint", "behavioral_pattern"})
         )
         rules = state.get("constraints") or []
@@ -835,7 +837,7 @@ def planning_state_in(state) -> dict:
     user_model = state.get("user_model")
     brain_dump = state.get("brain_dump")
     return {
-        "user_id": user_model.user_id if user_model else "demo",
+        "user_id": user_model.user_id if user_model else state.get("user_id") or "demo",
         "user_model": user_model,
         "user_message": state.get("user_message") or "",
         "restored_task_ids": [],

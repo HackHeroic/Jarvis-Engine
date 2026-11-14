@@ -6,10 +6,10 @@ sub-graphs, because a sub-graph compiled without its own checkpointer inherits
 the parent's (module_framework.py:226) — its channels are written under a
 nested ``checkpoint_ns`` through this same saver:
 
-* ``user_model``      — a facade holding asyncio locks and the Supabase client
+* ``user_model``      — a facade holding asyncio locks and the repository ports
 * ``progress_callback`` — a closure over the SSE queue
 * ``progress_queue``  — the ``asyncio.Queue`` itself
-* ``db_client``       — the live ``DatabaseClient`` (KnowledgeState)
+* ``db_client``       — the live ``DatabaseClient`` (JarvisState, KnowledgeState)
 * ``container``       — the turn's ``AppContainer`` (composition root), re-supplied
   by ``ChatTurnService`` every turn. Only ``draft_id`` — a plain string — needs to
   survive the turn; the drafts are reached through the container's ``DraftService``.
@@ -27,10 +27,10 @@ nested ``checkpoint_ns`` through this same saver:
 Without scrubbing, LangGraph's serializer raises
 ``TypeError: Type is not msgpack serializable: …`` and the whole turn dies.
 They are replaced with ``None`` on the way into SQLite — which touches the write
-path only, never the live channel values the running turn reads. ``_load_context``
-rebuilds ``user_model`` from the checkpointed ``user_id``; every other one is
-re-supplied per turn, the file fields from the request (ChatTurnService) and
-``db_client`` by ``knowledge_state_in`` from ``user_model._db``.
+path only, never the live channel values the running turn reads. Every one is
+re-supplied per turn by ``ChatTurnService``: the facade, the container and the
+``db_client`` it holds, the file fields from the request (``_load_context`` builds a
+``user_model`` from the container when a turn arrives without one).
 
 The key list is a fast path, not the safety net: any *new* live object added to
 any state class would silently reintroduce the crash. So the saver also catches

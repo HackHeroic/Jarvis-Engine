@@ -54,11 +54,6 @@ async def lifespan(app: FastAPI):
         print("   → Check SUPABASE_URL in .env (e.g. https://xxx.supabase.co) and network access.")
         app.state.db_client = _StubDBClient()
 
-    # The same db client, reachable from code with no request scope — notably
-    # _load_context rebuilding the UserModel facade on a checkpoint-resumed turn.
-    from app.core.runtime import set_shared_clients
-    set_shared_clients(db=app.state.db_client)
-
     from app.services.documents.registry import register_default_document_types
     register_default_document_types()
 
@@ -70,8 +65,8 @@ async def lifespan(app: FastAPI):
     from app.orchestrator.graph import build_jarvis_graph
 
     # SQLite checkpointer, one thread per (user, session). The saver scrubs the
-    # non-serializable per-turn objects (user_model, progress callback/queue);
-    # _load_context rebuilds the facade from the checkpointed user_id.
+    # non-serializable per-turn objects (user_model, container, progress callback/queue);
+    # every turn brings its own.
     checkpoint_stack = AsyncExitStack()
     checkpointer = await checkpoint_stack.enter_async_context(
         open_checkpointer(CHECKPOINT_DB_PATH)
@@ -107,15 +102,14 @@ async def lifespan(app: FastAPI):
     # The composition root: repositories, event bus, usage ledger, and the LLM chain
     # route_llm_call uses (metered onto that bus). With Supabase unreachable it runs
     # on in-memory repositories and says so; the legacy app.state.db_client above
-    # stays for the routes not yet on the repositories.
+    # stays for the routes not yet on the repositories. It lives on app.state only:
+    # a request reaches it through the app, a chat turn through its state.
     from app.container import AppContainer
-    from app.core.runtime import set_container
     from app.orchestrator.hooks import get_hooks
 
     supabase_client = getattr(app.state.db_client, "supabase", None)
     container = AppContainer.build(supabase_client=supabase_client, cfg=_cfg, hooks=get_hooks())
     app.state.container = container
-    set_container(container)
     if supabase_client is not None:
         print(" ✅ Repositories: Supabase")
 

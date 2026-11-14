@@ -17,7 +17,6 @@ import pytest
 
 import app.core.config as cfg
 from app.container import AppContainer
-from app.core import runtime
 from app.domain import errors
 from app.domain.entities import BehavioralConstraint, MemorySource, MemoryStatus
 from app.infrastructure.persistence.factory import RepositoryFactory
@@ -25,7 +24,7 @@ from app.orchestrator.hooks import ActionHooks
 from app.services.memory.constraint_bridge import memory_slots
 from app.services.memory.memory_service import MemoryCandidate, MemoryService
 from app.services.memory.stated_rules import StatedRules, rule_memory_id
-from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+from tests.fakes import BagOfWordsEmbedder, FakeSupabase
 
 RULE = "Never schedule anything before 11 AM"
 NOW = datetime(2026, 11, 16, 2, 30, tzinfo=timezone.utc)
@@ -187,8 +186,8 @@ async def _morning_blocks(container, fake) -> tuple[str, list[tuple[int, int]]]:
     from app.core.user_model import UserModel
     from app.modules.planning_graph import fetch_constraints, memory_to_constraints
 
-    user_model = UserModel(user_id="alice", db=FakeDBClient(fake))
-    state = {"user_id": "alice", "user_model": user_model}
+    user_model = UserModel.for_planning("alice", container.planning)
+    state = {"user_id": "alice", "user_model": user_model, "planning": container.planning}
     state.update(await fetch_constraints(state))
     slots = (await memory_to_constraints(state)).get("time_slots") or []
     return state["habits_text"], sorted({(s["start_min"] % 1440, s["end_min"] % 1440) for s in slots})
@@ -201,7 +200,6 @@ def wired():
         supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
-    runtime.set_container(container)  # conftest resets the registry afterwards
     return container, fake
 
 

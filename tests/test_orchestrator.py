@@ -7,7 +7,6 @@ from app.schemas.context import IntentType
 
 from tests.fakes import (
     CANNED_LLM_REPLY,
-    FakeDBClient,
     FakeSupabase,
     build_test_container,
     make_jarvis_state,
@@ -184,8 +183,9 @@ def test_jarvis_state__declares_serializable_user_id():
 @pytest.mark.asyncio
 async def test_load_context__hydrates_user_model_from_user_id():
     from app.orchestrator.graph import _load_context
+    from tests.fakes import build_test_container
 
-    state = _make_state(user_id="u42", user_model=None)
+    state = _make_state(user_id="u42", user_model=None, container=build_test_container())
     result = await _load_context(state)
 
     assert result["user_model"] is not None
@@ -195,8 +195,12 @@ async def test_load_context__hydrates_user_model_from_user_id():
 @pytest.mark.asyncio
 async def test_graph__hydrated_user_model_reaches_final_state(no_llm):
     """The load_context node's hydration must merge into the state the graph carries."""
+    from tests.fakes import build_test_container
+
     graph = build_jarvis_graph()
-    result = await graph.ainvoke(_make_state(user_id="u42", user_model=None, user_message="hello"))
+    result = await graph.ainvoke(_make_state(
+        user_id="u42", user_model=None, user_message="hello", container=build_test_container()
+    ))
 
     assert result["user_id"] == "u42"
     assert result["user_model"] is not None
@@ -230,48 +234,41 @@ async def test_load_context__no_user_id__stays_a_noop():
 
 
 # ---------------------------------------------------------------------------
-# Hydration must produce a FUNCTIONAL facade (Task 7)
+# Hydration must produce a FUNCTIONAL facade
 #
-# A db=None facade is truthy, so it silently inverts every downstream
-# `if user_model:` guard: a checkpoint-resumed PLAN_DAY turn would reach
-# planning_graph's `get_behavioral_constraints()` and die on
-# `AttributeError: 'NoneType' object has no attribute 'supabase'`.
+# A hollow facade is truthy, so it would silently invert every downstream
+# `if user_model:` guard. The facade is built over the ports of the container in
+# the turn's state, or not at all.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_load_context__hydrated_facade_can_query_the_registered_db():
-    from app.core.runtime import set_shared_clients
+async def test_load_context__hydrated_facade_reads_through_the_turns_container():
+    from app.domain.entities import BehavioralConstraint
     from app.orchestrator.graph import _load_context
+    from tests.fakes import build_test_container
 
-    db = FakeDBClient()
-    set_shared_clients(db=db)
+    container = build_test_container()
+    await container.repos.constraints.add("u42", BehavioralConstraint(
+        id="00000000-0000-0000-0000-000000000042", user_id="u42",
+        raw_text="No study before 11", constraint_type="habit",
+    ))
 
-    result = await _load_context(_make_state(user_id="u42", user_model=None))
+    result = await _load_context(_make_state(user_id="u42", user_model=None, container=container))
     user_model = result["user_model"]
 
     # The real assertion: this call is what a resumed PLAN_DAY turn makes.
-    # With db=None it raises AttributeError instead of returning rows.
-    assert await user_model.get_behavioral_constraints() == []
+    rules = await user_model.get_behavioral_constraints()
+    assert [r["raw_text"] for r in rules] == ["No study before 11"]
 
 
 @pytest.mark.asyncio
-async def test_load_context__before_startup__degrades_to_a_db_less_facade():
-    """No lifespan yet (tests, scripts) — hydrate anyway rather than crash."""
+async def test_load_context__no_container__no_facade():
+    """No composition root in the state (tests, scripts): nothing to read through, so
+    no facade, and every node that reads the user degrades as it does without one."""
     from app.orchestrator.graph import _load_context
 
-    result = await _load_context(_make_state(user_id="u42", user_model=None))
-    user_model = result["user_model"]
-
-    assert user_model.user_id == "u42"
-    assert user_model._db is None
-
-
-def test_runtime__accessors_are_none_before_registration():
-    from app.core import runtime
-
-    assert runtime.get_db() is None
-    assert runtime.registered_container() is None
+    assert await _load_context(_make_state(user_id="u42", user_model=None, container=None)) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +364,7 @@ async def _container_with_draft(user_id: str = "test_user"):
 
 
 def _user_model_with_db():
-    """A real UserModel over a real FakeSupabase.
+    """A real UserModel over the repositories of a real FakeSupabase, and that store.
 
     Accept writes through the accept_draft rpc and the tests read user_tasks
     back, so the fake has to be a working store: a MagicMock would report any
@@ -375,9 +372,10 @@ def _user_model_with_db():
     so the observation loop downstream finds the whole surface it expects.
     """
     from app.core.user_model import UserModel
-    from tests.fakes import FakeDBClient, FakeSupabase
+    from tests.fakes import FakeSupabase, build_test_container
 
-    return UserModel(user_id="test_user", db=FakeDBClient(FakeSupabase()))
+    supabase = FakeSupabase()
+    return UserModel.for_planning("test_user", build_test_container(supabase).planning), supabase
 
 
 @pytest.mark.asyncio
@@ -428,17 +426,17 @@ async def test_draft_action__accept__persists_tasks_and_closes_negotiation():
     """Runs the real accept against a FakeSupabase: the tasks must actually land."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    container = _seed_draft(user_model._db.supabase)
+    user_model, supabase = _user_model_with_db()
+    container = _seed_draft(supabase)
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
         container=container, user_message="accept", user_model=user_model,
     )
     result = await handle_draft_action(state)
 
-    rows = user_model._db.supabase.rows.get("user_tasks", [])
+    rows = supabase.rows.get("user_tasks", [])
     assert [(r["task_id"], r["user_id"]) for r in rows] == [("t1", "test_user")]
-    assert _draft_status(user_model._db.supabase) == "accepted"
+    assert _draft_status(supabase) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     # Kept: a repeated "looks good" on this thread must find this draft, closed.
     assert result["draft_id"] == _DRAFT_ID
@@ -578,8 +576,8 @@ async def test_graph__has_draft_action_nodes():
 async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm):
     """A REVIEWING turn saying "accept" must not be swallowed by the planning shortcut."""
     graph = build_jarvis_graph()
-    user_model = _user_model_with_db()
-    container = _seed_draft(user_model._db.supabase)
+    user_model, supabase = _user_model_with_db()
+    container = _seed_draft(supabase)
     result = await graph.ainvoke(
         _make_state(
             user_message="accept", negotiation_state=NegotiationPhase.REVIEWING,
@@ -587,10 +585,10 @@ async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm):
         )
     )
 
-    assert _draft_status(user_model._db.supabase) == "accepted"
+    assert _draft_status(supabase) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
     assert result["draft_id"] == _DRAFT_ID  # kept for a repeated accept to find
-    assert [r["task_id"] for r in user_model._db.supabase.rows.get("user_tasks", [])] == ["t1"]
+    assert [r["task_id"] for r in supabase.rows.get("user_tasks", [])] == ["t1"]
 
 
 @pytest.mark.asyncio
@@ -808,7 +806,7 @@ async def test_accept__persist_failure__reports_honestly_and_keeps_the_draft():
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
         container=container, draft_id=_DRAFT_ID, user_message="accept",
-        user_model=UserModel(user_id="test_user", db=FakeDBClient(supabase)),
+        user_model=UserModel.for_planning("test_user", container.planning),
     )
     result = await handle_draft_action(state)
 
@@ -824,8 +822,7 @@ async def test_accept__plan_clashes_with_existing_tasks__says_so_and_writes_noth
     never succeed, so the answer is neither "Locked in" nor "say accept again"."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     finished = {"user_id": "test_user", "task_id": "t1", "title": "read", "status": "completed"}
     supabase.rows["user_tasks"] = [dict(finished)]
     container = _seed_draft(supabase)
@@ -849,8 +846,7 @@ async def test_accept__every_slot_gone_by__says_so_honestly_and_writes_nothing()
     reply says why (not "clashes", not "Locked in") and the negotiation closes."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     container = _seed_draft(supabase, schedule={"t1": {"start_min": 60, "end_min": 85}})
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
@@ -873,8 +869,7 @@ async def test_accept__success__tasks_and_accepted_status_land_in_one_call():
     together or not at all, so there is no order between them to get wrong."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     container = _seed_draft(supabase)
     flips = []
     real_set_status = container.repos.drafts.set_status
@@ -900,8 +895,7 @@ async def test_accept__success__tasks_and_accepted_status_land_in_one_call():
 async def test_accept__draft_with_no_tasks__exits_without_claiming_success():
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     container = _seed_draft(supabase, tasks=[])
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
@@ -920,8 +914,7 @@ async def test_draft_action__accept_already_accepted_draft__says_locked_in_and_w
     accept must not rewrite the tasks. One of them is already done."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     container = _seed_draft(supabase, status="accepted")
     done = {"user_id": "test_user", "task_id": "t1", "status": "completed", "plan_id": "p1"}
     supabase.rows["user_tasks"] = [dict(done)]
@@ -943,8 +936,7 @@ async def test_draft_action__accept_expired_draft__does_not_claim_locked_in():
     "already locked in" would be the lie this node must never tell."""
     from app.orchestrator.graph import handle_draft_action
 
-    user_model = _user_model_with_db()
-    supabase = user_model._db.supabase
+    user_model, supabase = _user_model_with_db()
     container = _seed_draft(supabase, expires_at="2026-08-01T00:00:00+00:00")
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
@@ -1008,7 +1000,6 @@ async def test_accept__write_failure_over_a_preexisting_row__is_not_read_as_succ
     row must survive: the accept is all or nothing."""
     from app.core.user_model import UserModel
     from app.orchestrator.graph import handle_draft_action
-    from tests.fakes import FakeDBClient
 
     stale = {"user_id": "test_user", "task_id": "t1", "status": "pending",
              "plan_id": "plan-from-last-week"}
@@ -1017,7 +1008,7 @@ async def test_accept__write_failure_over_a_preexisting_row__is_not_read_as_succ
     state = _make_state(
         intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
         container=container, draft_id=_DRAFT_ID, user_message="accept",
-        user_model=UserModel(user_id="test_user", db=FakeDBClient(supabase)),
+        user_model=UserModel.for_planning("test_user", container.planning),
     )
     result = await handle_draft_action(state)
 
@@ -1381,11 +1372,9 @@ async def test_store_constraint__persists_each_habit_and_confirms(monkeypatch):
     from app.orchestrator import graph as graph_mod
     from app.schemas.context import BrainDumpExtraction
 
-    from app.core import runtime
     from tests.fakes import build_test_container
 
     container = build_test_container()
-    runtime.set_container(container)  # conftest resets the registry afterwards
     stored = []
 
     async def fake_store(constraints, habit, *, user_id, constraint_type="habit"):
@@ -1400,6 +1389,7 @@ async def test_store_constraint__persists_each_habit_and_confirms(monkeypatch):
     state = make_jarvis_state(
         user_message="I never want to study before 11am",
         user_id="u1",
+        container=container,  # the rule is stored through the turn's container
     )
     state["brain_dump"] = BrainDumpExtraction(
         inline_habits=["I never want to study before 11am"]
@@ -1431,12 +1421,9 @@ async def test_store_constraint__no_habits__honest_message(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_store_constraint__storage_fails__does_not_claim_success(monkeypatch):
-    from app.core import runtime
     from app.orchestrator import graph as graph_mod
     from app.schemas.context import BrainDumpExtraction
     from tests.fakes import build_test_container
-
-    runtime.set_container(build_test_container())  # conftest resets the registry afterwards
 
     async def failing_store(*a, **k):
         return {"status": "error", "error": "db down"}
@@ -1445,7 +1432,9 @@ async def test_store_constraint__storage_fails__does_not_claim_success(monkeypat
         "app.services.extraction.behavioral_store.store_behavioral_constraint",
         failing_store,
     )
-    state = make_jarvis_state(user_message="no meetings on fridays", user_id="u1")
+    state = make_jarvis_state(
+        user_message="no meetings on fridays", user_id="u1", container=build_test_container()
+    )
     state["brain_dump"] = BrainDumpExtraction(inline_habits=["no meetings on fridays"])
     result = await graph_mod.store_constraint(state)
 

@@ -146,17 +146,21 @@ async def process_full_pipeline(
         except Exception as e:
             raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
     db_client = getattr(http_request.app.state, "db_client", None)
-    # Rules are stored and read through the container's repository, and only with a
-    # database: without one the container is in-memory and nothing would last.
+    # Rules, tasks and goals are read and stored through the container's repositories,
+    # and only with a database: without one the container is in-memory and nothing
+    # would last.
     container = container_of(http_request)
     has_db = getattr(db_client, "supabase", None) is not None
+    repos = container.repos if container is not None and has_db else None
     return await process_ingestion(
         payload=request.payload or None,
         file_bytes=file_bytes,
         media_type=request.media_type,
         user_id=request.user_id,
         db_client=db_client,
-        constraints=container.repos.constraints if container is not None and has_db else None,
+        constraints=repos.constraints if repos is not None else None,
+        tasks=repos.tasks if repos is not None else None,
+        goals=repos.goals if repos is not None else None,
     )
 
 

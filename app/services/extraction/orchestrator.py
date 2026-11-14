@@ -4,7 +4,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.domain.ports import ConstraintRepository
+from app.domain.entities import GoalDeadlineUpdate
+from app.domain.ports import ConstraintRepository, GoalRepository, TaskRepository
 from app.schemas.context import (
     ActionItemProposal,
     ExtractedTimeSlots,
@@ -75,6 +76,22 @@ async def _classify(text: str) -> IntentClassification:
     return IntentClassification.model_validate(result)
 
 
+async def _goal_of_first_match(
+    tasks: Optional[TaskRepository], user_id: str, matched: list[str]
+) -> Optional[str]:
+    """The goal of the first matched task the user has; None when none is found."""
+    if tasks is None:
+        return None
+    for task_id in matched:
+        try:
+            task = await tasks.get(user_id, task_id)
+        except Exception:  # a deadline without its goal is still worth keeping
+            return None
+        if task is not None:
+            return task.goal_id
+    return None
+
+
 async def process_ingestion(
     payload: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
@@ -84,6 +101,8 @@ async def process_ingestion(
     intent_override: Optional[IntentType] = None,
     file_name: Optional[str] = None,
     constraints: Optional[ConstraintRepository] = None,
+    tasks: Optional[TaskRepository] = None,
+    goals: Optional[GoalRepository] = None,
 ) -> IngestionPipelineResult:
     """Run the full autonomous extraction pipeline.
 
@@ -92,10 +111,15 @@ async def process_ingestion(
         file_bytes: Optional raw PDF/image bytes.
         media_type: Optional "pdf" or "image" when file_bytes provided.
         user_id: Optional user identifier for behavioral context and storage.
-        db_client: Optional Supabase client for pending_calendar and documents.
+        db_client: Optional Supabase client for the pending calendar, the document
+            record and its task links (rows with no repository yet: Plan 3 cut Task 6).
         intent_override: When provided, skip SLM classification and use this intent (for Control Policy).
         constraints: The user's rules (the container's repository): read as calendar
             context, written for a stated preference. None (no database): neither.
+        tasks: The user's tasks (the container's repository): a document is linked to
+            the ones it matches. None: no links.
+        goals: The goals' deadline updates (the container's repository): a deadline the
+            document names is stored for the goal of the tasks it matched. None: not stored.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -190,11 +214,12 @@ async def process_ingestion(
             )
         # Task–Material Linking via embedding similarity (same source_id as ChromaDB)
         matched: list[str] = []
-        if user_id and kr.document_topics:
+        if user_id and kr.document_topics and tasks is not None:
             matched = await link_document_to_tasks(
                 user_id=user_id,
                 document_topics=kr.document_topics,
                 source_id=source_id,
+                tasks=tasks,
                 source_type="chunk",
                 supabase_client=supabase,
             )
@@ -244,49 +269,34 @@ async def process_ingestion(
             except Exception as e:
                 print(f"[Orchestrator] Insert ingested_documents failed: {e}")
 
-        # Store deadlines in user_plan_updates (goal-level persistence)
-        if user_id and kr.deadlines and supabase:
+        # Store deadlines as the goal's deadline updates (goal-level persistence)
+        if user_id and kr.deadlines and goals is not None:
             from app.utils.deadline_parser import parse_deadline_to_date
 
-            goal_id_val = None
-            if matched:
-                try:
-                    result = (
-                        supabase.table("user_tasks")
-                        .select("goal_id")
-                        .eq("user_id", user_id)
-                        .in_("task_id", matched)
-                        .limit(1)
-                        .execute()
-                    )
-                    if result.data and len(result.data) > 0:
-                        goal_id_val = result.data[0].get("goal_id")
-                except Exception:
-                    pass
+            goal_id_val = await _goal_of_first_match(tasks, user_id, matched)
             from app.services.planning.local_time import local_today
 
             # "Today" is the user's date: in UTC, a deadline due today in India
             # counted as tomorrow's until 05:30.
             plan_date = local_today()
+            context_snippet = (
+                kr.action_items[0][:200] if kr.action_items
+                else (", ".join(kr.document_topics[:3]) if kr.document_topics else None)
+            )
             for raw_deadline in kr.deadlines:
                 parsed = parse_deadline_to_date(raw_deadline, datetime.now(timezone.utc))
                 if parsed and parsed.date() > plan_date:
                     try:
-                        supabase.table("user_plan_updates").insert(
-                            {
-                                "user_id": user_id,
-                                "goal_id": goal_id_val,
-                                "source": "ingestion",
-                                "deadline_date": parsed.date().isoformat(),
-                                "deadline_raw": raw_deadline,
-                                "context_snippet": (
-                                    kr.action_items[0][:200] if kr.action_items
-                                    else (", ".join(kr.document_topics[:3]) if kr.document_topics else None)
-                                ),
-                            }
-                        ).execute()
+                        await goals.add_deadline_update(user_id, GoalDeadlineUpdate(
+                            user_id=user_id,
+                            goal_id=goal_id_val,
+                            source="ingestion",
+                            deadline_date=parsed.date(),
+                            deadline_raw=raw_deadline,
+                            context_snippet=context_snippet,
+                        ))
                     except Exception as e:
-                        print(f"[Orchestrator] Insert user_plan_updates failed: {e}")
+                        print(f"[Orchestrator] Storing a deadline update failed: {type(e).__name__}")
 
     elif classification.intent == IntentType.BEHAVIORAL_CONSTRAINT:
         if constraints is not None and user_id:

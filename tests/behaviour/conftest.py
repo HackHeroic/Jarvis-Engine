@@ -291,17 +291,15 @@ async def jarvis(tmp_path) -> Jarvis:
     """A fresh Jarvis: empty database, empty checkpoint file, real orchestrator."""
     import app.core.config as config
     from app.container import AppContainer
-    from app.core.runtime import set_container, set_shared_clients
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
     from app.orchestrator.hooks import get_hooks
     supabase = FakeSupabase()
     async with open_checkpointer(str(tmp_path / "checkpoints.sqlite")) as saver:
         app = Jarvis(build_jarvis_graph(checkpointer=saver), supabase)
-        # What the lifespan registers, for turns resumed from a checkpoint.
-        set_shared_clients(db=app.state.db_client)
-        # The composition root, over the same database. The chain stays the test's:
-        # the ``llm`` fixture installs the scripted model.
+        # The composition root, over the same database, on app.state and nowhere else:
+        # every turn reaches it through its state, as in the app. The chain stays the
+        # test's: the ``llm`` fixture installs the scripted model.
         container = AppContainer.build(
             supabase_client=supabase,
             cfg=config,
@@ -309,7 +307,6 @@ async def jarvis(tmp_path) -> Jarvis:
             embedder=BagOfWordsEmbedder(),
             install_chain=False,
         )
-        set_container(container)
         app.state.container = container
         yield app
         await settle_background_tasks()

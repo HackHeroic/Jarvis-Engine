@@ -23,7 +23,6 @@ import app.api.v1.endpoints.schedule as schedule_endpoint
 import app.core.config as cfg
 import app.domain.clock as utc_clock
 from app.container import AppContainer
-from app.core import runtime
 from app.domain.entities import BehavioralConstraint, DraftStatus, TaskEventType
 from app.services.memory.memory_service import MemoryCandidate
 from app.orchestrator.hooks import ActionHooks
@@ -70,14 +69,10 @@ def fake() -> FakeSupabase:
 
 @pytest.fixture
 def container(fake) -> AppContainer:
-    built = AppContainer.build(
+    return AppContainer.build(
         supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
-    # What the lifespan registers (conftest resets both afterwards).
-    runtime.set_container(built)
-    runtime.set_shared_clients(db=FakeDBClient(fake))
-    return built
 
 
 async def _draft(container, schedule: dict, tasks: list[dict] = TASKS):
@@ -187,10 +182,9 @@ async def _chat_accept(container, fake, draft_id: str) -> dict:
     from app.orchestrator.graph import handle_draft_action
     from app.schemas.context import IntentType
 
-    db = FakeDBClient(fake)
     return await handle_draft_action({
         "user_id": U,
-        "user_model": UserModel(user_id=U, db=db),
+        "user_model": UserModel.for_planning(U, container.planning),
         "intent": IntentType.ACCEPT_DRAFT,
         "container": container,
         "draft_id": draft_id,

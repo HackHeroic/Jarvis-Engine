@@ -254,23 +254,14 @@ async def test_bridge__dismissed_pattern__hands_the_hour_back(jarvis, llm, monke
 # --- the focus profile: learned hours lean the plan, stated rules still win ---------
 
 
-async def _register_container_with_evening_completions(jarvis, llm, count: int) -> None:
-    """The composition root over the same database, its history holding ``count``
-    completed 19:00 slots on the days before Monday."""
-    import app.core.config as cfg
-    from app.container import AppContainer
-    from app.core import runtime
+async def _seed_evening_completions(jarvis, count: int) -> None:
+    """``count`` completed 19:00 slots on the days before Monday, in the outcome history
+    of the harness's composition root (the one every turn carries in its state)."""
     from app.domain.entities import TaskEvent, TaskEventType
-    from app.infrastructure.llm.chain import FallbackChainProvider
-    from app.infrastructure.llm.factory import set_chain
-    from app.orchestrator.hooks import ActionHooks
 
-    container = AppContainer.build(supabase_client=jarvis.db, cfg=cfg, hooks=ActionHooks())
-    runtime.set_container(container)  # conftest resets the registry afterwards
-    set_chain(FallbackChainProvider([llm]))  # build installed the real chain; the script answers
     for day in range(1, count + 1):
         slot = (MONDAY_8AM - timedelta(days=day)).replace(hour=19)
-        await container.repos.task_events.append("alice", TaskEvent(
+        await jarvis.state.container.repos.task_events.append("alice", TaskEvent(
             user_id="alice", task_id=f"evening_{day}", event_type=TaskEventType.COMPLETED,
             occurred_at=slot + timedelta(minutes=25), scheduled_start=slot,
             scheduled_end=slot + timedelta(minutes=25),
@@ -285,7 +276,7 @@ async def test_energy__learned_evening_profile__teaching_a_rule_still_moves_the_
     from app.services.energy import HeuristicEnergyEstimator
 
     clock.freeze(MONDAY_8AM, schedule_endpoint, planning_graph)
-    await _register_container_with_evening_completions(jarvis, llm, 12)
+    await _seed_evening_completions(jarvis, 12)
     focus_seen: list = []
     real_run_schedule = schedule_endpoint.run_schedule
 

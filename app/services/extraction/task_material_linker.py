@@ -1,8 +1,9 @@
 """Task–Material Linking: Match documents to user tasks via embedding similarity."""
 
-from typing import Any, Optional
+from typing import Any
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.domain.ports import TaskRepository
 from app.utils.embedding import cosine_similarity as _cosine_similarity, get_embedding_function as _get_embedding_function
 from app.db.supabase_py import build_supabase_client
 
@@ -19,12 +20,15 @@ async def link_document_to_tasks(
     user_id: str,
     document_topics: list[str],
     source_id: str,
+    tasks: TaskRepository,
     source_type: str = "chunk",
     threshold: float = SIMILARITY_THRESHOLD,
     supabase_client: Any = None,
 ) -> list[str]:
     """Match document to user tasks via embedding similarity.
 
+    The user's tasks are read through ``tasks`` (the newest TASK_LIST_LIMIT); the links
+    are written to ``task_materials`` with the Supabase client (no repository yet).
     Returns matched task_ids. Empty list if no match above threshold.
     """
     if not document_topics:
@@ -39,23 +43,15 @@ async def link_document_to_tasks(
         return []
 
     try:
-        # Fetch user tasks (most recent per task_id or all)
-        result = (
-            supabase.table("user_tasks")
-            .select("id, task_id, title")
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(500)
-            .execute()
-        )
-        tasks = result.data or []
-        if not tasks:
+        # The user's tasks, newest first
+        rows = [t.model_dump() for t in await tasks.list_for_user(user_id)]
+        if not rows:
             return []
 
         # Dedupe by task_id (keep latest)
         seen: set[str] = set()
         unique_tasks: list[dict] = []
-        for t in tasks:
+        for t in rows:
             tid = t.get("task_id") or t.get("id", "")
             if tid and tid not in seen:
                 seen.add(tid)

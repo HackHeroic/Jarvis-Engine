@@ -2,8 +2,9 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
+from app.api.deps import container_of
 from app.domain import errors
 from app.schemas.workspace import TaskWorkspace
 from app.services.analytical.workspace_builder import (
@@ -17,6 +18,7 @@ router = APIRouter()
 @router.get("/{task_id}/workspace", response_model=TaskWorkspace)
 async def get_task_workspace(
     task_id: str,
+    http_request: Request,
     user_id: str = Query(..., description="User ID (required for IDOR protection)"),
     prompt: Optional[str] = Query(
         default=None,
@@ -30,12 +32,17 @@ async def get_task_workspace(
     """Get cached workspace, or build + persist (24h TTL) if missing/stale/refresh."""
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
+    # The goals the WOOP card reads, and the bus a web search is metered onto: the
+    # composition root's; without one the card keeps the task's title and nothing is metered.
+    container = container_of(http_request)
     try:
         return await get_or_build_task_workspace(
             user_id=user_id,
             task_id=task_id,
             user_prompt=prompt,
             refresh=refresh,
+            goals=container.repos.goals if container is not None else None,
+            bus=container.events if container is not None else None,
         )
     except errors.JarvisError:
         raise  # already says what went wrong, with its own status

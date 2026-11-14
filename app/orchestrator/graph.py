@@ -236,19 +236,14 @@ def is_trivial_input(text: str) -> bool:
 # --- Real LLM-powered nodes (replacing stubs) ---
 
 async def _load_context(state: JarvisState) -> dict:
-    """Hydrate the UserModel facade for checkpoint-resumed turns.
+    """Build the turn's ``UserModel`` facade when the turn arrived without one.
 
-    Live requests arrive with a pre-wired user_model (the shared db_client)
-    and this is a no-op. A turn resumed from a checkpoint has
-    only the serializable ``user_id`` — the facade was never persisted — so
-    rebuild it here. Without a user_id there is no identity to rebuild from,
-    so leave state untouched.
-
-    The rebuilt facade must be *functional*, not a hollow ``db=None`` shell:
-    it is truthy either way, so every downstream ``if user_model:`` guard
-    would wave the hollow one through and then fail on
-    ``AttributeError: 'NoneType' object has no attribute 'supabase'``. The
-    shared db client comes from the registry the lifespan populates.
+    A live turn arrives with the facade ``ChatTurnService`` built, and this is a no-op.
+    A turn with only the serializable ``user_id`` (the facade is never checkpointed)
+    gets one over the planning ports of the composition root in its state
+    (``UserModel.for_planning``). Without a user_id there is no identity to build from,
+    and without a container there are no ports to read through: the state is left as
+    it is, and every node that reads the user degrades as it does with no facade.
     """
     if state.get("user_model") is not None:
         return {}
@@ -257,10 +252,14 @@ async def _load_context(state: JarvisState) -> dict:
     if not user_id:
         return {}
 
-    from app.core.runtime import get_db
+    container = state.get("container")
+    if container is None:
+        logger.debug("load_context: no container in the turn's state, so no user model")
+        return {}
+
     from app.core.user_model import UserModel
 
-    return {"user_model": UserModel(user_id=user_id, db=get_db())}
+    return {"user_model": UserModel.for_planning(user_id, container.planning)}
 
 
 # The extraction is shown at most this many of the user's memories (the newest), each
@@ -270,19 +269,20 @@ KNOWN_MEMORY_LIMIT = 15
 KNOWN_MEMORIES_TIMEOUT_S = 1.0
 
 
-async def _known_memories(user_id: str | None, snapshot: Any = None) -> list:
+async def _known_memories(
+    user_id: str | None, snapshot: Any = None, container: Any = None
+) -> list:
     """The user's newest active memories, oldest first; none without a composition root.
 
     From the turn's ``snapshot`` (``MemorySnapshot``) when it has one: no read of its
-    own. Otherwise a slow or failing read gives none: the turn is extracted without them.
+    own. Otherwise through the turn's ``container``; a slow or failing read gives none:
+    the turn is extracted without them.
     """
-    from app.core.runtime import registered_container
     from app.domain.clock import utc_now
 
     if snapshot is not None:
         memories = snapshot.in_use(utc_now())
         return [m for m in memories if m.id and m.content.strip()][-KNOWN_MEMORY_LIMIT:]
-    container = registered_container()
     if container is None or not user_id:
         return []
     try:
@@ -340,9 +340,10 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     if not user_msg.strip():
         return {"brain_dump": None, "trivial_input": False}
 
-    prompt, handles = _extraction_prompt(
-        user_msg, await _known_memories(state.get("user_id"), state.get("memory_snapshot"))
+    known = await _known_memories(
+        state.get("user_id"), state.get("memory_snapshot"), state.get("container")
     )
+    prompt, handles = _extraction_prompt(user_msg, known)
     try:
         result = await route_llm_call(
             task="brain_dump_extraction",
@@ -448,17 +449,16 @@ async def _negotiation_precheck(state: JarvisState) -> dict:
 async def _store_rule(state: JarvisState, habit: str) -> dict:
     """Store one stated habit as a rule: ``{"status": "stored", "id": ...}`` or not stored.
 
-    Through the composition root's ``ConstraintRepository`` (the rule's id is known at
-    once, for linking it to the memory of stating it). Without a container (tests,
-    scripts) nothing is stored, and the turn says so.
+    Through the ``ConstraintRepository`` of the composition root in the turn's state
+    (the rule's id is known at once, for linking it to the memory of stating it).
+    Without a container (tests, scripts) nothing is stored, and the turn says so.
     """
-    from app.core.runtime import registered_container
     from app.services.extraction import behavioral_store
 
-    container = registered_container()
+    container = state.get("container")
     user_id = state.get("user_id")
     if container is None or not user_id:
-        logger.debug("store_constraint: no container registered, so the rule is not stored")
+        logger.debug("store_constraint: no container in the turn's state, so no rule is stored")
         return {"status": "skipped"}
     return await behavioral_store.store_behavioral_constraint(
         container.repos.constraints, habit, user_id=user_id
