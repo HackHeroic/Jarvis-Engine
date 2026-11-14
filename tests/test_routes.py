@@ -1,8 +1,7 @@
-"""The route table: one chat endpoint, and the v1 architecture gone for good.
+"""The route table: one chat endpoint, and the retired architecture gone for good.
 
-``POST /api/v1/chat/stream`` is the one turn handler. ``/api/v1/chat/v2/stream`` is the
-same function, kept hidden and deprecated so a frontend and a backend restarted in
-either order keep talking; it goes once the last live run has passed on the new path.
+``POST /api/v1/chat/stream`` is the one turn handler. Its old path,
+``/api/v1/chat/v2/stream``, is gone: nothing calls it any more.
 """
 
 import ast
@@ -27,7 +26,7 @@ RETIRED_MODULES = [
 ]
 
 
-def test_routes__chat__stream_and_hidden_alias_are_the_one_turn_handler():
+def test_routes__chat__stream_is_the_one_turn_handler():
     from app.api.v1.endpoints import chat
     from app.main import app
 
@@ -37,12 +36,26 @@ def test_routes__chat__stream_and_hidden_alias_are_the_one_turn_handler():
         if isinstance(route, APIRoute) and route.path.startswith("/api/v1/chat")
     }
 
-    assert set(routes) == {"/api/v1/chat/stream", "/api/v1/chat/v2/stream"}
-    stream, alias = routes["/api/v1/chat/stream"], routes["/api/v1/chat/v2/stream"]
+    assert set(routes) == {"/api/v1/chat/stream"}
+    stream = routes["/api/v1/chat/stream"]
     assert stream.endpoint is chat.chat_stream
-    assert alias.endpoint is chat.chat_stream
     assert (stream.deprecated, stream.include_in_schema) == (None, True)
-    assert (alias.deprecated, alias.include_in_schema) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_routes__old_chat_path__404_envelope():
+    import httpx
+
+    from app.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/chat/v2/stream", json={"user_prompt": "hi", "user_id": "u1"}
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "http_error"
 
 
 @pytest.mark.parametrize("name", RETIRED_MODULES)
