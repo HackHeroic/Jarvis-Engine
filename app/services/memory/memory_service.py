@@ -26,7 +26,7 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
-import app.core.config as config
+from app.core.settings import MemorySettings, default_settings
 from app.domain import errors
 from app.domain.clock import utc_now
 from app.domain.entities import (
@@ -112,10 +112,10 @@ def _has_words(text: str) -> bool:
     return _WORD.search(text) is not None
 
 
-def _in_use_at(memory: Memory, now: datetime) -> bool:
-    """Not expired and at least MEMORY_RETENTION_FLOOR strong at ``now``."""
+def _in_use_at(memory: Memory, now: datetime, retention_floor: float) -> bool:
+    """Not expired and at least ``retention_floor`` strong at ``now``."""
     return (memory.expires_at is None or memory.expires_at > now) and (
-        memory.strength_at(now) >= config.MEMORY_RETENTION_FLOOR
+        memory.strength_at(now) >= retention_floor
     )
 
 
@@ -162,6 +162,8 @@ class MemorySnapshot:
 
     memories: tuple[Memory, ...]
     let_go_ids: frozenset[str] = frozenset()
+    # Below this strength a memory is no longer in use (MemorySettings.retention_floor).
+    retention_floor: float = 0.0
 
     def in_use(self, now: datetime, *, types: frozenset[str] | None = None) -> list[Memory]:
         """What ``MemoryService.list_active`` would return at ``now``, oldest first."""
@@ -170,7 +172,7 @@ class MemorySnapshot:
             for m in self.memories
             if m.status is MemoryStatus.ACTIVE
             and (types is None or m.memory_type in types)
-            and _in_use_at(m, now)
+            and _in_use_at(m, now, self.retention_floor)
         ]
 
 
@@ -183,10 +185,12 @@ class MemoryService:
         embedder: TextEmbedder,
         *,
         clock: Callable[[], datetime] = utc_now,
+        settings: MemorySettings | None = None,
     ) -> None:
         self._memories = memories
         self._embedder = embedder
         self._clock = clock
+        self._settings = settings or default_settings().memory
         # drop_suppressed's answers: (user, texts, let-go ids, threshold) -> texts kept.
         self._kept: dict[tuple, tuple[str, ...]] = {}
 
@@ -220,7 +224,7 @@ class MemoryService:
             embedding,
             statuses=SUPPRESSING_STATUSES,
             limit=1,
-            min_similarity=config.MEMORY_SUPPRESS_SIMILARITY,
+            min_similarity=self._settings.suppress_similarity,
         ):
             return RememberOutcome(action="suppressed", memory=None)
 
@@ -249,7 +253,7 @@ class MemoryService:
             statuses=_IN_USE,
             types=frozenset({candidate.memory_type}),
             limit=1,
-            min_similarity=config.MEMORY_DEDUPE_SIMILARITY,
+            min_similarity=self._settings.dedupe_similarity,
         )
         if matches:
             existing = matches[0].memory
@@ -343,13 +347,13 @@ class MemoryService:
     ) -> list[Memory]:
         """The user's memories in use at ``now`` (default: the clock), oldest first.
 
-        Active, not superseded, not expired, and at least MEMORY_RETENTION_FLOOR strong.
+        Active, not superseded, not expired, and at least the retention floor strong.
         """
         now = now if now is not None else self._clock()
         return [
             memory
             for memory in await self._memories.list(user_id, types=types)
-            if _in_use_at(memory, now)
+            if _in_use_at(memory, now, self._settings.retention_floor)
         ]
 
     async def snapshot(self, user_id: str) -> MemorySnapshot:
@@ -362,7 +366,9 @@ class MemoryService:
                 user_id, statuses=SUPPRESSING_STATUSES, limit=MEMORY_SNAPSHOT_LIMIT
             ),
         )
-        return MemorySnapshot(tuple(reversed(active)), frozenset(let_go))
+        return MemorySnapshot(
+            tuple(reversed(active)), frozenset(let_go), self._settings.retention_floor
+        )
 
     async def recall(
         self,
@@ -406,7 +412,7 @@ class MemoryService:
                 m.id or "",
             )
         )
-        profile, profile_tokens = _within_budget(standing, now, config.MEMORY_PROFILE_TOKENS)
+        profile, profile_tokens = _within_budget(standing, now, self._settings.profile_tokens)
         if trivial or not _has_words(query):
             return Recall(profile=profile, relevant=[], tokens=profile_tokens)
 
@@ -420,13 +426,14 @@ class MemoryService:
             embedding,
             statuses=_ACTIVE,
             limit=_RECALL_CANDIDATES,
-            min_similarity=config.MEMORY_RECALL_MIN_SIMILARITY,
+            min_similarity=self._settings.recall_min_similarity,
         )
         shown = {m.id for m in profile}
         candidates = [
             match
             for match in matches
-            if match.memory.id not in shown and _in_use_at(match.memory, now)
+            if match.memory.id not in shown
+            and _in_use_at(match.memory, now, self._settings.retention_floor)
         ]
         candidates.sort(
             key=lambda match: (
@@ -437,7 +444,7 @@ class MemoryService:
             )
         )
         relevant, relevant_tokens = _within_budget(
-            [match.memory for match in candidates], now, config.MEMORY_RECALL_TOKENS
+            [match.memory for match in candidates], now, self._settings.recall_tokens
         )
         return Recall(profile=profile, relevant=relevant, tokens=profile_tokens + relevant_tokens)
 
@@ -446,14 +453,15 @@ class MemoryService:
         user_id: str,
         texts: list[str],
         *,
-        min_similarity: float = config.SUMMARY_SUPPRESS_SIMILARITY,
+        min_similarity: float | None = None,
         let_go_ids: frozenset[str] | None = None,
     ) -> list[str]:
         """``texts``, in order, less each one close to a memory the user forgot or dismissed.
 
         For text Jarvis wrote from the user's words (a conversation summary), so it never
-        brings back a fact the user let go of. Close means at least ``min_similarity`` to
-        the memory's embedding, which a forgotten memory keeps after losing its words.
+        brings back a fact the user let go of. Close means at least ``min_similarity``
+        (default: the settings' ``summary_suppress_similarity``) to the memory's
+        embedding, which a forgotten memory keeps after losing its words.
         One read when the user has let nothing go, and nothing is embedded then. The
         answer is kept for the same texts and the same set of let-go memories (their
         embeddings never change), so a summary shown on every turn is checked once.
@@ -468,6 +476,8 @@ class MemoryService:
         texts = list(texts)
         if not texts:
             return []
+        if min_similarity is None:
+            min_similarity = self._settings.summary_suppress_similarity
         if let_go_ids is None:
             let_go_ids = frozenset(await self._memories.list_ids(
                 user_id, statuses=SUPPRESSING_STATUSES, limit=MEMORY_SNAPSHOT_LIMIT
@@ -512,7 +522,9 @@ class MemoryService:
                 continue
             strength = memory.strength_at(now)
             fields: dict = {"strength": strength, "strength_as_of": now}
-            fades = strength < config.MEMORY_RETENTION_FLOOR and memory.memory_type != "constraint"
+            fades = (
+                strength < self._settings.retention_floor and memory.memory_type != "constraint"
+            )
             if fades:
                 fields["status"] = MemoryStatus.FADED
             try:

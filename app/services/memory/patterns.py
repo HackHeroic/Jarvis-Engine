@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
-import app.core.config as config
+from app.core.settings import FocusSettings, default_settings
 from app.domain import errors
 from app.domain.clock import utc_now
 from app.domain.entities import (
@@ -408,9 +408,11 @@ class PatternService:
         *,
         detectors: list[PatternDetector],
         clock: Callable[[], datetime] = utc_now,
+        settings: FocusSettings | None = None,
     ) -> None:
         """``detectors``: the strategies PEARL reads the history with, chosen by the
-        composition root (``app.container.default_pattern_detectors``)."""
+        composition root (``app.container.default_pattern_detectors``). ``settings``: the
+        focus profile's window, which the energy observation reads."""
         self._task_events = task_events
         self._memories = memories
         self._profiles = profiles
@@ -418,6 +420,7 @@ class PatternService:
         self._detectors = list(detectors)
         self._by_name = {detector.name: detector for detector in self._detectors}
         self._clock = clock
+        self._settings = settings or default_settings().focus
         self._pending: dict[str, deque[PatternChange]] = {}
         # The look running for each user, for a caller that arrives meanwhile to join.
         self._looking: dict[str, asyncio.Future[PatternLook]] = {}
@@ -605,7 +608,7 @@ class PatternService:
         if events is None:
             events = await self._task_events.list_for_user(
                 user_id,
-                since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
+                since=now - timedelta(days=self._settings.window_days),
                 types=set(SLOT_OUTCOMES),
             )
         return [p for detector in self._detectors for p in detector.detect(events, zone)]

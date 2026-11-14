@@ -14,6 +14,7 @@ from types import ModuleType
 from typing import Any
 
 from app.core.model_router import build_chain
+from app.core.settings import Settings
 from app.domain.anticipation import ConsentPolicy
 from app.domain.events import (
     EventBus,
@@ -97,6 +98,7 @@ class AppContainer:
     user_model_service: UserModelService
     conversation_memory: ConversationMemoryService
     stated_rules: StatedRules
+    settings: Settings
 
     @classmethod
     def build(
@@ -112,7 +114,8 @@ class AppContainer:
 
         ``supabase_client`` selects the Supabase repositories; ``None`` (Supabase
         unreachable at startup, or a test) selects the in-memory ones, so the app
-        keeps answering but persists nothing. ``cfg`` is the config module;
+        keeps answering but persists nothing. ``cfg`` is the config module: it becomes
+        each service's settings here, once (``Settings.from_config``);
         ``hooks`` gates every cloud send (PreCloudLLM). ``embedder`` turns memories
         into vectors; ``None`` means the local sentence model (``MiniLMEmbedder``).
         ``install_chain=False`` builds the chain without making it the process-wide
@@ -124,6 +127,7 @@ class AppContainer:
             logger.warning("running on in-memory repositories — nothing is persisted")
             repos = RepositoryFactory.in_memory()
 
+        settings = Settings.from_config(cfg)
         events = EventBus()
         usage_ledger = UsageLedger(repos.usage)
         events.subscribe(LLMCallCompleted, usage_ledger)
@@ -132,18 +136,26 @@ class AppContainer:
         if install_chain:
             set_chain(llm)
 
-        task_service = TaskService(repos.tasks, repos.task_events, events)
+        task_service = TaskService(
+            repos.tasks, repos.task_events, events, settings=settings.tasks
+        )
         embedder = embedder if embedder is not None else MiniLMEmbedder()
-        memory_service = MemoryService(repos.memories, embedder)
+        memory_service = MemoryService(repos.memories, embedder, settings=settings.memory)
         patterns = PatternService(
             repos.task_events, repos.memories, repos.profiles, events,
-            detectors=default_pattern_detectors(),
+            detectors=default_pattern_detectors(), settings=settings.focus,
         )
         observer = PatternObserver(patterns)  # PEARL looks again after every outcome
         for outcome in (TaskCompleted, TaskSkipped, TaskMissed):
             events.subscribe(outcome, observer)
         # The focus profile: the solver leans on it, the You page shows it.
-        energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
+        energy = HistoryEnergyEstimator(
+            repos.task_events,
+            HeuristicEnergyEstimator(),
+            window_days=settings.focus.window_days,
+            prior_strength=settings.focus.prior_strength,
+            min_observations=settings.focus.min_observations,
+        )
         draft_service = DraftService(
             repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
         )
@@ -170,12 +182,13 @@ class AppContainer:
             planner=planner,
         )
         anticipation = AnticipationService(
-            {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints
+            {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints,
+            settings=settings.anticipation,
         )
         anticipation.register_trigger(
             MorningBriefTrigger(
                 repos.tasks, repos.task_events, planner, energy, patterns, actions,
-                suggestions=repos.suggestions,
+                suggestions=repos.suggestions, settings=settings.anticipation,
             )
         )
         anticipation.register_trigger(
@@ -189,6 +202,7 @@ class AppContainer:
             repos.task_events,
             memory=memory_service,
             suggestions=repos.suggestions,
+            settings=settings.conversation,
         )
 
         return cls(
@@ -216,11 +230,12 @@ class AppContainer:
             anticipation_listener=anticipation_listener,
             user_model_service=UserModelService(
                 repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger,
-                repos.task_events,
+                repos.task_events, settings=settings.focus,
             ),
             conversation_memory=conversation_memory,
             # A stated rule and the memory of stating it: letting go of one lets go of both.
             stated_rules=StatedRules(repos.constraints, memory_service),
+            settings=settings,
         )
 
     async def shutdown(self) -> None:

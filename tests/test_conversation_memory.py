@@ -221,11 +221,17 @@ async def test_build_history__more_unsummarized_than_fit__newest_24_after_a_not_
 
 @pytest.mark.asyncio
 async def test_build_history__summary_over_its_budget__whole_sentences_within_it(
-    store, service, monkeypatch
+    store, repos, clock
 ):
+    from dataclasses import replace
+
+    from app.core.settings import default_settings
     from app.services.memory.context import estimate_tokens
 
-    monkeypatch.setattr(config, "CONVERSATION_SUMMARY_TOKENS", 30)
+    settings = replace(default_settings().conversation, summary_tokens=30)
+    service = ConversationMemoryService(
+        repos.conversations, repos.task_events, clock=clock, settings=settings
+    )
     long = "You described the whole history of graph theory since Euler in great detail."
     _session(store, S1, summary=f"You chose graphs. {long} We set Friday.\n- Trees?", through=T0)
     _messages(store, S1, 2)

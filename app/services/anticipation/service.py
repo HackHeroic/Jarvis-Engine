@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import app.core.config as config
+from app.core.settings import AnticipationSettings, default_settings
 from app.domain import errors
 from app.domain.anticipation import (
     ActionResult,
@@ -166,6 +166,7 @@ class AnticipationService:
         constraints: ConstraintRepository,
         *,
         clock: Callable[[], datetime] = utc_now,
+        settings: AnticipationSettings | None = None,
     ) -> None:
         self._triggers = dict(triggers)
         self._actions = actions
@@ -174,6 +175,7 @@ class AnticipationService:
         self._profiles = profiles
         self._constraints = constraints
         self._clock = clock
+        self._settings = settings or default_settings().anticipation
         self._locks = UserLocks()
         # One entry per (user, trigger), replaced each local day.
         self._settled: dict[tuple[str, str], _Settled] = {}
@@ -398,7 +400,7 @@ class AnticipationService:
         if recent is None:
             return None
         ran_at, outcome = recent
-        cooldown = timedelta(seconds=config.ANTICIPATION_MANUAL_COOLDOWN_SECONDS)
+        cooldown = timedelta(seconds=self._settings.manual_cooldown_seconds)
         return outcome if ran_at <= now < ran_at + cooldown else None
 
     def _remembered(self, user_id: str, name: str, now: datetime) -> TriggerOutcome | None:

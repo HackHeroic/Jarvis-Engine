@@ -379,3 +379,64 @@ async def test_process_ingestion__document_names_a_deadline__stored_for_the_matc
 
     assert seen_tasks == [repos.tasks]
     assert await repos.goals.latest_context(U, "dsa") == "Finish the graphs problem set"
+
+
+# --- settings come from the composition root ----------------------------------------------
+
+_CONTAINER_BUILT_SERVICES = (
+    "app/services/task_service.py",
+    "app/services/memory/memory_service.py",
+    "app/services/memory/conversation_memory.py",
+    "app/services/memory/patterns.py",
+    "app/services/user_model_service.py",
+    "app/services/anticipation/scheduler.py",
+    "app/services/anticipation/service.py",
+    "app/services/anticipation/triggers.py",
+)
+
+
+@pytest.mark.asyncio
+async def test_container__services_get_settings_from_the_composition_root():
+    """A config with a 5-minute grace gives the container's task service a 5-minute grace:
+    a slot that ended 10 minutes ago has passed (the default 30 would keep it)."""
+    from types import ModuleType
+
+    import app.core.config as config
+    from app.container import AppContainer
+    from app.domain.entities import TaskStatus
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder
+
+    cfg = ModuleType("cfg_stub")
+    cfg.__dict__.update({k: v for k, v in vars(config).items() if k.isupper()})
+    cfg.SLOT_GRACE_MINUTES = 5
+    container = AppContainer.build(
+        supabase_client=None, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+    now = datetime(2026, 11, 16, 10, 0, tzinfo=IST)
+    start = now - timedelta(minutes=35)
+    await _accepted(container.repos, [{
+        "task_id": "graphs", "title": "Graphs", "scheduled_start": start.isoformat(),
+        "scheduled_end": (start + timedelta(minutes=25)).isoformat(),
+    }])
+
+    await container.task_service.sweep_passed_slots(U, now)
+
+    assert container.task_service._settings.slot_grace_minutes == 5
+    assert (await container.repos.tasks.get(U, "graphs")).status is TaskStatus.MISSED
+
+
+def test_container_built_services__import_no_config_module():
+    importing = []
+    for relative in _CONTAINER_BUILT_SERVICES:
+        tree = ast.parse((ROOT / relative).read_text())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
+            if any(n == "app.core.config" or n.startswith("app.core.config.") for n in names):
+                importing.append(relative)
+    assert importing == []

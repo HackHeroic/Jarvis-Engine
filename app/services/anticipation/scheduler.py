@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable
 from datetime import datetime
 
-import app.core.config as config
+from app.core.settings import AnticipationSettings, default_settings
 from app.core.model_router import attribute_llm_calls
 from app.domain.ports import ProfileRepository, Sweep
 from app.services.anticipation.service import AnticipationService
@@ -31,13 +31,16 @@ class AnticipationScheduler:
         profiles: ProfileRepository,
         sweeps: list[Sweep],
         *,
-        tick_s: float = config.ANTICIPATION_TICK_SECONDS,
+        tick_s: float | None = None,
         clock: Callable[[], datetime] = utc_now,
+        settings: AnticipationSettings | None = None,
     ) -> None:
+        """A tick every ``tick_s`` seconds; default: the settings' ``tick_seconds``."""
         self._service = service
         self._profiles = profiles
         self._sweeps = list(sweeps)
-        self._tick_s = tick_s
+        settings = settings or default_settings().anticipation
+        self._tick_s = tick_s if tick_s is not None else settings.tick_seconds
         self._clock = clock
         self._last_swept: dict[str, datetime] = {}
         self._tick_lock = asyncio.Lock()
