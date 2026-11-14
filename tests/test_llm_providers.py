@@ -33,7 +33,9 @@ from app.infrastructure.llm.decorators import (
     MeteredProvider,
     RedactingProvider,
     RetryingProvider,
+    ServedModels,
     TimeoutProvider,
+    recording_served_models,
 )
 from app.infrastructure.llm.factory import LLMProviderFactory, reset_chain, set_chain
 from app.infrastructure.llm.gemini import GeminiProvider
@@ -1490,3 +1492,32 @@ async def test_metered__unbilled_call_cancelled__publishes_nothing():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert recorder.events == []
+
+
+# --- which model answered (the chat reply credits it) ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_metered__served_models_recorded__answers_only_visible_from_child_tasks():
+    """Billed failures are not answers; calls made in tasks started from the context land
+    in the same record (the chat graph runs in its own task)."""
+    claude = MeteredProvider(
+        FakeProvider("claude", LLMLocation.CLOUD, ["hi"]), EventBus(), lambda role: "claude-sonnet-5-5"
+    )
+    billed_failure = MeteredProvider(
+        FakeProvider("gemini", LLMLocation.CLOUD, [LLMOutputParseError("cut off")], tokens=(1, 2, 0)),
+        EventBus(),
+        lambda role: "gemini-2.5-flash",
+    )
+    served = ServedModels()
+    undo = recording_served_models(served)
+    try:
+        await asyncio.create_task(claude.complete(_req(task="voice_of_jarvis")))
+        with pytest.raises(LLMOutputParseError):
+            await billed_failure.complete(_req(task="voice_of_jarvis"))
+    finally:
+        undo()
+
+    assert served.answers == [("voice_of_jarvis", "claude", "claude-sonnet-5-5")]
+    assert served.last_model_for(("voice_of_jarvis",)) == "claude-sonnet-5-5"
+    assert served.last_model_for(("memory_extraction",)) is None

@@ -1187,7 +1187,7 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
 @router.post("/v2/stream")
 async def chat_stream_v2(request: ChatRequest, http_request: Request):
     """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
-    from app.core.model_router import attribute_llm_calls
+    from app.core.model_router import ServedModels, attribute_llm_calls, recording_served_models
     from app.core.user_model import UserModel
     from app.orchestrator.checkpoint import make_thread_id
     from app.orchestrator.state import ConversationPhase, NegotiationPhase
@@ -1218,7 +1218,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     if force_cloud_request:
         from app.core.model_router import force_cloud_var
         force_cloud_token = force_cloud_var.set(True)
-        print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
+        print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (cloud providers only this turn)")
 
     # --- Session management ---
     session_id = await get_or_create_session(
@@ -1331,10 +1331,23 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 memory_store.get_active_memories, request.user_id
             )
 
+    # Which provider and model answered each LLM call of this turn, recorded by the
+    # metering decorator; the reply is credited to the model that wrote it.
+    served = ServedModels()
+    _REPLY_TASKS = ("voice_of_jarvis", "voice_of_jarvis_synthesis")
+
     async def event_gen():
         import app.core.config as _cfg
-        LOCAL_LLM_MODEL = _cfg.LOCAL_LLM_MODEL
-        SLM_ROUTER_MODEL = _cfg.SLM_ROUTER_MODEL
+
+        def _answering_model() -> str:
+            """The model that wrote this turn's reply; "cloud"/"local" when no model call did."""
+            model = served.last_model_for(_REPLY_TASKS)
+            if model:
+                return model
+            from app.core.model_router import force_cloud_var
+
+            cloud_first = _cfg.GEMINI_PRIMARY or _cfg.CLAUDE_PRIMARY or force_cloud_var.get()
+            return "cloud" if cloud_first else "local"
 
         def _intent_str(intent) -> str:
             """Safely convert IntentType enum or string to plain string."""
@@ -1470,17 +1483,14 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _is_chat = _intent in ("CHAT", "GREETING", "GENERAL_QA")
             _has_schedule = bool(final_state.get("schedule"))
 
-            # Reflect actual routing: per-request force_cloud overrides static config.
-            try:
-                from app.core.model_router import force_cloud_var
-                _force_cloud_now = force_cloud_var.get()
-            except Exception:
-                _force_cloud_now = False
-            _active_model = _cfg.GEMINI_MODEL if (_cfg.GEMINI_PRIMARY or _force_cloud_now) else LOCAL_LLM_MODEL
-            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _active_model, 'force_cloud': _force_cloud_now})}\n\n"
+            from app.core.model_router import force_cloud_var
+
+            _force_cloud_now = force_cloud_var.get()
+            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _answering_model(), 'force_cloud': _force_cloud_now})}\n\n"
 
             # --- Token streaming (matches v1/stream SSE contract) ---
-            _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else LOCAL_LLM_MODEL
+            # Credited once the reply exists (below); a template reply keeps its label.
+            _stream_model: str | None = None
             if _gen_start is None:
                 # Nothing came through the bridge — this turn falls back to
                 # emitting the assembled message as a single frame. Time the
@@ -1490,7 +1500,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             if tokens_streamed:
                 # Synthesis already streamed live through the progress bridge.
                 # Re-emitting the assembled message here would duplicate it.
-                _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else SLM_ROUTER_MODEL
+                pass
 
             elif _has_schedule and _intent == "PLAN_DAY":
                 # Schedule responses: emit pre-computed message, no VoJ streaming needed
@@ -1570,13 +1580,15 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                             else:
                                 message_full += tok
                             yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
-                        _stream_model = _cfg.GEMINI_MODEL if _cfg.GEMINI_PRIMARY else SLM_ROUTER_MODEL
                     except Exception as voj_exc:
                         print(f"[v2/stream] VoJ streaming failed: {voj_exc}")
                         _fallback = final_state.get("response_message") or "Standing by, sir."
                         yield f"event: message\ndata: {json.dumps({'token': _fallback})}\n\n"
                         message_full = _fallback
                         _token_count = 1
+
+            if _stream_model is None:
+                _stream_model = _answering_model()
 
             # Generation window, not turn duration: tok/sec must describe the
             # model's output rate, not how long the whole pipeline ran.
@@ -1687,10 +1699,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     # attribution ends in the response's background task, which Starlette runs in
     # this same context once the last frame is sent or the client has gone.
     end_attribution = attribute_llm_calls(request.user_id, session_id)
+    end_recording = recording_served_models(served)
 
     async def _end_attribution() -> None:
         # async on purpose: a sync background task runs on a worker thread, in a
         # copy of this context, where the ContextVar reset would raise.
+        end_recording()
         end_attribution()
         if force_cloud_token is not None:
             from app.core.model_router import force_cloud_var

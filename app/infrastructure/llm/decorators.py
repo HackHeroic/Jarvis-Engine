@@ -10,7 +10,7 @@ the answer but never turn it into a timeout and a second, paid attempt.
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from contextlib import aclosing, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -213,6 +213,41 @@ def _billed(tally: TokenTally) -> bool:
     return bool(tally.input_tokens or tally.output_tokens or tally.cache_read_tokens)
 
 
+class ServedModels:
+    """Which provider and model answered each LLM call made in one context (a chat turn).
+
+    A mutable record behind a ``ContextVar``: tasks started from the context copy
+    the variable but share the record, so the graph's calls (run in their own
+    tasks) land where the chat endpoint can read them. Only calls that answered
+    are recorded.
+    """
+
+    def __init__(self) -> None:
+        self.answers: list[tuple[str, str, str]] = []  # (task, provider, model), in order
+
+    def record(self, task: str, provider: str, model: str) -> None:
+        self.answers.append((task, provider, model))
+
+    def last_model_for(self, tasks: Collection[str]) -> str | None:
+        """The model of the most recent answered call for one of ``tasks``; None if none."""
+        for task, _provider, model in reversed(self.answers):
+            if task in tasks:
+                return model
+        return None
+
+
+_SERVED_MODELS: ContextVar[ServedModels | None] = ContextVar("llm_served_models", default=None)
+
+
+def recording_served_models(record: ServedModels) -> Callable[[], None]:
+    """Record into ``record`` every LLM call answered from the current context on.
+
+    Returns the undo, to be called once from this same context.
+    """
+    token = _SERVED_MODELS.set(record)
+    return lambda: _SERVED_MODELS.reset(token)
+
+
 class MeteredProvider(_ProviderDecorator):
     """Times each call and publishes ``LLMCallCompleted``.
 
@@ -231,7 +266,9 @@ class MeteredProvider(_ProviderDecorator):
         self._bus = bus
         self._model_for_role = model_for_role
 
-    async def _publish(self, req: LLMRequest, started: float, tally: TokenTally) -> None:
+    async def _publish(
+        self, req: LLMRequest, started: float, tally: TokenTally, *, answered: bool
+    ) -> None:
         latency_ms = int((time.perf_counter() - started) * 1000)
         now = datetime.now(timezone.utc)
         usage = LLMUsageEvent(
@@ -249,6 +286,9 @@ class MeteredProvider(_ProviderDecorator):
             pii_redactions=req.pii_redactions if isinstance(req, RedactedLLMRequest) else 0,
             created_at=now,
         )
+        served = _SERVED_MODELS.get()
+        if answered and served is not None:
+            served.record(req.task, usage.provider, usage.model)
         await self._bus.publish(LLMCallCompleted(occurred_at=now, user_id=req.user_id, usage=usage))
 
     async def complete(self, req: LLMRequest) -> str | BaseModel:
@@ -260,9 +300,9 @@ class MeteredProvider(_ProviderDecorator):
         except (Exception, asyncio.CancelledError):
             # Cancelled too, as a stream's ``finally`` is: billed tokens are recorded.
             if _billed(tally):
-                await self._publish(req, started, tally)
+                await self._publish(req, started, tally, answered=False)
             raise
-        await self._publish(req, started, tally)
+        await self._publish(req, started, tally, answered=True)
         return result
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
@@ -282,4 +322,4 @@ class MeteredProvider(_ProviderDecorator):
         finally:
             # Also runs when the consumer closes the stream early (GeneratorExit).
             if finished or _billed(tally):
-                await self._publish(req, started, tally)
+                await self._publish(req, started, tally, answered=finished)
