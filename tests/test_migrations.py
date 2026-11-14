@@ -12,13 +12,22 @@ from pathlib import Path
 
 import pytest
 
-from app.domain.entities import DraftStatus, SuggestionStatus, TaskEventType, TaskStatus
+from app.domain.entities import (
+    DraftStatus,
+    MemorySource,
+    MemoryStatus,
+    SuggestionStatus,
+    TaskEventType,
+    TaskStatus,
+)
+from app.infrastructure.persistence._mapping import MEMORY_COLUMNS
 from app.services.planning.task_rows import build_task_rows
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "supabase" / "migrations"
 BASELINE = MIGRATIONS / "20260101000000_baseline_legacy_tables.sql"
 CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
 SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
+MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
 # Tables a migration creates that need no row-level security: the dead tables the
@@ -291,3 +300,141 @@ def test_migrations__pearl_task_fetch__selects_only_existing_user_tasks_columns(
     (selected,) = client.table.return_value.select.call_args.args
     missing = {c.strip() for c in selected.split(",")} - _user_tasks_columns()
     assert missing == set()
+
+
+# --- Memory lifecycle and vectors (20261115000002) ----------------------------------
+
+_MATCH_MEMORIES_SIGNATURE = (
+    r"public\.match_memories\(text, extensions\.vector\(384\), text\[\], text\[\], int, "
+    r"double precision\)"
+)
+
+
+def _match_memories() -> re.Match:
+    function = re.search(
+        r"create or replace function public\.match_memories\s*\((.*?)\)\s*"
+        r"returns table\s*\((.*?)\)\s*(.*?)\$\$(.*?)\$\$;",
+        _sql(MEMORY_VECTORS),
+        re.S,
+    )
+    assert function, "match_memories not found"
+    return function
+
+
+def _user_memories_columns() -> set[str]:
+    """Every user_memories column the migration set creates and does not drop."""
+    sql = _set_sql()
+    created = re.search(
+        rf"create table if not exists {_TABLE}user_memories\s*\((.*?)\);", sql, re.S
+    )
+    assert created, "no migration creates user_memories"
+    # Top-level definitions only: commas inside a CHECK (...) list are not separators.
+    body = re.sub(r"\((?:[^()]|\([^()]*\))*\)", "()", created.group(1))
+    columns = {part.split()[0] for part in (p.strip() for p in body.split(",")) if part}
+    for statement in re.findall(rf"alter table {_TABLE}user_memories\b(.*?);", sql, re.S):
+        columns |= set(re.findall(r"add column (?:if not exists )?(\w+)", statement))
+        columns -= set(re.findall(r"drop column (?:if exists )?(\w+)", statement))
+    return columns
+
+
+def test_migrations__memory_migration__enables_vector_and_defines_match_memories():
+    sql = _sql(MEMORY_VECTORS)
+    params, returned, attributes, _body = _match_memories().groups()
+
+    assert re.search(r"create extension if not exists vector with schema extensions;", sql)
+    # embedding becomes vector(384); an array of any other length becomes NULL.
+    assert re.search(
+        r"alter column embedding type extensions\.vector\(384\)\s+using case\s+"
+        r"when array_length\(embedding, 1\) = 384\s+then embedding::extensions\.vector\(384\)",
+        sql,
+    )
+    assert [p.split()[0] for p in params.split(",")] == [
+        "p_user_id", "p_query", "p_statuses", "p_types", "p_limit", "p_min_similarity",
+    ]
+    assert re.search(r"p_query extensions\.vector\(384\)", params)
+    assert re.search(r"language sql\s+stable", attributes)
+    assert re.search(r"set search_path = public, extensions", attributes)
+    # Every memory column but the embedding, plus the similarity.
+    returned_columns = [c.split()[0] for c in (part.strip() for part in returned.split(","))]
+    assert set(returned_columns) == _user_memories_columns() - {"embedding"} | {"similarity"}
+    assert re.search(r"similarity double precision", returned)
+    # The repositories read exactly the entity's columns, all of which exist.
+    assert "embedding" not in MEMORY_COLUMNS
+    assert set(MEMORY_COLUMNS) <= _user_memories_columns()
+    assert re.search(
+        rf"revoke execute on function {_MATCH_MEMORIES_SIGNATURE} from public, anon;", sql
+    )
+    assert re.search(
+        rf"grant execute on function {_MATCH_MEMORIES_SIGNATURE} to service_role, authenticated;",
+        sql,
+    )
+    # The new columns' CHECKs match the domain enums.
+    assert _check_values(sql, "user_memories_status_check") == {s.value for s in MemoryStatus}
+    assert _check_values(sql, "user_memories_provenance_check") == {s.value for s in MemorySource}
+    assert re.search(r"check \(observation_count >= 1\)", sql)
+    assert re.search(r"check \(stability between 0\.01 and 20\)", sql)
+    assert re.search(
+        rf"create unique index if not exists \w+\s+on {_TABLE}user_memories\s*"
+        r"\(user_id, pattern_key\)\s+where pattern_key is not null;",
+        sql,
+    )
+    assert re.search(
+        rf"create index if not exists \w+\s+on {_TABLE}user_memories\s*\(user_id, status\);", sql
+    )
+
+
+def test_migrations__match_memories__filters_user_and_status():
+    _params, _returned, _attributes, body = _match_memories().groups()
+    where = re.search(r"\bwhere\b(.*?)\border by\b", body, re.S)
+    assert where, "match_memories has no where clause"
+    conditions = [c.strip() for c in re.split(r"\band\b", where.group(1))]
+
+    assert "m.user_id = p_user_id" in conditions
+    assert "m.status = any (p_statuses)" in conditions
+    assert "(p_types is null or m.memory_type = any (p_types))" in conditions
+    assert "m.embedding is not null" in conditions
+    assert "m.superseded_by is null" in conditions
+    assert "1 - (m.embedding <=> p_query) >= p_min_similarity" in conditions
+    assert re.search(r"1 - \(m\.embedding <=> p_query\) as similarity", body)
+    assert re.search(r"order by m\.embedding <=> p_query\s+limit p_limit\s*;?\s*$", body)
+    assert "select *" not in body and "m.*" not in body
+
+
+def test_migrations__memory_migration__idempotent_statements():
+    sql = _sql(MEMORY_VECTORS)
+
+    for column in (
+        "status", "provenance", "pattern_key", "source_session_id", "source_message_id",
+        "last_confirmed_at", "strength_as_of",
+    ):
+        assert re.search(rf"add column if not exists {column}\b", sql), column
+    assert re.search(
+        r"add column if not exists source_session_id uuid\s+references public\.chat_sessions\s*"
+        r"\(id\) on delete set null",
+        sql,
+    )
+    assert re.search(
+        r"add column if not exists source_message_id uuid\s+references public\.chat_messages\s*"
+        r"\(id\) on delete set null",
+        sql,
+    )
+    # A re-run touches no row it already fixed (each update also bumps updated_at).
+    assert re.search(
+        rf"update {_TABLE}user_memories\s+set provenance = 'inferred'\s+"
+        r"where source = 'behavior' and provenance <> 'inferred'\s*;",
+        sql,
+    )
+    # The type change runs only while the column is still an array: a second run
+    # would otherwise call array_length() on a vector.
+    guard = re.search(
+        r"if exists \(.*?column_name = 'embedding'.*?data_type = 'array'.*?\)\s+then", sql, re.S
+    )
+    alter = re.search(r"alter column embedding type", sql)
+    assert guard and alter and guard.start() < alter.start()
+    for name in (
+        "user_memories_status_check",
+        "user_memories_provenance_check",
+        "user_memories_observation_count_check",
+        "user_memories_stability_range",
+    ):
+        assert re.search(rf"drop constraint if exists {name};", sql), name

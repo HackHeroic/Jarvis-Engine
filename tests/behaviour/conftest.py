@@ -22,9 +22,7 @@ PEARL, the constraint bridge and the draft service.
 
 import asyncio
 import copy
-import hashlib
 import json
-import math
 import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -41,7 +39,7 @@ from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.llm.transport import strip_fences
-from tests.fakes import FakeDBClient, FakeSupabase
+from tests.fakes import FakeDBClient, FakeSupabase, bag_of_words_embedding
 
 # --- the scripted language model ---------------------------------------------
 
@@ -120,15 +118,6 @@ class ScriptedLLM(LLMProvider):
 def _tokens(text: str) -> list[str]:
     """Split a reply into small streamed chunks, mid-word on purpose."""
     return [text[i : i + 5] for i in range(0, len(text), 5)] or [""]
-
-
-def bag_of_words_embedding(text: str, dims: int = 128) -> list[float]:
-    """Deterministic stand-in for the sentence embedder: hashed word counts."""
-    vector = [0.0] * dims
-    for word in re.findall(r"[a-z0-9]+", text.lower()):
-        vector[int(hashlib.md5(word.encode()).hexdigest(), 16) % dims] += 1.0
-    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
-    return [v / norm for v in vector]
 
 
 @pytest.fixture

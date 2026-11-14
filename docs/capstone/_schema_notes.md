@@ -5,7 +5,7 @@ These notes cover the two migrations that complete the Supabase schema:
 - `supabase/migrations/20260101000000_baseline_legacy_tables.sql`
 - `supabase/migrations/20261114000001_capstone_lld.sql`
 
-Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own section below ("Plan 2: Skip writes `skipped`").
+Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own section below ("Plan 2: Skip writes `skipped`"), and so does its memory change, `20261115000002_memory_lifecycle_and_vectors.sql` ("Plan 2: Memory lifecycle and vectors").
 
 They record why each choice was made. They are also the source for the ER diagram: every key, relationship and constraint below was checked by introspecting a database built from `supabase/migrations/` alone (PostgreSQL 18, local).
 
@@ -73,13 +73,13 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `behavioral_constraints` | `BehavioralConstraint` | `SupabaseConstraintRepository`, `behavioral_store` |
 | `proactive_suggestions` | `Suggestion` | `SupabaseSuggestionRepository` |
 | `llm_usage_events` | `LLMUsageEvent` | `SupabaseUsageRepository` |
+| `user_memories` | `Memory` | `SupabaseMemoryRepository`; the v1 memory store and PEARL (until plan 2 moves them) |
 
 `Pattern` is computed and never stored. The other user tables have no domain entity yet:
 
 | Table | Written by |
 |---|---|
 | `habit_trackers` | SM-2 (`sm2_engine`) |
-| `user_memories` | memory store and PEARL |
 | `chat_sessions`, `chat_messages` | `chat_history` |
 | `task_materials` | `task_material_linker` |
 | `ingested_documents` | ingestion orchestrator |
@@ -121,6 +121,8 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `chat_messages` | `session_id` | `chat_sessions (id)` | CASCADE (pre-existing) |
 | `habit_trackers` | `constraint_id` | `behavioral_constraints (id)` | SET NULL (pre-existing) |
 | `user_memories` | `superseded_by` | `user_memories (id)` | NO ACTION (pre-existing; deleting a user still cascades cleanly, checked locally) |
+| `user_memories` | `source_session_id` | `chat_sessions (id)` | SET NULL: deleting a conversation keeps what was learned in it (`20261115000002`) |
+| `user_memories` | `source_message_id` | `chat_messages (id)` | SET NULL (`20261115000002`) |
 
 **Why `goal_id` links use SET NULL.** `goal_id` is optional on all three tables, so deleting a goal clears the link and keeps the tasks, drafts and deadlines. A goal FK that includes `user_id` also means a row can never point at another user's goal.
 
@@ -163,6 +165,8 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `draft_schedules` | `draft_schedules_status_check` | `DraftStatus` values, including `superseded` |
 | `behavioral_constraints` | `behavioral_constraints_source_check` | `source in ('said','inferred')`, NOT NULL, default `said` |
 | `user_memories` | `user_memories_confidence_range`, `user_memories_strength_range` | both between 0 and 1 |
+| `user_memories` | `user_memories_status_check`, `user_memories_provenance_check` | `MemoryStatus` values; `said / inferred` (`20261115000002`) |
+| `user_memories` | `user_memories_observation_count_check`, `user_memories_stability_range` | `observation_count >= 1`; `0.01 ≤ stability ≤ 20` (`20261115000002`) |
 | `habit_trackers` | `habit_trackers_ef_floor` | `ef >= 1.3` (the SM-2 floor `sm2_engine` clamps to) |
 
 `tests/test_migrations.py` pins the four status/type CHECKs to the domain enums, so the database and the entities cannot drift apart.
@@ -197,6 +201,52 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 - **What Skip no longer writes.** The `reschedule_count` column and the "needs re-decomposition" memory. Later plan 2 tasks replace both from the `skipped` events: a repeated-skip detector (Task 6) and a per-task event count (Task 12).
 - **Missed tasks.** A missed slot is inferred, not asked about. `SlotPassedSweep` marks a pending task `missed`, with a `missed` event, once `scheduled_end + SLOT_GRACE_MINUTES` (30) has passed with no outcome recorded since the slot began. A passed deadline gives status `missed` with a `deadline_missed` event.
 - **Re-runs.** The file is idempotent: a re-run maps nothing and re-creates the same CHECK. `tests/test_migrations.py` pins the mapping, its order before the CHECK, and the final CHECK values.
+
+## Plan 2: Memory lifecycle and vectors
+
+`supabase/migrations/20261115000002_memory_lifecycle_and_vectors.sql` makes `user_memories` the storage of the `Memory` entity (`app/domain/entities.py`), behind `MemoryRepository` (`SupabaseMemoryRepository` / `InMemoryMemoryRepository`, one contract suite).
+
+**Apply note.** Apply it live only together with Task 7. Until then the legacy extractor (`MemoryStore.find_similar_memory`) still reads `embedding` as a float array, and after this migration PostgREST returns a vector as a string.
+
+**What it does.**
+1. `create extension if not exists vector with schema extensions`.
+2. Adds the lifecycle columns, each guarded by `add column if not exists`:
+
+   | Column | Type | Entity field |
+   |---|---|---|
+   | `status` | `text not null default 'active'`, CHECK `MemoryStatus` | `status` |
+   | `provenance` | `text not null default 'said'`, CHECK `said / inferred` | `provenance` |
+   | `pattern_key` | `text` | `pattern_key` |
+   | `source_session_id` | `uuid` → `chat_sessions (id)` on delete set null | `source_session_id` |
+   | `source_message_id` | `uuid` → `chat_messages (id)` on delete set null | `source_message_id` |
+   | `last_confirmed_at` | `timestamptz` | `last_confirmed_at` |
+   | `strength_as_of` | `timestamptz not null default now()` | `strength_as_of` |
+
+3. Backfills `provenance = 'inferred'` where `source = 'behavior'` (PEARL's rows). A re-run touches no row.
+4. Brings legacy rows inside the entity's ranges (`observation_count` to at least 1, `stability` clamped to [0.01, 20]), then adds the two range CHECKs.
+5. Turns `embedding` from `float[]` into `extensions.vector(384)`. An array that is not 384 long becomes NULL. The type change runs only while the column is still an array.
+6. Adds a unique partial index `idx_user_memories_user_pattern_key (user_id, pattern_key) where pattern_key is not null`, and `idx_user_memories_user_status (user_id, status)`. There is no ANN index: a user holds tens to hundreds of memories, scanned exactly behind the `user_id` filter.
+7. Adds `match_memories(p_user_id, p_query, p_statuses, p_types, p_limit, p_min_similarity)`, below.
+8. Revokes `execute` on it from `public` and `anon`, and grants it to `service_role` and `authenticated`.
+
+**Column mapping.**
+- The entity's `origin` (conversation, behavior, …) is the legacy `source` column, which the v1 path still writes. The new `provenance` column says whether the user said it.
+- The legacy `source_id`, `last_accessed`, `last_reinforced` and `updated_at` columns have no entity field.
+- Every read names its columns (`_mapping.MEMORY_COLUMNS`) and never selects `embedding`, which is 384 floats a row. Inserts and updates still get the written row back, embedding included: postgrest-py cannot narrow a write's returned columns.
+
+**`match_memories`.** It is `language sql stable`, with `set search_path = public, extensions` so the `<=>` operator resolves.
+- It keeps the user's rows whose status is in `p_statuses`, whose type is in `p_types` (NULL means any type), and that have an embedding and are not superseded.
+- `similarity = 1 - (embedding <=> p_query)`. Only rows with similarity `>= p_min_similarity` are kept, ordered by distance and limited to `p_limit`.
+- It returns every `user_memories` column except `embedding`, plus `similarity double precision`.
+- `SupabaseMemoryRepository.nearest` calls it; supabase-py sends `p_query` as a JSON array, which PostgREST reads as the vector's text form.
+
+**Checked against PostgreSQL 18 + pgvector (local, throwaway database).**
+- Built on top of the rest of the set, over legacy rows: a 384-long array became a vector; a 2-long one became NULL; the `behavior` row read `inferred`; `stability` 25 became 20 and `observation_count` 0 became 1.
+- A second application touched no row (`updated_at` unchanged). Applying the whole set again also succeeds.
+- Ranking, the type filter, `p_limit`, `p_min_similarity` and the status filter behave as above. A user with no memories gets no rows, whatever the statuses.
+- A duplicate `(user_id, pattern_key)` fails on `idx_user_memories_user_pattern_key`, and the same key for another user is accepted. `anon` gets `permission denied for function match_memories`.
+
+**Fake vs SQL.** `FakeSupabase` mirrors `match_memories` with cosine similarity over the stored lists and the same filters. It also enforces the unique `(user_id, pattern_key)` index on `insert` and `update`, raising the database's message. Unlike the SQL, it accepts an embedding of any length; the database rejects one that is not 384 long (`expected 384 dimensions`).
 
 ## Triggers
 
