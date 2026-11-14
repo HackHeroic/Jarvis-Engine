@@ -1533,15 +1533,48 @@ async def test_conversations__set_summary__roundtrip(repos, seed_chat):
 
 
 @pytest.mark.asyncio
+async def test_conversations__set_summary__compare_and_set_never_moves_back(repos, seed_chat):
+    session_id = seed_chat.session(U1)
+    t1, t2 = T0, T0 + timedelta(minutes=10)
+    written = T0 + timedelta(hours=1)
+
+    assert await repos.conversations.set_summary(U1, session_id, "First.", t1) is True
+    assert await repos.conversations.set_summary(
+        U1, session_id, "Reaches further.", t2, written_at=written
+    ) is True
+    # A slower writer that read an older state reaches less far: nothing is written.
+    assert await repos.conversations.set_summary(U1, session_id, "Stale.", t1) is False
+    stored = await repos.conversations.get_session(U1, session_id)
+    assert (stored.summary, stored.summary_through, stored.summary_updated_at) == (
+        "Reaches further.", t2, written,
+    )
+    # The same reach may be rewritten (an idle summary that keeps the window's start).
+    assert await repos.conversations.set_summary(U1, session_id, "Same reach.", t2) is True
+    assert (await repos.conversations.get_session(U1, session_id)).summary == "Same reach."
+
+
+@pytest.mark.asyncio
 async def test_conversations__messages__newest_limit_after_through_oldest_first(repos, seed_chat):
     session_id = seed_chat.session(U1)
     sent = [seed_chat.message(U1, session_id, T0 + timedelta(minutes=m)) for m in range(6)]
 
     newest_three = await repos.conversations.messages(U1, session_id, limit=3)
     after_second = await repos.conversations.messages(U1, session_id, after=sent[1].created_at)
+    oldest_two_after = await repos.conversations.messages(
+        U1, session_id, after=sent[1].created_at, limit=2, oldest_first=True
+    )
 
     assert [m.id for m in newest_three] == [m.id for m in sent[3:]]
     assert [m.id for m in after_second] == [m.id for m in sent[2:]]
+    assert [m.id for m in oldest_two_after] == [m.id for m in sent[2:4]]
+    # A limit above the count is every message, either way round.
+    assert [m.id for m in await repos.conversations.messages(U1, session_id, limit=50)] == [
+        m.id for m in sent
+    ]
+    assert [
+        m.id
+        for m in await repos.conversations.messages(U1, session_id, limit=50, oldest_first=True)
+    ] == [m.id for m in sent]
     assert await repos.conversations.messages(U1, "not-a-uuid") == []
     with pytest.raises(errors.ValidationError):
         await repos.conversations.messages(U1, session_id, limit=-1)

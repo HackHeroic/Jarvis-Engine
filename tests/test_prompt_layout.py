@@ -244,6 +244,46 @@ async def test_compacted_conversation__system_block_byte_identical_and_history_a
     assert later_wire["messages"][: len(after["messages"]) - 1] == after["messages"][:-1]
 
 
+@pytest.mark.asyncio
+async def test_return_after_idle__newest_8_verbatim_summary_in_the_note_prefix_append_only(
+    jarvis, llm, frozen
+):
+    from app.schemas.memory import SessionSummary
+
+    summary = "You are revising graph algorithms, one topic a turn."
+    llm.script("session_summary", SessionSummary(summary=summary))
+    session = None
+    for n in range(1, 8):  # 14 messages: no compaction yet
+        turn = await jarvis.say(f"Topic {n} of my graph revision", session=session)
+        session = turn.conversation_id
+    # The user goes quiet; the session-summary sweep finds the conversation idle.
+    memory = jarvis.state.container.conversation_memory
+    idle = frozen.now + timedelta(minutes=config.SESSION_IDLE_MINUTES + 1)
+    assert await memory.summarize_idle("alice", idle) == 1
+    for n in (8, 9):  # the user comes back to the same conversation
+        await jarvis.say(f"Topic {n} of my graph revision", session=session)
+
+    replies = _reply_calls(llm)
+    before, back, later = replies[6], replies[7], replies[8]  # turns 7, 8 and 9
+    (summary_call,) = llm.calls_for("session_summary")
+    assert all(f"Topic {n} of" in summary_call.prompt for n in range(1, 8))  # covers it all
+    # The system block is the same bytes before and after the idle summary.
+    claude = ClaudeProvider(config)
+    assert len({json.dumps(claude._params(c)["system"]) for c in (before, back, later)}) == 1
+    # Coming back: the newest 8 messages (turns 4-7) word for word, the summary in the note.
+    *turns, note = back.conversation_history
+    assert [m["content"] for m in turns if m["role"] == "user"] == [
+        f"Topic {n} of my graph revision" for n in (4, 5, 6, 7)
+    ]
+    assert len(turns) == 8 and all(m["role"] != "system" for m in turns)
+    assert f"<earlier>Earlier in this conversation: {summary}</earlier>" in note["content"]
+    # And the message list only grows from there.
+    *later_turns, _ = later.conversation_history
+    assert later_turns[: len(turns)] == turns and len(later_turns) == len(turns) + 2
+    back_wire, later_wire = claude._params(back), claude._params(later)
+    assert later_wire["messages"][: len(back_wire["messages"]) - 1] == back_wire["messages"][:-1]
+
+
 class _ScriptedGraph:
     """Stands in for the orchestrator: a fresh thread that emits the given node events.
 

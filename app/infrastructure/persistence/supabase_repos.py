@@ -761,37 +761,59 @@ class SupabaseConversationRepository(_SupabaseRepository, ConversationRepository
         *,
         after: datetime | None = None,
         limit: int = 50,
+        oldest_first: bool = False,
     ) -> list[ChatMessage]:
-        """Newest first, so PostgREST's silent read cap could only drop the oldest."""
+        """Newest first, so PostgREST's silent read cap could only drop the oldest; with
+        ``oldest_first``, oldest first, so it could only drop the newest."""
         check_limit(limit)
         if not is_uuid(session_id):
             return []
+        newest_first = not oldest_first
 
         def build(q: Any) -> Any:
             q = q.select(_MESSAGE_SELECT).eq("session_id", session_id).eq("user_id", user_id)
             if after is not None:
                 q = q.gt("created_at", iso(after))
-            return q.order("created_at", desc=True).order("id", desc=True).limit(limit)
+            return (
+                q.order("created_at", desc=newest_first)
+                .order("id", desc=newest_first)
+                .limit(limit)
+            )
 
         rows = await self._run(build, table=self._MESSAGES)
-        return [_read(ChatMessage, row) for row in reversed(rows)]
+        ordered = reversed(rows) if newest_first else rows
+        return [_read(ChatMessage, row) for row in ordered]
 
     async def set_summary(
-        self, user_id: str, session_id: str, summary: str, through: datetime
-    ) -> None:
+        self,
+        user_id: str,
+        session_id: str,
+        summary: str,
+        through: datetime,
+        *,
+        written_at: datetime | None = None,
+    ) -> bool:
+        """A compare-and-set in the UPDATE's own filter: one statement for a session whose
+        summary reaches no further than ``through``, a second for one with none yet."""
         summary, through = checked_summary(summary, through)
         if not is_uuid(session_id):
             raise not_found("session", session_id)
         payload = {
             "summary": summary,
             "summary_through": through.isoformat(),
-            "summary_updated_at": iso(now_utc()),
+            "summary_updated_at": iso(written_at or now_utc()),
         }
-        rows = await self._run(
-            lambda q: q.update(payload).eq("id", session_id).eq("user_id", user_id)
-        )
-        if not rows:
+
+        def update(q: Any) -> Any:
+            return q.update(payload).eq("id", session_id).eq("user_id", user_id)
+
+        if await self._run(lambda q: update(q).lte("summary_through", through.isoformat())):
+            return True
+        if await self._run(lambda q: update(q).is_("summary_through", "null")):
+            return True
+        if await self.get_session(user_id, session_id) is None:
             raise not_found("session", session_id)
+        return False
 
     async def recent_sessions(
         self, user_id: str, *, since: datetime

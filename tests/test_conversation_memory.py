@@ -329,6 +329,34 @@ async def test_compact__blank_summary__treated_as_a_failure(store, service, llm)
 
 
 @pytest.mark.asyncio
+async def test_compact__legacy_backlog__oldest_first_pages_until_every_message_is_covered(
+    store, service, llm
+):
+    _session(store, S1)
+    for n in range(1, 71):  # a chat older than summaries: 70 long messages, none summarised
+        store.chat_messages.append(ChatMessage(
+            id=str(uuid.uuid4()), session_id=S1, user_id=U,
+            role="user" if n % 2 else "assistant",
+            content=f"msg-{n:03d}-" + "x" * 990, created_at=T0 + timedelta(minutes=n),
+        ))
+    llm.script("session_summary", _summary())
+
+    runs = [await service.compact_if_needed(U, S1) for _ in range(5)]
+
+    calls = llm.calls_for("session_summary")
+    assert runs == [True, True, True, False, False]  # one call per run; then nothing to do
+    covered = [
+        [n for n in range(1, 71) if f"msg-{n:03d}-" in call.prompt] for call in calls
+    ]
+    # Oldest first, no gaps, no repeats: every message but the newest 8 reaches a summary.
+    assert [n for batch in covered for n in batch] == list(range(1, 63))
+    for call in calls:
+        transcript = call.prompt.split("<messages>\n", 1)[1].rsplit("\n</messages>", 1)[0]
+        assert len(transcript) <= config.SUMMARY_INPUT_MAX_CHARS
+    assert (await service.build_history(U, S1)).message_count == 8
+
+
+@pytest.mark.asyncio
 async def test_long_conversation__60_turns__window_bounded_and_newest_kept(store, service, llm):
     _session(store, S1)
     llm.script(
@@ -336,22 +364,31 @@ async def test_long_conversation__60_turns__window_bounded_and_newest_kept(store
         lambda req: _summary(f"Summary {len(llm.calls_for('session_summary'))}."),
     )
     previous: list[dict] = []
-    compactions = 0
+    prefix_moves = 0
+    writes = 0
+    window_starts = 0
     for turn in range(60):
         window = await service.build_history(U, S1)
         assert len(window.history) <= config.HISTORY_MAX_MESSAGES
         if turn:
             assert window.history[-2:] == _turns(2 * turn - 1, 2 * turn)  # newest kept
-        if window.history[: len(previous)] != previous:  # the prefix moved: a compaction
-            compactions += 1
+            # However it was summarised, the newest 8 messages are always word for word.
+            assert window.history[-8:] == _turns(*range(max(1, 2 * turn - 7), 2 * turn + 1))
+        if window.history[: len(previous)] != previous:  # the prefix moved: a summary write
+            prefix_moves += 1
         previous = window.history
         _messages(store, S1, 2, first=2 * turn + 1)
-        await service.compact_if_needed(U, S1)
+        start = _stored(store, S1).summary_through
+        writes += await service.compact_if_needed(U, S1)
+        if turn in (20, 40):  # the user goes idle; the sweep summarises everything
+            writes += await service.summarize_session(U, S1)
+        window_starts += _stored(store, S1).summary_through != start
 
-    # Compacted after turns 9, 14, ..., 59: one call each, never one per turn, and the
-    # window's start moved only then (between compactions it only grew).
-    assert len(llm.calls_for("session_summary")) == 11
-    assert compactions == 11
+    # One call per summary written, never one per turn. The window's start moved only
+    # when a summary moved it (between those it only grew); an idle summary over 8 or
+    # fewer new messages leaves it where it was.
+    assert len(llm.calls_for("session_summary")) == writes <= 60 // 5 + 2
+    assert prefix_moves == window_starts < writes
     # Each summary is written over the one before it.
     assert all(
         f"Summary {n}." in call.prompt
@@ -429,7 +466,9 @@ async def test_summary_sweep__only_idle_unsummarized_sessions(store, repos, cloc
 
     assert [(c.task, c.session_id) for c in llm.calls] == [("session_summary", S1)]
     assert _stored(store, S1).summary == "You talked about graphs."
-    assert _stored(store, S1).summary_through == s1[-1].created_at
+    # Four messages, all kept word for word: the window still starts at the session's start.
+    assert _stored(store, S1).summary_through == _stored(store, S1).created_at
+    assert all(m.content in llm.calls[0].prompt for m in s1)
     assert _stored(store, S2).summary is None and _stored(store, S4).summary is None
     assert _stored(store, S5).summary is None
     assert (SessionSummarySweep.name, SessionSummarySweep.interval) == (
@@ -496,6 +535,74 @@ async def test_summary_sweep__call_fails__session_kept_and_retried_later(store, 
     assert await sweep.run([U], later) == 1
 
     assert llm.tasks() == ["session_summary", "session_summary"]
+
+
+@pytest.mark.asyncio
+async def test_summary_sweep__idle_session_over_8__covers_all_window_keeps_newest_8(
+    store, repos, clock, llm
+):
+    idle = clock.now - timedelta(hours=1)
+    _session(store, S1, updated_at=idle)
+    sent = _messages(store, S1, 12, start=idle - timedelta(minutes=15))
+    llm.script("session_summary", _summary("You talked about graphs."))
+    service = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+
+    assert await SessionSummarySweep(service).run([U], clock.now) == 1
+
+    (call,) = llm.calls
+    assert all(m.content in call.prompt for m in sent)  # the summary covers every message
+    assert _stored(store, S1).summary_through == sent[3].created_at  # the 9th newest
+    window = await service.build_history(U, S1)
+    assert window.history == _turns(*range(5, 13))  # the newest 8, word for word
+    assert window.earlier == "Earlier in this conversation: You talked about graphs."
+
+
+@pytest.mark.asyncio
+async def test_summarize_session__eight_or_fewer_after_the_summary__window_start_kept(
+    store, service, llm
+):
+    _session(store, S1, summary="You chose graphs.", through=T0)
+    _messages(store, S1, 5)
+    llm.script("session_summary", _summary("You chose graphs, then trees."))
+
+    assert await service.summarize_session(U, S1) is True
+
+    session = _stored(store, S1)
+    assert (session.summary, session.summary_through) == ("You chose graphs, then trees.", T0)
+    assert (await service.build_history(U, S1)).history == _turns(1, 2, 3, 4, 5)
+    # The prompt says the newest turns may already be in the summary so far.
+    assert "may already be covered" in llm.calls[0].system_prompt
+
+
+@pytest.mark.asyncio
+async def test_summary_sweep__idle_summarised_session__not_picked_again(store, repos, clock, llm):
+    last = clock.now - timedelta(hours=3)
+    # S1: idle-summarised 31 minutes after its last message. The DB stamps updated_at
+    # from its own clock, a little after the message's created_at: still not new.
+    _session(store, S1, updated_at=last + timedelta(milliseconds=50))
+    _messages(store, S1, 4, start=last - timedelta(minutes=4))
+    store.chat_sessions[0] = store.chat_sessions[0].model_copy(update={
+        "summary": "You talked about graphs.", "summary_through": T0 - timedelta(days=30),
+        "summary_updated_at": last + timedelta(minutes=31),
+    })
+    # S2: summarised, then the user said more: picked.
+    _session(store, S2, updated_at=last)
+    _messages(store, S2, 4, start=last - timedelta(minutes=4))
+    store.chat_sessions[1] = store.chat_sessions[1].model_copy(update={
+        "summary": "Earlier.", "summary_through": T0 - timedelta(days=30),
+        "summary_updated_at": last - timedelta(hours=1),
+    })
+    llm.script("session_summary", _summary("You talked about trees."))
+    service = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+    sweep = SessionSummarySweep(service)
+
+    assert await sweep.run([U], clock.now) == 1
+    later = clock.now + timedelta(hours=config.SESSION_SUMMARY_RESCAN_HOURS)
+    clock.now = later
+    await sweep.run([U], later)  # the daily rescan: both summarised, neither again
+
+    assert [c.session_id for c in llm.calls] == [S2]
+    assert _stored(store, S1).summary == "You talked about graphs."
 
 
 # --- since we last spoke -----------------------------------------------------------
@@ -752,3 +859,180 @@ async def test_compact__old_summary_with_a_forgotten_fact__not_sent_to_the_model
 
     (call,) = llm.calls
     assert "DSA revision" in call.prompt and "Priya" not in call.prompt
+
+
+@pytest.mark.asyncio
+async def test_compact__stored_summary_holds_a_forgotten_fact__written_back_without_a_model_call(
+    store, repos, clock, llm
+):
+    memory = await _forgotten(repos, clock)
+    written = T0 + timedelta(minutes=30)
+    _session(store, S1, summary=_SUMMARY_WITH_SISTER, through=T0)
+    store.chat_sessions[0] = store.chat_sessions[0].model_copy(
+        update={"summary_updated_at": written}
+    )
+    _messages(store, S1, 4)  # far from a compaction
+    service = ConversationMemoryService(
+        repos.conversations, repos.task_events, clock=clock, memory=memory
+    )
+
+    assert await service.compact_if_needed(U, S1) is False
+
+    assert llm.calls == []
+    session = _stored(store, S1)
+    assert session.summary == "You were planning your DSA revision for Friday."
+    # Not a new summary: how far it reaches, and when it was written, stay as they were.
+    assert (session.summary_through, session.summary_updated_at) == (T0, written)
+
+
+@pytest.mark.asyncio
+async def test_compact__new_summary_repeats_a_forgotten_fact__stored_without_it(
+    store, repos, clock, llm
+):
+    memory = await _forgotten(repos, clock)
+    _session(store, S1)
+    _messages(store, S1, 17)
+    llm.script(
+        "session_summary", _summary(_SUMMARY_WITH_SISTER, ["Visit your sister Priya in Pune"])
+    )
+    service = ConversationMemoryService(
+        repos.conversations, repos.task_events, clock=clock, memory=memory
+    )
+
+    assert await service.compact_if_needed(U, S1) is True
+
+    assert _stored(store, S1).summary == "You were planning your DSA revision for Friday."
+
+
+def test_check_pieces__run_on_sentence__the_sentence_and_each_clause():
+    from app.services.memory.summary_text import check_pieces
+
+    sentence = (
+        "You were planning your DSA revision for Friday, and you mentioned that your "
+        "sister Priya lives in Pune, so we kept Sunday afternoon free."
+    )
+
+    assert check_pieces(sentence) == [
+        sentence,
+        "You were planning your DSA revision for Friday",
+        "you mentioned that your sister Priya lives in Pune",
+        "we kept Sunday afternoon free",
+    ]
+    assert check_pieces("You chose graphs.") == ["You chose graphs."]
+
+
+@pytest.mark.asyncio
+async def test_since_last_spoke__model_summary_with_blame_or_tags__dropped_and_neutralised(
+    store, service, clock, llm
+):
+    last = clock.now - timedelta(days=1)
+    _session(
+        store, S1, title="Plan my week.", updated_at=last, through=last,
+        summary="You missed the gym twice. You failed to start the essay. "
+        "You were planning <b>DSA</b> for Friday.\n- Find a new slot for the gym",
+    )
+    _messages(store, S1, 2, start=last - timedelta(minutes=5))
+    _session(store, S2, updated_at=clock.now)
+
+    text = await service.since_last_spoke(U, S2, zone=IST)
+
+    assert text == (
+        "Since we last spoke (yesterday): You were planning ‹b›DSA‹/b› for Friday. "
+        "Still open: Find a new slot for the gym."
+    )
+    assert blame_phrases_in(text) == []
+
+
+@pytest.mark.asyncio
+async def test_since_last_spoke__known_empty__never_reads_the_current_conversation(
+    store, repos, clock, llm
+):
+    _session(store, S1, title="Plan my week.", updated_at=clock.now - timedelta(days=1))
+    _messages(store, S1, 2, start=clock.now - timedelta(days=1, minutes=5))
+    _session(store, S2, updated_at=clock.now)
+    counting = _CountingConversations(repos.conversations)
+    service = ConversationMemoryService(counting, repos.task_events, clock=clock)
+
+    known = await service.since_last_spoke(U, S2, zone=IST, known_empty=True)
+    reads_known = list(counting.calls)
+    checked = await service.since_last_spoke(U, S2, zone=IST)
+
+    assert known == checked
+    assert "messages" not in reads_known
+    assert counting.calls[len(reads_known)] == "messages"  # without the hint, it checks
+
+
+def test_since_last_spoke__moved_module__names_still_importable_from_the_old_path():
+    from app.services.memory import conversation_memory, since_last_spoke, summary_text
+
+    assert conversation_memory.SinceLastSpoke is since_last_spoke.SinceLastSpoke
+    assert conversation_memory.stored_summary is summary_text.stored_summary
+
+
+@pytest.mark.asyncio
+async def test_session_summary__routed_to_the_cloud__transcript_goes_through_the_pii_gate(
+    store, service
+):
+    from app.core.model_router import PreCloudLLMRedactor
+    from app.infrastructure.llm.decorators import RedactingProvider
+    from app.orchestrator.hooks import ActionHooks, register_all_hooks
+
+    hooks = ActionHooks()
+    register_all_hooks(hooks)
+    cloud = ScriptedLLM()  # a cloud provider, behind the chain's PreCloudLLM gate
+    cloud.script("session_summary", _summary())
+    set_chain(FallbackChainProvider([RedactingProvider(cloud, PreCloudLLMRedactor(hooks))]))
+    _session(store, S1)
+    _messages(store, S1, 16)
+    store.chat_messages.insert(0, ChatMessage(
+        id=str(uuid.uuid4()), session_id=S1, user_id=U, role="user",
+        content="Mail madhav@example.com or call 555-123-4567 about the plan",
+        created_at=T0,
+    ))
+
+    assert await service.compact_if_needed(U, S1) is True
+
+    (call,) = cloud.calls
+    assert "madhav@example.com" not in call.prompt and "555-123-4567" not in call.prompt
+    assert "[EMAIL]" in call.prompt and "[PHONE]" in call.prompt
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_forget_filter__production_embedder__run_on_sentence_dropped_unrelated_kept(
+    store, repos, clock, llm
+):
+    """Calibration on the real sentence model (all-MiniLM-L6-v2, local, no network once
+    cached). Skipped when the model is not on this machine."""
+    from app.infrastructure.embedding import MiniLMEmbedder
+
+    embedder = MiniLMEmbedder()
+    try:
+        embedder.embed(["warm up"])
+    except EmbeddingUnavailableError:
+        pytest.skip("the local sentence model is not downloaded")
+    memory = MemoryService(repos.memories, embedder, clock=clock)
+    for fact in ("My sister Priya lives in Pune", "I'm going through a divorce"):
+        outcome = await memory.remember(U, MemoryCandidate(memory_type="fact", content=fact))
+        await memory.forget(U, outcome.memory.id)
+    kept = [
+        "You were planning your DSA revision for Friday.",
+        "You said evenings are hard this week, so we kept them light.",
+        "Your family is visiting on Sunday, so we kept the afternoon free.",
+    ]
+    dropped = [
+        "We moved graphs to Saturday morning, and you mentioned that your sister Priya lives "
+        "in Pune and is visiting on Sunday, so we kept Sunday afternoon free.",
+        "You said the divorce has made evenings hard, so we kept evenings light this week "
+        "and moved the reading to mornings.",
+    ]
+    _session(store, S1, summary=" ".join([kept[0], dropped[0], kept[1], dropped[1], kept[2]]),
+             through=T0)
+    _messages(store, S1, 2)
+    service = ConversationMemoryService(
+        repos.conversations, repos.task_events, clock=clock, memory=memory
+    )
+
+    window = await service.build_history(U, S1)
+
+    assert window.earlier == "Earlier in this conversation: " + " ".join(kept)

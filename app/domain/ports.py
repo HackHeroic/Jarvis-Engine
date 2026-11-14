@@ -388,22 +388,36 @@ class ConversationRepository(ABC):
         *,
         after: datetime | None = None,
         limit: int = 50,
+        oldest_first: bool = False,
     ) -> list[ChatMessage]:
         """Return the session's newest ``limit`` messages created after ``after``, oldest first.
 
         The read is newest first, so a bound (or PostgREST's 1000-row cap) only ever
-        leaves out the oldest. A negative ``limit`` raises ValidationError.
+        leaves out the oldest. With ``oldest_first`` it is the OLDEST ``limit`` instead
+        (read oldest first, for paging forward through a backlog). A negative ``limit``
+        raises ValidationError.
         """
 
     @abstractmethod
     async def set_summary(
-        self, user_id: str, session_id: str, summary: str, through: datetime
-    ) -> None:
-        """Store the session's summary, the last message it covers, and when it was written.
+        self,
+        user_id: str,
+        session_id: str,
+        summary: str,
+        through: datetime,
+        *,
+        written_at: datetime | None = None,
+    ) -> bool:
+        """Store the session's summary, where its verbatim window starts, and when it was
+        written (``written_at``, default the store's clock); True when it was stored.
 
-        The session's ``updated_at`` (its last activity) does not change. Raises
-        ValidationError for a blank summary, one over SESSION_SUMMARY_MAX_CHARS, or a
-        naive ``through``; NotFoundError if the user has no such session.
+        A compare-and-set: it writes only while the stored ``summary_through`` is null or
+        no later than ``through``, checked in the same step as the write, so a slower
+        writer never replaces a summary that reaches further. False when it did not
+        write for that reason (another writer won: nothing to do). The session's
+        ``updated_at`` (its last activity) does not change. Raises ValidationError for a
+        blank summary, one over SESSION_SUMMARY_MAX_CHARS, or a naive ``through``;
+        NotFoundError if the user has no such session.
         """
 
     @abstractmethod

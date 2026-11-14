@@ -474,13 +474,14 @@ class ConversationSession(BaseModel):
     summary: str | None = Field(
         default=None,
         max_length=4000,
-        description="Running summary of every message up to summary_through; None until the "
-        "first one is written.",
+        description="Running summary of the conversation: every message up to "
+        "summary_through, and, once it went idle, the newest ones after it too. None until "
+        "the first one is written.",
     )
     summary_through: datetime | None = Field(
         default=None,
-        description="created_at of the last message the summary covers; the history window "
-        "starts after it.",
+        description="Where the verbatim window starts: the history shows only the messages "
+        "created after it. It never moves back.",
     )
     summary_updated_at: datetime | None = Field(
         default=None, description="When the summary was last written."

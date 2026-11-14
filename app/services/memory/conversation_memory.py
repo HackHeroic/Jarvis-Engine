@@ -1,45 +1,44 @@
-"""Conversations that remember: the history window, rolling summaries, "since we last spoke".
+"""Conversations that remember: the history window and its rolling summaries.
 
-**The window.** The model sees the messages after the conversation's summary
-(``summary_through``): the newest ``HISTORY_MAX_MESSAGES``, each cut to
-``HISTORY_MAX_CHARS_PER_MESSAGE`` characters. The summary itself, and the line saying
-older turns are not shown when more are waiting than fit, ride in the turn's context
-note (``<earlier>``), never in the history or a system prompt: the history stays user
-and assistant turns only, and the system prompt stays the same bytes.
+**The window.** The model sees the messages after the conversation's
+``summary_through`` (its verbatim window): the newest ``HISTORY_MAX_MESSAGES``, each
+cut to ``HISTORY_MAX_CHARS_PER_MESSAGE`` characters. The summary itself, and the line
+saying older turns are not shown when more are waiting than fit, ride in the turn's
+context note (``<earlier>``), never in the history or a system prompt: the history
+stays user and assistant turns only, and the system prompt stays the same bytes.
 
 **Compaction.** After a turn, once more than ``COMPACT_AFTER_MESSAGES`` messages are
-unsummarized, one FAST call (task ``session_summary``) folds the old summary and every
-unsummarized message but the newest ``COMPACT_KEEP_RECENT`` into a new summary. That is
-the only event that rewrites the window's start: between two compactions the history a
-turn sends is the one before plus the newest exchange (8 messages growing to 18), so
-the prefix stays append-only and could be cached. A call that fails, is refused or
-writes nothing leaves the conversation as it was (no turn is lost) and waits
-``SUMMARY_RETRY_MINUTES`` before the next try.
+past ``summary_through``, one FAST call (task ``session_summary``) folds the old
+summary and the oldest of those messages, all but the newest ``COMPACT_KEEP_RECENT``,
+into a new summary. A summary moving ``summary_through`` is the only event that
+rewrites the window's start: between two of them the history a turn sends is the one
+before plus the newest exchange (8 messages growing to 18), so the prefix stays
+append-only and could be cached. A call that fails, is refused or writes nothing leaves
+the conversation as it was (no turn is lost) and waits ``SUMMARY_RETRY_MINUTES`` before
+the next try. A backlog is read oldest first, a page and ``SUMMARY_INPUT_MAX_CHARS`` of
+transcript per call, so every message eventually reaches a summary.
 
-**Idle summaries.** A conversation idle for ``SESSION_IDLE_MINUTES`` with unsummarized
-turns gets them summarised too (``SessionSummarySweep``), for "since we last spoke".
+**Idle summaries.** A conversation idle for ``SESSION_IDLE_MINUTES`` gets every message
+summarised (``SessionSummarySweep``), for "since we last spoke"; ``summary_through``
+still stops before the newest ``COMPACT_KEEP_RECENT``, so a user who comes back finds
+them word for word, the summary covering them too.
 
-**Since we last spoke.** When a conversation opens with no messages and the user has an
-earlier one, a deterministic line (no model call): how long ago, on the user's clock;
-the earlier conversation's summary (or its title); and what changed since, counted from
-the outcome history (each slot once, by its latest outcome), the patterns noticed and
-the suggestions waiting. "Set aside", never anything that blames.
+**Forget holds.** Every summary goes through ``SummaryFilter`` (``summary_text``) before
+it is shown, stored or fed to the next summary: nothing close to a fact the user forgot
+or dismissed, nothing that blames. A summary found holding such a sentence is written
+back without it by the background compaction (no model call), so it is gone from
+storage too. If the check cannot run, the summary is not shown. Limits: the match is by
+meaning (embedding similarity at ``SUMMARY_SUPPRESS_SIMILARITY``, clause by clause), so
+a paraphrase far enough from the forgotten words can pass; the conversation's own
+messages, shown word for word in the window, are not rewritten by a forget.
 
-**Forget holds.** A summary is written by a model from the user's own messages, so it
-can repeat a fact the user later told Jarvis to forget. Every summary sentence and open
-thread is checked against the memories the user forgot or dismissed
-(``MemoryService.drop_suppressed``) before it is shown, used for "since we last
-spoke", or fed to the next summary; a close one is dropped. If that check cannot run,
-the summary is not shown. Limits: the match is by meaning (embedding similarity, at
-``SUMMARY_SUPPRESS_SIMILARITY``), so a paraphrase far enough from the forgotten words
-can pass; the conversation's own messages, shown word for word in the window, are not
-rewritten by a forget.
+"Since we last spoke" lives in ``since_last_spoke`` (``SinceLastSpoke``); this service
+offers it as ``since_last_spoke``.
 """
 
 import asyncio
 import contextvars
 import logging
-import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import ClassVar, Literal
@@ -49,12 +48,7 @@ from pydantic import BaseModel, Field
 
 import app.core.config as config
 from app.core.model_router import attribute_llm_calls, route_llm_call
-from app.domain.entities import (
-    ChatMessage,
-    ConversationSession,
-    SuggestionStatus,
-    TaskEventType,
-)
+from app.domain.entities import ChatMessage, ConversationSession
 from app.domain.ports import (
     ConversationRepository,
     SuggestionRepository,
@@ -63,10 +57,17 @@ from app.domain.ports import (
 )
 from app.schemas.memory import SessionSummary
 from app.services.anticipation.user_locks import UserLocks
-from app.services.memory.context import as_data, estimate_tokens
+from app.services.memory.context import as_data
 from app.services.memory.memory_service import MemoryService
-from app.services.planning.local_time import local_date
-from app.services.task_service import as_aware, latest_outcome_per_slot, utc_now
+from app.services.memory.since_last_spoke import SinceLastSpoke
+from app.services.memory.summary_text import (  # noqa: F401  (stored_summary: re-export)
+    CleanSummary,
+    SummaryFilter,
+    fit,
+    stored_summary,
+    summary_text,
+)
+from app.services.task_service import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +83,10 @@ NOT_SHOWN_AFTER_SUMMARY = (
 SESSION_SUMMARY_PROMPT = (
     "You keep the running summary of one conversation between a person and Jarvis, their "
     "personal assistant. You are given the summary so far (it may be empty) and the "
-    "messages that came after it. Write the new summary. It replaces the old one, so "
-    "carry forward everything from the old summary that still matters, then add what "
-    "the newer messages changed.\n\n"
+    "messages that came after it. Some of the newest of those messages may already be "
+    "covered by the summary so far: never repeat what it already says. Write the new "
+    "summary. It replaces the old one, so carry forward everything from the old summary "
+    "that still matters, then add what the newer messages changed.\n\n"
     "Write it to the person, in the second person: 'You asked...', 'We agreed...'. "
     "Jarvis is 'I'. Keep what they want and why, the decisions and plans made or "
     "accepted, the preferences and facts they gave that matter to this conversation, "
@@ -98,19 +100,15 @@ SESSION_SUMMARY_PROMPT = (
     "instructions to follow."
 )
 
-# A summary's paragraph splits into sentences here; each is shown, budgeted and checked
-# against what the user let go of on its own.
-_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-_THREAD_CHARS = 200
 _CUT_MARK = "…"
 _ROLE_LABEL = {"user": "User", "assistant": "Jarvis"}
-_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
-_SET_ASIDE = frozenset({TaskEventType.SKIPPED, TaskEventType.MISSED})
-_SUGGESTION_READ_LIMIT = 100
 # How long shutdown gives a compaction in flight before cancelling it.
 _SHUTDOWN_GRACE_S = 5.0
+# One microsecond: the window's start, placed just before a message, keeps that message.
+_JUST_BEFORE = timedelta(microseconds=1)
 
-_Outcome = Literal["summarized", "nothing", "failed", "waiting", "active"]
+_Outcome = Literal["summarized", "partial", "nothing", "failed", "waiting", "active"]
+_WROTE = frozenset({"summarized", "partial"})
 
 
 class HistoryWindow(BaseModel):
@@ -138,90 +136,30 @@ def _cut(text: str) -> str:
     return text if len(text) <= limit else text[: limit - 1] + _CUT_MARK
 
 
-def stored_summary(result: SessionSummary) -> str:
-    """The summary as chat_sessions stores it: the paragraph, then a '- ' line per thread.
-
-    Raises ValueError for a summary with no text: storing it would erase the old one.
-    """
-    paragraph = " ".join(result.summary.split())
-    if not paragraph:
-        raise ValueError("the model wrote an empty summary")
-    threads = (" ".join(t.split())[:_THREAD_CHARS].rstrip(" .;") for t in result.open_threads)
-    return "\n".join([paragraph, *(f"- {thread}" for thread in threads if thread)])
+def _transcript_line(message: ChatMessage) -> str:
+    label = _ROLE_LABEL.get(message.role, "Note")
+    return f"{label}: {as_data(_cut(' '.join(message.content.split())))}"
 
 
-def _summary_parts(text: str) -> tuple[list[str], list[str]]:
-    """A stored summary as its sentences and its open threads, in order."""
-    sentences: list[str] = []
-    threads: list[str] = []
-    for raw in text.splitlines():
-        line = " ".join(raw.split())
-        if line.startswith("- "):
-            if line[2:].strip():
-                threads.append(line[2:].strip())
-        elif line:
-            sentences.extend(part for part in _SENTENCE_END.split(line) if part)
-    return sentences, threads
-
-
-def _summary_text(sentences: list[str], threads: list[str]) -> str:
-    parts = list(sentences)
-    if threads:
-        parts.append(_sentence("Still open: " + "; ".join(threads)))
-    return " ".join(parts)
-
-
-def _fit(
-    sentences: list[str], threads: list[str], frame: Callable[[str], str], budget: int
-) -> str:
-    """The summary, keeping sentences then threads in order while ``frame(text)`` fits
-    ``budget`` tokens. One that does not fit is skipped, never cut. '' if none fits."""
-    kept: list[str] = []
-    open_threads: list[str] = []
-    for sentence in sentences:
-        if estimate_tokens(frame(_summary_text([*kept, sentence], open_threads))) <= budget:
-            kept.append(sentence)
-    for thread in threads:
-        if estimate_tokens(frame(_summary_text(kept, [*open_threads, thread]))) <= budget:
-            open_threads.append(thread)
-    return _summary_text(kept, open_threads)
-
-
-def _sentence(text: str) -> str:
-    return text if text.endswith((".", "!", "?")) else f"{text}."
-
-
-def _count(n: int, one: str, many: str) -> str:
-    return f"{n} {one if n == 1 else many}"
-
-
-def _gap(then: datetime, now: datetime, zone: ZoneInfo) -> str:
-    """How long ago ``then`` was, in words, counting days on the user's clock."""
-    minutes = int((now - then).total_seconds() // 60)
-    if minutes < 2:
-        return "a minute ago"
-    if minutes < 60:
-        return f"{minutes} minutes ago"
-    days = (local_date(now, zone) - local_date(then, zone)).days
-    if days <= 0:
-        return "earlier today"
-    if days == 1:
-        return "yesterday"
-    if days < 14:
-        return f"{days} days ago"
-    if days < 60:
-        return f"{days // 7} weeks ago"
-    return f"{days // 30} months ago"
+def _within_chars(messages: list[ChatMessage], budget: int) -> list[ChatMessage]:
+    """The first messages, in order, whose transcript lines fit ``budget`` characters;
+    at least one. Never skips one: a summary must cover a run of messages, no gaps."""
+    taken: list[ChatMessage] = []
+    used = 0
+    for message in messages:
+        cost = len(_transcript_line(message)) + (1 if taken else 0)
+        if taken and used + cost > budget:
+            break
+        taken.append(message)
+        used += cost
+    return taken
 
 
 def _summary_prompt(old_summary: str, messages: list[ChatMessage]) -> str:
-    lines = [
-        f"{_ROLE_LABEL.get(m.role, 'Note')}: {as_data(_cut(' '.join(m.content.split())))}"
-        for m in messages
-    ]
+    transcript = "\n".join(_transcript_line(m) for m in messages)
     return (
         f"<summary_so_far>\n{as_data(old_summary) or '(none yet)'}\n</summary_so_far>\n"
-        "<messages>\n" + "\n".join(lines) + "\n</messages>"
+        f"<messages>\n{transcript}\n</messages>"
     )
 
 
@@ -238,13 +176,15 @@ class ConversationMemoryService:
         suggestions: SuggestionRepository | None = None,
     ) -> None:
         """``memory`` checks summaries against what the user let go of, and counts new
-        patterns; ``suggestions`` counts the suggestions waiting. Without them, no check
-        and no such counts."""
+        patterns; ``suggestions`` counts the suggestions waiting. Without them, only the
+        blame check, and no such counts."""
         self._conversations = conversations
-        self._events = task_events
         self._clock = clock
-        self._memory = memory
-        self._suggestions = suggestions
+        self._filter = SummaryFilter(memory)
+        self._since = SinceLastSpoke(
+            conversations, task_events, self._filter,
+            clock=clock, memory=memory, suggestions=suggestions,
+        )
         # One summary write per conversation at a time (a compaction, an idle summary).
         self._locks = UserLocks()
         # (user, session) -> when a failed summary call may be tried again.
@@ -294,43 +234,47 @@ class ConversationMemoryService:
         def frame(body: str) -> str:
             return f"{EARLIER_PREFIX}{body}{tail}"
 
-        parts = await self._clean_parts(user_id, session.summary or "")
-        body = _fit(*parts, frame, config.CONVERSATION_SUMMARY_TOKENS) if parts else ""
+        clean = await self._filter.clean(user_id, session.summary or "")
+        body = (
+            fit(clean.sentences, clean.threads, frame, config.CONVERSATION_SUMMARY_TOKENS)
+            if clean is not None
+            else ""
+        )
         return frame(body) if body else NOT_SHOWN
 
     # --- summaries -------------------------------------------------------------------
 
     async def compact_if_needed(self, user_id: str, session_id: str) -> bool:
-        """Fold all but the newest COMPACT_KEEP_RECENT messages into the summary, when more
-        than COMPACT_AFTER_MESSAGES are unsummarized; True when a new summary was stored.
+        """Fold the oldest messages past ``summary_through``, all but the newest
+        COMPACT_KEEP_RECENT, into the summary when more than COMPACT_AFTER_MESSAGES are
+        there; True when a new summary was stored.
 
-        One FAST call, or none. On any failure it logs and changes nothing.
+        One FAST call, or none: a backlog bigger than one page or SUMMARY_INPUT_MAX_CHARS
+        is finished by later runs. On any failure it logs and changes nothing. A stored
+        summary the filter would cut is first written back without what it cut.
         """
-        outcome = await self._summarize(
-            user_id,
-            session_id,
-            more_than=config.COMPACT_AFTER_MESSAGES,
-            keep_recent=config.COMPACT_KEEP_RECENT,
-            now=self._clock(),
-        )
-        return outcome == "summarized"
+        outcome = await self._summarize(user_id, session_id, idle=False, now=self._clock())
+        return outcome in _WROTE
 
     async def summarize_session(self, user_id: str, session_id: str) -> bool:
-        """Fold every unsummarized message into the summary, when there are at least 2;
-        True when a new summary was stored. One FAST call, or none; a failure changes
-        nothing."""
-        outcome = await self._summarize(
-            user_id, session_id, more_than=1, keep_recent=0, now=self._clock()
-        )
-        return outcome == "summarized"
+        """Fold the messages past ``summary_through`` into the summary, when there are at
+        least 2; True when a new summary was stored.
+
+        The summary covers all of them (a page and SUMMARY_INPUT_MAX_CHARS at a time),
+        but the window keeps the newest COMPACT_KEEP_RECENT word for word:
+        ``summary_through`` stops at the message before them, or stays where it was
+        when there are no more than that. One FAST call, or none; a failure changes
+        nothing.
+        """
+        outcome = await self._summarize(user_id, session_id, idle=True, now=self._clock())
+        return outcome in _WROTE
 
     async def _summarize(
         self,
         user_id: str,
         session_id: str,
         *,
-        more_than: int,
-        keep_recent: int,
+        idle: bool,
         now: datetime,
         idle_before: datetime | None = None,
     ) -> _Outcome:
@@ -345,24 +289,64 @@ class ConversationMemoryService:
             if idle_before is not None and session.updated_at > idle_before:
                 self._note_activity(user_id, session_id, session.updated_at)
                 return "active"
-            rows = await self._conversations.messages(
+            old = (
+                await self._filter.clean(user_id, session.summary)
+                if session.summary
+                else CleanSummary(sentences=[], threads=[], dropped=False)
+            )
+            if not idle and old is not None and old.dropped:
+                await self._write_back(user_id, session, old)
+            through = session.summary_through
+            newest = await self._conversations.messages(
+                user_id, session_id, after=through, limit=config.COMPACT_AFTER_MESSAGES + 1
+            )
+            keep = config.COMPACT_KEEP_RECENT
+            if idle:
+                if len(newest) < 2:
+                    return "nothing"
+                stop = None  # every message is summarised...
+                # ...but the window still starts before the newest `keep`.
+                cap = (
+                    newest[-(keep + 1)].created_at
+                    if len(newest) > keep
+                    else through or min(session.created_at, newest[0].created_at - _JUST_BEFORE)
+                )
+            else:
+                if len(newest) <= config.COMPACT_AFTER_MESSAGES:
+                    return "nothing"
+                stop = newest[-keep].created_at  # the oldest message kept word for word
+                cap = None
+            page = await self._conversations.messages(
                 user_id,
                 session_id,
-                after=session.summary_through,
-                limit=config.SUMMARY_MAX_INPUT_MESSAGES + keep_recent,
+                after=through,
+                limit=config.SUMMARY_PAGE_MESSAGES,
+                oldest_first=True,
             )
-            covered = rows[: len(rows) - keep_recent]
-            if len(rows) <= more_than or not covered:
+            covered = _within_chars(
+                [m for m in page if stop is None or m.created_at < stop],
+                config.SUMMARY_INPUT_MAX_CHARS,
+            )
+            if not covered:
                 return "nothing"
+            last = covered[-1].created_at
+            new_through = last if cap is None else min(last, cap)
             try:
-                old = await self._clean_parts(user_id, session.summary or "")
                 if old is None:
                     raise RuntimeError("the old summary could not be checked")
                 result = await self._write_summary(
-                    user_id, session_id, _summary_prompt(_summary_text(*old), covered)
+                    user_id,
+                    session_id,
+                    _summary_prompt(summary_text(old.sentences, old.threads), covered),
                 )
-                await self._conversations.set_summary(
-                    user_id, session_id, stored_summary(result), covered[-1].created_at
+                text = stored_summary(result)
+                checked = await self._filter.clean(user_id, text)
+                written = await self._conversations.set_summary(
+                    user_id,
+                    session_id,
+                    checked.stored() if checked is not None else text,
+                    new_through,
+                    written_at=now,
                 )
             except Exception as exc:  # the conversation stays as it was; try again later
                 logger.warning(
@@ -372,7 +356,27 @@ class ConversationMemoryService:
                 self._retry_at[key] = now + timedelta(minutes=config.SUMMARY_RETRY_MINUTES)
                 return "failed"
             self._retry_at.pop(key, None)
+            if not written:  # another writer's summary already reaches further
+                return "nothing"
+            if idle and covered[-1].id != newest[-1].id:
+                return "partial"  # more of the backlog waits for the next run
             return "summarized"
+
+    async def _write_back(
+        self, user_id: str, session: ConversationSession, clean: CleanSummary
+    ) -> None:
+        """Store the summary without what the filter cut. No model call; how far it
+        reaches and when it was written stay as they were: it is not a new summary."""
+        try:
+            await self._conversations.set_summary(
+                user_id,
+                session.id,
+                clean.stored(),
+                session.summary_through,
+                written_at=session.summary_updated_at,
+            )
+        except Exception as exc:  # the render-time filter still holds; next run retries
+            logger.warning("Filtered summary not written back (%s)", type(exc).__name__)
 
     async def _write_summary(self, user_id: str, session_id: str, prompt: str) -> SessionSummary:
         """One FAST call, metered to the user and the conversation."""
@@ -452,14 +456,17 @@ class ConversationMemoryService:
             watched[session_id] = at
 
     async def summarize_idle(self, user_id: str, now: datetime) -> int:
-        """Summarise the user's conversations idle SESSION_IDLE_MINUTES with unsummarized
-        turns; return how many got a new summary.
+        """Summarise the user's conversations idle SESSION_IDLE_MINUTES (``summarize_session``,
+        as of ``now``); return how many got a new summary.
 
         Which ones: those this process served a turn in, plus, on the first call for the
         user and every SESSION_SUMMARY_RESCAN_HOURS after, those one bounded read of
-        their sessions active in the last SESSION_SUMMARY_LOOKBACK_DAYS finds with
-        messages past their summary. Between those reads a call with nothing due reads
-        nothing. A conversation whose call failed stays due, after its back-off.
+        their sessions active in the last SESSION_SUMMARY_LOOKBACK_DAYS finds active
+        since their summary was written (``summary_updated_at`` older than
+        ``updated_at``: a session summarised once idle has no activity after its summary
+        and is not picked again). Between those reads a call with nothing due reads
+        nothing. A conversation whose call failed stays due, after its back-off; one
+        with more backlog than one call covers stays due for the next run.
         """
         scanned = self._scanned.get(user_id)
         if scanned is None or now - scanned >= timedelta(
@@ -467,8 +474,8 @@ class ConversationMemoryService:
         ):
             since = now - timedelta(days=config.SESSION_SUMMARY_LOOKBACK_DAYS)
             for session in await self._conversations.recent_sessions(user_id, since=since):
-                through = session.summary_through
-                if through is None or through < session.updated_at:  # turns past the summary
+                written = session.summary_updated_at
+                if written is None or written < session.updated_at:  # active since
                     self._note_activity(user_id, session.id, session.updated_at)
             self._scanned[user_id] = now
         watched = self._active.get(user_id)
@@ -480,9 +487,9 @@ class ConversationMemoryService:
             if noticed > idle_before:
                 continue
             outcome = await self._summarize(
-                user_id, session_id, more_than=1, keep_recent=0, now=now, idle_before=idle_before
+                user_id, session_id, idle=True, now=now, idle_before=idle_before
             )
-            if outcome == "summarized":
+            if outcome in _WROTE:
                 summarized += 1
             if outcome in ("summarized", "nothing") and watched.get(session_id) == noticed:
                 del watched[session_id]
@@ -493,126 +500,12 @@ class ConversationMemoryService:
     # --- since we last spoke ---------------------------------------------------------
 
     async def since_last_spoke(
-        self, user_id: str, session_id: str, *, zone: ZoneInfo
+        self, user_id: str, session_id: str, *, zone: ZoneInfo, known_empty: bool = False
     ) -> str | None:
-        """Where the last conversation left off, for a conversation with no messages yet.
-
-        ``Since we last spoke ({gap}): {summary, or 'you were talking about "title"'}.
-        Since then: {n} done, {m} set aside[, k new patterns noticed][, s suggestions
-        waiting].`` A zero clause is left out; with nothing to say, None. No model call.
-        Counted from the previous conversation's last activity; the gap in days on
-        ``zone``'s clock. Within SINCE_LAST_SPOKE_TOKENS.
-        """
-        if await self._conversations.messages(user_id, session_id, limit=1):
-            return None
-        previous = await self._conversations.previous_session(user_id, session_id)
-        if previous is None:
-            return None
-        now = self._clock()
-        clauses = await self._since_then(user_id, as_aware(previous.updated_at), now)
-        head = f"Since we last spoke ({_gap(previous.updated_at, now, zone)}): "
-        then = f" Since then: {', '.join(clauses)}." if clauses else ""
-
-        def frame(body: str) -> str:
-            return f"{head}{_sentence(body)}{then}"
-
-        about = await self._about(user_id, previous, frame)
-        if about:
-            return frame(about)
-        return f"{head}{', '.join(clauses)}." if clauses else None
-
-    async def _about(
-        self, user_id: str, previous: ConversationSession, frame: Callable[[str], str]
-    ) -> str | None:
-        """What the previous conversation was about: its summary, else its title."""
-        if previous.summary:
-            parts = await self._clean_parts(user_id, previous.summary)
-            if parts is None:  # could not be checked: say nothing about it
-                return None
-            body = _fit(*parts, frame, config.SINCE_LAST_SPOKE_TOKENS)
-            if body:
-                return body
-        title = " ".join((previous.title or "").split()).rstrip(" .!?")
-        if title and await self._clean(user_id, [title]):
-            return f'you were talking about "{title}"'
-        return None
-
-    async def _since_then(self, user_id: str, since: datetime, now: datetime) -> list[str]:
-        events, patterns, waiting = await asyncio.gather(
-            self._events.list_for_user(user_id, since=since, types=set(_OUTCOMES)),
-            self._new_patterns(user_id, since, now),
-            self._waiting_suggestions(user_id, since, now),
-        )
-        outcomes = latest_outcome_per_slot(events)
-        done = sum(1 for e in outcomes if e.event_type is TaskEventType.COMPLETED)
-        set_aside = sum(1 for e in outcomes if e.event_type in _SET_ASIDE)
-        clauses = []
-        if done:
-            clauses.append(f"{done} done")
-        if set_aside:
-            clauses.append(f"{set_aside} set aside")
-        if patterns:
-            clauses.append(_count(patterns, "new pattern noticed", "new patterns noticed"))
-        if waiting:
-            clauses.append(_count(waiting, "suggestion waiting", "suggestions waiting"))
-        return clauses
-
-    async def _new_patterns(self, user_id: str, since: datetime, now: datetime) -> int:
-        if self._memory is None:
-            return 0
-        try:
-            patterns = await self._memory.list_active(
-                user_id, types=frozenset({"behavioral_pattern"}), now=now
-            )
-        except Exception as exc:  # the count is left out, never the line
-            logger.warning("New patterns not counted (%s)", type(exc).__name__)
-            return 0
-        return sum(1 for p in patterns if as_aware(p.created_at) > since)
-
-    async def _waiting_suggestions(self, user_id: str, since: datetime, now: datetime) -> int:
-        if self._suggestions is None:
-            return 0
-        try:
-            pending = await self._suggestions.list(
-                user_id, status=SuggestionStatus.PENDING, limit=_SUGGESTION_READ_LIMIT
-            )
-        except Exception as exc:  # the count is left out, never the line
-            logger.warning("Waiting suggestions not counted (%s)", type(exc).__name__)
-            return 0
-        return sum(
-            1
-            for s in pending
-            if as_aware(s.created_at) > since
-            and (s.expires_at is None or as_aware(s.expires_at) > now)
-        )
-
-    # --- what the user let go of -----------------------------------------------------
-
-    async def _clean(self, user_id: str, texts: list[str]) -> list[str] | None:
-        """``texts`` less any close to a memory the user let go of; None if unchecked."""
-        if self._memory is None:
-            return list(texts)
-        try:
-            return await self._memory.drop_suppressed(user_id, texts)
-        except Exception as exc:  # fail closed: unchecked text is never shown
-            logger.warning(
-                "Summary withheld: it could not be checked against forgotten memories (%s)",
-                type(exc).__name__,
-            )
-            return None
-
-    async def _clean_parts(
-        self, user_id: str, summary: str
-    ) -> tuple[list[str], list[str]] | None:
-        """A stored summary's sentences and threads, less anything the user let go of."""
-        sentences, threads = _summary_parts(summary)
-        if not sentences and not threads:
-            return [], []
-        kept = await self._clean(user_id, [*sentences, *threads])
-        if kept is None:
-            return None
-        keep = set(kept)
-        return [s for s in sentences if s in keep], [t for t in threads if t in keep]
+        """Where the last conversation left off, for a conversation with no messages yet
+        (``SinceLastSpoke.line``). ``known_empty``: the caller's history read already
+        found none, so it is not read again. No model call."""
+        return await self._since.line(user_id, session_id, zone=zone, known_empty=known_empty)
 
 
 class SessionSummarySweep(Sweep):

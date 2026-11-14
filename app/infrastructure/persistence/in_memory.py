@@ -656,6 +656,7 @@ class InMemoryConversationRepository(ConversationRepository):
         *,
         after: datetime | None = None,
         limit: int = 50,
+        oldest_first: bool = False,
     ) -> list[ChatMessage]:
         check_limit(limit)
         found = [
@@ -665,19 +666,35 @@ class InMemoryConversationRepository(ConversationRepository):
             and m.session_id == session_id
             and (after is None or utc(m.created_at) > utc(after))
         ]
-        newest = sorted(found, key=lambda m: (utc(m.created_at), m.id), reverse=True)[:limit]
-        return [normalized(m) for m in reversed(newest)]
+        found.sort(key=lambda m: (utc(m.created_at), m.id))
+        chosen = found[:limit] if oldest_first else found[max(0, len(found) - limit) :]
+        return [normalized(m) for m in chosen]
 
     async def set_summary(
-        self, user_id: str, session_id: str, summary: str, through: datetime
-    ) -> None:
+        self,
+        user_id: str,
+        session_id: str,
+        summary: str,
+        through: datetime,
+        *,
+        written_at: datetime | None = None,
+    ) -> bool:
         summary, through = checked_summary(summary, through)
+        # No await between the check and the write: the compare-and-set is atomic.
         i = self._index(user_id, session_id)
         if i is None:
             raise not_found("session", session_id)
+        stored = self._store.chat_sessions[i].summary_through
+        if stored is not None and utc(stored) > through:
+            return False
         self._store.chat_sessions[i] = self._store.chat_sessions[i].model_copy(
-            update={"summary": summary, "summary_through": through, "summary_updated_at": now_utc()}
+            update={
+                "summary": summary,
+                "summary_through": through,
+                "summary_updated_at": utc(written_at) if written_at else now_utc(),
+            }
         )
+        return True
 
     async def recent_sessions(
         self, user_id: str, *, since: datetime
