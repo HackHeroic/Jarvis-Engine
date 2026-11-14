@@ -571,9 +571,18 @@ async def test_anti_guilt__skipping_tasks__every_reply_is_blame_free(jarvis, mon
 
 @pytest.mark.asyncio
 async def test_anti_guilt__learned_skip_pattern__insight_and_note_are_blame_free(
-    jarvis, embeddings
+    jarvis, embeddings, monkeypatch
 ):
-    from app.services.memory.pearl import detect_patterns, generate_proactive_insights
+    from app.services.memory.pearl import (
+        detect_patterns,
+        generate_proactive_insights,
+        pearl_registry,
+        register_default_patterns,
+    )
+
+    # The legacy detectors, for this test only: the app no longer registers them.
+    monkeypatch.setattr(pearl_registry, "_entries", {})
+    register_default_patterns()
 
     for i in range(3):
         jarvis.db.table("user_tasks").insert({
