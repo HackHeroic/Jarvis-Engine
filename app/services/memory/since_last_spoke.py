@@ -15,10 +15,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import app.core.config as config
-from app.domain.entities import ConversationSession, SuggestionStatus, TaskEventType
+from app.domain.entities import ConversationSession, Memory, SuggestionStatus, TaskEventType
 from app.domain.ports import ConversationRepository, SuggestionRepository, TaskEventRepository
 from app.services.memory.context import as_data
-from app.services.memory.memory_service import MemoryService
+from app.services.memory.memory_service import MemoryService, MemorySnapshot
 from app.services.memory.summary_text import CleanSummary, SummaryFilter, fit, sentence
 from app.services.planning.local_time import local_date
 from app.services.task_service import as_aware, latest_outcome_per_slot, utc_now
@@ -74,7 +74,13 @@ class SinceLastSpoke:
         self._suggestions = suggestions
 
     async def line(
-        self, user_id: str, session_id: str, *, zone: ZoneInfo, known_empty: bool = False
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        zone: ZoneInfo,
+        known_empty: bool = False,
+        snapshot: MemorySnapshot | None = None,
     ) -> str | None:
         """``Since we last spoke ({gap}): {summary, or 'you were talking about "title"'}.
         Since then: {n} done, {m} set aside[, k new patterns noticed][, s suggestions
@@ -84,7 +90,8 @@ class SinceLastSpoke:
         already knows (its history read found none), which saves a read; otherwise the
         conversation is checked first. Counted from the previous conversation's last
         activity; the gap in days on ``zone``'s clock; within SINCE_LAST_SPOKE_TOKENS.
-        The counts and the summary check run at the same time.
+        The counts and the summary check run at the same time. ``snapshot``: the user's
+        memories as the turn read them, for the pattern count and the forget check.
         """
         if not known_empty and await self._conversations.messages(user_id, session_id, limit=1):
             return None
@@ -93,8 +100,8 @@ class SinceLastSpoke:
             return None
         now = self._clock()
         clauses, subject = await asyncio.gather(
-            self._since_then(user_id, as_aware(previous.updated_at), now),
-            self._subject(user_id, previous),
+            self._since_then(user_id, as_aware(previous.updated_at), now, snapshot),
+            self._subject(user_id, previous, snapshot.let_go if snapshot is not None else None),
         )
         head = f"Since we last spoke ({gap(previous.updated_at, now, zone)}): "
         then = f" Since then: {', '.join(clauses)}." if clauses else ""
@@ -111,12 +118,12 @@ class SinceLastSpoke:
         return f"{head}{', '.join(clauses)}." if clauses else None
 
     async def _subject(
-        self, user_id: str, previous: ConversationSession
+        self, user_id: str, previous: ConversationSession, let_go: list[Memory] | None
     ) -> CleanSummary | str | None:
         """What the previous conversation was about: its summary (what the filter left),
         else its title; None when nothing may be said about it."""
         if previous.summary:
-            clean = await self._summaries.clean(user_id, previous.summary)
+            clean = await self._summaries.clean(user_id, previous.summary, let_go=let_go)
             if clean is None:  # could not be checked: say nothing about it
                 return None
             if clean.sentences or clean.threads:
@@ -124,15 +131,17 @@ class SinceLastSpoke:
         title = " ".join((previous.title or "").split()).rstrip(" .!?")
         if not title:
             return None
-        checked = await self._summaries.clean(user_id, title)
+        checked = await self._summaries.clean(user_id, title, let_go=let_go)
         if checked is None or checked.dropped:
             return None
         return f'you were talking about "{as_data(title)}"'
 
-    async def _since_then(self, user_id: str, since: datetime, now: datetime) -> list[str]:
+    async def _since_then(
+        self, user_id: str, since: datetime, now: datetime, snapshot: MemorySnapshot | None
+    ) -> list[str]:
         events, patterns, waiting = await asyncio.gather(
             self._events.list_for_user(user_id, since=since, types=set(_OUTCOMES)),
-            self._new_patterns(user_id, since, now),
+            self._new_patterns(user_id, since, now, snapshot),
             self._waiting_suggestions(user_id, since, now),
         )
         outcomes = latest_outcome_per_slot(events)
@@ -149,13 +158,16 @@ class SinceLastSpoke:
             clauses.append(_count(waiting, "suggestion waiting", "suggestions waiting"))
         return clauses
 
-    async def _new_patterns(self, user_id: str, since: datetime, now: datetime) -> int:
+    async def _new_patterns(
+        self, user_id: str, since: datetime, now: datetime, snapshot: MemorySnapshot | None
+    ) -> int:
+        types = frozenset({"behavioral_pattern"})
+        if snapshot is not None:
+            return sum(1 for p in snapshot.in_use(now, types=types) if as_aware(p.created_at) > since)
         if self._memory is None:
             return 0
         try:
-            patterns = await self._memory.list_active(
-                user_id, types=frozenset({"behavioral_pattern"}), now=now
-            )
+            patterns = await self._memory.list_active(user_id, types=types, now=now)
         except Exception as exc:  # the count is left out, never the line
             logger.warning("New patterns not counted (%s)", type(exc).__name__)
             return 0

@@ -508,8 +508,19 @@ class EnergyEstimator(ABC):
     """Estimates how well the user focuses at each hour of their day (Strategy)."""
 
     @abstractmethod
-    async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
-        """Return the user's focus profile as of ``now``, hours read on ``zone``'s clock."""
+    async def estimate(
+        self,
+        user_id: str,
+        zone: ZoneInfo,
+        *,
+        now: datetime,
+        events: list[TaskEvent] | None = None,
+    ) -> FocusProfile:
+        """Return the user's focus profile as of ``now``, hours read on ``zone``'s clock.
+
+        ``events``: the user's outcome events of the estimator's window, when the
+        caller has already read them; an estimator that reads history reads it otherwise.
+        """
 
 
 # --- Embeddings -------------------------------------------------------------

@@ -645,3 +645,39 @@ def test_brain_dump_prompt__memories_first__never_exclusive_of_inline_habits():
     # Nothing tells the model a habit cannot also be a memory.
     for text in (prompt, BrainDumpExtraction.model_fields["memories"].description):
         assert "repeat of inline_habits" not in text
+
+
+# --- what one turn costs the store ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_turn__store_reads__memories_listed_once_pearl_looks_once_profile_read_once(
+    jarvis, llm, monkeypatch
+):
+    """A turn reads the user's memories once (recall, the extraction's known memories and
+    the suppression check share it), and PEARL looks once (the learning moments and the
+    complete frame's insights share it), on the profile the turn already read."""
+    from collections import Counter
+
+    await _seed_skips_at_nine(jarvis)
+    first = await jarvis.say("Anything I should know about my week?")
+    patterns = jarvis.state.container.patterns
+    detections: list[str] = []
+    detect = patterns._detect
+
+    async def counted(user_id, *args, **kwargs):
+        detections.append(user_id)
+        return await detect(user_id, *args, **kwargs)
+
+    monkeypatch.setattr(patterns, "_detect", counted)
+    jarvis.db.selects.clear()
+
+    second = await jarvis.say("And how is next week looking?", session=first.conversation_id)
+
+    reads = Counter(table for table, _ in jarvis.db.selects)
+    assert reads["user_memories"] == 2, "the turn's one read, and PEARL's pattern memories"
+    assert reads["user_profiles"] == 1
+    assert reads["task_events"] == 1
+    assert detections == ["alice"]
+    (insight,) = second.payload["pearl_insights"]
+    assert "9 AM" in insight["insight"]

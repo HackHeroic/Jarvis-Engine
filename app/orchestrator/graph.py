@@ -270,13 +270,18 @@ KNOWN_MEMORY_LIMIT = 15
 KNOWN_MEMORIES_TIMEOUT_S = 1.0
 
 
-async def _known_memories(user_id: str | None) -> list:
+async def _known_memories(user_id: str | None, snapshot: Any = None) -> list:
     """The user's newest active memories, oldest first; none without a composition root.
 
-    A slow or failing read gives none: the turn is extracted without them.
+    From the turn's ``snapshot`` (``MemorySnapshot``) when it has one: no read of its
+    own. Otherwise a slow or failing read gives none: the turn is extracted without them.
     """
     from app.core.runtime import registered_container
+    from app.services.task_service import utc_now
 
+    if snapshot is not None:
+        memories = snapshot.in_use(utc_now())
+        return [m for m in memories if m.id and m.content.strip()][-KNOWN_MEMORY_LIMIT:]
     container = registered_container()
     if container is None or not user_id:
         return []
@@ -335,7 +340,9 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     if not user_msg.strip():
         return {"brain_dump": None, "trivial_input": False}
 
-    prompt, handles = _extraction_prompt(user_msg, await _known_memories(state.get("user_id")))
+    prompt, handles = _extraction_prompt(
+        user_msg, await _known_memories(state.get("user_id"), state.get("memory_snapshot"))
+    )
     try:
         result = await route_llm_call(
             task="brain_dump_extraction",

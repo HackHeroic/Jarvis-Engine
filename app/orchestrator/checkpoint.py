@@ -66,6 +66,7 @@ _TRANSIENT_KEYS = (
     "file_name",
     "conversation_history",
     "memory_context",
+    "memory_snapshot",
 )
 
 

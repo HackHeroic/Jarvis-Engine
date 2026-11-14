@@ -15,7 +15,13 @@ from zoneinfo import ZoneInfo
 
 import app.core.config as config
 from app.core.config import FOCUS_PRIOR_STRENGTH, FOCUS_WINDOW_DAYS, MIN_FOCUS_OBSERVATIONS
-from app.domain.entities import HOURS_PER_DAY, FocusProfile, HourFocus, TaskEventType
+from app.domain.entities import (
+    HOURS_PER_DAY,
+    FocusProfile,
+    HourFocus,
+    TaskEvent,
+    TaskEventType,
+)
 from app.domain.ports import EnergyEstimator, TaskEventRepository
 from app.services.task_service import SLOT_OUTCOMES, as_aware, latest_outcome_per_slot
 
@@ -40,7 +46,14 @@ class HeuristicEnergyEstimator(EnergyEstimator):
         else:
             return 0.3
 
-    async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
+    async def estimate(
+        self,
+        user_id: str,
+        zone: ZoneInfo,
+        *,
+        now: datetime,
+        events: list[TaskEvent] | None = None,
+    ) -> FocusProfile:
         return FocusProfile(
             source="prior",
             observations=0,
@@ -69,12 +82,22 @@ class HistoryEnergyEstimator(EnergyEstimator):
         self._prior_strength = prior_strength
         self._min_observations = min_observations
 
-    async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
+    async def estimate(
+        self,
+        user_id: str,
+        zone: ZoneInfo,
+        *,
+        now: datetime,
+        events: list[TaskEvent] | None = None,
+    ) -> FocusProfile:
+        """The profile from ``events`` (the user's outcomes of the last ``window_days``)
+        when given, else from the history read here."""
         # Skipped and missed (the slot passed) both count as "not done". A deadline miss
         # is about a date, not an hour, so it is not an outcome.
-        events = await self._task_events.list_for_user(
-            user_id, since=now - timedelta(days=self._window_days), types=set(SLOT_OUTCOMES)
-        )
+        if events is None:
+            events = await self._task_events.list_for_user(
+                user_id, since=now - timedelta(days=self._window_days), types=set(SLOT_OUTCOMES)
+            )
         done = [0] * HOURS_PER_DAY
         not_done = [0] * HOURS_PER_DAY
         for event in latest_outcome_per_slot(events):
