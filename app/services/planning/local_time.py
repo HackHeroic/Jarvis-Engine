@@ -65,13 +65,17 @@ def logical_day_start(
 
     Before that hour the logical day is still yesterday's (the late-night rule), so
     a plan made at 01:30 runs on yesterday's day, whose midnight-08:00 night block
-    covers the rest of the night, instead of starting a fresh day at 3 AM.
+    covers the rest of the night, instead of starting a fresh day at 3 AM. From
+    ``EVENING_CUTOFF_HOUR`` (22:00) on it is already tomorrow's (the evening rule):
+    a plan made at 22:30 starts at 08:00 the next local day, nothing that night.
     """
     hour = config.DAY_START_HOUR if day_start_hour is None else day_start_hour
     local_now = _local(now, zone)
     day = local_now.date()
     if local_now.hour < hour:
         day -= timedelta(days=1)
+    elif local_now.hour >= config.EVENING_CUTOFF_HOUR:
+        day += timedelta(days=1)
     return datetime.combine(day, time(hour, 0), tzinfo=zone)
 
 

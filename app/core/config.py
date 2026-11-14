@@ -172,6 +172,9 @@ CHECKPOINT_DB_PATH: str = os.getenv("JARVIS_CHECKPOINT_DB", "data/checkpoints.sq
 DEFAULT_HORIZON_MINUTES: int = 2880  # 48 hours
 MAX_HORIZON_MINUTES: int = 43200  # 30 days (per PDF: month-long planning)
 DAY_START_HOUR: int = 8  # Planning day starts at 8 AM local (habit translator convention)
+# From this local hour on, a new plan starts on the next local day at DAY_START_HOUR:
+# a plan made at 22:30 puts nothing that night.
+EVENING_CUTOFF_HOUR: int = 22
 # The zone a user's day runs in when their profile names none (IANA name). Minute 0
 # of every plan is DAY_START_HOUR in the user's zone, never in UTC.
 DEFAULT_TIMEZONE: str = os.getenv("JARVIS_DEFAULT_TIMEZONE", "Asia/Kolkata")

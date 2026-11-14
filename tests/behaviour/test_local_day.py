@@ -119,22 +119,25 @@ async def test_local_day__plan_at_half_past_one_ist__yesterdays_day_and_nothing_
     assert all(begin >= now for begin, _ in slots)
 
 
+@pytest.mark.parametrize(("hour", "minute"), [(22, 30), (23, 0)], ids=["22:30", "23:00"])
 @pytest.mark.asyncio
-async def test_local_day__plan_at_eleven_pm_ist__nothing_in_the_small_hours(jarvis, llm, clock):
-    now = _at(clock, 23, 0)
+async def test_local_day__plan_late_in_the_evening__nothing_that_night__starts_at_eight_next_day(
+    jarvis, llm, clock, hour, minute
+):
+    _at(clock, hour, minute)
     _script_plan(llm)
 
     turn = await jarvis.say("Plan my DSA revision")
 
+    # From the evening cutoff (22:00) a plan starts on the next local day: a
+    # UTC-anchored day put these at 23:00-05:30 IST, and a local one still put the
+    # first task at 23:00.
+    tuesday_8am = datetime.combine(MONDAY + timedelta(days=1), time(8, 0), tzinfo=IST)
+    horizon_start = datetime.fromisoformat(turn.payload["schedule"]["horizon_start"])
+    assert horizon_start == tuesday_8am
     slots = _local_slots(turn)
-    assert all(begin >= now for begin, _ in slots)
-    # A UTC-anchored day put these at 23:00-05:30 IST. The night is blocked
-    # (00:00-08:00 local), so whatever does not fit before midnight lands on the next
-    # local day from 08:00.
+    assert all(begin >= tuesday_8am for begin, _ in slots), slots
     assert not [s for s in slots if _in_the_night(s)], slots
-    after_midnight = [begin for begin, _ in slots if begin.date() > MONDAY]
-    assert after_midnight, slots
-    assert all(begin.time() >= time(8, 0) for begin in after_midnight)
 
 
 @pytest.mark.asyncio
