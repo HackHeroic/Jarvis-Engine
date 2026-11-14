@@ -8,6 +8,7 @@ import time as _time
 from typing import List, Optional
 
 from app.schemas.context import SemanticTimeSlot, SemanticTimeSlotsResponse
+from app.services.planning.rule_windows import DAY_START_MIN, MINUTES_PER_DAY, blocked_windows
 
 logger = logging.getLogger(__name__)
 
@@ -91,154 +92,53 @@ HABIT_TRANSLATOR_FALLBACK_PROMPT = (
 )
 
 
-def _python_fallback_for_time_anchor(habits_text: str) -> Optional[List[SemanticTimeSlot]]:
-    """Deterministic fallback for common time-anchor patterns. No LLM needed.
+# A habit that names its own days or dates ("on Fridays", "weekends", "every Monday",
+# "tonight") is the model's to expand: the words alone give only a daily slot.
+_NAMES_ITS_DAYS = re.compile(
+    r"\b(?:mon|tues|wednes|thurs|fri|satur|sun)days?\b|\bweek(?:day|end)s?\b"
+    r"|\b(?:every|each)\s+(?!(?:single\s+)?(?:day|night|evening|morning|afternoon)s?\b)\w+"
+    r"|\b(?:today|tonight|tomorrow|semester|exams?)\b|\b(?:this|next)\s+week\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE,
+)
 
-    Returns slots if a known pattern matches, None otherwise (caller should use LLM retry).
+
+def _python_fallback_for_time_anchor(habit: str) -> Optional[List[SemanticTimeSlot]]:
+    """The slots one habit's own words give, every day, with no model call.
+
+    The hours come from ``rule_windows.blocked_windows``: "never work after 10 PM"
+    blocks 22:00 onwards (night included), "I work only after 6 PM" blocks 08:00-18:00,
+    "I'm free after 5 PM" blocks nothing. None when the words give no window, or name
+    days of their own; the model reads those.
     """
-    lower = habits_text.lower()
-    slots: list[SemanticTimeSlot] = []
-
-    # "before X AM/PM" or "until X AM/PM" or "no work before X"
-    before_match = re.search(
-        r"(?:before|until|no\s+(?:work|tasks?|scheduling?)\s+(?:before|until))\s+(\d{1,2})\s*(am|pm)",
-        lower,
-    )
-    if before_match:
-        hour = int(before_match.group(1))
-        period = before_match.group(2)
-        if period == "pm" and hour != 12:
-            hour += 12
-        elif period == "am" and hour == 12:
-            hour = 0
-        end_min = max(0, (hour - 8) * 60)  # day starts at 8 AM = minute 0
-        if end_min > 0:
-            slots.append(SemanticTimeSlot(
-                name="morning_restriction",
-                start_min=0,
-                end_min=end_min,
-                availability="blocked",
-                recurrence="daily",
-            ))
-
-    # "before noon" / "no work before noon" / "until noon"
-    if not slots and re.search(r"(?:before|until|no\s+work\s+(?:before|until))\s+noon", lower):
-        slots.append(SemanticTimeSlot(
-            name="morning_restriction",
-            start_min=0,
-            end_min=240,  # noon = 12 PM = 4h from 8 AM
+    if _NAMES_ITS_DAYS.search(habit):
+        return None
+    slots = [
+        SemanticTimeSlot(
+            name=f"stated_rule_{_hhmm(start)}_{_hhmm(end)}",
+            start_min=start,
+            end_min=end,
             availability="blocked",
             recurrence="daily",
-        ))
+        )
+        for start, end in blocked_windows(habit)
+    ]
+    return slots or None
 
-    # "after X AM/PM" or "only after X"
-    after_match = re.search(r"(?:only\s+)?after\s+(\d{1,2})\s*(am|pm)", lower)
-    if after_match:
-        hour = int(after_match.group(1))
-        period = after_match.group(2)
-        if period == "pm" and hour != 12:
-            hour += 12
-        elif period == "am" and hour == 12:
-            hour = 0
-        start_min = max(0, (hour - 8) * 60)
-        # Block everything before the "after" time
-        if start_min > 0:
-            slots.append(SemanticTimeSlot(
-                name="morning_restriction",
-                start_min=0,
-                end_min=start_min,
-                availability="blocked",
-                recurrence="daily",
-            ))
 
-    # "after noon" / "after lunch"
-    if not slots and re.search(r"(?:only\s+)?after\s+(?:noon|lunch)", lower):
-        slots.append(SemanticTimeSlot(
-            name="morning_restriction",
-            start_min=0,
-            end_min=240,  # block before noon
-            availability="blocked",
-            recurrence="daily",
-        ))
-
-    # "evening only" / "only in the evening"
-    if not slots and re.search(r"(?:evening\s+only|only\s+(?:in\s+(?:the\s+)?)?evening)", lower):
-        slots.append(SemanticTimeSlot(
-            name="morning_restriction",
-            start_min=0,
-            end_min=600,  # block before 6 PM (8 AM + 600 min)
-            availability="blocked",
-            recurrence="daily",
-        ))
-
-    # "gym at X-Y" or "gym from X to Y" — block that time range
-    gym_match = re.search(
-        r"(?:gym|workout|exercise|training)\s+(?:at|from)\s+(\d{1,2})\s*(am|pm)?\s*[-–to]+\s*(\d{1,2})\s*(am|pm)",
-        lower,
-    )
-    if gym_match:
-        start_h = int(gym_match.group(1))
-        start_p = gym_match.group(2) or gym_match.group(4)  # infer AM/PM from end if missing
-        end_h = int(gym_match.group(3))
-        end_p = gym_match.group(4)
-        if start_p and start_p == "pm" and start_h != 12:
-            start_h += 12
-        if end_p == "pm" and end_h != 12:
-            end_h += 12
-        gym_start = max(0, (start_h - 8) * 60)
-        gym_end = max(0, (end_h - 8) * 60)
-        if gym_end > gym_start:
-            slots.append(SemanticTimeSlot(
-                name="gym_block",
-                start_min=gym_start,
-                end_min=gym_end,
-                availability="blocked",
-                recurrence="daily",
-            ))
-
-    # "class/meeting at X AM/PM" or "class from X to Y"
-    class_match = re.search(
-        r"(?:class|meeting|lecture)\s+(?:at|from)\s+(\d{1,2})\s*(am|pm)?\s*[-–to]*\s*(\d{1,2})?\s*(am|pm)?",
-        lower,
-    )
-    if class_match:
-        start_h = int(class_match.group(1))
-        start_p = class_match.group(2) or class_match.group(4)
-        end_h = int(class_match.group(3)) if class_match.group(3) else start_h + 1
-        end_p = class_match.group(4) or start_p
-        if start_p and start_p == "pm" and start_h != 12:
-            start_h += 12
-        if end_p and end_p == "pm" and end_h != 12:
-            end_h += 12
-        cls_start = max(0, (start_h - 8) * 60)
-        cls_end = max(0, (end_h - 8) * 60)
-        if cls_end > cls_start:
-            slots.append(SemanticTimeSlot(
-                name="class_block",
-                start_min=cls_start,
-                end_min=cls_end,
-                availability="blocked",
-                recurrence="daily",
-            ))
-
-    # "mornings" / "hate mornings" (conservative: block 0-180 = 8-11 AM)
-    if not slots and re.search(r"\bmorning", lower):
-        slots.append(SemanticTimeSlot(
-            name="morning_restriction",
-            start_min=0,
-            end_min=180,
-            availability="blocked",
-            recurrence="daily",
-        ))
-
-    return slots if slots else None
+def _hhmm(horizon_min: int) -> str:
+    """A horizon minute as the local clock shows it: 840 -> "2200"."""
+    minutes = (DAY_START_MIN + horizon_min) % MINUTES_PER_DAY
+    return f"{minutes // 60:02d}{minutes % 60:02d}"
 
 
 async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
-    """Convert raw habit text to semantic slots via 27B.
+    """Convert raw habit text (one habit per line) to semantic slots.
 
+    A habit whose own words give its hours is read with no model call
+    (``_python_fallback_for_time_anchor``); only the others go to the PRIMARY model.
     Returns SemanticTimeSlot list for horizon expansion. Short-circuit: [] if habits_text empty.
-    Uses in-memory cache to avoid redundant 27B calls for unchanged habits.
+    Uses in-memory cache to avoid redundant model calls for unchanged habits.
     """
     if not habits_text or not habits_text.strip():
         return []
@@ -254,15 +154,32 @@ async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
         else:
             del _habit_cache[cache_key]
 
-    # --- Python-first: try deterministic pattern matching before any LLM call ---
-    python_slots = _python_fallback_for_time_anchor(habits_text)
-    if python_slots:
-        slots = python_slots
-        logger.info("Habit translator: Python fallback matched %d slots, skipping 27B", len(slots))
-        _habit_cache[cache_key] = (_time.time(), slots)
-        return slots
+    # --- Python-first: each habit whose words give its hours needs no model call ---
+    known: list[SemanticTimeSlot] = []
+    unread: list[str] = []
+    for habit in (line.strip() for line in habits_text.splitlines()):
+        if habit:
+            read = _python_fallback_for_time_anchor(habit)
+            known.extend(read or [])
+            if not read:
+                unread.append(habit)
+    if not unread:
+        logger.info("Habit translator: every habit read without the model (%d slots)", len(known))
+        _habit_cache[cache_key] = (_time.time(), known)
+        return known
 
-    # --- LLM call (only if Python fallback didn't match) ---
+    slots = await _translate_with_model("\n".join(unread)) + known
+
+    # --- Cache store ---
+    if slots:
+        _habit_cache[cache_key] = (_time.time(), slots)
+        logger.info("Habit translation cached (%d slots)", len(slots))
+
+    return slots
+
+
+async def _translate_with_model(habits_text: str) -> List[SemanticTimeSlot]:
+    """The habits the words alone could not read, translated by the PRIMARY model."""
     from app.core.model_router import route_llm_call
 
     result = await route_llm_call(
@@ -299,10 +216,4 @@ async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
                 logger.info("Habit translator: LLM strict fallback produced slots for time anchor")
         except (json.JSONDecodeError, ValueError, Exception) as e:
             logger.warning("Habit translator strict fallback failed: %s", e)
-
-    # --- Cache store ---
-    if slots:
-        _habit_cache[cache_key] = (_time.time(), slots)
-        logger.info("Habit translation cached (%d slots)", len(slots))
-
-    return slots
+    return list(slots)

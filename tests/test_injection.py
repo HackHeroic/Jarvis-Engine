@@ -164,7 +164,7 @@ async def test_turn__container_only_in_turn_state__rule_memory_and_pattern_reach
 async def test_chat_plan__calendar_rule_expired__no_longer_constrains_the_plan(jarvis, llm, clock):
     """Chat planning reads the rules that apply now (``ConstraintRepository.list_active``),
     as the morning brief and a late accept do: an expired calendar block frees its hours."""
-    from app.services.memory.constraint_bridge import to_horizon
+    from app.services.planning.rule_windows import to_horizon
 
     clock.freeze(MONDAY_8AM, scheduling, utc_clock)
     _script(llm)

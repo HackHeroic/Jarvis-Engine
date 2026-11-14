@@ -17,9 +17,13 @@ from app.core.config import DAY_START_HOUR
 from app.domain.entities import Memory
 from app.schemas.context import TimeSlot
 from app.services.memory.patterns import SkipTimeWindowDetector
+from app.services.planning.rule_windows import (
+    blocked_windows,
+    horizon_window,
+    parse_time_range,
+    to_horizon,
+)
 
-MINUTES_PER_DAY = 1440
-DAY_START_MIN = DAY_START_HOUR * 60  # horizon minute 0 == 08:00 on the user's clock
 # A learned skip window at least this sure becomes a minimal-work hour.
 SKIP_WINDOW_MIN_CONFIDENCE = 0.6
 # A stated rule claims its window for focused work when it names such work and no
@@ -31,106 +35,6 @@ _FOCUSED_WORK = re.compile(
 _NEGATION = re.compile(r"\b(no|not|never|don'?t|avoid\w*|without)\b", re.IGNORECASE)
 # "9-10" or "2 to 4" with no AM/PM; never a piece of a date such as 2026-11-14.
 _BARE_HOURS = re.compile(r"(?<![\d/-])(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})(?![\d/:-])")
-
-
-def to_horizon(clock_min: int) -> int:
-    """Wall-clock minutes-from-midnight -> horizon minutes (0 = DAY_START_HOUR).
-
-    Every consumer of ``TimeSlot`` — the horizon expander, the biological sleep
-    fallback in ``run_schedule``, OR-Tools itself — anchors minute 0 at 08:00.
-    Emitting minutes-from-midnight put every memory constraint 8 hours late.
-    """
-    return (clock_min - DAY_START_MIN) % MINUTES_PER_DAY
-
-
-def parse_time_range(text: str) -> tuple[int, int] | None:
-    """Extract a time range from natural language constraint text.
-
-    Handles patterns like:
-    - "between 14:00 and 15:00"
-    - "from 2 PM to 3 PM"
-    - "No tasks between 14:00 and 15:00"
-
-    Returns ``(start_min, end_min)`` in **horizon minutes** (0 = ``DAY_START_HOUR``,
-    i.e. 08:00), the frame ``TimeSlot`` is defined in — or None when the text
-    carries no clock time, or names a window that lies entirely outside the
-    schedulable day.
-    """
-    # Pattern: HH:MM and HH:MM
-    match_24h = re.search(r"(\d{1,2}):(\d{2})\s*(?:and|to|-)\s*(\d{1,2}):(\d{2})", text)
-    if match_24h:
-        start_h, start_m = int(match_24h.group(1)), int(match_24h.group(2))
-        end_h, end_m = int(match_24h.group(3)), int(match_24h.group(4))
-        return _bounded_range(start_h * 60 + start_m, end_h * 60 + end_m)
-
-    # Pattern: N AM/PM to N AM/PM
-    match_12h = re.search(
-        r"(\d{1,2})\s*(AM|PM|am|pm)\s*(?:to|and|-)\s*(\d{1,2})\s*(AM|PM|am|pm)", text
-    )
-    if match_12h:
-        start_h = int(match_12h.group(1))
-        start_period = match_12h.group(2).upper()
-        end_h = int(match_12h.group(3))
-        end_period = match_12h.group(4).upper()
-
-        if start_period == "PM" and start_h != 12:
-            start_h += 12
-        if start_period == "AM" and start_h == 12:
-            start_h = 0
-        if end_period == "PM" and end_h != 12:
-            end_h += 12
-        if end_period == "AM" and end_h == 12:
-            end_h = 0
-
-        return _bounded_range(start_h * 60, end_h * 60)
-
-    # Pattern: "after N PM" → N PM to the end of the schedulable day.
-    match_after = re.search(r"after\s+(\d{1,2})\s*(AM|PM|am|pm)?", text)
-    if match_after:
-        h = int(match_after.group(1))
-        period = (match_after.group(2) or "").upper()
-        if period == "PM" and h != 12:
-            h += 12
-        if not period and 1 <= h <= 7:
-            # Bare small hour: PM is both the likelier reading ("after 6" = the
-            # evening) and the *less destructive* one — 06:00 would block the
-            # entire day. When guessing, guess the interpretation that blocks less.
-            h += 12
-        # Times at or before day start block everything schedulable, hence max(0, ...).
-        return (max(0, h * 60 - DAY_START_MIN), MINUTES_PER_DAY)
-
-    # Pattern: "before N AM/PM" → start of the schedulable day to N.
-    match_before = re.search(r"before\s+(\d{1,2})\s*(AM|PM|am|pm)?", text)
-    if match_before:
-        h = int(match_before.group(1))
-        period = (match_before.group(2) or "").upper()
-        if period == "PM" and h != 12:
-            h += 12
-        # NOTE: no bare-hour "+12" here — the mirror image of the "after" rule.
-        # For "before", PM is the *maximally* destructive guess: bare "before 6"
-        # read as 18:00 blocks 08:00-18:00, the 10-hour dead zone this parser
-        # used to emit. Read as 06:00 it blocks nothing schedulable. Again:
-        # when guessing, guess the interpretation that blocks less.
-        end = h * 60 - DAY_START_MIN
-        if end <= 0:
-            return None  # entirely before the day starts — nothing to block
-        return (0, end)
-
-    return None
-
-
-def _bounded_range(start_clock: int, end_clock: int) -> tuple[int, int] | None:
-    """Convert a wall-clock window to horizon minutes, dropping unusable ones.
-
-    A window that wraps across the 08:00 anchor (or is inverted/empty) cannot be
-    expressed as one interval in horizon space. Dropping it is the safe move: a
-    zero- or negative-length block would reach OR-Tools as a malformed interval,
-    and a wrapped one lands almost entirely inside the sleep window anyway.
-    """
-    start, end = to_horizon(start_clock), to_horizon(end_clock)
-    if end <= start:
-        return None
-    return (start, end)
 
 
 def _skip_window_hour(pattern_key: str | None) -> int | None:
@@ -154,7 +58,7 @@ def _claimed_window(text: str) -> tuple[int, int] | None:
     if window is None and (bare := _BARE_HOURS.search(text)):
         start_h, end_h = (_bare_hour(int(h)) for h in bare.groups())
         if start_h <= 23 and end_h <= 24:
-            window = _bounded_range(start_h * 60, end_h * 60)
+            window = horizon_window(start_h * 60, end_h * 60)
     return window
 
 
@@ -166,7 +70,9 @@ def memory_slots(
 ) -> list[TimeSlot]:
     """Turn the user's memories in use into solver constraints.
 
-    A ``constraint`` memory that names a clock range becomes a hard block, unless a
+    A ``constraint`` memory becomes a hard block over the hours its words keep free
+    (``rule_windows.blocked_windows``: "never after 10 PM" blocks 22:00 onwards, "only
+    after 6 PM" the day before 18:00, "free after 5 PM" nothing), unless a
     stored rule already covers it (its id is in ``covered``: the rule the user stated
     carries the id of the memory of stating it). Planning has that rule from the
     rules, so the memory never blocks the same hours a second time, and letting go of
@@ -191,12 +97,13 @@ def memory_slots(
         if memory.memory_type == "constraint":
             if memory.id in covered:
                 continue
-            time_range = parse_time_range(memory.content)
-            if time_range and _claimed_window(memory.content) is None:
+            if _claimed_window(memory.content) is not None:
+                continue
+            for i, (start, end) in enumerate(blocked_windows(memory.content)):
                 slots.append(TimeSlot(
-                    name=f"memory_constraint_{memory.id}",
-                    start_min=time_range[0],
-                    end_min=time_range[1],
+                    name=f"memory_constraint_{memory.id}" + (f"_{i + 1}" if i else ""),
+                    start_min=start,
+                    end_min=end,
                     availability="blocked",
                     recurring=True,
                     source="user",

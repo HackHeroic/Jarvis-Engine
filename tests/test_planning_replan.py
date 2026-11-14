@@ -81,7 +81,7 @@ async def _seed_tasks(repos, rows: list[dict]) -> None:
 
 def _learned_rule(hour: int) -> BehavioralConstraint:
     """A learned rule as accepting a pattern proposal stores it: its slot worked out."""
-    from app.services.memory.constraint_bridge import to_horizon
+    from app.services.planning.rule_windows import to_horizon
 
     start = to_horizon(hour * 60)
     return BehavioralConstraint(

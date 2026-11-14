@@ -100,6 +100,60 @@ async def test_local_day__never_before_11_am__holds_in_local_time_on_every_day(j
     assert min(begin.time() for begin, _ in slots) == time(11, 0)
 
 
+# --- a stated rule, read by the habit translator: the words decide which hours go -----
+
+
+def _script_rule_and_plan(llm, rule: str, trigger: str) -> None:
+    """The extraction hears the rule verbatim, as an inline habit: it is stored as a rule,
+    which planning translates. Asking for a plan plans."""
+
+    def extract(req) -> str:
+        message = said(req)
+        if trigger in message:
+            return brain_dump(inline_habits=[rule])
+        return brain_dump(planning_goal="Revise DSA") if "plan" in message.lower() else "{}"
+
+    llm.script("brain_dump_extraction", extract)
+    llm.script("socratic_chunker", decomposition(TOPICS[:5]))
+
+
+def _touches(slot: tuple[datetime, datetime], from_hour: int, to_hour: int) -> bool:
+    """Does the task overlap from_hour:00-to_hour:00 local on the day it starts?"""
+    begin, end = slot
+    window_start = begin.replace(hour=from_hour, minute=0, second=0, microsecond=0)
+    return begin < window_start + timedelta(hours=to_hour - from_hour) and end > window_start
+
+
+@pytest.mark.parametrize(
+    ("rule", "trigger", "said_at", "kept_free", "open_hours"),
+    [
+        ("Never work after 10 PM", "after 10", (21, 0), (22, 24), (8, 22)),
+        ("Never schedule work before 11 AM", "before 11", (7, 30), (8, 11), (11, 22)),
+    ],
+    ids=["never after 10 PM", "never before 11 AM"],
+)
+@pytest.mark.asyncio
+async def test_local_day__stated_rule__its_hours_stay_free_and_the_day_around_them_is_used(
+    jarvis, llm, clock, deterministic_solver, rule, trigger, said_at, kept_free, open_hours
+):
+    """"Never work after 10 PM" used to block 08:00-22:00, so a plan made at 21:00 went
+    into 22:00-24:00 every night. It keeps the night free and the day open."""
+    _at(clock, *said_at)
+    _script_rule_and_plan(llm, rule, trigger)
+    before = await jarvis.say("Plan my DSA revision")
+    assert any(_touches(slot, *kept_free) for slot in _local_slots(before))  # used, unruled
+
+    await jarvis.say(rule)
+    calls_before = len(llm.calls)
+    after = await jarvis.say("Plan my DSA revision")
+
+    slots = _local_slots(after)
+    assert slots
+    assert not [slot for slot in slots if _touches(slot, *kept_free)], slots
+    assert all(open_hours[0] <= begin.hour < open_hours[1] for begin, _ in slots), slots
+    assert "habit_translation" not in llm.tasks(calls_before)  # read with no model call
+
+
 @pytest.mark.asyncio
 async def test_local_day__plan_at_half_past_one_ist__yesterdays_day_and_nothing_before_eight(
     jarvis, llm, clock

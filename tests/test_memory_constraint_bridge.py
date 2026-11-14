@@ -16,29 +16,29 @@ class TestHorizonAnchoredParsing:
     """
 
     def test_before_11am__blocks_day_start_to_11(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         assert parse_time_range("The user never studies before 11am.") == (0, 180)
 
     def test_before_10am__blocks_day_start_to_10(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         assert parse_time_range("The user does not take calls before 10am.") == (0, 120)
 
     def test_after_6pm__blocks_evening_tail_only(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         # 18:00 is horizon minute 600; the block runs to the end of the 8 AM day.
         assert parse_time_range("No work after 6 PM") == (600, 1440)
 
     def test_explicit_range__converted_to_horizon_space(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         assert parse_time_range("No tasks between 14:00 and 15:00") == (360, 420)
         assert parse_time_range("Meeting from 2 PM to 3 PM") == (360, 420)
 
     def test_before_time_earlier_than_day_start__no_constraint(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         # Nothing in the schedulable day happens before 07:00; blocking 0 minutes
         # is the honest answer, not a wrapped or clamped block.
@@ -52,13 +52,13 @@ class TestHorizonAnchoredParsing:
         Bare "before 6" is the mirror image: PM blocks 08:00-18:00, AM blocks
         nothing schedulable. Both branches now pick the reading that blocks less.
         """
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         assert parse_time_range("wants it done before 6") is None
         assert parse_time_range("no deep work after 6") == (600, 1440)
 
     def test_goal_prose_without_a_clock_time__no_constraint(self):
-        from app.services.memory.constraint_bridge import parse_time_range
+        from app.services.planning.rule_windows import parse_time_range
 
         assert parse_time_range("tidy their email inbox this evening") is None
         assert parse_time_range("wants to finish the report tomorrow morning") is None

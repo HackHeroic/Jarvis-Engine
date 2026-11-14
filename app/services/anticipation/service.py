@@ -59,8 +59,8 @@ from app.domain.entities import (
 )
 from app.domain.ports import ConstraintRepository, ProfileRepository, SuggestionRepository
 from app.services.anticipation.user_locks import UserLocks
-from app.services.memory.constraint_bridge import DAY_START_MIN, parse_time_range
 from app.services.planning.local_time import user_zone
+from app.services.planning.rule_windows import DAY_START_MIN, blocked_windows
 from app.services.task_service import utc_now
 
 logger = logging.getLogger(__name__)
@@ -118,16 +118,18 @@ def _whole_local_hours(start_min: int, end_min: int) -> tuple[int, int] | None:
 def stated_blocks(constraints: list[BehavioralConstraint]) -> list[tuple[int, int, str]]:
     """The hours the user said (never inferred) to keep free, on their local clock.
 
-    Each is (start hour, end hour, their words); end <= start wraps past midnight.
+    Each is (start hour, end hour, their words); end <= start wraps past midnight. The
+    hours are what the words block (``rule_windows.blocked_windows``): "No work after
+    10 PM" keeps 22:00-08:00, "I work only after 6 PM" keeps 08:00-18:00.
     """
     blocks = []
     for constraint in constraints:
         if constraint.source != "said":
             continue
-        window = parse_time_range(constraint.raw_text)
-        hours = _whole_local_hours(*window) if window is not None else None
-        if hours is not None:
-            blocks.append((*hours, constraint.raw_text))
+        for window in blocked_windows(constraint.raw_text):
+            hours = _whole_local_hours(*window)
+            if hours is not None:
+                blocks.append((*hours, constraint.raw_text))
     return blocks
 
 
