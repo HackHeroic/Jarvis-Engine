@@ -5,7 +5,7 @@ task statuses, keeping only the latest outcome of each slot; a day is a date on 
 user's clock. India is UTC+5:30, so 00:00-05:30 IST is still the previous UTC day.
 """
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -16,6 +16,7 @@ from app.domain.ports import TaskEventRepository
 from app.services.analytical.mastery_tracker import (
     _get_reschedule_count,
     compute_streak_from_events,
+    streak_as_of,
 )
 from app.services.analytical.sm2_engine import get_due_trackers
 from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
@@ -67,10 +68,46 @@ def test_streak__completion_at_00_30_ist__counts_for_that_local_day():
     ]
 
     assert compute_streak_from_events(events, IST, datetime(2026, 11, 16).date()) == 3
-    # On UTC dates the 00:30 completion would sit on the 15th and the 16th would be empty.
-    assert compute_streak_from_events(events, ZoneInfo("UTC"), datetime(2026, 11, 16).date()) == 0
-    assert compute_streak_from_events(events, IST, datetime(2026, 11, 17).date()) == 0
+    # On UTC dates the 00:30 completion would sit on the 15th: the 16th would have none,
+    # and the streak would count only the 15th and the 14th.
+    assert compute_streak_from_events(events, ZoneInfo("UTC"), datetime(2026, 11, 16).date()) == 2
     assert compute_streak_from_events([], IST, datetime(2026, 11, 16).date()) == 0
+
+
+# One streak, the coach's and GET /you's: consecutive local days with something
+# completed. It is not broken until the local day ends: with nothing completed yet
+# today, it counts back from yesterday.
+
+
+def _completed_on(*days: int, hour: int = 10) -> list:
+    return [
+        _event("completed", datetime(2026, 11, day, hour, 0, tzinfo=IST), task_id=f"t{day}")
+        for day in days
+    ]
+
+
+def test_streak__done_today__today_counts():
+    assert compute_streak_from_events(_completed_on(16, 15), IST, date(2026, 11, 16)) == 2
+
+
+def test_streak__nothing_yet_today__counts_back_from_yesterday():
+    assert compute_streak_from_events(_completed_on(15, 14), IST, date(2026, 11, 16)) == 2
+
+
+def test_streak__nothing_yesterday_or_today__zero():
+    assert compute_streak_from_events(_completed_on(14, 13), IST, date(2026, 11, 16)) == 0
+
+
+def test_streak__ist_00_30__yesterdays_evening_keeps_it_and_the_new_day_starts_on_ist():
+    # 00:30 IST on the 17th is 19:00 UTC on the 16th: on the user's clock the 17th has
+    # begun with nothing done, and the 16th and 15th still count.
+    events = _completed_on(16, 15, hour=21)
+    now = datetime(2026, 11, 17, 0, 30, tzinfo=IST)
+
+    assert streak_as_of(events, IST, now) == 2
+    # Done at 00:20 IST on the 17th: the 17th counts as a new day of the streak.
+    early = [_event("completed", datetime(2026, 11, 17, 0, 20, tzinfo=IST), task_id="early")]
+    assert streak_as_of(events + early, IST, now) == 3
 
 
 @pytest.mark.asyncio

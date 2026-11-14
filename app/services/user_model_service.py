@@ -155,7 +155,11 @@ class YouView(BaseModel):
     focus: FocusProfile = Field(description="Focus by local hour, learned or the prior.")
     receipt: PrivacyReceipt = Field(description="Where the user's model calls ran.")
     streak_days: int = Field(
-        ge=0, description="Consecutive local days, ending today, with a completed task."
+        ge=0,
+        description=(
+            "Consecutive local days with a completed task, ending today, or yesterday while"
+            " nothing is done yet today."
+        ),
     )
 
 

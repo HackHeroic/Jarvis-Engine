@@ -52,7 +52,7 @@ def _identify_sources_used(mastery: dict, trend: str, streak: int, energy: float
 
 
 async def _completion_streak(container, user_id: str) -> int:
-    """Consecutive days, ending today on the user's clock, with a completed task.
+    """Consecutive days on the user's clock with a completed task (today's not yet over).
 
     ``mastery_tracker.completion_streak``: the outcome history (``task_events``) of the
     last STREAK_WINDOW_DAYS, never task statuses (``GET /you`` shows the same number).
