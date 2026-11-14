@@ -383,7 +383,7 @@ def test_endpoints_require_a_draft_service(client):
 
 
 def test_accept__persist_failure__does_not_report_accepted(client, monkeypatch):
-    """The endpoint shares accept_draft_and_persist with the orchestrator node,
+    """The endpoint shares accept_on_time with the orchestrator node,
     so it inherits the same duty: never call a failed write a success."""
     supabase = client.app.state._test_supabase
 

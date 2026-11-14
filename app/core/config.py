@@ -156,9 +156,6 @@ def detect_loaded_models() -> dict:
     except Exception as e:
         return {"loaded": [], "error": str(e), "warning": "LM Studio unreachable; using defaults"}
 
-# LM Studio native API (non-OpenAI endpoint) for direct streaming chat
-LM_STUDIO_NATIVE_URL: str = os.getenv("LM_STUDIO_NATIVE_URL", "http://127.0.0.1:1234")
-
 # LiteLLM observability
 LITELLM_VERBOSE: bool = os.getenv("LITELLM_VERBOSE", "false").lower() in ("1", "true", "yes")
 
@@ -235,9 +232,6 @@ SOLVER_MAX_TIME_SECONDS: float = float(os.getenv("JARVIS_SOLVER_MAX_TIME_SECONDS
 SOLVER_IDLE_STOP_SECONDS: float | None = float(
     os.getenv("JARVIS_SOLVER_IDLE_STOP_SECONDS", "1.0")
 )
-
-# Mental-health safeguard: max scheduled deep-work minutes per day to avoid cramming
-MAX_DEEP_WORK_MINUTES_PER_DAY: int = 360  # 6 hours (legacy; pacing module takes precedence)
 
 # Adaptive pacing (research-based; used when user_override not set)
 PACING_SUSTAINABLE_MIN_PER_DAY: int = 90  # slack >= 10
@@ -329,9 +323,8 @@ SINCE_LAST_SPOKE_TOKENS: int = 250
 # match. Unsplit, the same run-on sentences scored as low as 0.42.
 SUMMARY_SUPPRESS_SIMILARITY: float = 0.45
 
-# AWS S3 (document storage)
-AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
+# AWS S3 (document storage). The credentials are boto3's to read from the environment
+# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, loaded from .env above); the app reads only these.
 AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
 AWS_BUCKET_NAME: str = os.getenv("AWS_BUCKET_NAME", "jarvis-dev-0-storage")
 
