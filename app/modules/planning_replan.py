@@ -21,6 +21,11 @@ from app.services.draft_store import DraftStore
 
 _EXHAUSTED_FALLBACK = "I couldn't fit everything in even with a 30-day window."
 _HABITS_UNREAD = "I couldn't read your habits just now, so the plan waits until I can."
+_HABITS_UNREAD_ON_ACCEPT = (
+    "A few of those times had already gone by, and I couldn't read your habits just now"
+    " to fit them again, so I haven't locked it in. The draft is still open: try again"
+    " in a moment."
+)
 
 
 class PlanningGraphReplanner(DraftPlanner):
@@ -80,6 +85,50 @@ class PlanningGraphReplanner(DraftPlanner):
             )
         draft_id = result.get("draft_id")
         return await self._drafts.get(user_id, draft_id) if draft_id else None
+
+    async def reslot_from_now(self, user_id: str, draft: DraftSchedule) -> dict | None:
+        """The draft's own tasks re-solved from now (see ``DraftPlanner``).
+
+        The time slots are the planning module's own (``plan_time_slots``), from the
+        draft's horizon; the solve is the draft-edit re-solve (``resolve_from_now``) on
+        the user's clock with their learned focus. PersistenceError without a database.
+        """
+        import asyncio
+        from datetime import datetime, timezone
+
+        from app.modules.planning_graph import _learned_focus, compact_schedule, plan_time_slots
+        from app.services.analytical.schedule_modifier import resolve_from_now
+        from app.services.planning.local_time import user_zone
+
+        db = self._db_provider()
+        if getattr(db, "supabase", None) is None:
+            raise errors.PersistenceError("Could not reach the database.")
+        user_model = UserModel(user_id, db)
+        user_model.set_memory_store(self._memory_provider())
+        horizon_start = datetime.fromisoformat(draft.horizon_start)
+        if horizon_start.tzinfo is None:  # a legacy horizon without an offset was UTC
+            horizon_start = horizon_start.replace(tzinfo=timezone.utc)
+        built = await plan_time_slots({
+            "user_id": user_id,
+            "user_model": user_model,
+            "horizon_start": horizon_start.isoformat(),
+        })
+        if built["habits_unread"]:
+            raise errors.LLMUnavailableError(_HABITS_UNREAD_ON_ACCEPT)
+        zone = user_zone(await user_model.get_profile())
+        focus = await _learned_focus(user_id, zone)
+        resolved = await asyncio.to_thread(
+            resolve_from_now,
+            draft.tasks,
+            built["time_slots"],
+            horizon_start,
+            focus_by_hour=focus,
+            zone=zone,
+        )
+        if resolved is None:
+            return None
+        _graph, schedule = resolved
+        return compact_schedule(schedule.model_dump(mode="json"))
 
     @staticmethod
     async def _anything_to_plan(user_model: UserModel, reslot_ids: set[str]) -> bool:

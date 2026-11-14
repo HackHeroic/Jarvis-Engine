@@ -204,30 +204,62 @@ async def fetch_constraints(state: PlanningState) -> dict:
         start = max(start, schedule_ep._compute_horizon_start(zone=zone))
     horizon_start = start.isoformat()
     focus_by_hour = await _learned_focus(state.get("user_id", "demo"), zone)
-    user_model = state["user_model"]
-    if user_model:
-        constraints = await user_model.get_behavioral_constraints()
-        habits = [c for c in constraints if c.get("constraint_type") == "habit"]
-        precomputed = [slot for c in habits for slot in _precomputed_slots(c)]
-        habits_text = "\n".join(
-            c.get("raw_text", "") for c in habits if not _stored_slots(c)
-        )
-        return {
-            "constraints": constraints,
-            "habits_text": habits_text,
-            "precomputed_slots": precomputed,
-            "semantic_slots": precomputed,
-            "horizon_start": horizon_start,
-            "focus_by_hour": focus_by_hour,
-            "_tool_detail": {"rows": len(constraints)},
-        }
+    rules = await _rules_of(state.get("user_model"))
     return {
-        "constraints": [],
-        "habits_text": "",
-        "precomputed_slots": [],
+        **rules,
         "horizon_start": horizon_start,
         "focus_by_hour": focus_by_hour,
+        "_tool_detail": {"rows": len(rules["constraints"])},
     }
+
+
+async def _rules_of(user_model: Any) -> dict:
+    """The user's stored rules as planning reads them: every constraint row, the free
+    text of the habits still to translate, and the slots of those worked out already."""
+    if not user_model:
+        return {"constraints": [], "habits_text": "", "precomputed_slots": []}
+    constraints = await user_model.get_behavioral_constraints()
+    habits = [c for c in constraints if c.get("constraint_type") == "habit"]
+    precomputed = [slot for c in habits for slot in _precomputed_slots(c)]
+    return {
+        "constraints": constraints,
+        "habits_text": "\n".join(c.get("raw_text", "") for c in habits if not _stored_slots(c)),
+        "precomputed_slots": precomputed,
+        "semantic_slots": precomputed,
+    }
+
+
+async def plan_time_slots(state: dict) -> dict:
+    """Every time slot a plan of the user's respects, built by this module's own steps.
+
+    For a solve outside a planning turn (a draft accepted after some of its times went
+    by): the same rules, in the same way, as ``fetch_constraints`` -> ``translate_habits``
+    -> ``expand_slots`` and ``memory_to_constraints`` give a planning turn. That is the
+    stored rules' worked-out slots and their free text translated, expanded out to
+    MAX_HORIZON_MINUTES from the state's ``horizon_start``, plus the memory bridge
+    (constraint memories no rule covers, learned set-aside hours). The night block is
+    ``run_schedule``'s own. ``state`` needs ``user_id``, ``user_model`` and
+    ``horizon_start``.
+
+    Returns ``{"time_slots": [...], "habits_unread": bool}``: ``habits_unread`` when the
+    user has free-text habits that could not be translated (a plan must not go ahead
+    without them).
+    """
+    state = {**state, **await _rules_of(state.get("user_model"))}
+    state.update(await translate_habits(state))
+    slots = list((await expand_slots(state)).get("time_slots") or [])
+    slots += (await memory_to_constraints(state)).get("time_slots") or []
+    return {"time_slots": slots, "habits_unread": habits_unread(state)}
+
+
+def compact_schedule(schedule: Any) -> dict | None:
+    """A solved schedule as a draft stores it: task_id -> {start_min, end_min}."""
+    slots = (schedule or {}).get("schedule") if isinstance(schedule, dict) else None
+    return {
+        tid: {"start_min": t.get("start_min"), "end_min": t.get("end_min")}
+        for tid, t in (slots or {}).items()
+        if isinstance(t, dict)
+    } or None
 
 
 def _stored_slots(constraint: dict) -> list:
@@ -736,11 +768,7 @@ async def create_draft(state: PlanningState) -> dict:
             goal_id=state.get("goal_id"),
             # Compact solved map (task_id -> start/end minutes): accept converts
             # these to wall-clock scheduled_start/end via build_task_rows.
-            schedule={
-                tid: {"start_min": t.get("start_min"), "end_min": t.get("end_min")}
-                for tid, t in ((state.get("schedule") or {}).get("schedule") or {}).items()
-                if isinstance(t, dict)
-            } or None,
+            schedule=compact_schedule(state.get("schedule")),
         )
         draft_id = _draft_id_of(row)
         return {"draft_id": draft_id, "_tool_detail": {"draft_id": draft_id}}

@@ -13,6 +13,7 @@ from app.domain.errors import (
     ConflictError,
     DraftOutdatedError,
     InvalidStateTransition,
+    LLMUnavailableError,
     NotFoundError,
     ScheduleInfeasibleError,
 )
@@ -616,9 +617,10 @@ async def _apply_draft_action(state: JarvisState) -> dict:
             )
         except InvalidStateTransition:
             return await _closed_draft_reply(draft_store, user_id, draft_id)
-        except ScheduleInfeasibleError as exc:
-            # Some times had gone by and the rest no longer fits around now: nothing was
-            # accepted and the draft is still open, so the negotiation stays open too.
+        except (ScheduleInfeasibleError, LLMUnavailableError) as exc:
+            # Some times had gone by and the rest no longer fits around now, or the
+            # user's habits could not be read to fit them again: nothing was accepted
+            # and the draft is still open, so the negotiation stays open too.
             return {"response_message": exc.message, "draft_id": draft_id}
         except DraftOutdatedError as exc:  # every slot has gone by: say so, plainly
             return {

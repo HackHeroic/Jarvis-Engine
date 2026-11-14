@@ -24,7 +24,8 @@ import app.core.config as cfg
 import app.domain.clock as utc_clock
 from app.container import AppContainer
 from app.core import runtime
-from app.domain.entities import DraftStatus, TaskEventType
+from app.domain.entities import BehavioralConstraint, DraftStatus, TaskEventType
+from app.services.memory.memory_service import MemoryCandidate
 from app.orchestrator.hooks import ActionHooks
 from app.services.task_service import SlotPassedSweep
 from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
@@ -73,7 +74,9 @@ def container(fake) -> AppContainer:
         supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
-    runtime.set_container(built)  # conftest resets the registry afterwards
+    # What the lifespan registers (conftest resets both afterwards).
+    runtime.set_container(built)
+    runtime.set_shared_clients(db=FakeDBClient(fake))
     return built
 
 
@@ -241,5 +244,138 @@ async def test_chat_accept__the_rest_no_longer_fits__not_locked_in_and_still_ope
     out = await _chat_accept(container, fake, draft.id)
 
     assert "haven't locked it in" in out["response_message"]
+    assert (await container.repos.drafts.get(U, draft.id)).status is DraftStatus.PENDING
+    assert await container.repos.tasks.list_pending(U) == []
+
+
+# --- the re-solve keeps every rule a plan keeps ----------------------------------------
+
+EVENINGS_FREE = "Keep evenings after 9 PM free"
+
+
+async def _busy_days_rule(container) -> None:
+    """A learned rule, its slot worked out: no work 11:00-21:00, every day."""
+    from uuid import uuid4
+
+    await container.repos.constraints.add(U, BehavioralConstraint(
+        id=str(uuid4()), user_id=U, raw_text="No work between 11:00 and 21:00",
+        constraint_type="habit", recurrence="daily", source="inferred",
+        structured_semantics={"semantic_slots": [{
+            "name": "busy_days", "start_min": 180, "end_min": 780,
+            "availability": "blocked", "recurrence": "daily",
+        }]},
+    ))
+
+
+async def _evenings_free_said_only_as_a_memory(container) -> None:
+    outcome = await container.memory_service.remember(
+        U, MemoryCandidate(memory_type="constraint", content=EVENINGS_FREE, confidence=0.9)
+    )
+    assert outcome.action == "created"
+
+
+@pytest.mark.asyncio
+async def test_rest_accept__late__a_rule_kept_only_as_a_memory_still_holds(
+    monkeypatch, container, fake
+):
+    """Planned for 09:00, 10:00 and 14:00, accepted at 11:00: the day is blocked until
+    21:00 by a rule and the evening by a memory, so the work moves to tomorrow morning,
+    never after 9 PM."""
+    await _busy_days_rule(container)
+    await _evenings_free_said_only_as_a_memory(container)
+    draft = await _draft(container, PARTLY_PASSED)
+
+    async with _api(monkeypatch, container, fake) as api:
+        resp = await api.post(f"/api/v1/drafts/{draft.id}/accept", json={"user_id": U})
+
+    assert resp.status_code == 200 and resp.json()["moved"] is True
+    starts = await _starts(container)
+    assert len(starts) == 3
+    for start in starts.values():
+        assert start >= ELEVEN_AM
+        assert 8 <= start.hour < 11, f"{start:%a %H:%M} breaks a rule"
+
+
+@pytest.mark.asyncio
+async def test_rest_accept__late_and_habits_cannot_be_read__503_and_the_draft_stays_open(
+    monkeypatch, container, fake
+):
+    from uuid import uuid4
+
+    from app.domain.errors import LLMUnavailableError
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+    from tests.behaviour.conftest import ScriptedLLM
+
+    scripted = ScriptedLLM()
+
+    def down(_req):
+        raise LLMUnavailableError("the model is down")
+
+    scripted.script("habit_translation", down)
+    set_chain(FallbackChainProvider([scripted]))  # conftest resets the chain afterwards
+    await container.repos.constraints.add(U, BehavioralConstraint(
+        id=str(uuid4()), user_id=U, raw_text="Choir practice 6-8 PM on Mondays, unique",
+        constraint_type="habit", recurrence="daily",
+    ))
+    draft = await _draft(container, PARTLY_PASSED)
+
+    async with _api(monkeypatch, container, fake) as api:
+        resp = await api.post(f"/api/v1/drafts/{draft.id}/accept", json={"user_id": U})
+
+    assert resp.status_code == 503
+    error = resp.json()["error"]
+    assert error["code"] == "llm_unavailable"
+    assert "still open" in error["message"] and "the model is down" not in error["message"]
+    assert (await container.repos.drafts.get(U, draft.id)).status is DraftStatus.PENDING
+    assert await container.repos.tasks.list_pending(U) == []
+    assert scripted.calls_for("habit_translation")
+
+
+@pytest.mark.asyncio
+async def test_rest_accept__moved__the_draft_shows_its_new_times(monkeypatch, container, fake):
+    draft = await _draft(container, PARTLY_PASSED)
+
+    async with _api(monkeypatch, container, fake) as api:
+        await api.post(f"/api/v1/drafts/{draft.id}/accept", json={"user_id": U})
+        body = (await api.get(f"/api/v1/drafts/{draft.id}", params={"user_id": U})).json()
+
+    assert body["schedule"] is not None
+    shown = {t: datetime.fromisoformat(s["start"]) for t, s in body["schedule"]["schedule"].items()}
+    assert shown == await _starts(container)
+    stored = (await container.repos.drafts.get(U, draft.id)).schedule
+    assert set(stored) == set(shown)  # the compact map, as planning stores it
+    assert all(set(slot) == {"start_min", "end_min"} for slot in stored.values())
+
+
+@pytest.mark.asyncio
+async def test_chat_accept__late_and_habits_cannot_be_read__said_plainly_and_still_open(
+    container, fake
+):
+    from uuid import uuid4
+
+    from app.domain.errors import LLMUnavailableError
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+    from tests.behaviour.conftest import ScriptedLLM
+
+    scripted = ScriptedLLM()
+
+    def down(_req):
+        raise LLMUnavailableError("the model is down")
+
+    scripted.script("habit_translation", down)
+    set_chain(FallbackChainProvider([scripted]))  # conftest resets the chain afterwards
+    await container.repos.constraints.add(U, BehavioralConstraint(
+        id=str(uuid4()), user_id=U, raw_text="Swimming 7-8 PM on Tuesdays, chat case",
+        constraint_type="habit", recurrence="daily",
+    ))
+    draft = await _draft(container, PARTLY_PASSED)
+
+    out = await _chat_accept(container, fake, draft.id)
+
+    assert "couldn't read your habits" in out["response_message"]
+    assert "haven't locked it in" in out["response_message"]
+    assert out["draft_id"] == draft.id and "negotiation_state" not in out  # still open
     assert (await container.repos.drafts.get(U, draft.id)).status is DraftStatus.PENDING
     assert await container.repos.tasks.list_pending(U) == []
