@@ -299,22 +299,6 @@ async def test_tasks__update_status__unknown_task__raises_not_found(repos):
 
 
 @pytest.mark.asyncio
-async def test_tasks__reschedule__sets_times_and_keeps_row(repos):
-    await _seed_tasks(repos, U1, [_row("a", start=T0)])
-    before = await repos.tasks.get(U1, "a")
-    new_start, new_end = T0 + timedelta(days=1), T0 + timedelta(days=1, minutes=30)
-
-    moved = await repos.tasks.reschedule(U1, "a", new_start, new_end)
-
-    assert (moved.scheduled_start, moved.scheduled_end) == (new_start, new_end)
-    assert moved.id == before.id and moved.title == before.title
-    assert await repos.tasks.get(U1, "a") == moved
-    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["a"]
-    with pytest.raises(errors.NotFoundError):
-        await repos.tasks.reschedule(U2, "a", new_start, new_end)
-
-
-@pytest.mark.asyncio
 async def test_tasks__list_scheduled_between__window_filter(repos):
     await _seed_tasks(
         repos,

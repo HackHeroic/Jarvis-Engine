@@ -51,7 +51,11 @@ SESSION_SUMMARY_MAX_CHARS = 4000
 
 
 class TaskRepository(ABC):
-    """Storage for the user's committed tasks."""
+    """Storage for the user's committed tasks.
+
+    It writes only a task's status. A task's row, slot included, is written by
+    accepting a draft (``DraftRepository.accept_atomic``) and by nothing else.
+    """
 
     @abstractmethod
     async def list_pending(self, user_id: str) -> list[Task]:
@@ -90,10 +94,6 @@ class TaskRepository(ABC):
         happens only while the task still starts at that instant (compared as instants,
         whatever offset it is stored with), so a task re-slotted meanwhile is left alone.
         """
-
-    @abstractmethod
-    async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:
-        """Move the task to a new [start, end) slot and return it; raise NotFoundError if absent."""
 
 
 class TaskEventRepository(ABC):

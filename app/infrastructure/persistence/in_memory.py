@@ -176,19 +176,6 @@ class InMemoryTaskRepository(TaskRepository):
             )
         return self._store.tasks[indexes[0]].model_copy(deep=True)
 
-    async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:
-        start, end = utc(start), utc(end)
-        if end <= start:
-            raise errors.ValidationError("A task must end after it starts.")
-        indexes = self._indexes(user_id, task_id)
-        if not indexes:
-            raise not_found("task", task_id)
-        for i in indexes:
-            self._store.tasks[i] = self._store.tasks[i].model_copy(
-                update={"scheduled_start": start, "scheduled_end": end}
-            )
-        return self._store.tasks[indexes[0]].model_copy(deep=True)
-
 
 class InMemoryTaskEventRepository(TaskEventRepository):
     def __init__(self, store: InMemoryStore) -> None:

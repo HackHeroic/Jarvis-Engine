@@ -24,6 +24,7 @@ from app.api.deps import get_container
 from app.domain import errors
 from app.schemas.draft import (
     DraftAcceptRequest,
+    DraftAcceptResponse,
     DraftChatRequest,
     DraftModifyRequest,
     DraftRearrangeRequest,
@@ -106,13 +107,20 @@ async def get_draft(draft_id: str, user_id: str, http_request: Request):
     )
 
 
-@router.post("/{draft_id}/accept", summary="Accept a draft and persist its tasks")
-async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request: Request):
+@router.post(
+    "/{draft_id}/accept",
+    response_model=DraftAcceptResponse,
+    summary="Accept a draft and persist its tasks",
+)
+async def accept_draft(
+    draft_id: str, request: DraftAcceptRequest, http_request: Request
+) -> DraftAcceptResponse:
     """Accept the draft: write its tasks to ``user_tasks`` and mark it accepted.
 
     This is the only REST path that commits a proposed schedule — the planning
     flow deliberately persists nothing until the user says yes. A second accept
-    answers 409 and writes nothing.
+    answers 409 and writes nothing, as does a plan whose every slot has gone by
+    (``DraftOutdatedError``).
     """
     await _load_draft(http_request, draft_id, request.user_id)
     drafts = get_container(http_request).draft_service
@@ -120,7 +128,7 @@ async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request:
         task_count = await drafts.accept(request.user_id, draft_id)
     except errors.ValidationError:
         # Nothing in the draft can be scheduled; nothing was written.
-        return {"status": "empty", "draft_id": draft_id, "task_count": 0}
+        return DraftAcceptResponse(status="empty", draft_id=draft_id, task_count=0)
     except errors.PersistenceError as exc:
         # The tasks did not land, so the draft is still open and the client
         # may retry. Answering 200 "accepted" here is how a user ends up with
@@ -128,7 +136,7 @@ async def accept_draft(draft_id: str, request: DraftAcceptRequest, http_request:
         raise errors.PersistenceError(
             "The schedule could not be saved. The draft is still open; try again."
         ) from exc
-    return {"status": "accepted", "draft_id": draft_id, "task_count": task_count}
+    return DraftAcceptResponse(status="accepted", draft_id=draft_id, task_count=task_count)
 
 
 @router.post("/{draft_id}/reject", summary="Reject a draft")

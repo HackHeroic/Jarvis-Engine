@@ -99,9 +99,6 @@ class _DelegatingTasks(TaskRepository):
             user_id, task_id, status, expected=expected, expected_start=expected_start
         )
 
-    async def reschedule(self, user_id, task_id, start, end):
-        return await self._inner.reschedule(user_id, task_id, start, end)
-
 
 class _FailingEvents(TaskEventRepository):
     """An event log whose writes fail while ``fail`` is set (the database dropped)."""
@@ -632,3 +629,46 @@ def test_latest_outcome_per_slot__no_slot__one_per_task_and_non_outcomes_dropped
     assert latest_outcome_per_slot([skipped, other, completed, scheduled, deadline]) == [
         other, completed
     ]
+
+
+# --- unused pieces: gone, or published where they say -------------------------------------
+
+
+def test_task_repository__no_reschedule__a_slot_moves_only_by_an_accepted_draft():
+    """Nothing moved a task's slot but an accepted draft (which writes the row again,
+    and its rescheduled event); the unused port method is gone, not pretended."""
+    assert not hasattr(TaskRepository, "reschedule")
+
+
+@pytest.mark.asyncio
+async def test_planning_mark_missed__container_registered__deadline_missed_on_its_bus(
+    monkeypatch,
+):
+    """DeadlineMissed is published where it says: a pending task's deadline passed and a
+    plan set it aside, through the composition root's TaskService."""
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.core.user_model import UserModel
+    from app.modules.planning_graph import mark_missed
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+
+    fake = FakeSupabase({"user_tasks": [{
+        "id": "row-t1", "user_id": U1, "task_id": "t1", "title": "Revise t1", "status": "pending",
+        "duration_minutes": 25, "difficulty_weight": 0.5, "deadline_hint": "2020-01-01",
+    }]})
+    container = AppContainer.build(
+        supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+    runtime.set_container(container)
+    recorder = _Recorder()
+    container.events.subscribe(DeadlineMissed, recorder)
+
+    await mark_missed({
+        "user_id": U1, "user_model": UserModel(U1, FakeDBClient(fake)),
+        "user_message": "plan my week",
+    })
+
+    assert [(type(e), e.task_id) for e in recorder.events] == [(DeadlineMissed, "t1")]
