@@ -123,22 +123,30 @@ async def mark_missed(state: PlanningState) -> dict:
     A replan (the morning brief, an accepted rule) runs no deadline scan: it changes
     no task's status, and a task whose deadline passed stays as it is until the user
     plans or asks for it.
+
+    Every status change goes through the composition root's ``TaskService`` (setting
+    aside records a deadline_missed event). Without a container (tests, scripts)
+    neither the scan nor the bring-back runs: there is no second write path.
     """
     if state.get("replan_only"):
         return {"missed_deadlines": [], "anti_guilt_message": None}
     from app.services.analytical import missed_deadlines as md
 
-    user_model = state.get("user_model")
-    db = getattr(user_model, "_db", None) if user_model is not None else None
-    supabase = getattr(db, "supabase", None)
+    container = registered_container()
+    if container is None:
+        logger.debug("No container registered: no deadline scan or bring-back this turn")
+        return {"missed_deadlines": [], "anti_guilt_message": None}
+    user_id = state.get("user_id", "demo")
+    tasks, task_service = container.repos.tasks, container.task_service
     if md.asks_to_bring_back_missed(state.get("user_message")):
         # The overdue message's offer ("say the word and I'll work it into this
         # plan"), kept: the set-aside tasks are pending again before fusion reads
         # pending tasks, so this plan schedules them. Nothing is marked this turn,
         # even when nothing was set aside (a second ask must not undo the first).
-        restored = await md.restore_missed(state.get("user_id", "demo"), supabase)
+        restored = await md.restore_missed(user_id, tasks, task_service)
         if not restored:
             return {"missed_deadlines": [], "anti_guilt_message": None}
+        user_model = state.get("user_model")
         if user_model is not None and hasattr(user_model, "invalidate"):
             user_model.invalidate("pending_tasks")
         return {
@@ -147,13 +155,9 @@ async def mark_missed(state: PlanningState) -> dict:
             "restored_task_ids": [r["task_id"] for r in restored],
             "_tool_detail": {"restored": len(restored)},
         }
-    # With the composition root registered, each task is set aside through
-    # TaskService, which records a deadline_missed event alongside the status.
-    container = registered_container()
-    via_service = {"task_service": container.task_service} if container is not None else {}
     try:
         overdue = await md.detect_and_mark_missed(
-            state.get("user_id", "demo"), supabase, zone=await _user_zone(state), **via_service
+            user_id, tasks, task_service, zone=await _user_zone(state)
         )
     except Exception as e:
         logger.warning(f"Missed-deadline scan failed (non-fatal): {e}")

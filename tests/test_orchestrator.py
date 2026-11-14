@@ -1382,11 +1382,16 @@ async def test_store_constraint__persists_each_habit_and_confirms(monkeypatch):
     from app.orchestrator import graph as graph_mod
     from app.schemas.context import BrainDumpExtraction
 
+    from app.core import runtime
+    from tests.fakes import build_test_container
+
+    container = build_test_container()
+    runtime.set_container(container)  # conftest resets the registry afterwards
     stored = []
 
-    async def fake_store(raw_text, constraint_type="preference", user_id=None,
-                         structured_override=None, supabase_client=None):
-        stored.append((raw_text, constraint_type, user_id))
+    async def fake_store(constraints, habit, *, user_id, constraint_type="habit"):
+        assert constraints is container.repos.constraints
+        stored.append((habit, constraint_type, user_id))
         return {"status": "stored", "id": f"c-{len(stored)}"}
 
     monkeypatch.setattr(
@@ -1427,8 +1432,12 @@ async def test_store_constraint__no_habits__honest_message(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_store_constraint__storage_fails__does_not_claim_success(monkeypatch):
+    from app.core import runtime
     from app.orchestrator import graph as graph_mod
     from app.schemas.context import BrainDumpExtraction
+    from tests.fakes import build_test_container
+
+    runtime.set_container(build_test_container())  # conftest resets the registry afterwards
 
     async def failing_store(*a, **k):
         return {"status": "error", "error": "db down"}

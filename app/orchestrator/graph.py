@@ -461,32 +461,24 @@ def _supabase_of(state: JarvisState):
     return getattr(db, "supabase", None)
 
 
-async def _store_rule(state: JarvisState, habit: str, supabase: Any) -> dict:
+async def _store_rule(state: JarvisState, habit: str) -> dict:
     """Store one stated habit as a rule: ``{"status": "stored", "id": ...}`` or not stored.
 
-    Through the composition root's ``ConstraintRepository`` when one is registered (the
-    rule's id is known at once, for linking it to the memory of stating it); otherwise
-    (tests, scripts) the legacy behavioural store.
+    Through the composition root's ``ConstraintRepository`` (the rule's id is known at
+    once, for linking it to the memory of stating it). Without a container (tests,
+    scripts) nothing is stored, and the turn says so.
     """
-    from uuid import uuid4
-
     from app.core.runtime import registered_container
-    from app.domain.entities import BehavioralConstraint
-    from app.services.analytical.habit_translator import invalidate_habit_cache
     from app.services.extraction import behavioral_store
 
     container = registered_container()
     user_id = state.get("user_id")
     if container is None or not user_id:
-        return await behavioral_store.store_behavioral_constraint(
-            habit, constraint_type="habit", user_id=user_id, supabase_client=supabase
-        )
-    rule = await container.repos.constraints.add(user_id, BehavioralConstraint(
-        id=str(uuid4()), user_id=user_id, raw_text=habit, constraint_type="habit",
-        recurrence="daily", structured_semantics={}, source="said",
-    ))
-    invalidate_habit_cache()
-    return {"status": "stored", "id": rule.id}
+        logger.debug("store_constraint: no container registered, so the rule is not stored")
+        return {"status": "skipped"}
+    return await behavioral_store.store_behavioral_constraint(
+        container.repos.constraints, habit, user_id=user_id
+    )
 
 
 async def store_constraint(state: JarvisState) -> dict:
@@ -509,14 +501,13 @@ async def store_constraint(state: JarvisState) -> dict:
             ),
         }
 
-    supabase = _supabase_of(state)
     saved: list[str] = []
     # Each stored rule's id, by its words: the observation loop links the rule to the
     # memory of stating it, so the two are let go of together.
     rule_ids: dict[str, str] = {}
     for habit in habits:
         try:
-            result = await _store_rule(state, habit, supabase)
+            result = await _store_rule(state, habit)
         except Exception as e:  # storage must never crash the turn
             logger.warning(f"store_constraint failed ({type(e).__name__})")
             result = {"status": "error"}

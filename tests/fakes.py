@@ -98,7 +98,7 @@ def _unique_violation(index: str) -> Exception:
 # would from the real table. user_tasks: 20261114000001_capstone_lld.sql; user_memories:
 # 20261115000002_memory_lifecycle_and_vectors.sql (rows a test inserts without them).
 _COLUMN_DEFAULTS = {
-    "user_tasks": {"difficulty_weight": 0.5},
+    "user_tasks": {"duration_minutes": 25, "difficulty_weight": 0.5},
     "user_memories": {"status": "active", "provenance": "said"},
 }
 

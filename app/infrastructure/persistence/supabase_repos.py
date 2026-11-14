@@ -25,6 +25,9 @@ from app.domain.entities import (
     ConversationSession,
     DraftSchedule,
     DraftStatus,
+    Goal,
+    GoalDeadlineUpdate,
+    HabitTracker,
     LLMUsageEvent,
     Memory,
     MemoryStatus,
@@ -41,9 +44,12 @@ from app.domain.entities import (
 from app.domain.ports import (
     RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
+    TRACKER_LIST_LIMIT,
     ConstraintRepository,
     ConversationRepository,
     DraftRepository,
+    GoalRepository,
+    HabitTrackerRepository,
     MemoryMatch,
     MemoryRepository,
     ProfileRepository,
@@ -62,9 +68,11 @@ from app.infrastructure.persistence._mapping import (
     apply_memory_update,
     apply_profile_update,
     check_limit,
+    checked_review,
     checked_summary,
     constraint_to_row,
     day_bounds,
+    deadline_update_to_row,
     draft_closed,
     embedding_values,
     from_row,
@@ -78,12 +86,14 @@ from app.infrastructure.persistence._mapping import (
     not_found,
     now_utc,
     pattern_key_taken,
+    prepare_deadline_update,
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
     summary_coverage,
     USAGE_SUMMARY_COLUMNS,
     summarize_usage_rows,
+    task_changed,
     task_from_row,
     task_id_clash,
     task_status_values,
@@ -174,19 +184,28 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         )
         return [_read_task(r) for r in rows]
 
-    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
-        values = sorted({v for status in statuses for v in task_status_values(TaskStatus(status))})
-        if not values:
-            return []
-        rows = await self._run(
-            lambda q: q.select("*")
-            .eq("user_id", user_id)
-            .in_("status", values)
+    async def list_for_user(
+        self, user_id: str, *, statuses: frozenset[TaskStatus] | None = None
+    ) -> list[Task]:
+        values = None
+        if statuses is not None:
+            values = sorted(
+                {v for status in statuses for v in task_status_values(TaskStatus(status))}
+            )
+            if not values:
+                return []
+
+        def build(q: Any) -> Any:
+            q = q.select("*").eq("user_id", user_id)
+            if values is not None:
+                q = q.in_("status", values)
             # Newest first: whatever the bound leaves out is the oldest.
-            .order("created_at", desc=True)
-            .limit(TASK_LIST_LIMIT)
-        )
-        return [_read_task(r) for r in rows]
+            return q.order("created_at", desc=True).limit(TASK_LIST_LIMIT)
+
+        return [_read_task(r) for r in await self._run(build)]
+
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        return await self.list_for_user(user_id, statuses=frozenset(statuses))
 
     async def get(self, user_id: str, task_id: str) -> Task | None:
         rows = await self._run(
@@ -234,13 +253,22 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         guarded = expected is not None or expected_start is not None
         if not guarded or await self.get(user_id, task_id) is None:
             raise not_found("task", task_id)
-        raise errors.StaleVersionError(
-            "That task changed before this update; reload and try again.",
-            details={
-                "task_id": task_id,
-                "expected": TaskStatus(expected).value if expected is not None else None,
-            },
+        raise task_changed(task_id, expected)
+
+    async def bring_back(self, user_id: str, task_id: str) -> Task:
+        # One statement: the status filter is the compare-and-set, and the passed
+        # deadline is cleared in the same write.
+        rows = await self._run(
+            lambda q: q.update({"status": TaskStatus.PENDING.value, "deadline_hint": None})
+            .eq("user_id", user_id)
+            .eq("task_id", task_id)
+            .in_("status", task_status_values(TaskStatus.MISSED))
         )
+        if rows:
+            return _read_task(rows[0])
+        if await self.get(user_id, task_id) is None:
+            raise not_found("task", task_id)
+        raise task_changed(task_id, TaskStatus.MISSED)
 
 
 class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
@@ -427,11 +455,13 @@ class SupabaseConstraintRepository(_SupabaseRepository, ConstraintRepository):
     table = "behavioral_constraints"
 
     async def list_active(self, user_id: str) -> list[BehavioralConstraint]:
+        # Newest first, so PostgREST's row cap can only leave out the oldest rules;
+        # handed back oldest first, as the port says.
         rows = await self._run(
-            lambda q: q.select("*").eq("user_id", user_id).order("created_at")
+            lambda q: q.select("*").eq("user_id", user_id).order("created_at", desc=True)
         )
         now = now_utc()
-        return [_read(BehavioralConstraint, r) for r in rows if _applies_at(r, now)]
+        return [_read(BehavioralConstraint, r) for r in reversed(rows) if _applies_at(r, now)]
 
     async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
         stored = prepare_new(user_id, c, "constraint")
@@ -465,6 +495,81 @@ def _applies_at(row: dict, now: datetime) -> bool:
     if valid_from and utc(datetime.fromisoformat(valid_from)) > now:
         return False
     return not (valid_until and utc(datetime.fromisoformat(valid_until)) <= now)
+
+
+class SupabaseGoalRepository(_SupabaseRepository, GoalRepository):
+    """``goals`` and the deadline updates of ``user_plan_updates``."""
+
+    table = "goals"
+    _updates = "user_plan_updates"
+
+    async def get(self, user_id: str, goal_id: str) -> Goal | None:
+        rows = await self._run(
+            lambda q: q.select("*").eq("user_id", user_id).eq("id", goal_id).limit(1)
+        )
+        return _read(Goal, rows[0]) if rows else None
+
+    async def latest_context(self, user_id: str, goal_id: str) -> str | None:
+        rows = await self._run(
+            lambda q: q.select("context_snippet")
+            .eq("user_id", user_id)
+            .eq("goal_id", goal_id)
+            .order("created_at", desc=True)
+            .limit(1),
+            table=self._updates,
+        )
+        return (rows[0].get("context_snippet") or None) if rows else None
+
+    async def add_deadline_update(self, user_id: str, update: GoalDeadlineUpdate) -> None:
+        stored = prepare_deadline_update(user_id, update)
+        await self._run(lambda q: q.insert(deadline_update_to_row(stored)), table=self._updates)
+
+
+class SupabaseHabitTrackerRepository(_SupabaseRepository, HabitTrackerRepository):
+    table = "habit_trackers"
+
+    async def get(self, user_id: str, tracker_id: str) -> HabitTracker | None:
+        if not is_uuid(tracker_id):  # the id column is a uuid; anything else matches nothing
+            return None
+        rows = await self._run(
+            lambda q: q.select("*").eq("id", tracker_id).eq("user_id", user_id).limit(1)
+        )
+        return _read(HabitTracker, rows[0]) if rows else None
+
+    async def list_for_user(self, user_id: str) -> list[HabitTracker]:
+        rows = await self._run(
+            lambda q: q.select("*")
+            .eq("user_id", user_id)
+            # Newest first: whatever the bound leaves out is the oldest.
+            .order("created_at", desc=True)
+            .limit(TRACKER_LIST_LIMIT)
+        )
+        return [_read(HabitTracker, r) for r in rows]
+
+    async def record_review(
+        self,
+        user_id: str,
+        tracker_id: str,
+        *,
+        repetitions: int,
+        ef: float,
+        next_interval_days: int,
+        quality: int,
+        done_at: datetime,
+    ) -> HabitTracker:
+        fields = checked_review(
+            user_id, tracker_id, repetitions=repetitions, ef=ef,
+            next_interval_days=next_interval_days, quality=quality, done_at=done_at,
+        )
+        if not is_uuid(tracker_id):
+            raise not_found("tracker", tracker_id)
+        row = {**fields, "last_done_at": iso(fields["last_done_at"])}
+        rows = await self._run(
+            lambda q: q.update(row).eq("id", tracker_id).eq("user_id", user_id)
+        )
+        if not rows:
+            raise not_found("tracker", tracker_id)
+        return _read(HabitTracker, rows[0])
 
 
 class SupabaseProfileRepository(_SupabaseRepository, ProfileRepository):

@@ -44,13 +44,19 @@ async def test_synthesize_response_wraps_module_output(no_llm):
 
 @pytest.mark.asyncio
 async def test_coach_module_returns_message(no_llm):
+    from app.core import runtime
     from app.modules.coach import run_coaching_response
+    from tests.fakes import build_test_container
+
+    # The mastery numbers come from the composition root's repositories (empty here).
+    runtime.set_container(build_test_container())  # conftest resets the registry afterwards
     state = {
         "user_model": MagicMock(),
         "user_message": "how am I doing?",
         "modules_invoked": [],
         "error": None,
     }
+    state["user_model"].user_id = "u1"
     state["user_model"].get_all_tasks = AsyncMock(return_value=[
         {"status": "completed", "title": "Study DSA"},
         {"status": "pending", "title": "Read chapter 5"},

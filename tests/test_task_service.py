@@ -86,6 +86,9 @@ class _DelegatingTasks(TaskRepository):
     async def list_by_status(self, user_id, statuses):
         return await self._inner.list_by_status(user_id, statuses)
 
+    async def list_for_user(self, user_id, *, statuses=None):
+        return await self._inner.list_for_user(user_id, statuses=statuses)
+
     async def get(self, user_id, task_id):
         return await self._inner.get(user_id, task_id)
 
@@ -98,6 +101,9 @@ class _DelegatingTasks(TaskRepository):
         return await self._inner.update_status(
             user_id, task_id, status, expected=expected, expected_start=expected_start
         )
+
+    async def bring_back(self, user_id, task_id):
+        return await self._inner.bring_back(user_id, task_id)
 
 
 class _FailingEvents(TaskEventRepository):
@@ -556,7 +562,7 @@ async def test_detect_and_mark_missed__with_task_service__writes_deadline_missed
     repos = RepositoryFactory.supabase(fake)
     service = TaskService(repos.tasks, repos.task_events, EventBus(), clock=lambda: NOW)
 
-    overdue = await detect_and_mark_missed(U1, fake, task_service=service)
+    overdue = await detect_and_mark_missed(U1, repos.tasks, service)
 
     assert [o["task_id"] for o in overdue] == ["t1"]
     (event,) = fake.rows["task_events"]
@@ -572,7 +578,8 @@ async def test_detect_and_mark_missed__one_task_errors__others_still_marked_and_
 
     rows = [
         {"id": f"row-{t}", "user_id": U1, "task_id": t, "title": f"Revise {t}",
-         "status": "pending", "deadline_hint": "2020-01-01"}
+         "status": "pending", "duration_minutes": 25, "difficulty_weight": 0.5,
+         "deadline_hint": "2020-01-01"}
         for t in ("t1", "t2", "t3")
     ]
 
@@ -593,10 +600,41 @@ async def test_detect_and_mark_missed__one_task_errors__others_still_marked_and_
 
     service = _FlakyService()
 
-    overdue = await detect_and_mark_missed(U1, FakeSupabase({"user_tasks": rows}), task_service=service)
+    tasks = RepositoryFactory.supabase(FakeSupabase({"user_tasks": rows})).tasks
+
+    overdue = await detect_and_mark_missed(U1, tasks, service)
 
     assert service.calls == ["t1", "t2", "t3"]
     assert [o["task_id"] for o in overdue] == ["t1", "t3"]
+
+
+# --- Bring back -----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bring_back__missed__pending_with_deadline_cleared_and_no_outcome_event(
+    service, repos, store, recorder
+):
+    _seed(store, _task(status=TaskStatus.MISSED))
+
+    back = await service.bring_back(U1, "t1")
+
+    assert (back.task_id, back.status, back.deadline_hint) == ("t1", TaskStatus.PENDING, None)
+    assert await repos.tasks.get(U1, "t1") == back
+    # Not an outcome: nothing is added to the history learning reads, nothing announced.
+    assert await _events(repos) == []
+    assert recorder.events == []
+
+
+@pytest.mark.asyncio
+async def test_bring_back__not_missed_any_more__none_and_unchanged(service, repos, store):
+    _seed(store, _task(status=TaskStatus.COMPLETED))
+
+    assert await service.bring_back(U1, "t1") is None
+    kept = await repos.tasks.get(U1, "t1")
+    assert (kept.status, kept.deadline_hint) == (TaskStatus.COMPLETED, "2026-11-20")
+    with pytest.raises(errors.NotFoundError):
+        await service.bring_back(U1, "missing")
 
 
 # --- The latest outcome of each slot ------------------------------------------------------

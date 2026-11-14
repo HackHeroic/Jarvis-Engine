@@ -4,9 +4,12 @@ Runs at the start of every PLAN_DAY flow. Past-deadline + status=pending tasks
 are marked as `missed`, which takes them out of planning (fusion reads only
 pending tasks) without deleting them, and surfaced in the synthesis with
 anti-guilt framing — never shame language.
+
+Tasks are read through the ``TaskRepository`` and every status change goes through
+``TaskService``: setting a task aside records its ``deadline_missed`` event, and
+bringing it back is one compare-and-set write that also clears the passed deadline.
 """
 
-import asyncio
 import re
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -15,6 +18,7 @@ from zoneinfo import ZoneInfo
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.domain import errors
 from app.domain.entities import TaskStatus
+from app.domain.ports import TaskRepository
 from app.services.planning.local_time import end_of_local_day, user_zone
 
 if TYPE_CHECKING:
@@ -47,74 +51,50 @@ def parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
 
 async def detect_and_mark_missed(
     user_id: str,
-    supabase: Any,
+    tasks: TaskRepository,
+    task_service: "TaskService",
     zone: Optional[ZoneInfo] = None,
-    *,
-    task_service: "TaskService | None" = None,
 ) -> list[dict]:
-    """Find pending tasks whose deadline has passed; mark them `missed`.
+    """Find the user's pending tasks whose deadline has passed and set them aside.
 
     ``zone`` is the user's (default ``user_zone()``): it decides when a date-only
-    deadline has passed. With ``task_service`` each task is set aside through
-    ``TaskService.mark_deadline_missed``, which also records a ``deadline_missed``
-    event; a task that changed meanwhile is left alone and not returned. Without
-    one (the deprecated v1 flow) the status is written directly. Returns the list
-    of (task_id, title, deadline) tuples that were just marked. Empty list if none.
-    Tolerates supabase=None (returns []).
+    deadline has passed. Each task is set aside through
+    ``TaskService.mark_deadline_missed``, which records a ``deadline_missed`` event
+    with the status; a task that changed meanwhile is left alone and not returned, and
+    one task's failure never stops the others. Returns ``{id, task_id, title,
+    deadline}`` for each task just set aside; [] when none, or when the tasks could
+    not be read (logged: the turn plans on without the scan).
     """
-    if not supabase:
-        return []
     zone = zone or user_zone()
     now = datetime.now(timezone.utc)
     try:
-        result = (
-            supabase.table("user_tasks")
-            .select("id, task_id, title, deadline_hint, status")
-            .eq("user_id", user_id)
-            .eq("status", "pending")
-            .execute()
-        )
-        rows = result.data or []
-    except Exception as e:
-        logger.warning(f"missed-deadline scan failed: {e}")
+        pending = await tasks.list_for_user(user_id, statuses=frozenset({TaskStatus.PENDING}))
+    except errors.JarvisError as e:
+        logger.warning(f"missed-deadline scan could not read the tasks: {e.code}")
         return []
 
     overdue: list[dict] = []
-    for row in rows:
-        dl = parse_deadline(row.get("deadline_hint"), zone)
+    for task in pending:
+        dl = parse_deadline(task.deadline_hint, zone)
         if dl and dl < now:
             overdue.append({
-                "id": row.get("id"),
-                "task_id": row.get("task_id"),
-                "title": row.get("title"),
+                "id": task.id,
+                "task_id": task.task_id,
+                "title": task.title,
                 "deadline": dl.isoformat(),
             })
 
-    if not overdue:
-        return []
+    marked: list[dict] = []
+    for o in overdue:
+        try:
+            if await task_service.mark_deadline_missed(user_id, o["task_id"]) is not None:
+                marked.append(o)
+        except Exception as e:  # one task's failure never stops the others
+            logger.warning(f"Could not set task {o['task_id']} aside: {type(e).__name__}")
 
-    if task_service is not None:
-        marked: list[dict] = []
-        for o in overdue:
-            try:
-                if await task_service.mark_deadline_missed(user_id, o["task_id"]) is not None:
-                    marked.append(o)
-            except Exception as e:  # one task's failure never stops the others
-                logger.warning(f"Could not set task {o['task_id']} aside: {type(e).__name__}")
-        overdue = marked
-    else:
-        # Mark missed in DB
-        for o in overdue:
-            try:
-                supabase.table("user_tasks").update(
-                    {"status": "missed"}
-                ).eq("id", o["id"]).eq("user_id", user_id).execute()
-            except Exception as e:
-                logger.warning(f"Failed to mark task {o['task_id']} missed: {e}")
-
-    if overdue:
-        logger.info(f"Set aside {len(overdue)} missed tasks for user {user_id}")
-    return overdue
+    if marked:
+        logger.info(f"Set aside {len(marked)} missed tasks for user {user_id}")
+    return marked
 
 
 # "Say the word and I'll work it into this plan": the word, deterministically (no
@@ -146,60 +126,32 @@ def asks_to_bring_back_missed(message: str | None) -> bool:
     )
 
 
-async def _clear_passed_deadline(user_id: str, task_id: str, supabase: Any) -> None:
-    """Drop a restored task's passed deadline (only while it is still pending)."""
-    try:
-        await asyncio.to_thread(
-            lambda: supabase.table("user_tasks")
-            .update({"deadline_hint": None})
-            .eq("user_id", user_id)
-            .eq("task_id", task_id)
-            .eq("status", TaskStatus.PENDING.value)
-            .execute()
-        )
-    except Exception as e:
-        # Still back in this plan; a later scan may set it aside again.
-        logger.warning(f"Could not clear the passed deadline of task {task_id}: {e!r}")
+async def restore_missed(
+    user_id: str, tasks: TaskRepository, task_service: "TaskService"
+) -> list[dict]:
+    """Bring the user's ``missed`` tasks back to ``pending``; return the ones brought back.
 
-
-async def restore_missed(user_id: str, supabase: Any) -> list[dict]:
-    """Flip the user's ``missed`` tasks back to ``pending``; return the ones flipped.
-
-    Each move goes through ``TaskRepository.update_status`` as a compare-and-set
-    from MISSED, so a task that changed meanwhile is left alone. Bringing a task
-    back is durable: its passed ``deadline_hint`` is cleared, or the next scan
-    (``detect_and_mark_missed``) would set it straight aside again. Returns
-    ``[{"task_id", "title"}]`` for the tasks that are pending again.
+    Each goes through ``TaskService.bring_back``: one compare-and-set from MISSED that
+    also clears the passed ``deadline_hint``, or the next scan
+    (``detect_and_mark_missed``) would set it straight aside again. A task that changed
+    meanwhile is left alone. Returns ``[{"task_id", "title"}]`` for the tasks that are
+    pending again, newest first; [] when the tasks could not be read (logged).
     """
-    if not supabase:
-        return []
-    from app.services.draft_actions import task_repository
-
-    tasks = task_repository(supabase)
     try:
-        result = await asyncio.to_thread(
-            lambda: supabase.table("user_tasks")
-            .select("task_id, title")
-            .eq("user_id", user_id)
-            .eq("status", TaskStatus.MISSED.value)
-            .execute()
-        )
-        rows = result.data or []
-    except Exception as e:
-        logger.warning(f"Listing missed tasks failed: {e!r}")
+        missed = await tasks.list_for_user(user_id, statuses=frozenset({TaskStatus.MISSED}))
+    except errors.JarvisError as e:
+        logger.warning(f"Listing missed tasks failed: {e.code}")
         return []
 
     restored: list[dict] = []
-    for row in rows:
+    for task in missed:
         try:
-            await tasks.update_status(
-                user_id, row["task_id"], TaskStatus.PENDING, expected=TaskStatus.MISSED
-            )
+            back = await task_service.bring_back(user_id, task.task_id)
         except errors.JarvisError as e:
-            logger.warning(f"Could not bring task {row.get('task_id')} back: {e.code}")
+            logger.warning(f"Could not bring task {task.task_id} back: {e.code}")
             continue
-        await _clear_passed_deadline(user_id, row["task_id"], supabase)
-        restored.append({"task_id": row["task_id"], "title": row.get("title")})
+        if back is not None:
+            restored.append({"task_id": task.task_id, "title": task.title})
     if restored:
         logger.info(f"Brought {len(restored)} missed tasks back for user {user_id}")
     return restored

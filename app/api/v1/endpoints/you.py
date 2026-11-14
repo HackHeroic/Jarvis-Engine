@@ -67,6 +67,14 @@ class YouResponse(BaseModel):
             "Where the user's model calls of the last 30 days ran; `since` opens the window."
         )
     )
+    streak_days: int = Field(
+        ge=0,
+        description=(
+            "Consecutive days, ending today on the user's clock, with at least one task"
+            " completed (the coach's count, from the outcome history); 0 when nothing is"
+            " done yet today."
+        ),
+    )
 
 
 class SettingsUpdate(BaseModel):
@@ -105,8 +113,8 @@ def _service(request: Request) -> UserModelService:
     description=(
         "The profile, the patterns Jarvis sees in what happened (each with its evidence and "
         "the memory to confirm or dismiss), the rules plans respect, the memories in use, the "
-        "focus profile and the privacy receipt of the last 30 days. Looks for new patterns "
-        "first; asks no model."
+        "focus profile, the privacy receipt of the last 30 days and the completion streak. "
+        "Looks for new patterns first; asks no model."
     ),
 )
 async def get_you(request: Request, user: CurrentUser) -> YouResponse:
@@ -118,6 +126,7 @@ async def get_you(request: Request, user: CurrentUser) -> YouResponse:
         memories=[MemoryOut.of(memory, view.as_of) for memory in view.memories],
         focus=view.focus,
         receipt=view.receipt,
+        streak_days=view.streak_days,
     )
 
 

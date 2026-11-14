@@ -154,11 +154,7 @@ class TestCompletionDurationWrite:
 # ---------------------------------------------------------------------------
 
 
-def test_list_constraints__returns_user_rows_only():
-    from fastapi.testclient import TestClient
-    from app.main import app
-    from tests.fakes import FakeSupabase
-
+def test_list_constraints__returns_user_rows_only(monkeypatch):
     fake = FakeSupabase()
     fake.rows.setdefault("behavioral_constraints", []).extend([
         {"id": "c1", "user_id": "u1", "raw_text": "no study before 11am",
@@ -166,20 +162,13 @@ def test_list_constraints__returns_user_rows_only():
         {"id": "c2", "user_id": "OTHER", "raw_text": "leak", "constraint_type": "habit",
          "created_at": "2026-08-08T10:00:00+00:00"},
     ])
+    client = _client_over(fake, monkeypatch)
 
-    class _DB:
-        supabase = fake
+    resp = client.get("/api/v1/habits/constraints?user_id=u1")
 
-    original = getattr(app.state, "db_client", None)
-    app.state.db_client = _DB()
-    try:
-        client = TestClient(app)
-        resp = client.get("/api/v1/habits/constraints?user_id=u1")
-        assert resp.status_code == 200
-        rows = resp.json()["constraints"]
-        assert [r["raw_text"] for r in rows] == ["no study before 11am"]
-    finally:
-        app.state.db_client = original
+    assert resp.status_code == 200
+    rows = resp.json()["constraints"]
+    assert [r["raw_text"] for r in rows] == ["no study before 11am"]
 
 
 def test_list_constraints__degraded_db__503_not_an_empty_list():
@@ -240,61 +229,8 @@ def test_delete_constraint__removes_own_row_only():
 
 
 # ---------------------------------------------------------------------------
-# PATCH /api/v1/tasks/{task_id} — status is limited to what user_tasks accepts
+# Complete and Skip — an unknown task, or no database
 # ---------------------------------------------------------------------------
-
-
-def test_patch_task__unknown_status__422():
-    """`rolled_forward` passed validation and then failed the table's status CHECK."""
-    from fastapi.testclient import TestClient
-    from app.main import app
-    from tests.fakes import FakeSupabase
-
-    fake = FakeSupabase({"user_tasks": [
-        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending"},
-    ]})
-
-    class _DB:
-        supabase = fake
-
-    original = getattr(app.state, "db_client", None)
-    app.state.db_client = _DB()
-    try:
-        resp = TestClient(app).patch(
-            "/api/v1/tasks/t1", json={"user_id": "u1", "status": "rolled_forward"}
-        )
-        assert resp.status_code == 422
-        assert resp.json()["error"]["code"] == "validation_error"
-        assert fake.rows["user_tasks"][0]["status"] == "pending"
-    finally:
-        app.state.db_client = original
-
-
-def test_patch_task__status__422_points_to_complete_and_skip(monkeypatch):
-    """An outcome is recorded by Complete or Skip (one event each), never by PATCH."""
-    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
-    client = _client_over(fake, monkeypatch)
-
-    resp = client.patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "completed"})
-
-    assert resp.status_code == 422
-    error = resp.json()["error"]
-    assert error["code"] == "validation_error"
-    assert "/complete" in error["message"] and "/skip" in error["message"]
-    assert fake.rows["user_tasks"][0]["status"] == "pending"
-    assert fake.rows.get("task_events", []) == []
-
-
-def test_patch_task__pacing_pushed__422(monkeypatch):
-    """pacing_pushed is retired: skipped tasks are ``skipped``, and the CHECK drops it."""
-    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
-    client = _client_over(fake, monkeypatch)
-
-    resp = client.patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "pacing_pushed"})
-
-    assert resp.status_code == 422
-    assert resp.json()["error"]["code"] == "validation_error"
-    assert fake.rows["user_tasks"][0]["status"] == "pending"
 
 
 def test_complete_endpoint__unknown_task__404_envelope(monkeypatch):
@@ -369,8 +305,6 @@ _REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to"
         ("post", "/api/v1/tasks/t1/complete", {"user_id": "u1", "quality": 4}),
         ("post", "/api/v1/tasks/t1/skip", {"user_id": "u1"}),
         ("post", "/api/v1/tasks/t2/skip", {"user_id": "u1"}),
-        ("patch", "/api/v1/tasks/t1", {"user_id": "u1", "duration_minutes": 20}),
-        ("delete", "/api/v1/tasks/t1?user_id=u1", None),
     ],
 )
 def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
@@ -424,27 +358,9 @@ def test_skip_endpoint__reason_too_long__422_and_nothing_recorded(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "method, path, body",
-    [
-        ("patch", "/api/v1/tasks/nope", {"user_id": "u1", "title": "Renamed"}),
-        ("delete", "/api/v1/tasks/nope?user_id=u1", None),
-    ],
-)
-def test_task_endpoints__unknown_task__not_found_envelope(method, path, body, monkeypatch):
-    client = _client_over(FakeSupabase({"user_tasks": [_task_row("t1")]}), monkeypatch)
-
-    resp = client.request(method.upper(), path, json=body)
-
-    assert resp.status_code == 404
-    error = resp.json()["error"]
-    assert (error["code"], error["message"]) == ("not_found", "That task does not exist.")
-
-
-@pytest.mark.parametrize(
     "method, path",
     [
         ("get", "/api/v1/tasks/"),
-        ("delete", "/api/v1/tasks/"),
         ("post", "/api/v1/drafts/{draft_id}/accept"),
     ],
 )

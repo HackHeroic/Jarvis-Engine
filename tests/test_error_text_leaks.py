@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.domain import errors
-from tests.fakes import FakeDBClient, FakeSupabase
+from tests.fakes import FakeDBClient, FakeSupabase, build_test_container
 
 SECRET = "postgres://admin:hunter2@db.internal"
 
@@ -91,9 +91,9 @@ def test_process__preference_cannot_be_stored__result_carries_no_exception_text(
         )
 
     monkeypatch.setattr("app.services.extraction.orchestrator._classify", classify)
-    monkeypatch.setattr(
-        app.state, "db_client", FakeDBClient(_BrokenSupabase("behavioral_constraints"))
-    )
+    broken = _BrokenSupabase("behavioral_constraints")
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(broken))
+    monkeypatch.setattr(app.state, "container", build_test_container(broken), raising=False)
 
     resp = client.post(
         "/api/v1/ingestion/process", json={"payload": "No study after 10 PM", "user_id": "u1"}
@@ -142,19 +142,21 @@ def test_process__vector_store_fails__body_carries_no_exception_text(client, mon
     _assert_no_leak(resp)
 
 
-def test_delete_constraint__database_fails__500_fixed_message_no_exception_text(
+def test_delete_rule__database_fails__503_fixed_message_no_exception_text(
     app, client, monkeypatch
 ):
-    monkeypatch.setattr(
-        app.state, "db_client", FakeDBClient(_BrokenSupabase("behavioral_constraints"))
-    )
+    """The one rule delete (/habits/constraints/{id}; the /ingestion duplicate is gone)."""
+    broken = _BrokenSupabase("behavioral_constraints")
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(broken))
+    monkeypatch.setattr(app.state, "container", build_test_container(broken), raising=False)
 
     resp = client.delete(
-        "/api/v1/ingestion/behavioral-constraint/c1", params={"user_id": "u1"}
+        "/api/v1/habits/constraints/7d0c0f3e-5b1a-4c2e-9f00-0000000000c1",
+        params={"user_id": "u1"},
     )
 
-    assert resp.status_code == 500
-    assert resp.json()["error"]["message"] == "Could not delete the constraint."
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "persistence_unavailable"
     _assert_no_leak(resp)
 
 

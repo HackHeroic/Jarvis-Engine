@@ -14,6 +14,8 @@ from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 _UNSET = object()
 
 _SLOT = {"name": "OS lecture", "start_min": 60, "end_min": 120, "availability": "blocked"}
+# habit_trackers.id is a uuid: an id of another form could never name a tracker.
+_ALICES_TRACKER = "7d0c0f3e-5b1a-4c2e-9f00-00000000a11c"
 
 
 def _seed() -> dict[str, list[dict]]:
@@ -23,7 +25,8 @@ def _seed() -> dict[str, list[dict]]:
             {"id": "pc-bob", "user_id": "bob", "status": "pending", "extracted_slots": []},
         ],
         "habit_trackers": [
-            {"id": "tr-alice", "user_id": "alice", "repetitions": 0, "ef": 2.5, "next_interval_days": 1},
+            {"id": _ALICES_TRACKER, "user_id": "alice", "repetitions": 0, "ef": 2.5,
+             "next_interval_days": 1},
         ],
     }
 
@@ -35,22 +38,27 @@ class _RaisingSupabase:
         raise RuntimeError("connection refused: postgres://admin:hunter2@db.internal")
 
 
-@pytest.fixture
-def app_state(monkeypatch):
+def _container_over(client):
+    """The composition root over ``client``, as the lifespan builds it."""
     import app.core.config as cfg
     from app.container import AppContainer
-    from app.main import app
     from app.orchestrator.hooks import ActionHooks
+
+    return AppContainer.build(
+        supabase_client=client, cfg=cfg, hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(), install_chain=False,
+    )
+
+
+@pytest.fixture
+def app_state(monkeypatch):
+    from app.main import app
 
     original = getattr(app.state, "db_client", _UNSET)
     supabase = FakeSupabase(_seed())
     app.state.db_client = FakeDBClient(supabase)
-    # The composition root over the same database (routes read the user's profile there).
-    container = AppContainer.build(
-        supabase_client=supabase, cfg=cfg, hooks=ActionHooks(),
-        embedder=BagOfWordsEmbedder(), install_chain=False,
-    )
-    monkeypatch.setattr(app.state, "container", container, raising=False)
+    # The composition root over the same database: the routes read and write through it.
+    monkeypatch.setattr(app.state, "container", _container_over(supabase), raising=False)
     yield app, supabase
     if original is _UNSET:
         delattr(app.state, "db_client")
@@ -155,7 +163,7 @@ def test_pending_calendar_approve__db_raises__503_without_exception_text(client,
 
 
 def test_tracker_complete__no_user_id__422(client):
-    resp = client.post("/api/v1/habits/tracker/tr-alice/complete", json={"quality": 4})
+    resp = client.post(f"/api/v1/habits/tracker/{_ALICES_TRACKER}/complete", json={"quality": 4})
 
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "validation_error"
@@ -165,21 +173,27 @@ def test_tracker_complete__wrong_user__404(client, app_state):
     _, supabase = app_state
 
     resp = client.post(
-        "/api/v1/habits/tracker/tr-alice/complete",
+        f"/api/v1/habits/tracker/{_ALICES_TRACKER}/complete",
         params={"user_id": "bob"},
         json={"quality": 4},
     )
 
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
-    assert _row(supabase, "habit_trackers", "tr-alice")["repetitions"] == 0
+    assert _row(supabase, "habit_trackers", _ALICES_TRACKER)["repetitions"] == 0
 
 
 @pytest.mark.parametrize("path", ["/api/v1/habits/tracker/due", "/api/v1/habits/constraints"])
 @pytest.mark.parametrize("outage", ["no_client", "client_raises"])
-def test_habits_lists__db_unavailable__503_not_an_empty_list(client, app_state, path, outage):
+def test_habits_lists__db_unavailable__503_not_an_empty_list(
+    client, app_state, path, outage, monkeypatch
+):
     app, _ = app_state
-    app.state.db_client.supabase = None if outage == "no_client" else _RaisingSupabase()
+    if outage == "no_client":
+        app.state.db_client.supabase = None
+    else:  # the database drops: the client the repositories hold fails every call
+        app.state.db_client.supabase = _RaisingSupabase()
+        monkeypatch.setattr(app.state, "container", _container_over(_RaisingSupabase()))
 
     resp = client.get(path, params={"user_id": "alice"})
 
@@ -192,7 +206,7 @@ def test_tracker_due__as_alice__only_alices_trackers(client):
     resp = client.get("/api/v1/habits/tracker/due", params={"user_id": "alice"})
 
     assert resp.status_code == 200
-    assert [t["id"] for t in resp.json()["due_trackers"]] == ["tr-alice"]
+    assert [t["id"] for t in resp.json()["due_trackers"]] == [_ALICES_TRACKER]
 
 
 # ── task workspace ──────────────────────────────────────────

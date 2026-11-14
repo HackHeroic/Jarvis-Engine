@@ -7,7 +7,8 @@ caller holding a ``TaskRepository`` cannot tell which family it was given.
 """
 
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+import itertools
+from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -24,6 +25,9 @@ from app.domain.entities import (
     ConversationSession,
     ConsentReasonKind,
     DraftStatus,
+    Goal,
+    GoalDeadlineUpdate,
+    HabitTracker,
     LLMLocation,
     LLMUsageEvent,
     Memory,
@@ -36,8 +40,11 @@ from app.domain.entities import (
     TaskStatus,
 )
 from app.domain.ports import (
+    TASK_LIST_LIMIT,
     ConstraintRepository,
     DraftRepository,
+    GoalRepository,
+    HabitTrackerRepository,
     MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
@@ -93,6 +100,40 @@ def expire_draft(memory_store, fake_client):
                 row["expires_at"] = past.isoformat()
 
     return _expire
+
+
+@pytest.fixture
+def seed_goal(memory_store, fake_client):
+    """Store a goal in whichever store backs ``repos``.
+
+    No port writes a goal (the database's ensure_goal trigger creates its row), so the
+    suite reaches behind the ports here, writing both stores, as ``expire_draft`` does.
+    """
+
+    def _seed(goal: Goal) -> Goal:
+        memory_store.goals.append(goal)
+        fake_client.rows.setdefault("goals", []).append(goal.model_dump(mode="json"))
+        return goal
+
+    return _seed
+
+
+@pytest.fixture
+def seed_tracker(memory_store, fake_client):
+    """Store a habit tracker in whichever store backs ``repos``, each one newer than
+    the last. No port creates a tracker, so the suite writes both stores."""
+    ages = itertools.count()
+
+    def _seed(user_id: str, **fields) -> HabitTracker:
+        tracker = HabitTracker(id=str(uuid4()), user_id=user_id, **fields)
+        memory_store.habit_trackers.append(tracker)
+        created_at = (T0 + timedelta(seconds=next(ages))).isoformat()
+        fake_client.rows.setdefault("habit_trackers", []).append(
+            {**tracker.model_dump(mode="json"), "created_at": created_at}
+        )
+        return tracker
+
+    return _seed
 
 
 # --- Builders ----------------------------------------------------------------
@@ -211,6 +252,20 @@ def _memory(
     )
 
 
+def _plan_update(
+    user_id: str, goal_id: str, context: str | None, *, at: datetime | None = None
+) -> GoalDeadlineUpdate:
+    return GoalDeadlineUpdate(
+        user_id=user_id,
+        goal_id=goal_id,
+        source="ingestion",
+        deadline_date=date(2026, 12, 1),
+        deadline_raw="by December",
+        context_snippet=context,
+        created_at=at,
+    )
+
+
 def _vec(x: float, y: float) -> list[float]:
     """A 384-dimension embedding pointing (x, y) in its first two dimensions."""
     return [x, y] + [0.0] * 382
@@ -232,6 +287,8 @@ def test_factory__both_families__implement_every_port():
         "suggestions": SuggestionRepository,
         "usage": UsageRepository,
         "memories": MemoryRepository,
+        "goals": GoalRepository,
+        "habit_trackers": HabitTrackerRepository,
     }
     for family in (RepositoryFactory.in_memory(), RepositoryFactory.supabase(FakeSupabase())):
         for name, port in ports.items():
@@ -358,6 +415,58 @@ async def test_tasks__list_by_status__filters_and_isolates(repos):
     assert [t.task_id for t in await repos.tasks.list_by_status(
         U2, frozenset({TaskStatus.MISSED})
     )] == ["theirs"]
+
+
+@pytest.mark.asyncio
+async def test_tasks__list_for_user__newest_first_bounded_and_status_filtered(repos):
+    # One accept each, oldest first (an accept replaces the user's pending tasks).
+    await _seed_tasks(repos, U1, [_row("done", status="completed")])
+    await _seed_tasks(repos, U1, [_row("set_aside", status="skipped")])
+    await _seed_tasks(repos, U1, [_row("pushed", status="pacing_pushed")])
+    await _seed_tasks(repos, U1, [_row("pending")])
+    await _seed_tasks(repos, U2, [_row("theirs")])
+
+    every = await repos.tasks.list_for_user(U1)
+    skipped = await repos.tasks.list_for_user(U1, statuses=frozenset({TaskStatus.SKIPPED}))
+
+    assert [t.task_id for t in every] == ["pending", "pushed", "set_aside", "done"]
+    assert all(t.user_id == U1 for t in every)
+    assert [t.task_id for t in skipped] == ["pushed", "set_aside"]  # legacy reads as its meaning
+    assert await repos.tasks.list_for_user(U1, statuses=frozenset()) == []
+    assert [t.task_id for t in await repos.tasks.list_for_user(U2)] == ["theirs"]
+
+    # Past the bound, the newest TASK_LIST_LIMIT come back: only the oldest are left out.
+    await _seed_tasks(
+        repos, U1, [_row(f"bulk_{i:03}", status="completed") for i in range(TASK_LIST_LIMIT)]
+    )
+    bounded = await repos.tasks.list_for_user(U1)
+    assert len(bounded) == TASK_LIST_LIMIT
+    assert {t.task_id for t in bounded} == {f"bulk_{i:03}" for i in range(TASK_LIST_LIMIT)}
+
+
+@pytest.mark.asyncio
+async def test_tasks__bring_back__missed_to_pending_deadline_cleared(repos):
+    await _seed_tasks(repos, U1, [{**_row("set_aside", status="missed"), "deadline_hint": "2026-11-01"}])
+
+    back = await repos.tasks.bring_back(U1, "set_aside")
+
+    assert (back.task_id, back.status, back.deadline_hint) == ("set_aside", TaskStatus.PENDING, None)
+    assert await repos.tasks.get(U1, "set_aside") == back
+    with pytest.raises(errors.NotFoundError):
+        await repos.tasks.bring_back(U2, "set_aside")  # another user's task is no task
+
+
+@pytest.mark.asyncio
+async def test_tasks__bring_back__not_missed__stale_version(repos):
+    await _seed_tasks(repos, U1, [{**_row("planned"), "deadline_hint": "2026-11-01"}])
+
+    with pytest.raises(errors.StaleVersionError):
+        await repos.tasks.bring_back(U1, "planned")
+    with pytest.raises(errors.NotFoundError):
+        await repos.tasks.bring_back(U1, "missing")
+
+    kept = await repos.tasks.get(U1, "planned")
+    assert (kept.status, kept.deadline_hint) == (TaskStatus.PENDING, "2026-11-01")
 
 
 # --- Task events -------------------------------------------------------------
@@ -902,6 +1011,92 @@ async def test_constraints__add__store_stamps_created_at(repos):
     assert added.created_at is not None and added.created_at >= before
     (listed,) = await repos.constraints.list_active(U1)
     assert listed.created_at == added.created_at
+
+
+@pytest.mark.asyncio
+async def test_constraints__list_active__read_cap__drops_oldest_never_newest(repos, fake_client):
+    """Whatever PostgREST's row cap leaves out of the read, it is the oldest rules: the
+    newest always come back, still oldest first. The cap only binds the Supabase family."""
+    fake_client.max_rows = 3
+    times = [T0 + timedelta(minutes=m) for m in range(5)]
+    for at in times:
+        await repos.constraints.add(U1, _constraint(U1).model_copy(update={"created_at": at}))
+
+    returned = [c.created_at for c in await repos.constraints.list_active(U1)]
+
+    assert len(returned) >= 3
+    assert returned == times[-len(returned):]
+
+
+# --- Goals -------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_goals__latest_context__newest_update_for_that_goal_only(repos):
+    await repos.goals.add_deadline_update(U1, _plan_update(U1, "g1", "first", at=T0))
+    await repos.goals.add_deadline_update(
+        U1, _plan_update(U1, "g1", "second", at=T0 + timedelta(hours=1))
+    )
+    await repos.goals.add_deadline_update(
+        U1, _plan_update(U1, "g2", "another goal", at=T0 + timedelta(hours=2))
+    )
+    await repos.goals.add_deadline_update(
+        U2, _plan_update(U2, "g1", "their goal", at=T0 + timedelta(hours=3))
+    )
+
+    assert await repos.goals.latest_context(U1, "g1") == "second"
+    assert await repos.goals.latest_context(U1, "g2") == "another goal"
+    assert await repos.goals.latest_context(U1, "unknown") is None
+    assert await repos.goals.latest_context(U2, "g2") is None
+
+
+@pytest.mark.asyncio
+async def test_goals__add_deadline_update__user_scoped(repos, seed_goal):
+    with pytest.raises(errors.ValidationError):
+        await repos.goals.add_deadline_update(U1, _plan_update(U2, "g1", "not U1's"))
+    assert await repos.goals.latest_context(U2, "g1") is None  # nothing was written
+
+    await repos.goals.add_deadline_update(U1, _plan_update(U1, "g1", "mine"))
+
+    assert await repos.goals.latest_context(U1, "g1") == "mine"
+    assert await repos.goals.latest_context(U2, "g1") is None
+    thesis = seed_goal(Goal(id="g1", user_id=U1, title="Thesis"))
+    assert await repos.goals.get(U1, "g1") == thesis
+    assert await repos.goals.get(U2, "g1") is None
+
+
+# --- Habit trackers ------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trackers__record_review__other_users_tracker__not_found(repos, seed_tracker):
+    mine = seed_tracker(U1, repetitions=2, ef=2.5, next_interval_days=6)
+    review = {"repetitions": 3, "ef": 2.6, "next_interval_days": 15, "quality": 5, "done_at": T0}
+
+    for user_id, tracker_id in [(U2, mine.id), (U1, str(uuid4())), (U1, "not-a-uuid")]:
+        with pytest.raises(errors.NotFoundError):
+            await repos.habit_trackers.record_review(user_id, tracker_id, **review)
+
+    assert await repos.habit_trackers.get(U1, mine.id) == mine  # untouched
+    assert await repos.habit_trackers.get(U2, mine.id) is None
+    done = await repos.habit_trackers.record_review(U1, mine.id, **review)
+    assert done == mine.model_copy(update={
+        "repetitions": 3, "ef": 2.6, "next_interval_days": 15, "quality_last": 5,
+        "last_done_at": T0,
+    })
+    assert await repos.habit_trackers.get(U1, mine.id) == done
+
+
+@pytest.mark.asyncio
+async def test_trackers__list_for_user__only_theirs(repos, seed_tracker):
+    first = seed_tracker(U1)
+    second = seed_tracker(U1, last_done_at=T0, repetitions=1)
+    seed_tracker(U2)
+
+    listed = await repos.habit_trackers.list_for_user(U1)
+
+    assert listed == [second, first]  # newest first
+    assert await repos.habit_trackers.list_for_user("nobody") == []
 
 
 # --- Profiles ----------------------------------------------------------------
@@ -1793,9 +1988,17 @@ class _UnreachableClient:
     "call",
     [
         lambda r: r.tasks.list_pending(U1),
+        lambda r: r.tasks.list_for_user(U1),
+        lambda r: r.tasks.bring_back(U1, "t1"),
         lambda r: r.task_events.list_for_user(U1),
         lambda r: r.drafts.accept_atomic(U1, str(uuid4()), [_row("x")]),
         lambda r: r.constraints.list_active(U1),
+        lambda r: r.goals.latest_context(U1, "g1"),
+        lambda r: r.goals.add_deadline_update(U1, _plan_update(U1, "g1", "context")),
+        lambda r: r.habit_trackers.list_for_user(U1),
+        lambda r: r.habit_trackers.record_review(
+            U1, str(uuid4()), repetitions=1, ef=2.5, next_interval_days=1, quality=4, done_at=T0
+        ),
         lambda r: r.profiles.get_or_create(U1),
         lambda r: r.suggestions.exists_today(U1, "evening_review", T0.date()),
         lambda r: r.usage.record(_usage(U1, LLMLocation.LOCAL, 1, 1)),

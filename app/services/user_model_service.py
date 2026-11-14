@@ -2,8 +2,8 @@
 
 ``snapshot`` gathers the You page: the profile, the patterns PEARL sees in the outcome
 history (each with its evidence and the memory that holds it), the rules the user's
-plans respect, the memories in use, the focus profile and the privacy receipt of the
-last RECEIPT_WINDOW_DAYS. It runs PEARL's idempotent ``observe`` first, so every
+plans respect, the memories in use, the focus profile, the privacy receipt of the
+last RECEIPT_WINDOW_DAYS and the completion streak (the coach's count). It runs PEARL's idempotent ``observe`` first, so every
 pattern shown has a memory the user can confirm or dismiss. A dismissed or forgotten
 pattern is never shown again. A remembered pattern PEARL does not see now (its
 evidence aged out) is listed among the memories: it may still shape plans, so it
@@ -40,10 +40,11 @@ from app.domain.ports import (
     ProfileRepository,
     TaskEventRepository,
 )
+from app.services.analytical.mastery_tracker import STREAK_WINDOW_DAYS, streak_as_of
 from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import PatternService, PatternView
 from app.services.planning.local_time import user_zone
-from app.services.task_service import SLOT_OUTCOMES
+from app.services.task_service import SLOT_OUTCOMES, as_aware
 from app.services.usage_ledger import UsageLedger
 
 # How each outcome reads on the page: never "missed", "skipped" or "failed".
@@ -153,6 +154,9 @@ class YouView(BaseModel):
     )
     focus: FocusProfile = Field(description="Focus by local hour, learned or the prior.")
     receipt: PrivacyReceipt = Field(description="Where the user's model calls ran.")
+    streak_days: int = Field(
+        ge=0, description="Consecutive local days, ending today, with a completed task."
+    )
 
 
 class UserModelService:
@@ -182,21 +186,25 @@ class UserModelService:
     async def snapshot(self, user_id: str) -> YouView:
         """The You page for ``user_id``: PEARL looks first, then every section is read.
 
-        The profile and the outcome history of the last FOCUS_WINDOW_DAYS are read
-        once: PEARL's look (``PatternService.look``: idempotent, nothing new is nothing
-        written) and the focus profile share them. The other sections are independent
-        reads, made concurrently with the look. Any store failure propagates
-        (PersistenceError): an outage is never an empty page.
+        The profile and the outcome history are read once. PEARL's look
+        (``PatternService.look``: idempotent, nothing new is nothing written) and the
+        focus profile share its last FOCUS_WINDOW_DAYS; the streak counts its last
+        STREAK_WINDOW_DAYS (``mastery_tracker.streak_as_of``, the coach's count). The
+        read is newest first, so under a row cap the focus window's events are exactly
+        those a read of that window alone would return. The other sections are
+        independent reads, made concurrently with the look. Any store failure
+        propagates (PersistenceError): an outage is never an empty page.
         """
         now = self._clock()
-        profile, events = await asyncio.gather(
+        history_days = max(config.FOCUS_WINDOW_DAYS, STREAK_WINDOW_DAYS)
+        profile, history = await asyncio.gather(
             self._profiles.get_or_create(user_id),
             self._task_events.list_for_user(
-                user_id,
-                since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
-                types=set(SLOT_OUTCOMES),
+                user_id, since=now - timedelta(days=history_days), types=set(SLOT_OUTCOMES)
             ),
         )
+        focus_since = now - timedelta(days=config.FOCUS_WINDOW_DAYS)
+        events = [e for e in history if as_aware(e.occurred_at) >= focus_since]
         zone = user_zone(profile)
         since = now - timedelta(days=RECEIPT_WINDOW_DAYS)
         look, rules, active, focus, receipt = await asyncio.gather(
@@ -220,6 +228,7 @@ class UserModelService:
             ],
             focus=focus,
             receipt=PrivacyReceipt(since=since, **receipt),
+            streak_days=streak_as_of(history, zone, now),
         )
 
     async def update_settings(

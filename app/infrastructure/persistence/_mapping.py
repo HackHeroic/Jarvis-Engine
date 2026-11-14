@@ -25,6 +25,8 @@ from app.domain.entities import (
     ConversationSession,
     DraftSchedule,
     DraftStatus,
+    GoalDeadlineUpdate,
+    HabitTracker,
     LLMLocation,
     LLMUsageEvent,
     Memory,
@@ -124,6 +126,18 @@ def draft_closed(draft_id: str, status: DraftStatus | str | None) -> errors.Inva
     return errors.InvalidStateTransition(
         "This draft is no longer open, so it cannot be changed.",
         details={"draft_id": draft_id, "from": status_value},
+    )
+
+
+def task_changed(task_id: str, expected: TaskStatus | None) -> errors.StaleVersionError:
+    """A compare-and-set on a task lost: it is no longer ``expected`` (or no longer in the
+    slot the caller read)."""
+    return errors.StaleVersionError(
+        "That task changed before this update; reload and try again.",
+        details={
+            "task_id": task_id,
+            "expected": TaskStatus(expected).value if expected is not None else None,
+        },
     )
 
 
@@ -442,3 +456,53 @@ def checked_summary(summary: str, through: datetime) -> tuple[str, datetime]:
     if through.tzinfo is None:
         raise errors.ValidationError("A summary's reach must be an instant with a UTC offset.")
     return summary, utc(through)
+
+
+# --- Goals and habit trackers ----------------------------------------------------------
+
+
+def prepare_deadline_update(user_id: str, update: GoalDeadlineUpdate) -> GoalDeadlineUpdate:
+    """``update`` normalised, once it is known to be ``user_id``'s; else ValidationError."""
+    if update.user_id != user_id:
+        raise errors.ValidationError("This deadline update belongs to a different user.")
+    return normalized(update)
+
+
+def deadline_update_to_row(update: GoalDeadlineUpdate) -> dict:
+    """``update`` as a user_plan_updates row; an unset created_at is left to the column."""
+    row = to_row(update)
+    if row.get("created_at") is None:
+        row.pop("created_at", None)
+    return row
+
+
+def checked_review(
+    user_id: str,
+    tracker_id: str,
+    *,
+    repetitions: int,
+    ef: float,
+    next_interval_days: int,
+    quality: int,
+    done_at: datetime,
+) -> dict[str, Any]:
+    """One review's habit_trackers fields, checked as a tracker would hold them.
+
+    Raises ValidationError for a value the tracker rejects (a rating outside 0-5, an
+    easiness below the SM-2 floor, a negative count); ``done_at`` is held in UTC.
+    """
+    fields = {
+        "repetitions": repetitions,
+        "ef": ef,
+        "next_interval_days": next_interval_days,
+        "quality_last": quality,
+        "last_done_at": done_at,
+    }
+    try:
+        checked = HabitTracker(id=tracker_id, user_id=user_id, **fields)
+    except PydanticValidationError as exc:
+        bad = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+        raise errors.ValidationError(
+            "That review cannot be stored.", details={"fields": bad}
+        ) from exc
+    return {name: getattr(normalized(checked), name) for name in fields}

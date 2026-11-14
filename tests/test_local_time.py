@@ -107,18 +107,19 @@ def test_generate_schedule__naive_plan_start__eight_am_local_on_that_date():
 async def test_missed_deadlines__date_only_deadline__missed_after_local_midnight(clock):
     """A deadline of the 15th ends at 23:59 IST on the 15th, not at 05:29 IST on the 16th."""
     import app.services.analytical.missed_deadlines as md
-    from tests.fakes import FakeSupabase
+    from tests.fakes import FakeSupabase, build_test_container
 
-    db = FakeSupabase({"user_tasks": [
-        {"id": 1, "user_id": "u1", "task_id": "t1", "title": "Essay",
-         "status": "pending", "deadline_hint": "2026-11-15"},
-    ]})
+    container = build_test_container(FakeSupabase({"user_tasks": [
+        {"user_id": "u1", "task_id": "t1", "title": "Essay", "status": "pending",
+         "duration_minutes": 25, "difficulty_weight": 0.5, "deadline_hint": "2026-11-15"},
+    ]}))
+    tasks, service = container.repos.tasks, container.task_service
 
     clock.freeze(datetime(2026, 11, 15, 23, 30, tzinfo=IST), md)
-    assert await md.detect_and_mark_missed("u1", db) == []
+    assert await md.detect_and_mark_missed("u1", tasks, service) == []
 
     clock.freeze(datetime(2026, 11, 16, 0, 30, tzinfo=IST), md)  # 19:00 UTC on the 15th
-    (missed,) = await md.detect_and_mark_missed("u1", db)
+    (missed,) = await md.detect_and_mark_missed("u1", tasks, service)
     assert missed["task_id"] == "t1"
 
 
