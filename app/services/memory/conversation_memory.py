@@ -83,8 +83,7 @@ NOT_SHOWN_AFTER_SUMMARY = (
 SESSION_SUMMARY_PROMPT = (
     "You keep the running summary of one conversation between a person and Jarvis, their "
     "personal assistant. You are given the summary so far (it may be empty) and the "
-    "messages that came after it. Some of the newest of those messages may already be "
-    "covered by the summary so far: never repeat what it already says. Write the new "
+    "messages that came after it, none of which it covers yet. Write the new "
     "summary. It replaces the old one, so carry forward everything from the old summary "
     "that still matters, then add what the newer messages changed.\n\n"
     "Write it to the person, in the second person: 'You asked...', 'We agreed...'. "
@@ -163,8 +162,31 @@ def _summary_prompt(old_summary: str, messages: list[ChatMessage]) -> str:
     )
 
 
+def _idle_summary_due(session: ConversationSession) -> bool:
+    """Whether the session's newest turns may be in no summary yet, from its row alone.
+
+    Active since its summary was written (``summary_updated_at`` older than
+    ``updated_at``), or never summarised; or its last summary reaches no further than
+    the window's start (a compaction, or an idle summary cut short by its backlog): the
+    turns the window keeps word for word wait for an idle summary, even when that
+    summary was written after the last message. A summary written before its reach was
+    tracked (``summary_covered_through`` None) is judged by its activity alone.
+    """
+    written, covered = session.summary_updated_at, session.summary_covered_through
+    if written is None or written < session.updated_at:
+        return True
+    return covered is not None and session.summary_through is not None and (
+        covered <= session.summary_through
+    )
+
+
 class ConversationMemoryService:
-    """The conversation window, its summaries, and where the last conversation left off."""
+    """The conversation window, its summaries, and where the last conversation left off.
+
+    Each summary covers a run of messages that starts after the previous summary's own
+    reach (``summary_covered_through``), with the previous summary as context: no
+    message is summarised twice.
+    """
 
     def __init__(
         self,
@@ -312,6 +334,12 @@ class ConversationMemoryService:
             if not idle and old is not None and old.dropped:
                 await self._write_back(user_id, session, old)
             through = session.summary_through
+            # What the summary already covers is never sent again: an idle summary also
+            # covered the turns the window still shows word for word.
+            covered_to = max(
+                (t for t in (through, session.summary_covered_through) if t is not None),
+                default=None,
+            )
             newest = await self._conversations.messages(
                 user_id, session_id, after=through, limit=config.COMPACT_AFTER_MESSAGES + 1
             )
@@ -334,7 +362,7 @@ class ConversationMemoryService:
             page = await self._conversations.messages(
                 user_id,
                 session_id,
-                after=through,
+                after=covered_to,
                 limit=config.SUMMARY_PAGE_MESSAGES,
                 oldest_first=True,
             )
@@ -343,7 +371,11 @@ class ConversationMemoryService:
                 config.SUMMARY_INPUT_MAX_CHARS,
             )
             if not covered:
-                return "nothing"
+                if idle or old is None:
+                    return "nothing"  # the summary covers it all already
+                # Compaction with everything before the kept turns already summarised
+                # (an idle summary reached into them): the window moves, no model call.
+                return await self._move_window(user_id, session, old, newest[-(keep + 1)])
             last = covered[-1].created_at
             new_through = last if cap is None else min(last, cap)
             try:
@@ -362,6 +394,7 @@ class ConversationMemoryService:
                     checked.stored() if checked is not None else text,
                     new_through,
                     written_at=now,
+                    covered_through=last,
                 )
             except Exception as exc:  # the conversation stays as it was; try again later
                 logger.warning(
@@ -377,6 +410,29 @@ class ConversationMemoryService:
                 return "partial"  # more of the backlog waits for the next run
             return "summarized"
 
+    async def _move_window(
+        self,
+        user_id: str,
+        session: ConversationSession,
+        old: CleanSummary,
+        before_kept: ChatMessage,
+    ) -> _Outcome:
+        """Start the window after ``before_kept`` (the message before the turns kept word
+        for word), the summary unchanged: it covers that far already. No model call; when
+        the summary was written and how far it reaches stay as they were."""
+        text = old.stored()
+        if not text.strip():  # nothing of it may be kept: no summary to move the window under
+            return "nothing"
+        written = await self._conversations.set_summary(
+            user_id,
+            session.id,
+            text,
+            before_kept.created_at,
+            written_at=session.summary_updated_at,
+            covered_through=session.summary_covered_through,
+        )
+        return "summarized" if written else "nothing"
+
     async def _write_back(
         self, user_id: str, session: ConversationSession, clean: CleanSummary
     ) -> None:
@@ -389,6 +445,7 @@ class ConversationMemoryService:
                 clean.stored(),
                 session.summary_through,
                 written_at=session.summary_updated_at,
+                covered_through=session.summary_covered_through,
             )
         except Exception as exc:  # the render-time filter still holds; next run retries
             logger.warning("Filtered summary not written back (%s)", type(exc).__name__)
@@ -476,11 +533,11 @@ class ConversationMemoryService:
 
         Which ones: those this process served a turn in, plus, on the first call for the
         user and every SESSION_SUMMARY_RESCAN_HOURS after, those one bounded read of
-        their sessions active in the last SESSION_SUMMARY_LOOKBACK_DAYS finds active
-        since their summary was written (``summary_updated_at`` older than
-        ``updated_at``: a session summarised once idle has no activity after its summary
-        and is not picked again). Between those reads a call with nothing due reads
-        nothing. A conversation whose call failed stays due, after its back-off; one
+        their sessions active in the last SESSION_SUMMARY_LOOKBACK_DAYS finds due
+        (``_idle_summary_due``: active since their summary was written, or last
+        summarised by a compaction, so their newest turns are in no summary yet). The
+        choice reads storage only, never this process's memory, so a restart loses
+        none. Between those reads a call with nothing due reads nothing. A conversation whose call failed stays due, after its back-off; one
         with more backlog than one call covers stays due for the next run.
         """
         scanned = self._scanned.get(user_id)
@@ -489,8 +546,7 @@ class ConversationMemoryService:
         ):
             since = now - timedelta(days=config.SESSION_SUMMARY_LOOKBACK_DAYS)
             for session in await self._conversations.recent_sessions(user_id, since=since):
-                written = session.summary_updated_at
-                if written is None or written < session.updated_at:  # active since
+                if _idle_summary_due(session):
                     self._note_activity(user_id, session.id, session.updated_at)
             self._scanned[user_id] = now
         watched = self._active.get(user_id)

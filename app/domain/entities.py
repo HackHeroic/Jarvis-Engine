@@ -563,6 +563,12 @@ class ConversationSession(BaseModel):
     summary_updated_at: datetime | None = Field(
         default=None, description="When the summary was last written."
     )
+    summary_covered_through: datetime | None = Field(
+        default=None,
+        description="created_at of the newest message the summary covers: never before "
+        "summary_through, and past it once an idle summary covered the turns the window "
+        "still shows word for word. None for a summary written before it was tracked.",
+    )
 
 
 class ChatMessage(BaseModel):

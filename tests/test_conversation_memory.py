@@ -570,8 +570,8 @@ async def test_summarize_session__eight_or_fewer_after_the_summary__window_start
     session = _stored(store, S1)
     assert (session.summary, session.summary_through) == ("You chose graphs, then trees.", T0)
     assert (await service.build_history(U, S1)).history == _turns(1, 2, 3, 4, 5)
-    # The prompt says the newest turns may already be in the summary so far.
-    assert "may already be covered" in llm.calls[0].system_prompt
+    # Only messages the summary so far does not cover are sent, and the prompt says so.
+    assert "none of which it covers yet" in llm.calls[0].system_prompt
 
 
 @pytest.mark.asyncio
@@ -1036,3 +1036,92 @@ async def test_forget_filter__production_embedder__run_on_sentence_dropped_unrel
     window = await service.build_history(U, S1)
 
     assert window.earlier == "Earlier in this conversation: " + " ".join(kept)
+
+
+# --- what a summary already covers is never summarised again -------------------------
+
+
+def _sent(call) -> str:
+    """The transcript part of a session_summary prompt (after the summary so far)."""
+    return call.prompt.split("<messages>", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_idle_summary__again_after_new_messages__only_what_came_after_its_reach(
+    store, repos, clock, llm
+):
+    idle = clock.now - timedelta(hours=1)
+    _session(store, S1, updated_at=idle)
+    first = _messages(store, S1, 12, start=idle - timedelta(minutes=30))
+    llm.script("session_summary", _summary("You talked about graphs."))
+    service = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+    assert await service.summarize_session(U, S1) is True  # covers all 12; window keeps 8
+    assert _stored(store, S1).summary_covered_through == first[-1].created_at
+
+    later = _messages(store, S1, 3, start=idle - timedelta(minutes=30), first=13)
+    llm.script("session_summary", _summary("You talked about graphs, then trees."))
+    assert await service.summarize_session(U, S1) is True
+
+    second = _sent(llm.calls[1])
+    assert [line for line in second.splitlines() if line.startswith(("User:", "Jarvis:"))] == [
+        f"{'User' if n % 2 else 'Jarvis'}: message {n}" for n in (13, 14, 15)
+    ]
+    assert "You talked about graphs." in llm.calls[1].prompt  # the summary so far, as context
+    session = _stored(store, S1)
+    assert session.summary_covered_through == later[-1].created_at
+    assert session.summary_through == first[6].created_at  # the window: the newest 8
+    assert (await service.build_history(U, S1)).history == _turns(*range(8, 16))
+
+
+@pytest.mark.asyncio
+async def test_compact__everything_before_the_window_already_covered__window_moves_no_call(
+    store, repos, clock, llm
+):
+    idle = clock.now - timedelta(hours=1)
+    _session(store, S1, updated_at=idle)
+    first = _messages(store, S1, 12, start=idle - timedelta(minutes=40))
+    llm.script("session_summary", _summary("You talked about graphs."))
+    service = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+    assert await service.summarize_session(U, S1) is True  # covers all 12
+
+    _messages(store, S1, 4, start=idle - timedelta(minutes=40), first=13)  # 13..16
+    # 12 messages past the window (5..16): no compaction yet; 17 needed.
+    assert await service.compact_if_needed(U, S1) is False
+    _messages(store, S1, 6, start=idle - timedelta(minutes=40), first=17)  # 17..22
+    llm.script("session_summary", _summary("You talked about graphs, trees, heaps."))
+
+    assert await service.compact_if_needed(U, S1) is True
+
+    (_, compaction) = llm.calls
+    assert [line for line in _sent(compaction).splitlines() if line.startswith(("User:", "Jarvis:"))] == [
+        f"{'User' if n % 2 else 'Jarvis'}: message {n}" for n in (13, 14)
+    ]  # 1..12 were covered already; 15..22 stay word for word
+    # The window now starts after message 14: the newest 8 (15..22) stay word for word.
+    assert _stored(store, S1).summary_through == first[-1].created_at + timedelta(minutes=2)
+
+
+@pytest.mark.asyncio
+async def test_summary_sweep__compacted_right_after_its_last_turn__picked_up_after_a_restart(
+    store, repos, clock, llm
+):
+    """The rescan reads storage, not this process's memory: a conversation whose last
+    summary was a compaction written after its last message still gets its idle summary
+    (its newest turns, kept word for word, are not in any summary yet)."""
+    last = clock.now - timedelta(hours=3)
+    _session(store, S1, updated_at=last)
+    sent = _messages(store, S1, 17, start=last - timedelta(minutes=17))
+    llm.script("session_summary", _summary("You started on graphs."))
+    before = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+    assert await before.compact_if_needed(U, S1) is True  # written after the last message
+    assert _stored(store, S1).summary_updated_at > _stored(store, S1).updated_at
+
+    restarted = ConversationMemoryService(repos.conversations, repos.task_events, clock=clock)
+    llm.script("session_summary", _summary("You started on graphs and moved to trees."))
+
+    assert await SessionSummarySweep(restarted).run([U], clock.now) == 1
+
+    idle_call = llm.calls[1]
+    assert [line for line in _sent(idle_call).splitlines() if line.startswith(("User:", "Jarvis:"))] == [
+        f"{'User' if n % 2 else 'Jarvis'}: message {n}" for n in range(10, 18)
+    ]
+    assert _stored(store, S1).summary_covered_through == sent[-1].created_at

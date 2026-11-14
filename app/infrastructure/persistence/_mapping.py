@@ -416,6 +416,16 @@ SESSION_COLUMNS = tuple(ConversationSession.model_fields)
 MESSAGE_COLUMNS = tuple(ChatMessage.model_fields)
 
 
+def summary_coverage(through: datetime, covered_through: datetime | None) -> datetime:
+    """How far a summary reaches, as stored: ``covered_through`` (an instant, in UTC),
+    never before the window start ``through``; ``through`` when not given."""
+    if covered_through is None:
+        return through
+    if covered_through.tzinfo is None:
+        raise errors.ValidationError("A summary's reach must be an instant with a UTC offset.")
+    return max(through, utc(covered_through))
+
+
 def checked_summary(summary: str, through: datetime) -> tuple[str, datetime]:
     """``(summary, through)`` as stored; ValidationError for a value the table rejects.
 

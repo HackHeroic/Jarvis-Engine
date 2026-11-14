@@ -71,6 +71,7 @@ from app.infrastructure.persistence._mapping import (
     prepare_new_memory,
     suggestion_changed,
     summarize_usage,
+    summary_coverage,
     task_from_row,
     task_id_clash,
     utc,
@@ -716,8 +717,10 @@ class InMemoryConversationRepository(ConversationRepository):
         through: datetime,
         *,
         written_at: datetime | None = None,
+        covered_through: datetime | None = None,
     ) -> bool:
         summary, through = checked_summary(summary, through)
+        covered = summary_coverage(through, covered_through)
         # No await between the check and the write: the compare-and-set is atomic.
         i = self._index(user_id, session_id)
         if i is None:
@@ -730,6 +733,7 @@ class InMemoryConversationRepository(ConversationRepository):
                 "summary": summary,
                 "summary_through": through,
                 "summary_updated_at": utc(written_at) if written_at else now_utc(),
+                "summary_covered_through": covered,
             }
         )
         return True

@@ -31,6 +31,7 @@ SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
 ACCEPT_DRAFT_RESLOTS = MIGRATIONS / "20261115000001_accept_draft_reslots_missed.sql"
 MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
 SESSION_SUMMARIES = MIGRATIONS / "20261115000003_session_summaries.sql"
+SUMMARY_REACH = MIGRATIONS / "20261115000006_session_summary_reach.sql"
 SUGGESTION_CONSENT_KIND = MIGRATIONS / "20261115000004_suggestion_consent_kind.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
@@ -562,5 +563,36 @@ def test_migrations__session_summaries__columns_match_the_entity():
     from app.infrastructure.persistence._mapping import SESSION_COLUMNS
 
     added = set(re.findall(r"add column if not exists (\w+)", _sql(SESSION_SUMMARIES)))
+    reach = set(re.findall(r"add column if not exists (\w+)", _sql(SUMMARY_REACH)))
     assert set(SESSION_COLUMNS) == set(ConversationSession.model_fields)
     assert {"summary", "summary_through", "summary_updated_at"} == added
+    assert {"summary_covered_through"} == reach
+
+
+# --- How far a summary reaches (20261115000006) ---------------------------------------
+
+
+def test_migrations__summary_reach__column_check_and_writing_it_is_not_activity():
+    sql = _sql(SUMMARY_REACH)
+
+    assert re.search(
+        rf"alter table {_TABLE}chat_sessions\s+"
+        r"add column if not exists summary_covered_through timestamptz\b",
+        sql,
+    )
+    # Never before the window's start, and only beside a summary.
+    assert re.search(
+        r"add constraint chat_sessions_summary_covered_through_check\s+check \("
+        r"summary_covered_through is null or \(summary_through is not null and "
+        r"summary_covered_through >= summary_through\)\)",
+        sql,
+    )
+    # The trigger keeps updated_at for a write of the summary columns alone, this one too.
+    body = re.search(r"function (?:public\.)?set_chat_session_updated_at\(\).*?\$\$;", sql, re.S)
+    assert body and "old.updated_at" in body.group(0) and "now()" in body.group(0)
+    assert body.group(0).count("summary_covered_through") >= 3, "compared and ignored"
+    assert re.search(
+        rf"create or replace trigger set_updated_at before update on {_TABLE}chat_sessions\s+"
+        rf"for each row execute function {_TABLE}set_chat_session_updated_at\(\)",
+        sql,
+    )

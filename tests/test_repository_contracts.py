@@ -1629,6 +1629,31 @@ async def test_conversations__set_summary__roundtrip(repos, seed_chat):
 
 
 @pytest.mark.asyncio
+async def test_conversations__set_summary__covered_through_stored_never_before_the_window(
+    repos, seed_chat
+):
+    session_id = seed_chat.session(U1, updated_at=T0)
+    window, reach = T0, T0 + timedelta(minutes=8)
+
+    await repos.conversations.set_summary(U1, session_id, "Idle.", window, covered_through=reach)
+    assert (await repos.conversations.get_session(U1, session_id)).summary_covered_through == reach
+
+    await repos.conversations.set_summary(U1, session_id, "Compacted.", reach)  # default
+    assert (await repos.conversations.get_session(U1, session_id)).summary_covered_through == reach
+    later = reach + timedelta(minutes=1)
+    await repos.conversations.set_summary(
+        U1, session_id, "Behind.", later, covered_through=window  # never before the window
+    )
+    stored = await repos.conversations.get_session(U1, session_id)
+    assert (stored.summary_through, stored.summary_covered_through) == (later, later)
+    assert stored.updated_at == T0  # not activity
+    with pytest.raises(errors.ValidationError):
+        await repos.conversations.set_summary(
+            U1, session_id, "Naive.", later, covered_through=later.replace(tzinfo=None)
+        )
+
+
+@pytest.mark.asyncio
 async def test_conversations__set_summary__compare_and_set_never_moves_back(repos, seed_chat):
     session_id = seed_chat.session(U1)
     t1, t2 = T0, T0 + timedelta(minutes=10)
