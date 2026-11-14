@@ -465,7 +465,10 @@ class InMemorySuggestionRepository(SuggestionRepository):
     ) -> bool:
         start, end = day_bounds(day, tz)
         return any(
-            s.user_id == user_id and s.trigger == trigger and start <= s.created_at < end
+            s.user_id == user_id
+            and s.trigger == trigger
+            and s.status is not SuggestionStatus.EXPIRED
+            and start <= s.created_at < end
             for s in self._store.suggestions
         )
 

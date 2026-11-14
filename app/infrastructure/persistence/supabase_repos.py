@@ -551,6 +551,7 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
             lambda q: q.select("id")
             .eq("user_id", user_id)
             .eq("trigger", trigger)
+            .neq("status", SuggestionStatus.EXPIRED.value)
             .gte("created_at", start.isoformat())
             .lt("created_at", end.isoformat())
             .limit(1)

@@ -183,10 +183,12 @@ def _draft_service(supabase: Any) -> Optional[DraftService]:
     from app.infrastructure.persistence.supabase_repos import (
         SupabaseDraftRepository,
         SupabaseTaskEventRepository,
+        SupabaseTaskRepository,
     )
 
     return DraftService(
         SupabaseDraftRepository(supabase),
         NullEventBus(),
         task_events=SupabaseTaskEventRepository(supabase),
+        tasks=SupabaseTaskRepository(supabase),
     )

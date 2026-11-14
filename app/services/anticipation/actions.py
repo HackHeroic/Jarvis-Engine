@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from app.domain import errors
 from app.domain.anticipation import ActionResult, ActionRisk, ProactiveAction
-from app.domain.entities import HOURS_PER_DAY, BehavioralConstraint
+from app.domain.entities import HOURS_PER_DAY, BehavioralConstraint, DraftStatus
 from app.domain.ports import ConstraintRepository, DraftPlanner
 from app.schemas.context import SemanticTimeSlot
 from app.services.anticipation.service import ActionFactory
@@ -25,15 +25,29 @@ from app.services.memory.patterns import _clock_hour
 logger = logging.getLogger(__name__)
 
 
+REFRESHED = "I refreshed the plan first — it's in place now."
+NOTHING_LEFT = "Nothing left to place today."
+COULDNT_FIT_REST = "I couldn't fit what's left into today — want to look at it together?"
+
+
 class ApplyDraftAction(ProactiveAction):
-    """Accept a drafted plan: its tasks are written, each with its slot."""
+    """Accept a drafted plan: its tasks are written, each with its slot.
+
+    Only while the plan still holds. A slot that has begun, or a task finished or
+    skipped since it was drafted, means it no longer does: the user's open tasks are
+    drafted again from now (through the ``DraftPlanner``) and that plan is put in
+    place instead, and the result says so. Nothing left to place, the stale draft is
+    expired and the action is done. Accepting slots that have gone by would hand the
+    slot sweep tasks to set aside as if the user had.
+    """
 
     kind: ClassVar[str] = "apply_plan"
     risk: ClassVar[ActionRisk] = ActionRisk.SCHEDULE_CHANGE
 
-    def __init__(self, draft_id: str, *, drafts: DraftService) -> None:
+    def __init__(self, draft_id: str, *, drafts: DraftService, planner: DraftPlanner) -> None:
         self._draft_id = draft_id
         self._drafts = drafts
+        self._planner = planner
 
     def describe(self) -> str:
         return "Put today's plan in place"
@@ -45,14 +59,44 @@ class ApplyDraftAction(ProactiveAction):
         return {"kind": self.kind, "dedupe_key": self.dedupe_key(), "draft_id": self._draft_id}
 
     async def execute(self, user_id: str) -> ActionResult:
-        """InvalidStateTransition when the draft closed meanwhile (a newer plan replaced it)."""
-        written = await self._drafts.accept(user_id, self._draft_id)
+        """Put the plan in place, refreshed first if it no longer holds.
+
+        InvalidStateTransition when the draft closed meanwhile (a newer plan replaced
+        it); NotFoundError when it is gone; LLMUnavailableError when a refresh could
+        not read the user's habits (a later try can).
+        """
+        draft = await self._drafts.get(user_id, self._draft_id)
+        draft.transition(DraftStatus.ACCEPTED)  # closed meanwhile: out of date
+        currency = await self._drafts.currency(user_id, draft)
+        if currency.current:
+            written = await self._drafts.accept(user_id, self._draft_id)
+            return ActionResult(
+                kind=self.kind,
+                message="Done — today's plan is in place.",
+                tasks_written=written,
+                draft_id=self._draft_id,
+            )
+        try:
+            fresh = await self._planner.replan(
+                user_id, reslot_task_ids=sorted(currency.set_aside)
+            )
+        except errors.ScheduleInfeasibleError:
+            await self._drafts.expire(user_id, self._draft_id)
+            return ActionResult(kind=self.kind, message=COULDNT_FIT_REST)
+        if fresh is None:
+            await self._drafts.expire(user_id, self._draft_id)
+            return ActionResult(kind=self.kind, message=NOTHING_LEFT)
+        written = await self._drafts.accept(user_id, fresh.id)
         return ActionResult(
-            kind=self.kind,
-            message="Done — today's plan is in place.",
-            tasks_written=written,
-            draft_id=self._draft_id,
+            kind=self.kind, message=REFRESHED, tasks_written=written, draft_id=fresh.id
         )
+
+
+# A pattern the user let go of since it was proposed is never made a rule, by status.
+_PATTERN_LET_GO = {
+    "dismissed": "You told me this pattern doesn't fit, so I haven't made it a rule.",
+    "forgotten": "You asked me to forget this pattern, so I haven't made it a rule.",
+}
 
 
 class AdoptRuleAction(ProactiveAction):
@@ -113,16 +157,26 @@ class AdoptRuleAction(ProactiveAction):
         }
 
     async def execute(self, user_id: str) -> ActionResult:
-        """Store the rule (once, however often this runs), confirm the pattern, redraft.
+        """Confirm the pattern, store the rule (once, however often this runs), redraft.
+
+        A pattern the user dismissed or forgot since it was proposed is a ConflictError,
+        before anything is stored: no rule, no draft.
 
         The rule carries its blocked slot already worked out, so planning never spends a
         model call translating it. Nothing to plan, or nothing that fits, is no draft:
         the rule still holds for every plan after it. Habits that can't be read right
         now mean no draft yet, and the message says the redraft waits for them.
         """
+        try:
+            await self._memory.confirm(user_id, self._memory_id)
+        except errors.ConflictError as exc:  # dismissed or forgotten since it was proposed
+            status = (exc.details or {}).get("status")
+            raise errors.ConflictError(
+                _PATTERN_LET_GO.get(status, _PATTERN_LET_GO["dismissed"]),
+                details={"memory_id": self._memory_id, "status": status},
+            ) from exc
         if not await self._rule_stored(user_id):
             await self._constraints.add(user_id, self._rule(user_id))
-        await self._memory.confirm(user_id, self._memory_id)
         h12 = _clock_hour(self._hour)
         saved = f"Saved. Every plan from now on keeps {h12} clear"
         try:
@@ -235,7 +289,7 @@ def build_action_factory(
     factory = ActionFactory()
     factory.register(
         ApplyDraftAction.kind,
-        lambda p: ApplyDraftAction(_field(p, "draft_id", str), drafts=drafts),
+        lambda p: ApplyDraftAction(_field(p, "draft_id", str), drafts=drafts, planner=planner),
     )
     factory.register(
         AdoptRuleAction.kind,

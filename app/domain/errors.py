@@ -49,6 +49,12 @@ class StaleVersionError(ConflictError):
     code = "stale_version"
 
 
+class DraftOutdatedError(ConflictError):
+    """Every slot in the draft has already begun: accepting it would plan only the past."""
+
+    code = "draft_outdated"
+
+
 class ScheduleInfeasibleError(DomainError):
     code = "schedule_infeasible"
     http_status = 422

@@ -865,6 +865,30 @@ async def test_accept__plan_clashes_with_existing_tasks__says_so_and_writes_noth
 
 
 @pytest.mark.asyncio
+async def test_accept__every_slot_gone_by__says_so_honestly_and_writes_nothing():
+    """A plan whose every time has passed is not put in place, in chat as anywhere: the
+    reply says why (not "clashes", not "Locked in") and the negotiation closes."""
+    from app.orchestrator.graph import handle_draft_action
+
+    user_model = _user_model_with_db()
+    supabase = user_model._db.supabase
+    store = _seed_draft(supabase, schedule={"t1": {"start_min": 60, "end_min": 85}})
+    state = _make_state(
+        intent=IntentType.ACCEPT_DRAFT, negotiation_state=NegotiationPhase.REVIEWING,
+        draft_store=store, draft_id=_DRAFT_ID, user_message="accept", user_model=user_model,
+    )
+    result = await handle_draft_action(state)
+
+    assert supabase.rows.get("user_tasks", []) == []
+    assert _draft_status(store) == "pending"
+    message = result["response_message"].lower()
+    assert "already gone by" in message and "fresh plan" in message
+    assert "clashes" not in message and "locked in" not in message
+    assert result["negotiation_state"] == NegotiationPhase.NONE
+    assert result["draft_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_accept__success__tasks_and_accepted_status_land_in_one_call():
     """No separate status flip: the tasks and the ACCEPTED status commit
     together or not at all, so there is no order between them to get wrong."""

@@ -9,7 +9,12 @@ import re
 from typing import Any, Callable
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.domain.errors import ConflictError, InvalidStateTransition, NotFoundError
+from app.domain.errors import (
+    ConflictError,
+    DraftOutdatedError,
+    InvalidStateTransition,
+    NotFoundError,
+)
 
 from langgraph.graph import END, StateGraph
 
@@ -575,6 +580,12 @@ async def _apply_draft_action(state: JarvisState) -> dict:
             )
         except InvalidStateTransition:
             return await _closed_draft_reply(draft_store, user_id, draft_id)
+        except DraftOutdatedError as exc:  # every slot has gone by: say so, plainly
+            return {
+                "response_message": exc.message,
+                "negotiation_state": NegotiationPhase.NONE,
+                "draft_id": None,
+            }
         except ConflictError:
             # The draft reuses a task id the user's finished tasks hold. No retry
             # can write it, so close the negotiation instead of inviting one.

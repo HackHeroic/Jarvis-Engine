@@ -249,8 +249,11 @@ class AnticipationService:
         Raises NotFoundError if the user has no such suggestion, StaleVersionError
         (409) if it is no longer pending, and InvalidStateTransition (409) if it is
         past its ``expires_at`` or its action is out of date, after marking it
-        expired. Any other way the action ends without finishing, an error or a
-        cancellation, puts it back to pending and is raised as it came.
+        expired. Any other conflict the action meets (its plan clashes with the
+        user's tasks: no retry can fix it) also marks it expired and is raised as it
+        came, and its trigger may make a fresh suggestion that day. Any other way the
+        action ends without finishing, an error or a cancellation, puts it back to
+        pending and is raised as it came.
         """
         suggestion = await self._suggestions.get(user_id, suggestion_id)
         if suggestion is None:
@@ -275,6 +278,11 @@ class AnticipationService:
             raise errors.InvalidStateTransition(
                 _OUT_OF_DATE, details={"suggestion_id": suggestion_id}
             ) from exc
+        except errors.ConflictError:
+            # Never handed back as pending: every tap would meet the same conflict.
+            await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.EXPIRED))
+            self._settled.pop((user_id, suggestion.trigger), None)
+            raise
         except BaseException:
             # Shielded: a cancellation must not also cancel the release.
             await asyncio.shield(self._release(user_id, suggestion_id, SuggestionStatus.PENDING))
