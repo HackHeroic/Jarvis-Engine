@@ -1191,6 +1191,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         save_assistant_message,
         build_context_messages,
     )
+    from contextlib import AsyncExitStack
+
+    from app.api.error_handlers import error_envelope, request_id_of
+    from app.domain.errors import JarvisError
     from app.services.turn_locks import thread_lock
 
     jarvis_graph = http_request.app.state.jarvis_graph
@@ -1200,40 +1204,23 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
     # Model selector: when user picks Gemini, force this whole turn to cloud.
     # MUST be set BEFORE the graph is invoked so every LLM call inherits it.
+    # Reset with the usage attribution once the stream is over (see the end of
+    # this handler): set here, it would otherwise outlive the turn.
     model_mode = request.model_mode or "auto"
     force_cloud_request = model_mode in ("4b", "cloud", "gemini")
+    force_cloud_token = None
     if force_cloud_request:
-        try:
-            from app.core.model_router import force_cloud_var
-            force_cloud_var.set(True)
-            print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
-        except Exception as _e:
-            print(f"[chat/v2] Failed to set force_cloud_var: {_e}")
+        from app.core.model_router import force_cloud_var
+        force_cloud_token = force_cloud_var.set(True)
+        print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
 
     # --- Session management ---
     session_id = await get_or_create_session(
         request.user_id, request.conversation_id, supabase
     )
-    # History first, then save: the window is the PRIOR context. Saved first, the
-    # message being answered also sat in its own history — the model read it
-    # twice and it took one of the ten slots.
-    conversation_history = await build_context_messages(
-        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
-    )
-    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
 
-    # Inject archival memory
-    memory_context = ""
-    if memory_store:
-        from app.services.memory.retriever import build_memory_context
-        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
-
-    # Fetch existing memories for frontend MemoryPanel
+    # Existing memories for the frontend MemoryPanel; filled by _read_conversation.
     _existing_memories: list[dict] = []
-    if memory_store:
-        _existing_memories = await asyncio.to_thread(
-            memory_store.get_active_memories, request.user_id
-        )
 
     user_model = UserModel(user_id=request.user_id, db=db_client)
     if memory_store:
@@ -1284,8 +1271,10 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         "needs_followup": False,
         "needs_consent": None,
         "error": None,
-        "conversation_history": conversation_history,
-        "memory_context": memory_context,
+        # Read under the turn lock by _read_conversation, so a turn that waited
+        # for the one before it sees that turn's reply.
+        "conversation_history": [],
+        "memory_context": "",
         "progress_callback": progress_cb,
         "progress_queue": progress_queue,
         # Per-turn flag, cleared explicitly: it is checkpointed now, and the
@@ -1315,6 +1304,27 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             initial_state["negotiation_state"] = NegotiationPhase.NONE
             initial_state["draft_id"] = None
 
+    async def _read_conversation() -> None:
+        """Read the conversation as it stands now. Runs under the turn lock.
+
+        History first, then save: the window is the PRIOR context. Saved first, the
+        message being answered also sat in its own history — the model read it
+        twice and it took one of the ten slots.
+        """
+        initial_state["conversation_history"] = await build_context_messages(
+            session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
+        )
+        await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
+        if memory_store:
+            # Archival memory for the model, and the active memories for the panel.
+            from app.services.memory.retriever import build_memory_context
+            initial_state["memory_context"] = await asyncio.to_thread(
+                build_memory_context, request.user_id, memory_store
+            )
+            _existing_memories[:] = await asyncio.to_thread(
+                memory_store.get_active_memories, request.user_id
+            )
+
     async def event_gen():
         import app.core.config as _cfg
         LOCAL_LLM_MODEL = _cfg.LOCAL_LLM_MODEL
@@ -1334,14 +1344,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
         async def _pump_graph():
             try:
-                # One turn at a time per conversation: a second tab's turn on this
-                # thread queues here until this graph run is over (finished, failed,
-                # or cancelled by a disconnect). The checkpoint is read under the
-                # lock too, so a queued turn sees what the turn before it left.
-                async with thread_lock(thread_id):
-                    await _seed_if_fresh_thread()
-                    async for _ev in jarvis_graph.astream(initial_state, config=graph_config):
-                        progress_queue.put_nowait((_NODE, _ev))
+                await _seed_if_fresh_thread()
+                async for _ev in jarvis_graph.astream(initial_state, config=graph_config):
+                    progress_queue.put_nowait((_NODE, _ev))
             except Exception as _exc:
                 progress_queue.put_nowait((_ERROR, _exc))
             finally:
@@ -1358,7 +1363,15 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         thinking_streamed = False
 
         pump_task: asyncio.Task | None = None
+        turn_lock = AsyncExitStack()
         try:
+            # One turn at a time per conversation: a second tab's turn on this thread
+            # queues here until this turn is over — its reply saved, or failed, or
+            # cancelled by a disconnect. History, memory and the checkpoint are all
+            # read under the lock, so a queued turn sees what the turn before it left.
+            # A wait past TURN_LOCK_WAIT_SECONDS ends in a conflict frame instead.
+            await turn_lock.enter_async_context(thread_lock(thread_id))
+            await _read_conversation()
             final_state = {}
             graph_exc: Exception | None = None
             pump_task = asyncio.create_task(_pump_graph())
@@ -1629,6 +1642,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 },
             }
             yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
+        except JarvisError as exc:
+            # Raised on purpose, with a user-facing message (a turn that waited too
+            # long for the one before it is a conflict): the standard envelope.
+            envelope = error_envelope(
+                request_id_of(http_request), exc.code, exc.message, exc.details
+            )
+            yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
         except Exception as exc:
             import traceback
             traceback.print_exc()  # full traceback to server terminal
@@ -1638,6 +1658,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             # would otherwise leave it churning through LLM calls nobody reads.
             if pump_task is not None and not pump_task.done():
                 pump_task.cancel()
+                # Release the conversation only once this run has stopped writing it.
+                await asyncio.wait([pump_task])
+            await turn_lock.aclose()
 
     # Usage attribution, like force_cloud_var: every LLM call of this turn — the
     # graph pump and every task it starts copy this context — is metered to this
@@ -1650,6 +1673,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         # async on purpose: a sync background task runs on a worker thread, in a
         # copy of this context, where the ContextVar reset would raise.
         end_attribution()
+        if force_cloud_token is not None:
+            from app.core.model_router import force_cloud_var
+            force_cloud_var.reset(force_cloud_token)
 
     return StreamingResponse(
         event_gen(),

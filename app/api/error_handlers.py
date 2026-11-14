@@ -72,6 +72,25 @@ def _request_id(request: Request) -> str:
     return getattr(request.state, "request_id", None) or uuid4().hex
 
 
+def request_id_of(request: object) -> str:
+    """The id ``RequestIdMiddleware`` gave this request; a fresh one if it has none."""
+    return getattr(getattr(request, "state", None), "request_id", None) or uuid4().hex
+
+
+def error_envelope(
+    request_id: str, code: str, message: str, details: dict | None = None
+) -> dict:
+    """The error envelope as data, for an error no HTTP response can carry.
+
+    A streamed (SSE) response has already sent its 200 when the error happens, so
+    the error goes out as a frame — in the same shape as every error response.
+    """
+    body = ErrorResponse(
+        error=ErrorBody(code=code, message=message, details=details, request_id=request_id)
+    )
+    return body.model_dump(mode="json")
+
+
 def _envelope(
     request_id: str,
     status_code: int,

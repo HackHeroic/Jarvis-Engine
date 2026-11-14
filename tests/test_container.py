@@ -172,4 +172,6 @@ def test_runtime__reset_shared_clients__forgets_the_container():
 
     runtime.reset_shared_clients()
 
-    assert runtime.get_container() is None
+    assert runtime.registered_container() is None
+    # One name per meaning: get_container is the request-scoped dependency in app.api.deps.
+    assert not hasattr(runtime, "get_container")

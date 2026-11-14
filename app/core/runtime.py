@@ -53,8 +53,12 @@ def set_container(container: "AppContainer") -> None:
     _container = container
 
 
-def get_container() -> "AppContainer | None":
-    """The ``AppContainer`` the lifespan built, or ``None`` before startup (tests, scripts)."""
+def registered_container() -> "AppContainer | None":
+    """The ``AppContainer`` the lifespan built, or ``None`` before startup (tests, scripts).
+
+    Not ``app.api.deps.get_container``: that one is the request-scoped FastAPI
+    dependency; this is for code with no request in hand.
+    """
     return _container
 
 

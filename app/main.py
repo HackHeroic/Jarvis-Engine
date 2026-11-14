@@ -137,6 +137,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         print("Shutting down Jarvis Reasoning Engine.")
+        # Bounded: in-flight usage records get a moment to land, never a hang.
+        await container.usage_ledger.shutdown()
         await checkpoint_stack.aclose()
 
 

@@ -21,7 +21,7 @@ import asyncio
 from typing import Any, Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.runtime import get_container
+from app.core.runtime import registered_container
 from app.domain import errors
 from app.domain.events import NullEventBus
 from app.services.draft_service import DraftService
@@ -137,7 +137,7 @@ def _draft_service(supabase: Any) -> Optional[DraftService]:
     With no container registered (tests, scripts) one is built here over
     ``supabase``, with nobody listening; ``None`` when there is no client either.
     """
-    container = get_container()
+    container = registered_container()
     if container is not None:
         return container.draft_service
     if supabase is None:

@@ -296,3 +296,137 @@ async def test_chat_v2__through_starlette__attribution_ends_cleanly_after_the_st
     assert response.status_code == 200
     assert "event: complete" in response.text
     assert graph.seen == [("u5", "sess-3")]
+
+
+# --- waiting has a limit; a queued turn reads the conversation as it is now ---------
+
+
+@pytest.mark.asyncio
+async def test_thread_lock__held_past_the_wait_limit__raises_conflict_and_forgets_the_waiter(
+    monkeypatch,
+):
+    from app.domain.errors import ConflictError
+
+    monkeypatch.setattr(turn_locks, "TURN_LOCK_WAIT_SECONDS", 0.05)
+    holding = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def hold() -> None:
+        async with thread_lock("u1:s1"):
+            holding.set()
+            await finish.wait()
+
+    holder = asyncio.create_task(hold())
+    await holding.wait()
+
+    with pytest.raises(ConflictError) as refused:
+        async with thread_lock("u1:s1"):
+            pytest.fail("entered a lock somebody else holds")
+
+    assert refused.value.code == "conflict"
+    finish.set()
+    await holder
+    assert "u1:s1" not in turn_locks._locks
+
+
+async def _frames(response) -> list[tuple[str, object]]:
+    import json
+
+    raw = ""
+    async for chunk in response.body_iterator:
+        raw += chunk if isinstance(chunk, str) else chunk.decode()
+    frames = []
+    for block in raw.split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+        if "event" in lines:
+            frames.append((lines["event"], json.loads(lines.get("data", "null"))))
+    return frames
+
+
+@pytest.mark.asyncio
+async def test_chat_v2__turn_queued_past_the_wait_limit__honest_conflict_frame(
+    no_llm, monkeypatch
+):
+    monkeypatch.setattr(turn_locks, "TURN_LOCK_WAIT_SECONDS", 0.05)
+    _stub_chat_io(monkeypatch)
+    graph = _TwoTabGraph()
+    first = asyncio.create_task(_drain(await _open_turn(graph, "first")))
+    await graph.first_running.wait()
+
+    frames = await asyncio.wait_for(_frames(await _open_turn(graph, "second")), timeout=2)
+
+    (error,) = [data for event, data in frames if event == "error"]
+    assert set(error) == {"error"}
+    assert set(error["error"]) == {"code", "message", "details", "request_id"}
+    assert error["error"]["code"] == "conflict"
+    assert "still being answered" in error["error"]["message"]
+    assert error["error"]["request_id"]
+    assert "second starts" not in graph.log  # the queued turn never ran
+    graph.finish_first.set()
+    await asyncio.wait_for(first, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_chat_v2__queued_turn__history_includes_the_reply_it_waited_for(
+    no_llm, monkeypatch
+):
+    saved: list[dict] = []
+
+    async def _history(session_id, user_id, **kwargs):
+        return [dict(m) for m in saved]
+
+    async def _save_user(session_id, user_id, content, supabase):
+        saved.append({"role": "user", "content": content})
+        return "u-msg"
+
+    async def _save_assistant(session_id, user_id, content, intent, metadata, supabase):
+        saved.append({"role": "assistant", "content": content})
+        return "a-msg"
+
+    _stub_chat_io(monkeypatch)
+    monkeypatch.setattr("app.services.chat_history.build_context_messages", _history)
+    monkeypatch.setattr("app.services.chat_history.save_user_message", _save_user)
+    monkeypatch.setattr("app.services.chat_history.save_assistant_message", _save_assistant)
+    graph = _TwoTabGraph()
+    first = asyncio.create_task(_drain(await _open_turn(graph, "first")))
+    await graph.first_running.wait()
+    second = asyncio.create_task(_drain(await _open_turn(graph, "second")))
+    await _settle()
+
+    graph.finish_first.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+
+    first_reply = next(m for m in saved if m["role"] == "assistant")
+    history = graph.states["second"]["conversation_history"]
+    assert history[-2:] == [{"role": "user", "content": "first"}, first_reply]
+    # Still built before the turn's own message is saved: it is not in its own history.
+    assert {"role": "user", "content": "second"} not in history
+
+
+class _ForceCloudGraph(_AttributionGraph):
+    async def astream(self, state, config=None, **kwargs):
+        from app.core.model_router import force_cloud_var
+
+        self.seen.append(force_cloud_var.get())
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+
+@pytest.mark.asyncio
+async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_llm, monkeypatch):
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.core.model_router import force_cloud_var
+
+    _stub_chat_io(monkeypatch)
+    graph = _ForceCloudGraph()
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+
+    response = await chat_stream_v2(
+        ChatRequest(user_prompt="hi", user_id="u1", model_mode="cloud"), http_request
+    )
+    await _drain(response)
+    await response.background()
+
+    assert graph.seen == [True]  # the turn itself ran on the cloud
+    assert force_cloud_var.get() is False  # and nothing after it does
