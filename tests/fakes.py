@@ -116,8 +116,9 @@ class _Query:
         self._payload: Any = None
         self._filters: list[tuple[str, Any]] = []
         self._predicates: list[Callable[[dict], bool]] = []
-        self._order: tuple[str, bool] | None = None
+        self._orders: list[tuple[str, bool]] = []
         self._limit: int | None = None
+        self._range: tuple[int, int] | None = None
 
     # ── query construction ──────────────────────────────────
     def insert(self, payload: dict | list[dict]) -> "_Query":
@@ -173,11 +174,17 @@ class _Query:
         return self._where(column, None, lambda cell, _value: cell is None)
 
     def order(self, column: str, desc: bool = False) -> "_Query":
-        self._order = (column, desc)
+        """Each call adds a sort key after the earlier ones, as PostgREST's order does."""
+        self._orders.append((column, desc))
         return self
 
     def limit(self, count: int) -> "_Query":
         self._limit = count
+        return self
+
+    def range(self, start: int, end: int) -> "_Query":
+        """Rows ``start`` to ``end`` inclusive (offset and limit), before the max_rows cap."""
+        self._range = (start, end)
         return self
 
     # ── execution ───────────────────────────────────────────
@@ -227,9 +234,11 @@ class _Query:
             for row in matched:
                 self._rows.remove(row)
 
-        if self._order:
-            column, desc = self._order
-            matched.sort(key=lambda r: r.get(column) or "", reverse=desc)
+        for column, desc in reversed(self._orders):  # stable: the first key decides first
+            matched.sort(key=lambda r, column=column: r.get(column) or "", reverse=desc)
+        if self._range is not None:
+            start, end = self._range
+            matched = matched[start : end + 1]
         if self._limit is not None:
             matched = matched[: self._limit]
         if self._op == "select" and self._max_rows is not None:

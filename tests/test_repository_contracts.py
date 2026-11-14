@@ -818,6 +818,17 @@ async def test_constraints__add_list_delete__user_scoped(repos):
     assert await repos.constraints.list_active(U1) == [inferred]
 
 
+@pytest.mark.asyncio
+async def test_constraints__add__store_stamps_created_at(repos):
+    before = datetime.now(timezone.utc)
+
+    added = await repos.constraints.add(U1, _constraint(U1))
+
+    assert added.created_at is not None and added.created_at >= before
+    (listed,) = await repos.constraints.list_active(U1)
+    assert listed.created_at == added.created_at
+
+
 # --- Profiles ----------------------------------------------------------------
 
 
@@ -1022,6 +1033,7 @@ async def test_usage__summary__counts_local_and_cloud(repos):
         "input_tokens": 310,
         "output_tokens": 135,
         "pii_redactions": 2,
+        "truncated": False,
     }
     assert await repos.usage.summary(U1, since=T0 + timedelta(hours=1)) == {
         "local_calls": 0,
@@ -1029,7 +1041,48 @@ async def test_usage__summary__counts_local_and_cloud(repos):
         "input_tokens": 200,
         "output_tokens": 80,
         "pii_redactions": 2,
+        "truncated": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_usage__summary__more_rows_than_one_read__exact_totals(repos, fake_client):
+    """PostgREST answers at most max_rows (1000) rows per read: the summary pages past it."""
+    assert fake_client.max_rows == 1000
+    for i in range(1205):
+        location = LLMLocation.LOCAL if i % 5 else LLMLocation.CLOUD
+        await repos.usage.record(
+            _usage(U1, location, 10, 2, pii=1 if location is LLMLocation.CLOUD else 0,
+                   at=T0 + timedelta(seconds=i))
+        )
+    await repos.usage.record(_usage(U2, LLMLocation.CLOUD, 999, 999, pii=9))
+
+    assert await repos.usage.summary(U1) == {
+        "local_calls": 964,
+        "cloud_calls": 241,
+        "input_tokens": 12050,
+        "output_tokens": 2410,
+        "pii_redactions": 241,
+        "truncated": False,
+    }
+    assert (await repos.usage.summary(U1, since=T0 + timedelta(seconds=1200)))["local_calls"] == 4
+
+
+@pytest.mark.asyncio
+async def test_usage__summary__past_the_page_bound__says_truncated(monkeypatch, fake_client):
+    from app.infrastructure.persistence import supabase_repos
+
+    monkeypatch.setattr(supabase_repos, "USAGE_PAGE_ROWS", 2)
+    monkeypatch.setattr(supabase_repos, "USAGE_MAX_PAGES", 2)
+    usage = RepositoryFactory.supabase(fake_client).usage
+    for i in range(5):
+        await usage.record(_usage(U1, LLMLocation.LOCAL, 1, 1, at=T0 + timedelta(seconds=i)))
+
+    summary = await usage.summary(U1)
+
+    assert (summary["local_calls"], summary["truncated"]) == (4, True)  # never silently short
+    (columns,) = {names for table, names in fake_client.selects if table == "llm_usage_events"}
+    assert set(columns) == {"location", "input_tokens", "output_tokens", "pii_redactions"}
 
 
 # --- Memories ----------------------------------------------------------------

@@ -20,6 +20,7 @@ from pydantic_core import PydanticSerializationError, to_jsonable_python
 
 from app.domain import errors
 from app.domain.entities import (
+    BehavioralConstraint,
     DraftSchedule,
     DraftStatus,
     LLMLocation,
@@ -361,17 +362,44 @@ def memory_changed(memory_id: str, status: MemoryStatus | str) -> errors.StaleVe
     )
 
 
+# The llm_usage_events columns a summary reads: nothing else is fetched.
+USAGE_SUMMARY_COLUMNS = ("location", "input_tokens", "output_tokens", "pii_redactions")
+
+
 def summarize_usage(events: Iterable[LLMUsageEvent]) -> dict:
+    """Totals over ``events``, every one of them (``truncated`` is False)."""
+    return summarize_usage_rows(
+        event.model_dump(mode="json", include=set(USAGE_SUMMARY_COLUMNS)) for event in events
+    )
+
+
+def summarize_usage_rows(rows: Iterable[dict], *, truncated: bool = False) -> dict:
+    """Totals over llm_usage_events rows holding USAGE_SUMMARY_COLUMNS.
+
+    ``truncated`` says the rows stopped at a read bound, so the totals may be short.
+    A NULL count reads as 0.
+    """
     totals = {
         "local_calls": 0,
         "cloud_calls": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "pii_redactions": 0,
+        "truncated": truncated,
     }
-    for event in events:
-        totals["local_calls" if event.location is LLMLocation.LOCAL else "cloud_calls"] += 1
-        totals["input_tokens"] += event.input_tokens
-        totals["output_tokens"] += event.output_tokens
-        totals["pii_redactions"] += event.pii_redactions
+    for row in rows:
+        local = row.get("location") == LLMLocation.LOCAL.value
+        totals["local_calls" if local else "cloud_calls"] += 1
+        totals["input_tokens"] += row.get("input_tokens") or 0
+        totals["output_tokens"] += row.get("output_tokens") or 0
+        totals["pii_redactions"] += row.get("pii_redactions") or 0
     return totals
+
+
+def constraint_to_row(constraint: BehavioralConstraint) -> dict:
+    """``constraint`` as a behavioral_constraints row; an unset created_at is left out,
+    so the column's default (now) stamps it."""
+    row = to_row(constraint)
+    if row.get("created_at") is None:
+        row.pop("created_at", None)
+    return row

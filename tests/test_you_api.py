@@ -6,7 +6,7 @@ never an empty page.
 """
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from types import SimpleNamespace
 
 import httpx
@@ -40,7 +40,10 @@ _MEMORY = {
 }
 _FOCUS = {"source", "observations", "hours"}
 _HOUR = {"hour", "score", "done", "not_done"}
-_RECEIPT = {"on_device_calls", "cloud_calls", "pii_redactions", "input_tokens", "output_tokens"}
+_RECEIPT = {
+    "since", "truncated", "on_device_calls", "cloud_calls", "pii_redactions", "input_tokens",
+    "output_tokens",
+}
 
 
 def _container(supabase):
@@ -88,7 +91,7 @@ async def _skips_at_nine(container, user_id: str = "alice") -> None:
 
 
 @pytest.mark.asyncio
-async def test_you_api__get__matches_response_model(monkeypatch):
+async def test_you_api__get__matches_response_model(monkeypatch, recording_llm):
     from app.api.v1.endpoints.you import YouResponse
 
     supabase = FakeSupabase()
@@ -130,6 +133,7 @@ async def test_you_api__get__matches_response_model(monkeypatch):
     (rule,) = body["rules"]
     assert set(rule) == _RULE
     assert (rule["text"], rule["provenance"]) == ("No work after 10 PM", "said")
+    assert datetime.fromisoformat(rule["created_at"]).tzinfo is not None
     (memory,) = body["memories"]  # the pattern's own memory shows under "patterns" only
     assert set(memory) == _MEMORY
     assert (memory["content"], memory["provenance"]) == (MARATHON, MemorySource.SAID.value)
@@ -139,11 +143,15 @@ async def test_you_api__get__matches_response_model(monkeypatch):
     assert [h["hour"] for h in body["focus"]["hours"]] == list(range(24))
     assert set(body["focus"]["hours"][9]) == _HOUR
     assert (body["focus"]["hours"][9]["done"], body["focus"]["hours"][9]["not_done"]) == (0, 3)
-    assert body["receipt"] == {
-        "on_device_calls": 1, "cloud_calls": 0, "pii_redactions": 0,
+    receipt = body["receipt"]
+    assert set(receipt) == _RECEIPT
+    assert {k: v for k, v in receipt.items() if k != "since"} == {
+        "truncated": False, "on_device_calls": 1, "cloud_calls": 0, "pii_redactions": 0,
         "input_tokens": 120, "output_tokens": 30,
     }
-    assert set(body["receipt"]) == _RECEIPT
+    window = datetime.now(timezone.utc) - datetime.fromisoformat(receipt["since"])
+    assert timedelta(days=30) <= window < timedelta(days=30, minutes=5)
+    assert recording_llm.calls == []  # one read of what Jarvis knows: no model is asked
 
 
 @pytest.mark.asyncio
@@ -151,11 +159,16 @@ async def test_you_api__bad_timezone__422_envelope(monkeypatch):
     supabase = FakeSupabase()
     container = _container(supabase)
     params = {"user_id": "alice"}
+    await container.repos.profiles.update(  # settings chosen earlier, all unlike the request
+        "alice", timezone="Asia/Tokyo", wake_time=time(5, 45), autonomy_mode="auto_low_risk"
+    )
+    (prior,) = [dict(r) for r in supabase.rows["user_profiles"]]
 
     async with _api(monkeypatch, container, supabase) as api:
         unknown = await api.patch(
             "/api/v1/you/settings", params=params,
-            json={"timezone": "Mars/Olympus_Mons", "wake_time": "06:30"},
+            json={"timezone": "Mars/Olympus_Mons", "wake_time": "06:30",
+                  "autonomy_mode": "suggest_only"},
         )
         too_long = await api.patch(
             "/api/v1/you/settings", params=params, json={"timezone": "A" * 65}
@@ -163,18 +176,23 @@ async def test_you_api__bad_timezone__422_envelope(monkeypatch):
         not_a_time = await api.patch(
             "/api/v1/you/settings", params=params, json={"wake_time": "25:99"}
         )
+        unknown_key = await api.patch(
+            "/api/v1/you/settings", params=params, json={"wake_up": "06:30"}
+        )
+        (after_422s,) = [dict(r) for r in supabase.rows["user_profiles"]]
         fine = await api.patch(
             "/api/v1/you/settings", params=params,
             json={"autonomy_mode": "suggest_only", "wake_time": "06:30",
                   "timezone": "Europe/London"},
         )
 
-    for resp in (unknown, too_long, not_a_time):
+    for resp in (unknown, too_long, not_a_time, unknown_key):
         assert resp.status_code == 422
         error = resp.json()["error"]
         assert set(error) == {"code", "message", "details", "request_id"}
         assert error["code"] == "validation_error"
     assert unknown.json()["error"]["details"] == {"fields": ["timezone"]}
+    assert after_422s == prior  # a rejected change changes nothing, not even the valid parts
     assert fine.status_code == 200
     assert fine.json() == {
         "display_name": None, "timezone": "Europe/London", "wake_time": "06:30",

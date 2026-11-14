@@ -52,6 +52,7 @@ from app.infrastructure.persistence._mapping import (
     apply_memory_update,
     apply_profile_update,
     check_limit,
+    constraint_to_row,
     day_bounds,
     draft_closed,
     embedding_values,
@@ -69,7 +70,8 @@ from app.infrastructure.persistence._mapping import (
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
-    summarize_usage,
+    USAGE_SUMMARY_COLUMNS,
+    summarize_usage_rows,
     task_from_row,
     task_id_clash,
     task_status_values,
@@ -88,6 +90,12 @@ _MEMORY_PRIMARY_KEY = "user_memories_pkey"
 _MEMORY_SELECT = ", ".join(MEMORY_COLUMNS)
 # A lost compare-and-set on a draft's status is retried against the status that won.
 _STATUS_CAS_ATTEMPTS = 3
+
+# One page of a usage summary. It must not exceed PostgREST's max_rows (1000,
+# supabase/config.toml): a page cut by that cap would read as the last one.
+USAGE_PAGE_ROWS = 1000
+# Pages one summary may read (20,000 calls); past it the summary says it is truncated.
+USAGE_MAX_PAGES = 20
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -373,7 +381,7 @@ class SupabaseConstraintRepository(_SupabaseRepository, ConstraintRepository):
 
     async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
         stored = prepare_new(user_id, c, "constraint")
-        rows = await self._run(lambda q: q.insert(to_row(stored)))
+        rows = await self._run(lambda q: q.insert(constraint_to_row(stored)))
         return _read(BehavioralConstraint, rows[0]) if rows else stored
 
     async def delete(self, user_id: str, constraint_id: str) -> bool:
@@ -671,8 +679,24 @@ class SupabaseUsageRepository(_SupabaseRepository, UsageRepository):
         await self._run(lambda q: q.insert(to_row(event)))
 
     async def summary(self, user_id: str, *, since: datetime | None = None) -> dict:
-        def build(q: Any) -> Any:
-            q = q.select("*").eq("user_id", user_id)
-            return q.gte("created_at", iso(since)) if since is not None else q
+        # PostgREST answers at most max_rows rows per read and says nothing, so the
+        # summary reads page after page (oldest first, a stable order) until one comes
+        # back short. Past USAGE_MAX_PAGES it stops and says so (truncated), never
+        # reporting a short total as the whole.
+        rows: list[dict] = []
+        for page in range(USAGE_MAX_PAGES):
+            first = page * USAGE_PAGE_ROWS
 
-        return summarize_usage(_read(LLMUsageEvent, r) for r in await self._run(build))
+            def build(q: Any, first: int = first) -> Any:
+                q = q.select(",".join(USAGE_SUMMARY_COLUMNS)).eq("user_id", user_id)
+                if since is not None:
+                    q = q.gte("created_at", iso(since))
+                return (
+                    q.order("created_at").order("id").range(first, first + USAGE_PAGE_ROWS - 1)
+                )
+
+            batch = await self._run(build)
+            rows.extend(batch)
+            if len(batch) < USAGE_PAGE_ROWS:
+                return summarize_usage_rows(rows)
+        return summarize_usage_rows(rows, truncated=True)

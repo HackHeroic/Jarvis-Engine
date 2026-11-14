@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.domain.entities import TaskEvent, TaskEventType
+from app.domain.errors import PersistenceError
+from app.domain.ports import TaskEventRepository
 from app.services.analytical.mastery_tracker import (
     _get_reschedule_count,
     compute_streak_from_events,
@@ -139,10 +141,32 @@ async def test_reschedule_count__counts_skipped_events_for_goal():
         "status": "pending", "duration_minutes": 25, "reschedule_count": 9,
     }).execute()
 
-    assert _get_reschedule_count("alice", "g1", supabase) == 2
-    assert _get_reschedule_count("alice", "g2", supabase) == 1
-    assert _get_reschedule_count("alice", None, supabase) == 3
-    assert _get_reschedule_count("carol", "g1", supabase) == 0
+    reads_before = len(supabase.selects)
+
+    assert await _get_reschedule_count("alice", "g1", events) == 2
+    assert await _get_reschedule_count("alice", "g2", events) == 1
+    assert await _get_reschedule_count("alice", None, events) == 3
+    assert await _get_reschedule_count("carol", "g1", events) == 0
+    assert await _get_reschedule_count("alice", "g1", None) == 0  # no history to read
+    # Through the repository: task_events only, never the old user_tasks column.
+    assert {table for table, _ in supabase.selects[reads_before:]} == {"task_events"}
+
+
+class _EventsUnreachable(TaskEventRepository):
+    async def append(self, user_id, event):
+        raise NotImplementedError
+
+    async def append_many(self, user_id, events):
+        raise NotImplementedError
+
+    async def list_for_user(self, user_id, **filters):
+        raise PersistenceError("Could not reach the database.")
+
+
+@pytest.mark.asyncio
+async def test_reschedule_count__history_unreadable__logged_and_zero(caplog):
+    assert await _get_reschedule_count("alice", "g1", _EventsUnreachable()) == 0
+    assert "Reschedule count" in caplog.text
 
 
 @pytest.mark.asyncio

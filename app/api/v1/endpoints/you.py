@@ -9,7 +9,7 @@ answers 503 in the one error envelope, never an empty page.
 from datetime import time
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import CurrentUser, get_container, require_supabase
 from app.api.v1.endpoints.memories import MemoryOut
@@ -55,14 +55,24 @@ class YouResponse(BaseModel):
     )
     rules: list[RuleShown] = Field(description="Rules the user's plans respect.")
     memories: list[MemoryOut] = Field(
-        description="Memories in use, oldest first; pattern memories show under patterns."
+        description=(
+            "Memories in use, oldest first. A learned pattern's memory is listed here only"
+            " when the pattern is not among `patterns` (its evidence aged out): it may still"
+            " shape plans, so it stays visible, as noticed, with its freshness."
+        )
     )
     focus: FocusProfile = Field(description="Focus by local hour: learned, or the prior.")
-    receipt: PrivacyReceipt = Field(description="Where the user's model calls ran.")
+    receipt: PrivacyReceipt = Field(
+        description=(
+            "Where the user's model calls of the last 30 days ran; `since` opens the window."
+        )
+    )
 
 
 class SettingsUpdate(BaseModel):
-    """Settings to change; any left out stay as they are."""
+    """Settings to change; any left out stay as they are. An unknown key is a 422."""
+
+    model_config = ConfigDict(extra="forbid")
 
     autonomy_mode: AutonomyMode | None = Field(
         default=None, description="suggest_only, ask_first or auto_low_risk."
@@ -95,7 +105,8 @@ def _service(request: Request) -> UserModelService:
     description=(
         "The profile, the patterns Jarvis sees in what happened (each with its evidence and "
         "the memory to confirm or dismiss), the rules plans respect, the memories in use, the "
-        "focus profile and the privacy receipt. Looks for new patterns first."
+        "focus profile and the privacy receipt of the last 30 days. Looks for new patterns "
+        "first; asks no model."
     ),
 )
 async def get_you(request: Request, user: CurrentUser) -> YouResponse:

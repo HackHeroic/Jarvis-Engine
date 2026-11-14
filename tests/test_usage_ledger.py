@@ -88,6 +88,7 @@ async def test_usage_ledger__receipt__splits_local_and_cloud():
         "pii_redactions": 2,
         "input_tokens": 180,
         "output_tokens": 35,
+        "truncated": False,
     }
 
 
