@@ -12,8 +12,10 @@ file. Where something is a stub, it says stub.
 
 The **LangGraph orchestrator** (`app/orchestrator/`) is the live request path.
 It replaces `execute_agentic_flow()` in `app/services/analytical/control_policy.py`,
-which now survives only as a library of helpers the v2 graph calls into
-(`_persist_fused_tasks`, `BRAIN_DUMP_EXTRACTION_PROMPT`).
+which now survives only as a library of helpers the v2 graph calls into:
+`BRAIN_DUMP_EXTRACTION_PROMPT` (brain-dump extraction) and `_namespace_chunk`,
+`derive_goal_id`, `mint_run_token` (`decompose_goal`). v2 never calls
+`_persist_fused_tasks`; only the deprecated `/accept-schedule` does.
 
 - **The one entry point:** `POST /api/v1/chat/v2/stream` (SSE).
 - **Deprecated:** `POST /api/v1/chat`, `POST /api/v1/chat/stream`,
@@ -27,7 +29,15 @@ which now survives only as a library of helpers the v2 graph calls into
   (`data/checkpoints.sqlite`) persists graph state per `(user_id, session_id)`
   thread, so a draft proposed on one turn is still under review on the next.
   One turn at a time per thread (`app/services/turn_locks.py`); a turn queued
-  behind another waits at most 120 s, then gets a `conflict` error frame.
+  behind another waits at most 120 s, then gets a `conflict` error frame. The
+  stream's cleanup is shielded from cancellation, so on a client disconnect the
+  lock is released only after the cancelled run has finished unwinding.
+- **Replies are honest about who wrote them and what happened.** The `complete`
+  frame's `generation_metrics.model` names the model that wrote the reply (the
+  metering decorator records each answering provider and model per turn;
+  "cloud"/"local" when no model wrote it). Exception text never reaches the
+  client: `tool_use` frames, module errors narrated in the reply, and HTTP
+  bodies carry a `JarvisError`'s message or a fixed text.
 
 **Layers (capstone LLD).** Dependencies point inward:
 
@@ -62,7 +72,7 @@ the machine and meters each answered search into the same ledger (provider
 `gemini`, task `web_search`; zero tokens when the transport reports none). A guard
 test (`tests/test_layering.py`) keeps every other caller out.
 
-**Test suite: 1,034 tests in 61 files; the default run is 1,029 passed and 4 strict xfails in ~15 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
+**Test suite: 1,113 tests in 65 files; the default run is 1,108 passed and 4 strict xfails in ~18 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach
 Supabase, Gemini, or ChromaDB.
 
@@ -202,9 +212,22 @@ flowchart TD
   (`SOLVE_STEP_TIMEOUT_MS`) always outlasts the cap; a solve that still ends
   without a schedule routes to `report_unsolved`, which says so plainly
   ("couldn't work out a schedule… try again") instead of narrating a plan.
-- **Nothing is scheduled in the past.** Minute 0 is 08:00 UTC of today; for a
-  plan made later in the day `run_schedule` hard-blocks the minutes already
-  gone (rounded up to the next 5). An explicit `plan_start` is left as given.
+- **Plans run on the user's clock.** Minute 0 is 08:00 in the user's zone —
+  `UserProfile.timezone` (read once per turn through the `UserModel` facade),
+  else `DEFAULT_TIMEZONE` (env `JARVIS_DEFAULT_TIMEZONE`, default
+  `Asia/Kolkata`) — on their logical day: before 08:00 it is still yesterday's
+  (the late-night rule). `horizon_start` is an offset-aware ISO timestamp, so the
+  frontend's `horizon_start + minutes` is the right instant in any browser, and
+  everything the solver sees stays in minutes from it: habit slots, the
+  constraint bridge and the midnight–08:00 night block are local by
+  construction. `fetch_constraints` fixes the horizon once per turn; habit
+  expansion and every solve attempt use it. Missed-deadline dates end at local
+  midnight, and PEARL reads skip hours on the same clock (`app/services/planning/local_time.py`).
+  Zones with DST have 23/25-hour days that "minute 1440 = 08:00 tomorrow"
+  ignores; India has none.
+- **Nothing is scheduled in the past.** For a plan made after 08:00
+  `run_schedule` hard-blocks the minutes already gone (rounded up to the next
+  5). An explicit `plan_start` (`/generate-schedule`) is left as given.
 - **One goal, one namespace.** `decompose_goal` derives a `goal_id` via
   `derive_goal_id` (the model's `goal_metadata.goal_id` → a slug of the
   objective/planning goal → `plan_{uuid8}`) and prefixes every chunk and every
@@ -219,7 +242,14 @@ flowchart TD
   `goal_id` on the `draft_schedules` row.
 - **Retry ladder:** `HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]`
   minutes — 3d → 5d → 7d → 14d → 30d. Exhaustion returns an anti-guilt
-  clarification ("a scope problem, not a you problem"), never a 500.
+  clarification ("a scope problem, not a you problem"), never a 500. Habit slots
+  and the bridge's standing rules are expanded out to 30 days and filtered per
+  attempt, so they (and the sleep habit) hold on every day of every retry.
+- **Overdue tasks are set aside, and can come back.** `mark_missed` marks
+  pending tasks past their deadline `missed` and says so without blame; a
+  planning turn that asks for them ("add the missed tasks" — deterministic, no
+  model call) flips them back to `pending` through `TaskRepository.update_status`
+  before fusion, and the new draft carries them.
 - **Nothing is committed here.** `create_draft` proposes; `user_tasks` is
   written only on accept.
 - **Feature flags** are env vars with the `JARVIS_` prefix and default to *on*:
@@ -297,8 +327,8 @@ The two properties that make this safe:
    is not enough. "looks good, lock it in" accepts; "looks good but move the
    calculus block later" does not. Negations (`don't`, `not yet`, `hold off`)
    and any `?` disqualify outright. This matters because ACCEPT_DRAFT is the
-   only v2 intent that writes to `user_tasks`, and `_persist_fused_tasks`
-   deletes every pending row before inserting.
+   only v2 intent that writes to `user_tasks`, and the accept replaces every
+   pending row.
 2. **Atomic accept.** `accept_draft_and_persist` calls `DraftService.accept`,
    whose one repository call (`accept_draft()` in SQL) replaces the user's
    pending tasks with the draft's, marks the draft `accepted` and the user's
@@ -334,7 +364,7 @@ all.
 | ModuleStep framework | `app/core/module_framework.py` | Declarative steps → compiled LangGraph; AND-join barriers, `routes_to` branches, timeouts, feature flags, SSE `tool_use` events, orphan check |
 | Module registry | `app/modules/__init__.py` | `planning_module`, `research_agent`, `knowledge_module` registered at lifespan startup |
 | Planning module | `app/modules/planning_graph.py` | Diagram 2 above — end to end, with drafts, TMT, full horizon ladder |
-| Draft actions | `app/services/draft_actions.py` | Shared accept/resolve/coerce logic for the graph node and the REST API |
+| Draft actions | `app/services/draft_actions.py` | Shared resolve/coerce logic for the graph node and the REST API; accept and reject both go through `DraftService` (via the container, or the shim's no-container fallback), so a closed draft is never "accepted" or "discarded" twice |
 | Drafts REST API | `app/api/v1/endpoints/drafts.py` | GET / accept / reject / modify / delete / PATCH task / rearrange / chat — all on the live Supabase-backed `DraftStore` |
 | Real token streaming | `app/api/v1/endpoints/chat.py` | Background pump task + shared queue; `token` → `event: message`, `thinking_token` → `event: thinking` |
 | Model router | `app/core/model_router.py` | Task → role (PRIMARY/FAST/CLOUD), then the provider chain Local → Claude → Gemini; cloud-first on `force_cloud`, the per-request ContextVar, `GEMINI_PRIMARY` or `CLAUDE_PRIMARY`. Web search stays on Gemini (`gemini_web_search`) |
@@ -355,7 +385,6 @@ all.
 | `app/modules/knowledge_graph.py` | `ingest_document` is real (`process_ingestion` → Docling → ChromaDB). `classify_content` is a two-keyword check; `extract_calendar` returns a hardcoded `{"status": "pending_approval"}`; `link_to_tasks`, `propose_actions`, `file_operations` all return empties. |
 | `app/orchestrator/hooks.py` | 7 handlers registered, **2 events have call sites**: `PreCloudLLM` (in `model_router.route_llm_call` and `voice_of_jarvis`) and `PreModuleExecution` (in `module_wrapper`). `PreScheduleModify`, `PostModuleExecution`, `PreMemoryWrite`, `CostThreshold`, `ProactiveSuggestion` are never invoked by app code. The PII filter itself is regex-only (email + US-format phone). |
 | `app/core/psychology/woop.py` | Declarations only; WOOP fields are produced by the decomposition prompt, not by this module. |
-| `app/api/v1/endpoints/analytical.py`, `telemetry.py` | Files exist but are **not mounted** in `app/api/v1/router.py`. |
 
 ### Deferred (design preserved, no implementation)
 
@@ -506,8 +535,9 @@ unfiltered query, which put other users' chunks into the prompt.)
    four later additions, so a `supabase db push` into a clean project produced
    an incomplete schema.
 
-10. **`analytical.py` and `telemetry.py` are dead files** — present in
-    `app/api/v1/endpoints/` but never included in `app/api/v1/router.py`.
+10. ~~**`analytical.py` and `telemetry.py` are dead files.**~~ **FIXED
+    2026-11-14:** deleted (they held a docstring each and were never mounted),
+    with the `/lmstudio` raw-httpx proxy and the no-op `DraftStore` component shims.
 
 11. **A failed decomposition still produces a schedule.** `fuse_tasks`
     `depends_on=["decompose_goal"]` with no routing on the error, so when
@@ -558,7 +588,7 @@ unfiltered query, which put other users' chunks into the prompt.)
 
 ## Test Coverage
 
-**1,034 collected · 1,029 passed · 4 strict xfails · 1 slow (deselected by default) · 61 files · ~15 s · fully offline.**
+**1,113 collected · 1,108 passed · 4 strict xfails · 1 slow (deselected by default) · 65 files · ~18 s · fully offline.**
 
 Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
 form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).
@@ -583,7 +613,11 @@ Areas covered, by file:
 | `test_document_*.py` (3 files) | Document type registry, classification, ingestion end-to-end |
 | `test_scheduler.py`, `test_chunker.py` | Real CP-SAT constraints; chunk parsing |
 | `test_store_resilience.py` | Explicit-`None` client sentinel — degrade, don't 500 |
-| `behaviour/` (5 suites) | The real `/chat/v2/stream` handler, orchestrator, CP-SAT and draft service over a fake database and a scripted LLM: chat turns, short- and long-term memory, learning, psychology |
+| `behaviour/` (6 suites) | The real `/chat/v2/stream` handler, orchestrator, CP-SAT and draft service over a fake database and a scripted LLM: chat turns, short- and long-term memory, learning, psychology, the user's local day |
+| `test_local_time.py` | The user's zone (profile, default, misconfiguration), the logical day, local deadline dates, PEARL's local hour, offset-aware accepted instants |
+| `test_chroma_search.py` | Document search: user-scoped only, no unfiltered fallback, relevance cut-off, one client, off the event loop; the documents API's chunk reads and deletes are owner-scoped |
+| `test_error_text_leaks.py`, `test_turn_locks.py` | No exception text on the wire; one turn per conversation, the lock released after a real (Starlette) disconnect unwinds |
+| `test_dependencies.py` | `requirements.txt` and `pyproject.toml` describe the same install |
 | `test_domain.py`, `test_layering.py`, `test_repository_contracts.py`, `test_container.py` | Entities and the draft state machine, the event bus, import rules between layers, both repository families against one contract, the composition root |
 | `test_llm_providers.py`, `test_claude_provider.py`, `test_llm_call_sites.py`, `test_usage_ledger.py` | The provider chain and its decorators, Claude on the real SDK over a mock transport, every LLM call site through the chain, usage metering |
 | `test_errors.py`, `test_error_text_leaks.py`, `test_data_isolation.py`, `test_turn_locks.py` | One error envelope, no exception text on the wire, per-user scoping, one turn at a time per conversation |

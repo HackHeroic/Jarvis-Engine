@@ -22,6 +22,7 @@ from app.domain.entities import (
     DraftStatus,
     LLMLocation,
     LLMUsageEvent,
+    OPEN_DRAFT_STATUSES,  # noqa: F401  (re-exported to the repositories)
     Task,
     TaskStatus,
     UserProfile,
@@ -31,7 +32,6 @@ M = TypeVar("M", bound=BaseModel)
 
 # Matches the draft_schedules.expires_at column default (now() + 24 hours).
 DRAFT_TTL = timedelta(hours=24)
-OPEN_DRAFT_STATUSES = (DraftStatus.PENDING, DraftStatus.MODIFIED)
 
 # Legacy user_tasks.status values, and the status each one reads as.
 _LEGACY_TASK_STATUSES = {"pacing_pushed": TaskStatus.SKIPPED}

@@ -52,10 +52,7 @@ def _pending(supabase: FakeSupabase) -> list[dict]:
 
 
 def test_get_all_pending_tasks_with_goals__pairs_each_chunk_with_its_goal_id():
-    from app.services.analytical.task_retrieval import (
-        get_all_pending_tasks,
-        get_all_pending_tasks_with_goals,
-    )
+    from app.services.analytical.task_retrieval import get_all_pending_tasks_with_goals
 
     supabase = FakeSupabase({"user_tasks": [
         {"user_id": U1, "task_id": IDS[1], "goal_id": GOAL, "title": "a", "status": "pending",
@@ -69,8 +66,6 @@ def test_get_all_pending_tasks_with_goals__pairs_each_chunk_with_its_goal_id():
     pairs = get_all_pending_tasks_with_goals(U1, supabase)
 
     assert [(chunk.task_id, goal) for chunk, goal in pairs] == [(IDS[1], GOAL), ("task_1", None)]
-    # The plain function keeps its return type for its callers.
-    assert [c.task_id for c in get_all_pending_tasks(U1, supabase)] == [IDS[1], "task_1"]
 
 
 @pytest.mark.asyncio

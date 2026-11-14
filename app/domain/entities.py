@@ -53,6 +53,10 @@ class LLMLocation(str, Enum):
     CLOUD = "cloud"
 
 
+# The states a draft is still under review in. The only definition: the persistence
+# mapping and the legacy DraftStore both import it.
+OPEN_DRAFT_STATUSES: tuple[DraftStatus, ...] = (DraftStatus.PENDING, DraftStatus.MODIFIED)
+
 _OPEN_DRAFT_TARGETS = frozenset(
     {
         DraftStatus.MODIFIED,

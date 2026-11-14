@@ -15,30 +15,17 @@ def _get_supabase(client: Any = None):
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-def get_all_pending_tasks(
-    user_id: str,
-    supabase_client: Any = None,
-) -> list[TaskChunk]:
-    """Fetch all pending tasks from user_tasks, hydrating to TaskChunk format.
-
-    Task ids come back exactly as stored: namespaced ``{goal_id}_{run}_{task_id}``
-    by planning (rows written before the run token read ``{goal_id}_{task_id}``),
-    dependencies likewise. Deduplicates by task_id, keeping the newest row.
-
-    TaskChunk has no goal_id field, so the goal is lost here. A caller that writes
-    the tasks back, or decides which goal a task belongs to, uses
-    ``get_all_pending_tasks_with_goals``.
-    """
-    return [chunk for chunk, _ in get_all_pending_tasks_with_goals(user_id, supabase_client)]
-
-
 def get_all_pending_tasks_with_goals(
     user_id: str,
     supabase_client: Any = None,
 ) -> list[tuple[TaskChunk, str | None]]:
-    """``get_all_pending_tasks``, with each chunk paired with its row's goal_id.
+    """Fetch all pending tasks from user_tasks as TaskChunks, each paired with its goal_id.
 
-    The goal_id is None for a row that has none.
+    Task ids come back exactly as stored: namespaced ``{goal_id}_{run}_{task_id}``
+    by planning (rows written before the run token read ``{goal_id}_{task_id}``),
+    dependencies likewise. Deduplicates by task_id, keeping the newest row.
+    TaskChunk has no goal_id field, so it travels alongside; it is None for a row
+    that has none.
     """
     supabase = _get_supabase(supabase_client)
     if not supabase or not user_id:
@@ -57,7 +44,7 @@ def get_all_pending_tasks_with_goals(
         )
         rows = result.data or []
     except Exception as e:
-        print(f"[task_retrieval] get_all_pending_tasks failed: {e}")
+        print(f"[task_retrieval] get_all_pending_tasks_with_goals failed: {e}")
         return []
 
     seen: set[str] = set()
