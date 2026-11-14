@@ -7,9 +7,9 @@ that the stores actually call: ``table(name).insert(row).execute()``,
 ``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` / ``.gt()`` filters,
 ``.is_(column, "null")``, and
 ``rpc("accept_draft" | "match_memories", params).execute()``. It records the
-columns every ``select`` names (``FakeSupabase.selects``) and enforces the one
-unique index a repository maps to an error on a plain write: user_memories'
-``(user_id, pattern_key) where pattern_key is not null``.
+columns every ``select`` names (``FakeSupabase.selects``) and enforces the
+unique keys a repository maps to an error on a plain write: user_memories' primary
+key and its ``(user_id, pattern_key) where pattern_key is not null`` index.
 
 It is deliberately a real (if tiny) implementation rather than a MagicMock:
 a MagicMock returns a canned payload regardless of the filters passed, so it
@@ -73,12 +73,16 @@ def _compare(op: Callable[[Any, Any], bool]) -> Callable[[Any, Any], bool]:
     return check
 
 
-# Unique indexes the fake enforces on table().insert/update, as {table: (name, columns)}.
-# The index only binds rows where every column is non-NULL (a partial index on
-# "where <column> is not null" behaves the same here).
+# Unique keys the fake enforces on table().insert/update, as {table: ((name, columns), ...)},
+# checked in order (Postgres checks the primary key first). A key only binds rows
+# where every column is non-NULL (a partial index on "where <column> is not null"
+# behaves the same here).
 _UNIQUE_INDEXES = {
-    # 20261115000002_memory_lifecycle_and_vectors.sql
-    "user_memories": ("idx_user_memories_user_pattern_key", ("user_id", "pattern_key")),
+    "user_memories": (
+        ("user_memories_pkey", ("id",)),
+        # 20261115000002_memory_lifecycle_and_vectors.sql
+        ("idx_user_memories_user_pattern_key", ("user_id", "pattern_key")),
+    ),
 }
 
 
@@ -167,14 +171,12 @@ class _Query:
     # ── execution ───────────────────────────────────────────
     def _check_unique(self, candidate: dict, others: list[dict]) -> None:
         """Raise as Postgres would if ``candidate`` repeats a unique key held in ``others``."""
-        if self._table not in _UNIQUE_INDEXES:
-            return
-        index, columns = _UNIQUE_INDEXES[self._table]
-        key = tuple(candidate.get(column) for column in columns)
-        if None in key:
-            return
-        if any(tuple(row.get(column) for column in columns) == key for row in others):
-            raise _unique_violation(index)
+        for index, columns in _UNIQUE_INDEXES.get(self._table, ()):
+            key = tuple(candidate.get(column) for column in columns)
+            if None in key:
+                continue
+            if any(tuple(row.get(column) for column in columns) == key for row in others):
+                raise _unique_violation(index)
 
     def _matches(self, row: dict) -> bool:
         return all(row.get(col) == val for col, val in self._filters) and all(

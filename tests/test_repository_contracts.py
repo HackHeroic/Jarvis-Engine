@@ -919,10 +919,12 @@ async def test_memories__duplicate_pattern_key__raises_conflict(repos):
     first = await repos.memories.add(U1, _memory(U1, "Skips 9 AM", pattern_key="skip_hour:9"))
     other = await repos.memories.add(U1, _memory(U1, "Skips 10 AM", pattern_key="skip_hour:10"))
 
-    with pytest.raises(errors.ConflictError):
+    with pytest.raises(errors.ConflictError) as added_again:
         await repos.memories.add(U1, _memory(U1, "Skips 9 AM again", pattern_key="skip_hour:9"))
-    with pytest.raises(errors.ConflictError):
+    with pytest.raises(errors.ConflictError) as moved_onto:
         await repos.memories.update(U1, other.id, pattern_key="skip_hour:9")
+
+    assert added_again.value.details == moved_onto.value.details == {"pattern_key": "skip_hour:9"}
 
     # Unkeyed memories never clash, and another user may hold the same key.
     await repos.memories.add(U1, _memory(U1, "Likes tea"))
@@ -931,6 +933,72 @@ async def test_memories__duplicate_pattern_key__raises_conflict(repos):
     assert await repos.memories.find_by_pattern_key(U1, "skip_hour:9") == first
     assert (await repos.memories.get(U1, other.id)).pattern_key == "skip_hour:10"
     assert len(await repos.memories.list(U1)) == 4
+
+
+@pytest.mark.asyncio
+async def test_memories__duplicate_id__raises_conflict_naming_the_id(repos):
+    memory_id = str(uuid4())
+    await repos.memories.add(U1, _memory(U1, "Likes tea", id=memory_id, pattern_key="tea"))
+
+    for user_id in (U1, U2):  # the id is a primary key across every user
+        with pytest.raises(errors.ConflictError) as info:
+            await repos.memories.add(user_id, _memory(user_id, "Likes coffee", id=memory_id))
+        assert info.value.details == {"memory_id": memory_id}
+
+    assert [m.content for m in await repos.memories.list(U1)] == ["Likes tea"]
+    assert await repos.memories.list(U2) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["source_session_id", "source_message_id", "superseded_by"])
+async def test_memories__non_uuid_reference__raises_validation_and_writes_nothing(repos, field):
+    every_status = frozenset(MemoryStatus)
+
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.add(U1, _memory(U1, **{field: "session-1"}))
+    assert await repos.memories.list(U1, statuses=every_status) == []
+
+    # A UUID with no row behind it is fine: these are soft references.
+    stored = await repos.memories.add(U1, _memory(U1, **{field: str(uuid4())}))
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.update(U1, stored.id, **{field: "not-a-uuid"})
+    assert await repos.memories.get(U1, stored.id) == stored
+
+
+_BAD_EMBEDDINGS = {
+    "too_short": [1.0, 0.0, 0.0],
+    "too_long": [1.0] * 385,
+    "all_zero": [0.0] * 384,
+    "nan": [float("nan")] + [1.0] * 383,
+    "infinite": [float("inf")] + [1.0] * 383,
+    "not_numbers": ["a"] * 384,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", _BAD_EMBEDDINGS.values(), ids=_BAD_EMBEDDINGS.keys())
+async def test_memories__bad_embedding__raises_validation_and_writes_nothing(repos, bad):
+    stored = await repos.memories.add(U1, _memory(U1, "Likes tea"), embedding=_vec(1.0, 0.0))
+
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.add(U1, _memory(U1, "Likes coffee"), embedding=bad)
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.update(U1, stored.id, embedding=bad)
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.nearest(U1, bad, statuses=ACTIVE)
+
+    assert await repos.memories.list(U1) == [stored]
+    (match,) = await repos.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE)
+    assert match.similarity == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_memories__nearest__negative_limit__raises_validation(repos):
+    await repos.memories.add(U1, _memory(U1, "Likes tea"), embedding=_vec(1.0, 0.0))
+
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE, limit=-1)
+    assert await repos.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE, limit=0) == []
 
 
 @pytest.mark.asyncio
@@ -1135,3 +1203,58 @@ async def test_supabase_repos__unreadable_stored_row__raises_persistence_error(f
 
     assert info.value.message == "Stored data is not readable."
     assert isinstance(info.value.__cause__, PydanticValidationError)
+
+
+@pytest.mark.asyncio
+async def test_supabase_memories__legacy_row_with_null_columns__reads_with_defaults(fake_client):
+    """Rows the v1 path wrote before 20261115000002 may hold NULL in these columns
+    (the migration fills them), or a fake row may not carry them at all."""
+    legacy = ("confidence", "strength", "stability", "observation_count", "source", "created_at")
+    base = {
+        "user_id": U1,
+        "memory_type": "fact",
+        "status": "active",
+        "provenance": "said",
+        "strength_as_of": T0.isoformat(),
+        "embedding": _vec(1.0, 0.0),
+    }
+    nulls = {**base, "id": str(uuid4()), "content": "Null columns", **dict.fromkeys(legacy)}
+    absent = {**base, "id": str(uuid4()), "content": "Absent columns"}
+    fake_client.rows["user_memories"] = [nulls, absent]
+    repos = RepositoryFactory.supabase(fake_client)
+
+    listed = await repos.memories.list(U1)
+    found = [m.memory for m in await repos.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE)]
+
+    assert sorted(m.content for m in listed) == sorted(m.content for m in found) == [
+        "Absent columns", "Null columns",
+    ]
+    for memory in listed:
+        assert (memory.confidence, memory.strength, memory.stability) == (0.5, 1.0, 1.0)
+        assert memory.observation_count == 1 and memory.origin == "conversation"
+        assert memory.created_at == T0  # falls back to strength_as_of
+
+
+class _UniqueViolationClient(FakeSupabase):
+    """Every user_memories insert fails on a unique index that is not the pattern key's."""
+
+    def table(self, name: str):
+        query = super().table(name)
+
+        def insert(payload):
+            error = Exception('duplicate key value violates unique constraint "some_other_key"')
+            error.code = "23505"
+            raise error
+
+        query.insert = insert
+        return query
+
+
+@pytest.mark.asyncio
+async def test_supabase_memories__other_unique_violation__raises_persistence_error():
+    repos = RepositoryFactory.supabase(_UniqueViolationClient())
+
+    with pytest.raises(errors.PersistenceError) as info:
+        await repos.memories.add(U1, _memory(U1, pattern_key="tea"))
+
+    assert info.value.message == "Could not reach the database."

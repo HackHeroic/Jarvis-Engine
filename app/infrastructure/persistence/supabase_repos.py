@@ -50,6 +50,7 @@ from app.infrastructure.persistence._mapping import (
     accepted_task_rows,
     apply_memory_update,
     apply_profile_update,
+    check_limit,
     day_bounds,
     draft_closed,
     embedding_values,
@@ -57,12 +58,14 @@ from app.infrastructure.persistence._mapping import (
     is_uuid,
     iso,
     memory_from_row,
+    memory_id_taken,
     memory_to_row,
     new_draft,
     not_found,
     now_utc,
     pattern_key_taken,
     prepare_new,
+    prepare_new_memory,
     summarize_usage,
     task_from_row,
     task_id_clash,
@@ -76,9 +79,9 @@ _UNREACHABLE = "Could not reach the database."
 _TASK_ID_KEY = "user_tasks_user_id_task_id_key"
 _UNREADABLE = "Stored data is not readable."
 # The name 20261115000002_memory_lifecycle_and_vectors.sql gives the unique
-# (user_id, pattern_key) index on user_memories.
+# (user_id, pattern_key) index on user_memories, and user_memories' primary key.
 _PATTERN_KEY_INDEX = "idx_user_memories_user_pattern_key"
-_UNIQUE_VIOLATION = "23505"
+_MEMORY_PRIMARY_KEY = "user_memories_pkey"
 _MEMORY_SELECT = ", ".join(MEMORY_COLUMNS)
 # A lost compare-and-set on a draft's status is retried against the status that won.
 _STATUS_CAS_ATTEMPTS = 3
@@ -468,27 +471,30 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
 
     table = "user_memories"
 
-    async def _write(self, build: Callable[[Any], Any], pattern_key: str | None) -> list[dict]:
-        """Run a write; a clash on the unique (user_id, pattern_key) index is a ConflictError."""
+    async def _write(self, build: Callable[[Any], Any], memory: Memory) -> list[dict]:
+        """Run a write of ``memory``; a clash on one of its unique keys is a ConflictError.
+
+        Only the two keys named here are conflicts; any other failure stays a
+        PersistenceError.
+        """
         try:
             return await self._run(build)
         except errors.PersistenceError as exc:
-            cause = exc.__cause__
-            if isinstance(cause, Exception) and (
-                _PATTERN_KEY_INDEX in _error_text(cause)
-                or getattr(cause, "code", None) == _UNIQUE_VIOLATION
-            ):
-                raise pattern_key_taken(pattern_key) from cause
+            text = _error_text(exc.__cause__) if isinstance(exc.__cause__, Exception) else ""
+            if _PATTERN_KEY_INDEX in text:
+                raise pattern_key_taken(memory.pattern_key) from exc.__cause__
+            if _MEMORY_PRIMARY_KEY in text:
+                raise memory_id_taken(memory.id) from exc.__cause__
             raise
 
     async def add(
         self, user_id: str, m: Memory, *, embedding: list[float] | None = None
     ) -> Memory:
-        stored = prepare_new(user_id, m, "memory")
+        stored = prepare_new_memory(user_id, m)
         row = memory_to_row(stored)
         if embedding is not None:
             row[EMBEDDING] = embedding_values(embedding)
-        rows = await self._write(lambda q: q.insert(row), stored.pattern_key)
+        rows = await self._write(lambda q: q.insert(row), stored)
         return _read_memory(rows[0]) if rows else stored
 
     async def get(self, user_id: str, memory_id: str) -> Memory | None:
@@ -543,7 +549,7 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
             "p_query": embedding_values(embedding),
             "p_statuses": sorted(MemoryStatus(s).value for s in statuses),
             "p_types": sorted(types) if types is not None else None,
-            "p_limit": limit,
+            "p_limit": check_limit(limit),
             "p_min_similarity": min_similarity,
         }
         try:
@@ -572,8 +578,7 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
         if not payload:
             return current
         rows = await self._write(
-            lambda q: q.update(payload).eq("id", memory_id).eq("user_id", user_id),
-            updated.pattern_key,
+            lambda q: q.update(payload).eq("id", memory_id).eq("user_id", user_id), updated
         )
         if not rows:  # deleted since it was read
             raise not_found("memory", memory_id)

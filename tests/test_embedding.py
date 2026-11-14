@@ -4,6 +4,7 @@ import pytest
 
 from app.domain.errors import InfrastructureError
 from app.infrastructure.embedding import MiniLMEmbedder
+from app.infrastructure.persistence._mapping import MEMORY_EMBEDDING_DIMENSIONS
 from tests.fakes import BagOfWordsEmbedder
 
 
@@ -36,9 +37,25 @@ def test_minilm_embedder__model_available__one_float_vector_per_text(monkeypatch
         "app.infrastructure.embedding.embed_texts", lambda texts: [[1, 0.5]] * len(texts)
     )
 
+    monkeypatch.setattr(MiniLMEmbedder, "dimensions", 2)
+
     assert MiniLMEmbedder().embed(["a", "b"]) == [[1.0, 0.5], [1.0, 0.5]]
     assert MiniLMEmbedder().embed([]) == []
-    assert MiniLMEmbedder.dimensions == 384
+
+
+def test_minilm_embedder__dimensions__match_the_stored_embedding_width():
+    assert MiniLMEmbedder.dimensions == MEMORY_EMBEDDING_DIMENSIONS == 384
+
+
+def test_minilm_embedder__vector_of_the_wrong_length__raises_infrastructure_error(monkeypatch):
+    monkeypatch.setattr(
+        "app.infrastructure.embedding.embed_texts", lambda texts: [[0.1] * 383] * len(texts)
+    )
+
+    with pytest.raises(InfrastructureError) as info:
+        MiniLMEmbedder().embed(["Likes tea"])
+
+    assert info.value.message == "Text embeddings are unavailable."
 
 
 def test_bag_of_words_embedder__shared_words__closer_than_unrelated():

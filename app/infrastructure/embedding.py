@@ -12,7 +12,8 @@ class MiniLMEmbedder(TextEmbedder):
 
     384 dimensions, the width of the user_memories.embedding column. Raises
     InfrastructureError when the model cannot run (chromadb missing, model not
-    downloaded); the driver's text is chained, never repeated.
+    downloaded) or answers with a vector of any other length; the driver's text is
+    chained, never repeated.
     """
 
     dimensions = 384
@@ -24,6 +25,8 @@ class MiniLMEmbedder(TextEmbedder):
             vectors = embed_texts(texts)
         except Exception as exc:  # any model load or inference failure
             raise InfrastructureError(_UNAVAILABLE) from exc
-        if len(vectors) != len(texts) or any(v is None for v in vectors):
+        if len(vectors) != len(texts) or any(
+            v is None or len(v) != self.dimensions for v in vectors
+        ):
             raise InfrastructureError(_UNAVAILABLE)
         return [[float(x) for x in v] for v in vectors]
