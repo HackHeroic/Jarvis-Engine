@@ -278,6 +278,6 @@ async def chat_modify_draft(draft_id: str, request: DraftChatRequest, http_reque
     Nothing calls this today (``jarvis-frontend/lib/api.ts`` uses
     accept/reject/edit/rearrange/delete), so saying so plainly costs no caller.
     The conversational path to editing a plan is the orchestrator's negotiation
-    flow at /api/v1/chat/v2/stream.
+    flow at /api/v1/chat/stream.
     """
     raise HTTPException(status_code=501, detail="draft chat modification not implemented")

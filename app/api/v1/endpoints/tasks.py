@@ -99,8 +99,8 @@ class TaskResponse(BaseModel):
     task_id: str
     status: str
     message: str
-    # Always False: the background replan (control_policy.trigger_replan) is off
-    # until it can run to completion. Kept because the frontend reads it.
+    # Always False: no task endpoint starts a replan (the v1 background replan was
+    # retired with the v1 chat). Kept because the frontend reads it.
     replan_triggered: bool = False
 
 

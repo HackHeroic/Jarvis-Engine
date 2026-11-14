@@ -175,11 +175,11 @@ def _stub_chat_io(monkeypatch, session_id: str = "sess-1") -> None:
 
 
 async def _open_turn(graph, prompt: str, user_id: str = "u1"):
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
 
-    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
-    return await chat_stream_v2(ChatRequest(user_prompt=prompt, user_id=user_id), http_request)
+    return await chat_stream(ChatRequest(user_prompt=prompt, user_id=user_id), http_request)
 
 
 async def _drain(response) -> None:
@@ -253,11 +253,11 @@ async def _serve_over_asgi(graph, prompt: str, disconnect: asyncio.Event) -> Non
     ASGI spec 2.3 — Starlette then streams inside an anyio task group and cancels the
     stream when ``http.disconnect`` arrives. Handler and response share one task, as
     under Starlette's ``request_response``."""
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
 
-    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
-    response = await chat_stream_v2(ChatRequest(user_prompt=prompt, user_id="u1"), http_request)
+    response = await chat_stream(ChatRequest(user_prompt=prompt, user_id="u1"), http_request)
 
     async def receive():
         await disconnect.wait()
@@ -356,13 +356,13 @@ async def test_chat_v2__through_starlette__attribution_ends_cleanly_after_the_st
 
     _stub_chat_io(monkeypatch, session_id="sess-3")
     graph = _AttributionGraph()
-    for name, value in (("jarvis_graph", graph), ("db_client", None), ("memory_store", None)):
+    for name, value in (("jarvis_graph", graph), ("db_client", None)):
         monkeypatch.setattr(app.state, name, value, raising=False)
 
     transport = httpx.ASGITransport(app=app)  # re-raises anything the app raises
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/api/v1/chat/v2/stream", json={"user_prompt": "hi", "user_id": "u5"}
+            "/api/v1/chat/stream", json={"user_prompt": "hi", "user_id": "u5"}
         )
 
     assert response.status_code == 200
@@ -486,15 +486,15 @@ class _ForceCloudGraph(_AttributionGraph):
 
 @pytest.mark.asyncio
 async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_llm, monkeypatch):
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
     from app.core.model_router import force_cloud_var
 
     _stub_chat_io(monkeypatch)
     graph = _ForceCloudGraph()
-    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
-    response = await chat_stream_v2(
+    response = await chat_stream(
         ChatRequest(user_prompt="hi", user_id="u1", model_mode="cloud"), http_request
     )
     await _drain(response)

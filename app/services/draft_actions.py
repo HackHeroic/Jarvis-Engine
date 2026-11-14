@@ -69,32 +69,6 @@ async def resolve_draft(
     return await asyncio.to_thread(draft_store.get_pending_draft, user_id)
 
 
-def _count_persisted(supabase: Any, user_id: str, plan_id: str) -> int:
-    """How many rows carrying *this* ``plan_id`` are in ``user_tasks`` now.
-
-    Used by the deprecated v1 ``/accept-schedule`` to prove its non-atomic
-    ``_persist_fused_tasks`` write landed. Draft acceptance needs no re-read: its
-    write is one transaction that returns the row count.
-
-    Filtering on plan_id rather than task_id is the whole point. Fused chunk
-    lists deliberately carry pre-existing pending tasks forward (``fuse_tasks``
-    merges them into the draft), and ``_persist_fused_tasks`` builds its rows
-    *before* deleting the old ones — so after a total write failure the stale
-    rows are still there, wearing the same task_ids. Matching on those would
-    read an outage as a success, flip the draft to accepted, and take the retry
-    path away with it. A plan_id is minted per call, so only rows this call
-    wrote can carry it.
-    """
-    result = (
-        supabase.table("user_tasks")
-        .select("task_id")
-        .eq("user_id", user_id)
-        .eq("plan_id", plan_id)
-        .execute()
-    )
-    return len(result.data or [])
-
-
 # What the user is told when an accept moved times that had gone by, or could not.
 MOVED_ON_ACCEPT = "A few of those times had already gone by, so I moved them — it's locked in now."
 NO_ROOM_ON_ACCEPT = (

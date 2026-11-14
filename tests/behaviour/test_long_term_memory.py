@@ -19,10 +19,7 @@ from datetime import datetime, timezone
 import httpx
 import pytest
 
-import app.services.memory.retriever as retriever_module
-import app.services.memory.store as store_module
 import app.domain.clock as utc_clock
-from app.services.memory.retriever import build_memory_context
 from tests.behaviour.conftest import brain_dump, said
 
 MARATHON = "Training for the Mumbai marathon in March"
@@ -74,6 +71,13 @@ def _context_of_reply(llm, since: int) -> str:
     return "\n".join(notes)
 
 
+async def _in_use(jarvis, user="alice", now=None) -> list[str]:
+    """The words of the memories Jarvis has in use for ``user`` at ``now``: what recall,
+    the extraction's known memories and planning read from (``MemoryService.list_active``)."""
+    memories = await jarvis.state.container.memory_service.list_active(user, now=now)
+    return [m.content for m in memories]
+
+
 def _memories(jarvis, user="alice", content=None) -> list[dict]:
     rows = jarvis.rows("user_memories", user_id=user)
     return [r for r in rows if content is None or r["content"] == content]
@@ -94,7 +98,7 @@ async def _memory_api(jarvis, monkeypatch):
 @pytest.fixture
 def frozen_memory_clock(clock):
     """Memory writes and decay read one controllable clock."""
-    clock.freeze(_T0, store_module, retriever_module, utc_clock)
+    clock.freeze(_T0, utc_clock)
     return clock
 
 
@@ -146,7 +150,7 @@ async def test_memory__contradiction__supersedes_the_old_fact_everywhere(jarvis,
     context = _context_of_reply(llm, calls_before)
     assert NIGHTS in context
     assert MORNINGS not in context
-    assert MORNINGS not in build_memory_context("alice", jarvis.memory_store)
+    assert MORNINGS not in await _in_use(jarvis)
 
 
 # --- the user's controls -------------------------------------------------------
@@ -197,9 +201,9 @@ async def test_memory__dismiss_hides_and_confirm_raises_confidence(jarvis, llm, 
     assert dismissed.id not in confidence
     assert confidence[confirmed.id] == pytest.approx(0.9)
     # Hidden from the model's context too, not only from the panel.
-    context = build_memory_context("alice", jarvis.memory_store)
-    assert dismissed.content not in context
-    assert confirmed.content in context
+    in_use = await _in_use(jarvis)
+    assert dismissed.content not in in_use
+    assert confirmed.content in in_use
 
 
 # --- fading -------------------------------------------------------------------
@@ -212,7 +216,7 @@ async def test_memory__unused_for_a_week__still_in_context(jarvis, llm, frozen_m
 
     frozen_memory_clock.advance(days=7)
 
-    assert MARATHON in build_memory_context("alice", jarvis.memory_store)
+    assert MARATHON in await _in_use(jarvis, now=frozen_memory_clock.now)
 
 
 @pytest.mark.asyncio
@@ -241,16 +245,22 @@ async def test_memory__mentioned_again_after_three_weeks__survives_the_month(
 
     frozen_memory_clock.advance(days=9)  # 30 days after it was first learned
 
-    assert MARATHON in build_memory_context("alice", jarvis.memory_store)
+    assert MARATHON in await _in_use(jarvis, now=frozen_memory_clock.now)
 
 
 @pytest.mark.asyncio
 async def test_memory__confirmed_pattern__outlasts_an_unconfirmed_one(
     jarvis, llm, monkeypatch, frozen_memory_clock
 ):
+    from app.domain.entities import MemorySource
+    from app.services.memory.memory_service import MemoryCandidate
+
     for content in ("Skips work around 9 AM", "Most productive after lunch"):
-        jarvis.memory_store.store_memory(
-            "alice", {"type": "behavioral_pattern", "content": content, "confidence": 0.8}
+        await jarvis.state.container.memory_service.remember(
+            "alice",
+            MemoryCandidate(memory_type="behavioral_pattern", content=content, confidence=0.8),
+            provenance=MemorySource.INFERRED,
+            origin="behavior",
         )
     unconfirmed, confirmed = _memories(jarvis)
     async with _memory_api(jarvis, monkeypatch) as api:
@@ -258,9 +268,9 @@ async def test_memory__confirmed_pattern__outlasts_an_unconfirmed_one(
 
     frozen_memory_clock.advance(days=30)
 
-    context = build_memory_context("alice", jarvis.memory_store)
-    assert confirmed["content"] in context
-    assert unconfirmed["content"] not in context
+    in_use = await _in_use(jarvis, now=frozen_memory_clock.now)
+    assert confirmed["content"] in in_use
+    assert unconfirmed["content"] not in in_use
 
 
 # --- isolation ------------------------------------------------------------------

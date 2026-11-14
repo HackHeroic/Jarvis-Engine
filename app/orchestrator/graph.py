@@ -1,6 +1,8 @@
 """Main LangGraph StateGraph — the Jarvis orchestrator.
 
-Replaces execute_agentic_flow() in control_policy.py.
+Every chat turn (``POST /api/v1/chat/stream``) runs this graph: load the user's
+context, read the message, classify the intent, run the module that serves it,
+synthesize the reply, then learn from the turn.
 """
 
 import asyncio
@@ -236,8 +238,8 @@ def is_trivial_input(text: str) -> bool:
 async def _load_context(state: JarvisState) -> dict:
     """Hydrate the UserModel facade for checkpoint-resumed turns.
 
-    Live requests arrive with a pre-wired user_model (shared db_client /
-    memory_store) and this is a no-op. A turn resumed from a checkpoint has
+    Live requests arrive with a pre-wired user_model (the shared db_client)
+    and this is a no-op. A turn resumed from a checkpoint has
     only the serializable ``user_id`` — the facade was never persisted — so
     rebuild it here. Without a user_id there is no identity to rebuild from,
     so leave state untouched.
@@ -246,7 +248,7 @@ async def _load_context(state: JarvisState) -> dict:
     it is truthy either way, so every downstream ``if user_model:`` guard
     would wave the hollow one through and then fail on
     ``AttributeError: 'NoneType' object has no attribute 'supabase'``. The
-    shared clients come from the registry the lifespan populates.
+    shared db client comes from the registry the lifespan populates.
     """
     if state.get("user_model") is not None:
         return {}
@@ -255,14 +257,10 @@ async def _load_context(state: JarvisState) -> dict:
     if not user_id:
         return {}
 
-    from app.core.runtime import get_db, get_memory_store
+    from app.core.runtime import get_db
     from app.core.user_model import UserModel
 
-    user_model = UserModel(user_id=user_id, db=get_db())
-    memory_store = get_memory_store()
-    if memory_store is not None:
-        user_model.set_memory_store(memory_store)
-    return {"user_model": user_model}
+    return {"user_model": UserModel(user_id=user_id, db=get_db())}
 
 
 # The extraction is shown at most this many of the user's memories (the newest), each
@@ -327,7 +325,7 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     entirely → routes to CHAT. Avoids 26B over-extraction when E4B isn't loaded.
     """
     from app.schemas.context import BrainDumpExtraction
-    from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT
+    from app.services.planning.brain_dump_prompt import BRAIN_DUMP_EXTRACTION_PROMPT
     from app.core.model_router import route_llm_call
 
     user_msg = state.get("user_message", "")
@@ -400,7 +398,7 @@ async def _classify_intent(state: JarvisState) -> dict:
     if not bd:
         return {"intent": IntentType.CHAT}
 
-    # Rule-based classification matching control_policy.py logic
+    # Rule-based classification: no model call
     if bd.planning_goal:
         return {"intent": IntentType.PLAN_DAY}
     if bd.has_calendar:

@@ -325,7 +325,7 @@ class Client:
     def turn(self, text: str, session: str | None = None) -> tuple[list[tuple[str, Any]], dict]:
         """One chat turn over the SSE stream; returns every frame, in order, and ``complete``."""
         body = {"user_prompt": text, "user_id": self.user_id, "conversation_id": session}
-        with self.http.stream("POST", "/api/v1/chat/v2/stream", json=body) as response:
+        with self.http.stream("POST", "/api/v1/chat/stream", json=body) as response:
             assert response.status_code == 200, f"chat answered {response.status_code}"
             frames = parse_sse(list(response.iter_lines()))
         errors = [data for event, data in frames if event == "error"]

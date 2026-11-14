@@ -1,7 +1,7 @@
 """Harness for the behaviour suites.
 
 Each suite talks to Jarvis the way a person does — a message into the real
-``POST /chat/v2/stream`` handler, the reply read back off its SSE stream — and
+``POST /chat/stream`` handler, the reply read back off its SSE stream — and
 checks what that person would see: the reply, the draft, the rows in their task
 list, what Jarvis remembers next time.
 
@@ -12,11 +12,12 @@ Only the boundaries are faked:
   provider chain with ``set_chain`` — every LLM call reaches it through
   ``route_llm_call``. An LLM call the test did not script is recorded and fails
   the test;
-* ChromaDB returns no documents, and text embeddings are a deterministic
-  bag-of-words (the real model would be downloaded, which the socket guard forbids).
+* ChromaDB returns no documents, and the composition root embeds memories with a
+  deterministic bag-of-words (the real model would be downloaded, which the socket
+  guard forbids).
 
 Everything else is real: the LangGraph orchestrator and its SQLite checkpointer,
-the planning sub-graph, CP-SAT, Pydantic parsing, the memory store and its decay,
+the planning sub-graph, CP-SAT, Pydantic parsing, the memory service and its decay,
 PEARL, the constraint bridge and the draft service.
 """
 
@@ -39,7 +40,7 @@ from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.llm.transport import strip_fences
-from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase, bag_of_words_embedding
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 # --- the scripted language model ---------------------------------------------
 
@@ -118,13 +119,7 @@ def _tokens(text: str) -> list[str]:
 
 
 @pytest.fixture
-def embeddings(monkeypatch) -> None:
-    """Memory similarity uses the deterministic bag-of-words embedder."""
-    monkeypatch.setattr("app.services.memory.store.embed_text", bag_of_words_embedding)
-
-
-@pytest.fixture
-def llm(monkeypatch, embeddings) -> ScriptedLLM:
+def llm(monkeypatch) -> ScriptedLLM:
     """The only language model the test can reach. Fails the test on any unscripted call."""
     scripted = ScriptedLLM()
     set_chain(FallbackChainProvider([scripted]))  # conftest's _fresh_llm_chain resets it
@@ -249,28 +244,25 @@ async def settle_background_tasks(timeout: float = 10.0) -> None:
 
 
 class Jarvis:
-    """The app as one user's browser sees it: the real v2 chat handler over fakes."""
+    """The app as one user's browser sees it: the real chat handler over fakes."""
 
     def __init__(self, graph: Any, supabase: FakeSupabase) -> None:
         from app.services.draft_store import DraftStore
-        from app.services.memory.store import MemoryStore
 
         self.db = supabase
-        self.memory_store = MemoryStore(supabase_client=supabase)
         self.draft_store = DraftStore(supabase_client=supabase)
         self.state = SimpleNamespace(
             jarvis_graph=graph,
             db_client=FakeDBClient(supabase),
-            memory_store=self.memory_store,
             draft_store=self.draft_store,
         )
 
     async def say(self, text: str, *, user: str = "alice", session: str | None = None) -> Turn:
         """Send one message and read the whole SSE reply, then let background work finish."""
-        from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+        from app.api.v1.endpoints.chat import ChatRequest, chat_stream
 
         request = SimpleNamespace(app=SimpleNamespace(state=self.state))
-        response = await chat_stream_v2(
+        response = await chat_stream(
             ChatRequest(user_prompt=text, user_id=user, conversation_id=session), request
         )
         raw = ""
@@ -306,12 +298,11 @@ async def jarvis(tmp_path) -> Jarvis:
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
     from app.orchestrator.hooks import get_hooks
-    # Like the lifespan, no legacy PEARL detectors: the composition root is built below.
     supabase = FakeSupabase()
     async with open_checkpointer(str(tmp_path / "checkpoints.sqlite")) as saver:
         app = Jarvis(build_jarvis_graph(checkpointer=saver), supabase)
         # What the lifespan registers, for turns resumed from a checkpoint.
-        set_shared_clients(db=app.state.db_client, memory_store=app.memory_store)
+        set_shared_clients(db=app.state.db_client)
         # The composition root, over the same database. The chain stays the test's:
         # the ``llm`` fixture installs the scripted model.
         container = AppContainer.build(

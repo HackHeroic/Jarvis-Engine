@@ -1,36 +1,35 @@
-"""Unified chat endpoint: single entry point for Control Policy orchestration."""
+"""The chat endpoint: ``POST /api/v1/chat/stream``, the one way to talk to Jarvis.
+
+A turn runs the LangGraph orchestrator and streams its progress and reply as
+server-sent events. ``/api/v1/chat/v2/stream`` is the same handler under its old
+path, hidden from the schema and deprecated, kept so a frontend and a backend
+restarted in either order keep talking.
+"""
 
 import asyncio
 import json
 import json as json_mod
 import re
 import time as time_mod
-from collections.abc import AsyncGenerator
-from typing import Any, Optional
+from typing import Optional
 
 import anyio
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.jarvis_logger import log_step
-from app.schemas.context import ChatResponse
-from app.services.analytical.control_policy import execute_agentic_flow
 from app.services.analytical.voice_of_jarvis import (
-    build_thinking_fallback,
     extract_thinking_process,
-    summary_capture,
     synthesize_jarvis_response_stream,
 )
-from app.models.brain.litellm_conf import hybrid_route_query
 
 router = APIRouter()
 
-# Progress-queue `_event_type` → SSE frame name. Token events land on the same
-# two channels v1 /chat/stream uses, so the frontend needs no new handler:
-# a streamed reply is just many `event: message` frames instead of one.
+# Progress-queue `_event_type` → SSE frame name. Token events land on the
+# `message` and `thinking` channels, so a streamed reply is just many
+# `event: message` frames instead of one.
 _PROGRESS_EVENT_CHANNEL = {
     "tool_use": "tool_use",
     "memory_extracted": "memory_extracted",
@@ -82,44 +81,10 @@ NODE_TO_PHASE = {
 
 
 class ChatRequest(BaseModel):
-    """Request body for POST /chat."""
+    """Request body for POST /api/v1/chat/stream."""
 
     user_prompt: str = Field(..., description="The user's message or goal")
     user_id: str = Field(..., description="User identifier for habits and storage")
-    day_start_hour: Optional[int] = Field(
-        default=None,
-        ge=0,
-        le=23,
-        description="Override planning day start hour (0-23). Default from config.",
-    )
-    deadline_override: Optional[str] = Field(
-        default=None,
-        description="Manual deadline (ISO-8601 YYYY-MM-DD). Used for horizon if provided.",
-    )
-    max_daily_deep_work_minutes: Optional[int] = Field(
-        default=None,
-        ge=30,
-        le=600,
-        description="Cap on deep work per day; None uses adaptive formula.",
-    )
-    min_daily_deep_work_minutes: Optional[int] = Field(
-        default=None,
-        ge=15,
-        le=240,
-        description="Avoid days with less than X min; constrains spread.",
-    )
-    max_task_duration_minutes: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=25,
-        description="Clamp per-chunk duration ceiling.",
-    )
-    min_task_duration_minutes: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=25,
-        description="Clamp per-chunk duration floor.",
-    )
     file_base64: Optional[str] = Field(
         default=None,
         description="Base64-encoded PDF or image. Combined with user_prompt for brain dump.",
@@ -130,19 +95,16 @@ class ChatRequest(BaseModel):
     )
     model_mode: Optional[str] = Field(
         default="auto",
-        description="LLM routing mode: 'auto' (default pipeline routing), '4b' (force SLM), '27b' (force local 27B).",
+        description=(
+            "Which models answer this turn. 'auto' (the default): the local model first, "
+            "the cloud providers when it cannot answer (cloud only while no local model is "
+            "loaded). 'cloud' (also 'gemini', and the older '4b'): the cloud providers only, "
+            "for this turn. Any other value reads as 'auto'."
+        ),
     )
     file_name: Optional[str] = Field(
         default=None,
         description="Original filename of the uploaded file (for document management).",
-    )
-    confirm_before_schedule: Optional[bool] = Field(
-        default=False,
-        description="If true, pause after decomposition for user to review tasks before scheduling.",
-    )
-    draft_schedule: Optional[dict] = Field(
-        default=None,
-        description="Current draft schedule + execution_graph for modification. Keys: schedule, execution_graph, horizon_start.",
     )
     conversation_id: Optional[str] = Field(
         default=None,
@@ -151,1120 +113,7 @@ class ChatRequest(BaseModel):
 
 
 @router.post(
-    "/",
-    response_model=ChatResponse,
-    deprecated=True,
-    summary="Unified chat endpoint (DEPRECATED — use /api/v1/chat/v2/stream)",
-    description=(
-        "DEPRECATED (2026-08-08): superseded by the LangGraph orchestrator at "
-        "/api/v1/chat/v2/stream. Still live for existing callers; do not add features here.\n\n"
-        "Single entry point: routes to ingestion or plan-day pipeline via SLM classification. "
-        "Returns ChatResponse with intent, message, and pipeline-specific results (schedule, "
-        "execution_graph, or ingestion_result)."
-    ),
-)
-async def chat(request: ChatRequest, http_request: Request) -> ChatResponse:
-    """Execute the agentic flow: classify intent, then run ingestion or plan-day pipeline.
-
-    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
-    """
-    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
-    log_step("REQUEST", "Chat received", {"user_id": request.user_id, "prompt_preview": request.user_prompt[:60]})
-    db_client = getattr(http_request.app.state, "db_client", None)
-    draft_store = getattr(http_request.app.state, "draft_store", None)
-    memory_store = getattr(http_request.app.state, "memory_store", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-    # Session management
-    from app.services.chat_history import (
-        get_or_create_session,
-        save_user_message,
-        save_assistant_message,
-        build_context_messages,
-    )
-
-    session_id = await get_or_create_session(
-        request.user_id, request.conversation_id, supabase
-    )
-    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
-    conversation_history = await build_context_messages(
-        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
-    )
-
-    # Inject archival memory into conversation context
-    memory_context = ""
-    if memory_store:
-        from app.services.memory.retriever import build_memory_context
-        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
-
-    response = await execute_agentic_flow(
-        user_prompt=request.user_prompt,
-        user_id=request.user_id,
-        db_client=db_client,
-        day_start_hour_override=request.day_start_hour,
-        deadline_override=request.deadline_override,
-        file_base64=request.file_base64,
-        media_type=request.media_type,
-        max_daily_deep_work_minutes=request.max_daily_deep_work_minutes,
-        min_daily_deep_work_minutes=request.min_daily_deep_work_minutes,
-        max_task_duration_minutes=request.max_task_duration_minutes,
-        min_task_duration_minutes=request.min_task_duration_minutes,
-        file_name=request.file_name,
-        draft_schedule=request.draft_schedule,
-        draft_store=draft_store,
-        conversation_history=conversation_history,
-        memory_context=memory_context,
-        memory_store=memory_store,
-    )
-
-    # Save assistant response
-    msg_id = await save_assistant_message(
-        session_id, request.user_id, response.message, response.intent,
-        {"schedule": response.schedule.model_dump(mode='json') if response.schedule else None, "draft_id": response.draft_id, "intent": response.intent},
-        supabase,
-    )
-
-    # Fire-and-forget: extract memories from this turn
-    if memory_store:
-        from app.services.memory.extractor import safe_extract_memories
-        asyncio.create_task(safe_extract_memories(
-            request.user_id, request.user_prompt, response.message, memory_store,
-            db_client=supabase,
-        ))
-
-    response.conversation_id = session_id
-    response.message_id = msg_id
-    return response
-
-
-@router.post(
     "/stream",
-    deprecated=True,
-    summary="Streaming chat endpoint (SSE) (DEPRECATED — use /api/v1/chat/v2/stream)",
-    description=(
-        "DEPRECATED (2026-08-08): superseded by the LangGraph orchestrator at "
-        "/api/v1/chat/v2/stream. Still live for existing callers; do not add features here.\n\n"
-        "SSE endpoint. Runs the full pipeline then streams Voice of Jarvis output token by token. "
-        "Events: step (pipeline done), thinking (think-block tokens), message (response tokens), "
-        "complete (full ChatResponse JSON)."
-    ),
-)
-async def chat_stream(request: ChatRequest, http_request: Request) -> StreamingResponse:
-    """Run pipeline, then stream Voice of Jarvis as SSE events.
-
-    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
-    """
-    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
-    log_step("STREAM_REQUEST", "Stream chat received", {"user_id": request.user_id})
-    db_client = getattr(http_request.app.state, "db_client", None)
-    draft_store = getattr(http_request.app.state, "draft_store", None)
-    memory_store = getattr(http_request.app.state, "memory_store", None)
-    model_mode = request.model_mode or "auto"
-    # Frontend sends "4b" or "cloud" when user picks Gemini in the picker
-    # (legacy: "4b" was the SLM label, now repurposed as cloud override).
-    # We treat both as "force cloud Gemini for this turn".
-    force_cloud_request = model_mode in ("4b", "cloud", "gemini")
-    if force_cloud_request:
-        # Set the per-request cloud override so every route_llm_call in this
-        # request hits Gemini, regardless of LM Studio loaded models.
-        try:
-            from app.core.model_router import force_cloud_var
-            force_cloud_var.set(True)
-            print(f"[chat] model_mode={model_mode} → force_cloud=True (Gemini for this turn)")
-        except Exception as _e:
-            print(f"[chat] Failed to set force_cloud_var: {_e}")
-
-    # --- Session management (before any early returns) ---
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-    from app.services.chat_history import (
-        get_or_create_session,
-        save_user_message,
-        save_assistant_message,
-        build_context_messages,
-    )
-
-    session_id = await get_or_create_session(
-        request.user_id, request.conversation_id, supabase
-    )
-    await save_user_message(session_id, request.user_id, request.user_prompt, supabase)
-    conversation_history = await build_context_messages(
-        session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
-    )
-
-    # Inject archival memory into conversation context
-    memory_context = ""
-    if memory_store:
-        from app.services.memory.retriever import build_memory_context
-        memory_context = await asyncio.to_thread(build_memory_context, request.user_id, memory_store)
-
-    # --- 27B DIRECT MODE: bypass pipeline, stream 27B directly ---
-    if model_mode == "27b":
-        return StreamingResponse(
-            _stream_direct_27b(request, db_client, session_id=session_id, supabase=supabase, memory_store=memory_store),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-        )
-
-    # --- NORMAL PIPELINE MODE (auto / 4b) ---
-    async def event_stream():
-        from app.services.memory.extractor import safe_extract_memories
-
-        # Fetch existing memories for frontend MemoryPanel
-        _existing_memories = []
-        if memory_store:
-            _existing_memories = await asyncio.to_thread(
-                memory_store.get_active_memories, request.user_id
-            )
-
-        # Progress queue: pipeline emits phase events, we yield them as SSE
-        progress_queue: asyncio.Queue = asyncio.Queue()
-        # Track the primary model used during pipeline (for final metrics)
-        _primary_model: list[str] = []  # mutable container for closure
-
-        async def progress_cb(phase: str, detail: dict | None = None):
-            detail = detail or {}
-            # Capture the model from heavyweight phases (decomposing, habits_translated)
-            if detail.get("model") and phase in ("decomposing", "habits_translated", "decomposition_done"):
-                _primary_model.clear()
-                _primary_model.append(detail["model"])
-            await progress_queue.put((phase, detail))
-
-        # Step 1: Run full pipeline with summary_capture + progress_callback
-        captured_summary: dict = {}
-        ctx_token = summary_capture.set(captured_summary)
-        pipeline_error: Exception | None = None
-        partial: ChatResponse | None = None
-
-        async def run_pipeline():
-            nonlocal partial, pipeline_error
-            try:
-                partial = await execute_agentic_flow(
-                    user_prompt=request.user_prompt,
-                    user_id=request.user_id,
-                    db_client=db_client,
-                    day_start_hour_override=request.day_start_hour,
-                    deadline_override=request.deadline_override,
-                    file_base64=request.file_base64,
-                    media_type=request.media_type,
-                    max_daily_deep_work_minutes=request.max_daily_deep_work_minutes,
-                    min_daily_deep_work_minutes=request.min_daily_deep_work_minutes,
-                    max_task_duration_minutes=request.max_task_duration_minutes,
-                    min_task_duration_minutes=request.min_task_duration_minutes,
-                    progress_callback=progress_cb,
-                    model_mode=model_mode,
-                    skip_scheduling=request.confirm_before_schedule or False,
-                    file_name=request.file_name,
-                    draft_schedule=request.draft_schedule,
-                    draft_store=draft_store,
-                    conversation_history=conversation_history,
-                    memory_context=memory_context,
-                    memory_store=memory_store,
-                )
-            except Exception as exc:
-                pipeline_error = exc
-            finally:
-                await progress_queue.put(("__done__", {}))
-
-        pipeline_task = asyncio.create_task(run_pipeline())
-
-        while True:
-            phase, detail = await progress_queue.get()
-            if phase == "__done__":
-                break
-            yield f"event: phase\ndata: {json.dumps({'phase': phase, **detail})}\n\n"
-
-        summary_capture.reset(ctx_token)
-
-        if pipeline_error is not None:
-            yield f"event: error\ndata: {json.dumps({'error': str(pipeline_error)})}\n\n"
-            return
-        if partial is None:
-            yield f"event: error\ndata: {json.dumps({'error': 'Pipeline returned no result'})}\n\n"
-            return
-
-        import app.core.config as _cfg_v1
-        from app.core.config import SLM_ROUTER_MODEL, LOCAL_LLM_MODEL
-        try:
-            from app.core.model_router import force_cloud_var as _fc_v1
-            _v1_force_cloud = _fc_v1.get()
-        except Exception:
-            _v1_force_cloud = False
-        if _cfg_v1.GEMINI_PRIMARY or _v1_force_cloud:
-            _synthesis_model = _cfg_v1.GEMINI_MODEL
-        else:
-            _synthesis_model = LOCAL_LLM_MODEL if partial.intent == "GENERAL_QA" else SLM_ROUTER_MODEL
-        yield f"event: step\ndata: {json.dumps({'intent': partial.intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _synthesis_model, 'force_cloud': _v1_force_cloud})}\n\n"
-
-        if partial.awaiting_task_confirmation:
-            partial_dict = partial.model_dump()
-            # Save assistant response and attach session info
-            _assistant_msg = partial.message or "Standing by, sir."
-            _msg_id = await save_assistant_message(
-                session_id, request.user_id, _assistant_msg, partial.intent or "",
-                {},
-                supabase,
-            )
-            partial_dict["conversation_id"] = session_id
-            partial_dict["message_id"] = _msg_id
-            # Fire-and-forget memory extraction
-            if memory_store:
-                _resp_text = partial.message or ""
-                asyncio.create_task(safe_extract_memories(
-                    request.user_id, request.user_prompt, _resp_text, memory_store,
-                    db_client=supabase,
-                ))
-            if _existing_memories:
-                partial_dict["memories"] = [
-                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                    for m in _existing_memories[:20]
-                ]
-            yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
-            return
-
-        # Step 2: For GENERAL_QA and GREETING, the pipeline already computed the
-        # response (27B for QA, VoJ for greeting). Stream the 27B live for QA,
-        # or emit the pre-computed message for greeting. VoJ streaming is only
-        # for pipeline intents (PLAN_DAY, ingestion, habits, etc.).
-        _is_qa = partial.intent in ("GENERAL_QA", "GREETING")
-
-        if _is_qa and partial.intent == "GENERAL_QA":
-            # Stream 27B response live (like direct 27B mode) for best UX
-            _qa_start = time_mod.monotonic()
-            _qa_ttft: float | None = None
-            _qa_token_count = 0
-            thinking_full = ""
-            message_full = ""
-
-            try:
-                token_gen = await hybrid_route_query(
-                    user_prompt=request.user_prompt,
-                    system_prompt=(
-                        "You are Jarvis, an intelligent AI assistant. Answer the user's question clearly and helpfully. "
-                        "If the question is about a concept, algorithm, or topic, explain it well with examples. "
-                        "Be thorough but concise."
-                    ),
-                    response_schema=None,
-                    model_override=LOCAL_LLM_MODEL,
-                    stream=True,
-                )
-
-                async for evt_type, tok in token_gen:
-                    if _qa_ttft is None:
-                        _qa_ttft = (time_mod.monotonic() - _qa_start) * 1000
-                    _qa_token_count += 1
-                    if evt_type == "reasoning":
-                        thinking_full += tok
-                        yield f"event: thinking\ndata: {json.dumps({'token': tok})}\n\n"
-                    else:
-                        message_full += tok
-                        yield f"event: message\ndata: {json.dumps({'token': tok})}\n\n"
-            except Exception as exc:
-                print(f"[Stream] QA 27B streaming failed: {exc}")
-                message_full = partial.message or "I encountered an error."
-                yield f"event: message\ndata: {json.dumps({'token': message_full})}\n\n"
-
-            _qa_total_s = time_mod.monotonic() - _qa_start
-            message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
-            thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
-
-            # If no separate reasoning, try regex extraction
-            if not thinking_clean and message_clean:
-                message_clean, thinking_extracted = extract_thinking_process(message_clean)
-                thinking_clean = thinking_extracted or ""
-
-            partial_dict = partial.model_dump()
-            partial_dict["message"] = message_clean or partial.message or "Standing by, sir."
-            partial_dict["thinking_process"] = thinking_clean or None
-            partial_dict["generation_metrics"] = {
-                "total_tokens": _qa_token_count,
-                "total_time_s": round(_qa_total_s, 2),
-                "tok_per_sec": round(_qa_token_count / _qa_total_s, 2) if _qa_total_s > 0 else 0,
-                "ttft_ms": round(_qa_ttft, 1) if _qa_ttft is not None else None,
-                "model": LOCAL_LLM_MODEL,
-            }
-            # Save assistant response and attach session info
-            _assistant_msg = message_clean or partial.message or "Standing by, sir."
-            _msg_id = await save_assistant_message(
-                session_id, request.user_id, _assistant_msg, "GENERAL_QA",
-                {},
-                supabase,
-            )
-            partial_dict["conversation_id"] = session_id
-            partial_dict["message_id"] = _msg_id
-            # Fire-and-forget memory extraction
-            if memory_store:
-                _resp_text = message_clean or partial.message or ""
-                asyncio.create_task(safe_extract_memories(
-                    request.user_id, request.user_prompt, _resp_text, memory_store,
-                    db_client=supabase,
-                ))
-            if _existing_memories:
-                partial_dict["memories"] = [
-                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                    for m in _existing_memories[:20]
-                ]
-            yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
-            return
-
-        if _is_qa and partial.intent == "GREETING":
-            # Greeting: re-stream through the LLM if pre-computed message is empty.
-            # Never hardcode a greeting reply — user explicit constraint.
-            if not partial.message:
-                from app.modules.conversation import run_general_chat as _run_gc
-                _gc_state = {"user_message": request.user_prompt, "user_model": None,
-                             "memory_context": "", "conversation_history": []}
-                _gc_out = await _run_gc(_gc_state)
-                partial.message = _gc_out.get("response_message") or "Standing by, sir."
-                partial.thinking_process = _gc_out.get("thinking_process") or partial.thinking_process
-
-            if partial.thinking_process:
-                yield f"event: thinking\ndata: {json.dumps({'token': partial.thinking_process})}\n\n"
-            yield f"event: message\ndata: {json.dumps({'token': partial.message})}\n\n"
-            partial_dict = partial.model_dump()
-            partial_dict["generation_metrics"] = {
-                "total_tokens": 1, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
-                "model": SLM_ROUTER_MODEL,
-            }
-            _assistant_msg = partial.message
-            _msg_id = await save_assistant_message(
-                session_id, request.user_id, _assistant_msg, "GREETING",
-                {},
-                supabase,
-            )
-            partial_dict["conversation_id"] = session_id
-            partial_dict["message_id"] = _msg_id
-            if memory_store:
-                _resp_text = partial.message
-                asyncio.create_task(safe_extract_memories(
-                    request.user_id, request.user_prompt, _resp_text, memory_store,
-                    db_client=supabase,
-                ))
-            if _existing_memories:
-                partial_dict["memories"] = [
-                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                    for m in _existing_memories[:20]
-                ]
-            yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
-            return
-
-        # Skip VoJ for PLAN_DAY when schedule data exists — frontend renders it directly
-        if partial.schedule and partial.intent == "PLAN_DAY":
-            partial_dict = partial.model_dump()
-            partial_dict["message"] = partial.message or "Here's your schedule."
-            partial_dict["thinking_process"] = partial.thinking_process or build_thinking_fallback(captured_summary)
-            partial_dict["generation_metrics"] = {
-                "total_tokens": 0, "total_time_s": 0, "tok_per_sec": 0, "ttft_ms": None,
-                "model": "none (structured response)",
-            }
-            # Save assistant response and attach session info
-            _assistant_msg = partial.message or "Here's your schedule."
-            _msg_id = await save_assistant_message(
-                session_id, request.user_id, _assistant_msg, "PLAN_DAY",
-                {},
-                supabase,
-            )
-            partial_dict["conversation_id"] = session_id
-            partial_dict["message_id"] = _msg_id
-            # Fire-and-forget memory extraction
-            if memory_store:
-                _resp_text = partial.message or "Here's your schedule."
-                asyncio.create_task(safe_extract_memories(
-                    request.user_id, request.user_prompt, _resp_text, memory_store,
-                    db_client=supabase,
-                ))
-            if _existing_memories:
-                partial_dict["memories"] = [
-                    {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                    for m in _existing_memories[:20]
-                ]
-            yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
-            return
-
-        # Step 2b: For pipeline intents (PLAN_DAY, ingestion, habits), stream VoJ
-        # Guard: if pipeline already has a meaningful message (e.g. error, INFEASIBLE,
-        # or decomposition failure) and captured_summary is empty, skip VoJ streaming
-        # and use the pipeline's message directly.
-        _pipeline_has_message = (
-            partial.message
-            and partial.message not in ("", "Standing by, sir.")
-            and not captured_summary
-        )
-
-        _voj_start = time_mod.monotonic()
-        _voj_ttft: float | None = None
-        _voj_token_count = 0
-        thinking_full = ""
-        message_full = ""
-
-        if _pipeline_has_message:
-            # Pipeline computed its own message (error/fallback) — emit it directly
-            if partial.thinking_process:
-                yield f"event: thinking\ndata: {json.dumps({'token': partial.thinking_process})}\n\n"
-                thinking_full = partial.thinking_process
-            yield f"event: message\ndata: {json.dumps({'token': partial.message})}\n\n"
-            message_full = partial.message
-            _voj_token_count = 1
-        else:
-            try:
-                async for event_type, tok in synthesize_jarvis_response_stream(captured_summary):
-                    if _voj_ttft is None:
-                        _voj_ttft = (time_mod.monotonic() - _voj_start) * 1000
-                    _voj_token_count += 1
-                    if event_type == "thinking":
-                        thinking_full += tok
-                    else:
-                        message_full += tok
-                    yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
-            except Exception as exc:
-                print(f"[Stream] VoJ streaming failed: {exc}")
-                fallback_thinking = build_thinking_fallback(captured_summary)
-                if fallback_thinking:
-                    yield f"event: thinking\ndata: {json.dumps({'token': fallback_thinking})}\n\n"
-                    thinking_full = fallback_thinking
-                fallback_msg = partial.message or "Standing by, sir."
-                yield f"event: message\ndata: {json.dumps({'token': fallback_msg})}\n\n"
-                message_full = fallback_msg
-
-        _voj_total_s = time_mod.monotonic() - _voj_start
-        message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
-        thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
-
-        partial_dict = partial.model_dump()
-        partial_dict["message"] = message_clean or partial.message or "Standing by, sir."
-        partial_dict["thinking_process"] = thinking_clean or partial.thinking_process or build_thinking_fallback(captured_summary)
-        # Add generation metrics
-        partial_dict["generation_metrics"] = {
-            "total_tokens": _voj_token_count,
-            "total_time_s": round(_voj_total_s, 2),
-            "tok_per_sec": round(_voj_token_count / _voj_total_s, 2) if _voj_total_s > 0 else 0,
-            "ttft_ms": round(_voj_ttft, 1) if _voj_ttft is not None else None,
-            "model": _primary_model[0] if _primary_model else SLM_ROUTER_MODEL,
-        }
-        # Save assistant response and attach session info
-        _assistant_msg = message_clean or partial.message or "Standing by, sir."
-        _msg_id = await save_assistant_message(
-            session_id, request.user_id, _assistant_msg, partial.intent or "",
-            {},
-            supabase,
-        )
-        partial_dict["conversation_id"] = session_id
-        partial_dict["message_id"] = _msg_id
-        # Fire-and-forget memory extraction
-        if memory_store:
-            _resp_text = message_clean or partial.message or ""
-            asyncio.create_task(safe_extract_memories(
-                request.user_id, request.user_prompt, _resp_text, memory_store,
-                db_client=supabase,
-            ))
-        if _existing_memories:
-            partial_dict["memories"] = [
-                {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                for m in _existing_memories[:20]
-            ]
-        yield f"event: complete\ndata: {json.dumps(partial_dict)}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
-    )
-
-
-async def _stream_direct_27b(request: "ChatRequest", db_client, session_id: str | None = None, supabase=None, memory_store=None) -> AsyncGenerator:
-    """Stream 27B model response directly — no pipeline routing.
-
-    Captures reasoning_content separately, tracks tok/sec, TTFT, token count.
-    """
-    from app.core.config import LOCAL_LLM_MODEL
-
-    yield f"event: phase\ndata: {json.dumps({'phase': 'intent_classified', 'intent': 'GENERAL_QA', 'model': LOCAL_LLM_MODEL, 'model_mode': '27b', 'phase_summary': 'Direct 27B mode'})}\n\n"
-    yield f"event: step\ndata: {json.dumps({'intent': 'GENERAL_QA', 'stage': 'pipeline_done', 'model_mode': '27b', 'synthesis_model': LOCAL_LLM_MODEL})}\n\n"
-
-    _start = time_mod.monotonic()
-    _ttft: float | None = None
-    _token_count = 0
-    thinking_full = ""
-    message_full = ""
-
-    try:
-        token_gen = await hybrid_route_query(
-            user_prompt=request.user_prompt,
-            system_prompt=(
-                "You are Jarvis, an intelligent AI assistant. Answer the user's question clearly and helpfully. "
-                "If the question is about a concept, algorithm, or topic, explain it well with examples. "
-                "Be thorough but concise."
-            ),
-            response_schema=None,
-            model_override=LOCAL_LLM_MODEL,
-            stream=True,
-        )
-
-        async for evt_type, tok in token_gen:
-            if _ttft is None:
-                _ttft = (time_mod.monotonic() - _start) * 1000
-            _token_count += 1
-            if evt_type == "reasoning":
-                thinking_full += tok
-                yield f"event: thinking\ndata: {json.dumps({'token': tok})}\n\n"
-            else:
-                message_full += tok
-                yield f"event: message\ndata: {json.dumps({'token': tok})}\n\n"
-
-    except Exception as exc:
-        print(f"[Direct 27B] Streaming failed: {exc}")
-        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
-        return
-
-    _total_s = time_mod.monotonic() - _start
-
-    # Clean up
-    message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
-    thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
-
-    # If no separate reasoning, try regex extraction
-    if not thinking_clean:
-        message_clean, thinking_extracted = extract_thinking_process(message_clean or message_full)
-        thinking_clean = thinking_extracted or ""
-
-    # Save assistant response and attach session info
-    _assistant_msg = message_clean or "Standing by, sir."
-    _msg_id = None
-    if session_id and supabase:
-        from app.services.chat_history import save_assistant_message
-        _msg_id = await save_assistant_message(
-            session_id, request.user_id, _assistant_msg, "GENERAL_QA",
-            {}, supabase,
-        )
-
-    # Fire-and-forget memory extraction
-    if memory_store:
-        from app.services.memory.extractor import safe_extract_memories
-        asyncio.create_task(safe_extract_memories(
-            request.user_id, request.user_prompt, _assistant_msg, memory_store,
-            db_client=supabase,
-        ))
-
-    complete_data = {
-        "intent": "GENERAL_QA",
-        "message": _assistant_msg,
-        "thinking_process": thinking_clean or None,
-        "generation_metrics": {
-            "total_tokens": _token_count,
-            "total_time_s": round(_total_s, 2),
-            "tok_per_sec": round(_token_count / _total_s, 2) if _total_s > 0 else 0,
-            "ttft_ms": round(_ttft, 1) if _ttft is not None else None,
-            "model": LOCAL_LLM_MODEL,
-        },
-        "conversation_id": session_id,
-        "message_id": _msg_id,
-    }
-    yield f"event: complete\ndata: {json.dumps(complete_data)}\n\n"
-
-
-class ConfirmScheduleRequest(BaseModel):
-    """Request to schedule user-confirmed tasks."""
-
-    user_id: str = Field(..., description="User identifier")
-    tasks: list[dict] = Field(..., description="Edited TaskChunk dicts from frontend")
-    goal_metadata: Optional[dict] = Field(default=None, description="Goal metadata from decomposition")
-    day_start_hour: Optional[int] = Field(default=None, ge=0, le=23)
-    deadline_override: Optional[str] = Field(default=None)
-    max_daily_deep_work_minutes: Optional[int] = Field(default=None, ge=30, le=600)
-    min_daily_deep_work_minutes: Optional[int] = Field(default=None, ge=15, le=240)
-    max_task_duration_minutes: Optional[int] = Field(default=None, ge=1, le=25)
-    min_task_duration_minutes: Optional[int] = Field(default=None, ge=1, le=25)
-
-
-@router.post(
-    "/confirm-schedule",
-    deprecated=True,
-    summary="Schedule user-confirmed tasks (SSE) (DEPRECATED — use /api/v1/chat/v2/stream)",
-    description=(
-        "DEPRECATED (2026-08-08): v1-adjacent surface, superseded by the "
-        "LangGraph orchestrator at /api/v1/chat/v2/stream, which proposes a "
-        "draft instead. Still live for existing callers; do not add features here.\n\n"
-        "After user reviews and edits decomposed tasks, run scheduling + Voice of Jarvis."
-    ),
-)
-async def confirm_schedule_stream(
-    request: ConfirmScheduleRequest, http_request: Request
-) -> StreamingResponse:
-    """Run Phase 2: scheduling + VoJ on user-confirmed tasks.
-
-    DEPRECATED (2026-08-08): superseded by /api/v1/chat/v2/stream.
-    """
-    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/chat/v2/stream")
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
-    from app.api.v1.endpoints.schedule import run_schedule
-    from app.core.config import (
-        DAY_START_HOUR,
-        DEFAULT_HORIZON_MINUTES,
-        MAX_HORIZON_MINUTES,
-        SLM_ROUTER_MODEL,
-    )
-    from app.services.analytical.habit_translator import translate_habits_to_slots
-    from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
-    from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
-
-    log_step("CONFIRM_SCHEDULE", "Scheduling user-confirmed tasks", {"user_id": request.user_id, "task_count": len(request.tasks)})
-    db_client = getattr(http_request.app.state, "db_client", None)
-
-    async def event_stream():
-        import time as time_mod
-        from datetime import datetime, timedelta, time, timezone
-
-        supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-        # Parse tasks from frontend — clamp user-edited values to valid TaskChunk ranges
-        def _clamp_task(t: dict) -> dict:
-            out = dict(t)
-            if "duration_minutes" in out:
-                out["duration_minutes"] = max(1, min(60, int(out.get("duration_minutes", 25))))
-            if "difficulty_weight" in out:
-                out["difficulty_weight"] = max(0.0, min(1.0, float(out.get("difficulty_weight", 0.5))))
-            return out
-
-        try:
-            task_chunks = [TaskChunk(**_clamp_task(t)) for t in request.tasks]
-        except Exception as exc:
-            yield f"event: error\ndata: {json.dumps({'error': f'Invalid tasks: {exc}'})}\n\n"
-            return
-
-        yield f"event: phase\ndata: {json.dumps({'phase': 'confirming', 'task_count': len(task_chunks)})}\n\n"
-
-        try:
-            # Fetch habits and translate
-            _sched_start = time_mod.monotonic()
-            habits = ""
-            try:
-                habits = await get_behavioral_context_for_calendar(request.user_id, supabase)
-            except Exception as exc:
-                print(f"[ConfirmSchedule] habits fetch failed (non-fatal): {exc}")
-            semantic_slots = []
-            if habits and habits.strip():
-                yield f"event: phase\ndata: {json.dumps({'phase': 'habits_translated', 'phase_summary': 'Translating habits for scheduling...'})}\n\n"
-                try:
-                    semantic_slots = await translate_habits_to_slots(habits)
-                except Exception as exc:
-                    print(f"[ConfirmSchedule] habit translation failed (non-fatal): {exc}")
-
-            # Time context: the user's day, never UTC's.
-            from app.services.planning.local_time import user_zone
-
-            _zone = user_zone()
-            resolved_day_start = request.day_start_hour or DAY_START_HOUR
-            plan_start = datetime.now(_zone)
-            plan_date = plan_start.date()
-            if plan_start.hour < resolved_day_start:
-                plan_date -= timedelta(days=1)
-            horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
-            # After midnight, start today's day instead of yesterday's mostly-past one.
-            past_min = max(0, int((plan_start - horizon_start).total_seconds() / 60))
-            if past_min > 960:
-                plan_date = plan_start.date()
-                horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
-                if horizon_start < plan_start:
-                    horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=_zone)
-
-            expanded_slots = expand_semantic_slots_to_time_slots(
-                semantic_slots,
-                horizon_minutes=DEFAULT_HORIZON_MINUTES,
-                plan_start=plan_start,
-            )
-
-            # Build execution graph
-            goal_meta = request.goal_metadata or {}
-            avg_load = sum(t.difficulty_weight for t in task_chunks) / max(len(task_chunks), 1)
-            synthetic_graph = ExecutionGraph(
-                goal_metadata=goal_meta,
-                decomposition=task_chunks,
-                cognitive_load_estimate={"intrinsic_load": round(avg_load, 3)},
-            )
-
-            yield f"event: phase\ndata: {json.dumps({'phase': 'scheduling', 'task_count': len(task_chunks), 'started_at_ms': int(time_mod.time() * 1000)})}\n\n"
-
-            # Schedule
-            schedule_response = None
-            used_horizon = DEFAULT_HORIZON_MINUTES
-            horizon_steps = [DEFAULT_HORIZON_MINUTES, 4320, 7200, 10080]
-            for horizon_min in horizon_steps:
-                if horizon_min > MAX_HORIZON_MINUTES:
-                    break
-                try:
-                    schedule_response = run_schedule(
-                        synthetic_graph,
-                        expanded_slots,
-                        horizon_minutes=horizon_min,
-                        horizon_start=horizon_start,
-                        max_daily_deep_work_minutes=request.max_daily_deep_work_minutes,
-                        min_daily_deep_work_minutes=request.min_daily_deep_work_minutes,
-                        max_task_duration_minutes=request.max_task_duration_minutes,
-                        min_task_duration_minutes=request.min_task_duration_minutes,
-                    )
-                    used_horizon = horizon_min
-                    break
-                except Exception:
-                    continue
-
-            _sched_dur = int((time_mod.monotonic() - _sched_start) * 1000)
-
-            if schedule_response is None:
-                yield f"event: error\ndata: {json.dumps({'error': 'Could not find a feasible schedule. Try reducing scope or relaxing constraints.'})}\n\n"
-                return
-
-            _task_count = len(schedule_response.schedule) if hasattr(schedule_response, 'schedule') else 0
-            yield f"event: phase\ndata: {json.dumps({'phase': 'schedule_done', 'status': 'OPTIMAL', 'task_count': _task_count, 'horizon_hours': round(used_horizon / 60, 1), 'duration_ms': _sched_dur})}\n\n"
-
-            # Defer persistence — schedule returned as draft for user acceptance
-            # Tasks are persisted via POST /chat/accept-schedule
-
-            # Voice of Jarvis synthesis
-            execution_summary = {"schedule_generated": True}
-            if used_horizon > DEFAULT_HORIZON_MINUTES:
-                execution_summary["spread_across_days"] = True
-
-            try:
-                from app.core.model_router import force_cloud_var as _fc_pd
-                _pd_force_cloud = _fc_pd.get()
-            except Exception:
-                _pd_force_cloud = False
-            import app.core.config as _cfg_pd
-            _pd_synth = _cfg_pd.GEMINI_MODEL if (_cfg_pd.GEMINI_PRIMARY or _pd_force_cloud) else SLM_ROUTER_MODEL
-            yield f"event: step\ndata: {json.dumps({'intent': 'PLAN_DAY', 'stage': 'pipeline_done', 'synthesis_model': _pd_synth, 'force_cloud': _pd_force_cloud})}\n\n"
-
-            # Step 2: Stream Voice of Jarvis
-            captured_summary = execution_summary
-            ctx_token = summary_capture.set(captured_summary)
-            thinking_full = ""
-            message_full = ""
-            try:
-                async for event_type, tok in synthesize_jarvis_response_stream(captured_summary):
-                    if event_type == "thinking":
-                        thinking_full += tok
-                    else:
-                        message_full += tok
-                    yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
-            except Exception as exc:
-                print(f"[ConfirmSchedule] VoJ streaming failed: {exc}")
-                fallback_thinking = build_thinking_fallback(captured_summary)
-                if fallback_thinking:
-                    yield f"event: thinking\ndata: {json.dumps({'token': fallback_thinking})}\n\n"
-                    thinking_full = fallback_thinking
-                message_full = "Here's your schedule."
-                yield f"event: message\ndata: {json.dumps({'token': message_full})}\n\n"
-
-            summary_capture.reset(ctx_token)
-
-            # Clean and emit complete
-            message_clean = re.sub(r"</?think>", "", message_full, flags=re.IGNORECASE).strip()
-            thinking_clean = re.sub(r"</?think>", "", thinking_full, flags=re.IGNORECASE).strip()
-
-            complete_data = {
-                "intent": "PLAN_DAY",
-                "message": message_clean or "Here's your schedule.",
-                "schedule": schedule_response.model_dump(mode='json') if hasattr(schedule_response, "model_dump") else schedule_response,
-                "execution_graph": synthetic_graph.model_dump(mode='json') if hasattr(synthetic_graph, "model_dump") else None,
-                "thinking_process": thinking_clean or build_thinking_fallback(captured_summary),
-                "awaiting_task_confirmation": False,
-                "schedule_status": "draft",
-            }
-            yield f"event: complete\ndata: {json.dumps(complete_data)}\n\n"
-
-        except Exception as exc:
-            print(f"[ConfirmSchedule] Unhandled error in event_stream: {exc}")
-            yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
-def _persist_failed() -> JSONResponse:
-    """503 for "the schedule is not saved" — the honest answer to a failed write.
-
-    503 rather than 500: the write is retryable, nothing about the request was
-    wrong, and the frontend keeps the draft in hand to try again.
-    """
-    return JSONResponse(
-        status_code=503,
-        content={"status": "failed", "detail": "schedule could not be persisted"},
-    )
-
-
-class AcceptScheduleRequest(BaseModel):
-    """Request to persist a draft schedule."""
-
-    user_id: str = Field(..., description="User identifier")
-    tasks: list[dict] = Field(..., description="TaskChunk dicts from accepted draft")
-    goal_metadata: Optional[dict] = Field(default=None, description="Goal metadata")
-    schedule: Optional[dict] = Field(default=None, description="Schedule map from OR-Tools {task_id: {start_min, end_min}}")
-    horizon_start: Optional[str] = Field(default=None, description="ISO-8601 horizon start for computing wall-clock times")
-
-
-@router.post(
-    "/accept-schedule",
-    deprecated=True,
-    summary="Accept and persist a draft schedule (DEPRECATED — use /api/v1/drafts/{id}/accept)",
-    description=(
-        "DEPRECATED (2026-08-08): v1-adjacent surface, superseded by "
-        "POST /api/v1/drafts/{draft_id}/accept. Still live as the frontend's "
-        "no-draft fallback; do not add features here.\n\n"
-        "Called when user accepts a draft schedule. Persists tasks to Supabase."
-    ),
-)
-async def accept_schedule(request: AcceptScheduleRequest, http_request: Request):
-    """Persist accepted draft schedule tasks to Supabase.
-
-    DEPRECATED (2026-08-08): superseded by POST /api/v1/drafts/{draft_id}/accept.
-
-    With the composition root (always, in the app) the plan is stored as a draft and
-    accepted through ``DraftService`` like every other plan (``_accept_as_a_draft``):
-    one atomic write, its slots recorded, other open drafts superseded, times gone
-    by moved first; a task id a finished task holds is 409.
-
-    Without one (tests, scripts) the legacy write: answers 503 unless the tasks are
-    verifiably in ``user_tasks``. ``_persist_fused_tasks`` swallows its own
-    exceptions, so its return value (a freshly minted plan_id, or None) plus a
-    read-back of the rows carrying that plan_id is the only honest evidence available.
-    """
-    logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/drafts/{draft_id}/accept")
-    from app.api.deps import container_of
-    from app.api.v1.endpoints.reasoning import TaskChunk
-    from app.services.analytical.control_policy import _persist_fused_tasks
-    from app.services.draft_actions import _count_persisted
-
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-    try:
-        task_chunks = [TaskChunk(**t) for t in request.tasks]
-    except Exception as exc:
-        logger.warning(f"accept-schedule got tasks it cannot parse: {exc}")
-        return {
-            "status": "error",
-            "message": "Invalid tasks: some tasks are not in the expected shape.",
-            "task_count": 0,
-        }
-
-    # A goal_id the client sends (a v2 plan's tasks carry one) rides along:
-    # TaskChunk has no such field, and build_task_rows would otherwise read it off
-    # the id prefix and refile `learn_dsa_…` under `learn`.
-    chunks = [
-        {**chunk.model_dump(), "goal_id": raw.get("goal_id")}
-        for chunk, raw in zip(task_chunks, request.tasks)
-    ]
-    container = container_of(http_request)
-    if container is not None:
-        return await _accept_as_a_draft(container, request, chunks, supabase)
-    plan_id = _persist_fused_tasks(
-        request.user_id, chunks, supabase,
-        schedule=request.schedule.get("schedule") if request.schedule else None,
-        horizon_start=request.horizon_start,
-    )
-    if not plan_id:
-        logger.error(f"accept-schedule persisted nothing for {request.user_id} — reporting failure")
-        return _persist_failed()
-
-    # Read back on plan_id, never task_id: fused lists carry pre-existing
-    # pending rows forward, and those survive a failed write wearing the same
-    # task_ids — matching them would read an outage as a success.
-    try:
-        landed = _count_persisted(supabase, request.user_id, plan_id)
-    except Exception as exc:
-        logger.error(f"accept-schedule could not verify plan {plan_id}: {exc}")
-        return _persist_failed()
-    if landed <= 0:
-        logger.error(f"accept-schedule write for plan {plan_id} did not land")
-        return _persist_failed()
-
-    # Fire-and-forget: detect behavioral patterns from task history — only without the
-    # composition root (this path). With it, PEARL runs on task outcomes
-    # (PatternService); the legacy detectors read user_tasks and would bring back a
-    # pattern the user dismissed.
-    memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store:
-        from app.services.memory.pearl import detect_patterns
-        _sb = getattr(db_client, "supabase", db_client) if db_client else None
-        if _sb:
-            asyncio.create_task(asyncio.to_thread(
-                detect_patterns, request.user_id, _sb, memory_store
-            ))
-
-    return {"status": "accepted", "task_count": len(task_chunks)}
-
-
-async def _accept_as_a_draft(
-    container: Any, request: AcceptScheduleRequest, chunks: list[dict], supabase: Any
-) -> Any:
-    """Accept the posted plan the one way plans are accepted: as a draft, through
-    ``DraftService`` (``accept_on_time``). Its slots are recorded as scheduled, the
-    user's other open drafts (a morning brief) are superseded, and a time already gone
-    by is moved first. A task id a finished task holds is 409; an outage, 503
-    ``{"status": "failed"}`` as before; nothing schedulable, the parse-error shape. A
-    failed accept expires the draft it made, so nothing can accept it later."""
-    from app.domain import errors
-    from app.services.draft_actions import MOVED_ON_ACCEPT, accept_on_time
-
-    schedule = request.schedule.get("schedule") if request.schedule else None
-    try:
-        draft = await container.repos.drafts.create(
-            request.user_id,
-            tasks=chunks,
-            horizon_start=request.horizon_start,
-            goal_id=(request.goal_metadata or {}).get("goal_id"),
-            schedule=schedule,
-        )
-    except errors.PersistenceError:
-        logger.error(f"accept-schedule for {request.user_id} did not land — reporting failure")
-        return _persist_failed()
-    try:
-        outcome = await accept_on_time(
-            container.draft_service, request.user_id, draft.id, supabase=supabase
-        )
-    except Exception as failure:
-        # The draft was made only to be accepted now: a failed accept leaves no open
-        # draft for the newest-pending fallback to find and accept later.
-        try:
-            await container.draft_service.expire(request.user_id, draft.id)
-        except Exception as exc:  # the failure itself is still the answer
-            logger.warning(f"accept-schedule draft left open ({type(exc).__name__})")
-        if isinstance(failure, errors.PersistenceError):
-            logger.error(f"accept-schedule for {request.user_id} did not land — reporting failure")
-            return _persist_failed()
-        if isinstance(failure, errors.ValidationError):
-            return {
-                "status": "error",
-                "message": "Invalid tasks: some tasks are not in the expected shape.",
-                "task_count": 0,
-            }
-        raise
-    return {
-        "status": "accepted",
-        "task_count": outcome.written,
-        "draft_id": draft.id,
-        "message": MOVED_ON_ACCEPT if outcome.moved else None,
-    }
-
-
-class ModifyScheduleRequest(BaseModel):
-    """Request to modify a draft schedule via chat."""
-
-    user_id: str = Field(..., description="User identifier")
-    user_prompt: str = Field(..., description="Natural language modification request")
-    current_tasks: list[dict] = Field(..., description="Current task list from draft")
-    execution_graph: Optional[dict] = Field(default=None, description="Current execution graph")
-    current_schedule: Optional[dict] = Field(default=None, description="Current schedule data from draft")
-    horizon_start: Optional[str] = Field(default=None, description="Schedule horizon start ISO")
-
-
-@router.post(
-    "/modify-schedule",
-    summary="Modify draft schedule via chat",
-    description="Parse a natural language modification and apply it to the draft schedule.",
-)
-async def modify_schedule(request: ModifyScheduleRequest, http_request: Request):
-    """Parse modification, apply to tasks, re-schedule."""
-    from app.services.analytical.schedule_modifier import (
-        parse_modification_request,
-        apply_modification,
-    )
-    from app.services.analytical.habit_translator import translate_habits_to_slots
-    from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
-    from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
-    from app.core.config import DEFAULT_HORIZON_MINUTES
-    from datetime import datetime, timezone
-
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-
-    # Parse the modification intent
-    modification = await parse_modification_request(
-        user_prompt=request.user_prompt,
-        task_list=request.current_tasks,
-    )
-    if not modification:
-        return {"status": "error", "message": "Could not understand the modification. Try being more specific."}
-
-    # Build time slots for re-scheduling
-    habits = ""
-    try:
-        habits = await get_behavioral_context_for_calendar(request.user_id, supabase)
-    except Exception:
-        pass
-    semantic_slots = []
-    if habits and habits.strip():
-        try:
-            semantic_slots = await translate_habits_to_slots(habits)
-        except Exception:
-            pass
-
-    # The user's day, never UTC's: minute 0 is DAY_START_HOUR in their zone, read from
-    # their profile (the same zone the focus profile below is read on).
-    from app.api.deps import container_of
-    from app.api.v1.endpoints.schedule import current_horizon_start
-    from app.services.planning.local_time import stored_user_zone
-
-    container = container_of(http_request)
-    zone = await stored_user_zone(
-        container.repos.profiles if container is not None else None, request.user_id
-    )
-    horizon_start = current_horizon_start(zone)
-    if request.horizon_start:
-        try:
-            parsed = datetime.fromisoformat(request.horizon_start)
-            # A legacy horizon without an offset was written in UTC.
-            horizon_start = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-
-    # Weekdays are counted from the horizon's own first day.
-    expanded_slots = expand_semantic_slots_to_time_slots(
-        semantic_slots,
-        horizon_minutes=DEFAULT_HORIZON_MINUTES,
-        plan_start=horizon_start,
-    )
-
-    # Build execution graph dict
-    eg = request.execution_graph or {"decomposition": request.current_tasks, "goal_metadata": {}}
-
-    # The re-solve leans on the user's learned focus profile, as the plan did.
-    from app.services.energy import solver_focus
-
-    focus_by_hour = await solver_focus(
-        container.energy if container is not None else None,
-        request.user_id,
-        zone,
-        now=datetime.now(timezone.utc),
-    )
-
-    # Apply modification and re-schedule
-    updated_graph, updated_schedule = apply_modification(
-        modification=modification,
-        execution_graph=eg,
-        schedule_data=request.current_schedule or {"schedule": {}},
-        time_slots=expanded_slots,
-        horizon_start=horizon_start,
-        focus_by_hour=focus_by_hour,
-    )
-
-    return {
-        "status": "modified",
-        "modification": modification.model_dump(),
-        "execution_graph": updated_graph,
-        "schedule": updated_schedule,
-        "schedule_status": "draft",
-    }
-
-
-@router.post(
-    "/v2/stream",
     summary="Talk to Jarvis (server-sent events)",
     description=(
         "THE entry point. Streams phase / step / thinking / message / tool_use / "
@@ -1273,8 +122,11 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
         "the standard envelope."
     ),
 )
-async def chat_stream_v2(request: ChatRequest, http_request: Request):
-    """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream; the
+# The old path of this same handler, hidden and deprecated: a frontend and a backend
+# restarted in either order keep talking. It goes once the new path has passed a live run.
+@router.post("/v2/stream", include_in_schema=False, deprecated=True)
+async def chat_stream(request: ChatRequest, http_request: Request):
+    """One turn: the LangGraph orchestrator, streamed as server-sent events. The
     ``complete`` frame is validated against ``ChatCompletePayload`` before it is sent."""
     from app.core.model_router import ServedModels, attribute_llm_calls, recording_served_models
     from app.core.observation import pearl_insights
@@ -1301,7 +153,6 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
     jarvis_graph = http_request.app.state.jarvis_graph
     db_client = getattr(http_request.app.state, "db_client", None)
-    memory_store = getattr(http_request.app.state, "memory_store", None)
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
     # Model selector: when user picks Gemini, force this whole turn to cloud.
@@ -1314,7 +165,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     if force_cloud_request:
         from app.core.model_router import force_cloud_var
         force_cloud_token = force_cloud_var.set(True)
-        print(f"[chat/v2] model_mode={model_mode} → force_cloud=True (cloud providers only this turn)")
+        print(f"[chat] model_mode={model_mode} → force_cloud=True (cloud providers only this turn)")
 
     # --- Session management ---
     session_id = await get_or_create_session(
@@ -1327,8 +178,6 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     _since_last_spoke: list[str] = []
 
     user_model = UserModel(user_id=request.user_id, db=db_client)
-    if memory_store:
-        user_model.set_memory_store(memory_store)
 
     # --- Progress bridge: sub-graph callbacks → SSE phase events ---
     progress_queue: asyncio.Queue = asyncio.Queue()
@@ -1338,7 +187,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
     initial_state = {
         # Serializable identity — survives checkpointing; user_model does not.
-        # The facade is still passed here (shared db_client / memory_store wiring);
+        # The facade is still passed here (the shared db_client);
         # _load_context rebuilds it from user_id only on checkpoint-resumed turns.
         "user_id": request.user_id,
         "user_model": user_model,
@@ -1412,7 +261,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _existing = await jarvis_graph.aget_state(graph_config)
             _resumed = bool(_existing and getattr(_existing, "values", None))
         except Exception as _e:
-            print(f"[chat/v2] Checkpoint lookup failed ({_e}) — starting a fresh thread")
+            print(f"[chat] Checkpoint lookup failed ({_e}) — starting a fresh thread")
             _resumed = False
         if not _resumed:
             initial_state["conversation_phase"] = ConversationPhase.GREETING
@@ -1720,7 +569,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _force_cloud_now = force_cloud_var.get()
             yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _answering_model(), 'force_cloud': _force_cloud_now})}\n\n"
 
-            # --- Token streaming (matches v1/stream SSE contract) ---
+            # --- Token streaming ---
             # Credited once the reply exists (below); a template reply keeps its label.
             _stream_model: str | None = None
             if _gen_start is None:
@@ -1819,7 +668,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                                 message_full += tok
                             yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
                     except Exception as voj_exc:
-                        print(f"[v2/stream] VoJ streaming failed: {voj_exc}")
+                        print(f"[chat/stream] VoJ streaming failed: {voj_exc}")
                         _fallback = final_state.get("response_message") or "Standing by, sir."
                         yield f"event: message\ndata: {json.dumps({'token': _fallback})}\n\n"
                         message_full = _fallback
@@ -1877,7 +726,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 else None
             )
 
-            # --- Build full ChatResponse payload ---
+            # --- The complete frame (ChatCompletePayload) ---
             complete_payload = {
                 "intent": _intent,
                 "message": _assistant_msg,
@@ -1888,7 +737,6 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 "search_result": None,
                 "suggested_action": _suggested_action,
                 "thinking_process": thinking_clean or final_state.get("thinking_process"),
-                "awaiting_task_confirmation": False,
                 "schedule_status": _schedule_status,
                 "conflict_summary": (
                     final_state.get("clarification_request") if _infeasible else None
@@ -1936,7 +784,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             # The cause is logged with the request id; its text never goes to the client.
             request_id = request_id_of(http_request)
             logger.error(
-                f"v2 stream failed [request_id={request_id}]: {type(exc).__name__}",
+                f"chat stream failed [request_id={request_id}]: {type(exc).__name__}",
                 exc_info=exc,
             )
             envelope = error_envelope(

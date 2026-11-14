@@ -7,7 +7,7 @@ user's documents, the time — rides in one ``system`` note after the history, a
 provider folds that note into the final user turn. So two turns share the system block
 and every earlier message byte for byte, and differ only from the note on.
 
-These drive the real ``/chat/v2/stream`` handler through the behaviour harness
+These drive the real ``/chat/stream`` handler through the behaviour harness
 (``tests/behaviour/conftest.py``) and read the ``LLMRequest`` the scripted model got.
 """
 
@@ -36,10 +36,9 @@ from app.services.memory.context import (
     with_documents,
 )
 from app.services.memory.memory_service import MemoryCandidate
-from tests.behaviour.conftest import (  # noqa: F401 - embeddings, jarvis and llm are fixtures
+from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtures
     brain_dump,
     decomposition,
-    embeddings,
     jarvis,
     llm,
 )

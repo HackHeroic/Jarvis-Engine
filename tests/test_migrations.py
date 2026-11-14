@@ -305,41 +305,6 @@ def test_migrations__skip_migration__maps_pacing_pushed_and_drops_it_from_check(
     assert _check_values(_set_sql(), "user_tasks_status_check") == {s.value for s in TaskStatus}
 
 
-def _user_tasks_columns() -> set[str]:
-    """Every user_tasks column the migration set creates and does not drop."""
-    sql = _set_sql()
-    created = re.search(rf"create table if not exists {_TABLE}user_tasks\s*\((.*?)\);", sql, re.S)
-    assert created, "no migration creates user_tasks"
-    columns = {
-        definition.split()[0]
-        for definition in (part.strip() for part in created.group(1).split(","))
-        if definition and definition.split()[0] not in {"primary", "unique", "constraint", "check", "foreign"}
-    }
-    for statement in re.findall(rf"alter table {_TABLE}user_tasks\b(.*?);", sql, re.S):
-        columns |= set(re.findall(r"add column (?:if not exists )?(\w+)", statement))
-        columns -= set(re.findall(r"drop column (?:if exists )?(\w+)", statement))
-    return columns
-
-
-def test_migrations__pearl_task_fetch__selects_only_existing_user_tasks_columns():
-    """PostgREST fails the whole query (42703) on one unknown column, and with it
-    every PEARL detector, on every turn."""
-    from unittest.mock import MagicMock
-
-    from app.services.memory.pearl import detect_patterns
-
-    client = MagicMock()
-    query = client.table.return_value.select.return_value
-    query.eq.return_value.execute.return_value.data = []
-
-    detect_patterns("alice", client, MagicMock())
-
-    client.table.assert_called_once_with("user_tasks")
-    (selected,) = client.table.return_value.select.call_args.args
-    missing = {c.strip() for c in selected.split(",")} - _user_tasks_columns()
-    assert missing == set()
-
-
 # --- Memory lifecycle and vectors (20261115000002) ----------------------------------
 
 _MATCH_MEMORIES_SIGNATURE = (

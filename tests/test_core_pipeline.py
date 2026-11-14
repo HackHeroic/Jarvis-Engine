@@ -3,35 +3,6 @@
 import pytest
 from unittest.mock import MagicMock
 from app.core.registry import BaseRegistry, RegistryEntry
-from app.services.intent_registry import intent_registry, register_default_intents
-
-
-class TestIntentClassification:
-    """Test that the intent registry generates valid classification prompts."""
-
-    def setup_method(self):
-        register_default_intents()
-
-    def test_classification_prompt_is_valid(self):
-        prompt = intent_registry.classification_prompt()
-        assert len(prompt) > 100
-        assert "PLAN_DAY" in prompt
-        assert "CHAT" in prompt
-
-    def test_all_intents_have_handlers(self):
-        for name in intent_registry.registered_names():
-            entry = intent_registry.get(name)
-            assert entry is not None, f"Missing entry for {name}"
-            assert callable(entry.handler), f"Handler for {name} is not callable"
-
-    def test_all_intents_have_examples(self):
-        for name in intent_registry.registered_names():
-            entry = intent_registry.get(name)
-            assert len(entry.examples) > 0, f"No examples for {name}"
-
-    def test_fallback_to_chat(self):
-        result = intent_registry.get_or_fallback("BANANA")
-        assert result.name == "CHAT"
 
 
 class TestDraftStore:

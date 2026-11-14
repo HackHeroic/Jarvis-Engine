@@ -1,38 +1,9 @@
-"""Draft persistence layer — Supabase-backed, survives server restarts.
-
-Backward-compatibility note: DraftComponent and Draft dataclasses are kept
-here so existing control_policy.py references do not raise ImportError at
-runtime. They will be removed when Task 8 rewrites the draft negotiation flow.
-"""
+"""Draft persistence layer — Supabase-backed, survives server restarts."""
 
 import uuid
-from dataclasses import dataclass, field
-from typing import Any
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.domain.entities import OPEN_DRAFT_STATUSES
-
-
-# ── Legacy stubs (used by control_policy.py pending Task 8 rewrite) ─────────
-
-@dataclass
-class DraftComponent:
-    """Reviewable component within a legacy in-memory draft (stub)."""
-
-    component_type: str
-    data: Any
-    status: str = "pending"
-
-
-@dataclass
-class Draft:
-    """Legacy in-memory draft container (stub — kept for import compat)."""
-
-    draft_id: str
-    user_id: str
-    created_at: float
-    components: dict = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
 
 
 def _get_supabase():
@@ -163,17 +134,10 @@ class DraftStore:
         return True
 
     # ── Backward-compatible aliases ──────────────────────────
-    # What is left of the old in-memory DraftStore's API: create(), get(),
-    # delete(), add_component(), cleanup_expired(). control_policy.py's v1 flow
-    # still calls create() and add_component(), so these stay until that flow is
-    # retired; tests/test_draft_store.py pins their contract so nobody mistakes
-    # the no-ops for working code. The component accept/reject/update shims had
-    # no caller left and are gone.
-
-    def create(self, user_id: str, **kwargs) -> "Draft":
-        """Legacy alias. Returns a Draft stub with a generated draft_id."""
-        import time
-        return Draft(draft_id=str(uuid.uuid4()), user_id=user_id, created_at=time.time(), metadata=kwargs.get("metadata", {}))
+    # What is left of the old in-memory DraftStore's API: get(), delete(),
+    # cleanup_expired(). tests/test_draft_store.py pins their contract so nobody
+    # mistakes the no-ops for working code. create() and add_component() went with
+    # the v1 flow, their only caller.
 
     def delete(self, draft_id: str, user_id: str = None, **kwargs) -> bool:
         """Legacy alias for delete_draft. Returns False if user_id missing (fail-safe)."""
@@ -184,10 +148,6 @@ class DraftStore:
     def get(self, draft_id: str, user_id: str = None, **kwargs):
         """Legacy alias, permanently None. No caller remains — drafts.py now uses get_draft()."""
         return None
-
-    def add_component(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
-        """Legacy no-op. Still called by control_policy.py:897,907,1260,1354 (v1 flow)."""
-        return True
 
     def cleanup_expired(self) -> int:
         """Legacy no-op. Supabase handles expiry via expires_at column."""

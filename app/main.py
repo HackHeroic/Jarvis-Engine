@@ -58,18 +58,10 @@ async def lifespan(app: FastAPI):
     from app.services.draft_store import DraftStore
     app.state.draft_store = DraftStore(supabase_client=getattr(app.state.db_client, 'supabase', None))
 
-    from app.services.memory.store import MemoryStore
-    app.state.memory_store = MemoryStore(
-        supabase_client=getattr(app.state.db_client, 'supabase', None)
-    )
-
-    # Same singletons, reachable from code with no request scope — notably
+    # The same db client, reachable from code with no request scope — notably
     # _load_context rebuilding the UserModel facade on a checkpoint-resumed turn.
     from app.core.runtime import set_shared_clients
-    set_shared_clients(db=app.state.db_client, memory_store=app.state.memory_store)
-
-    from app.services.intent_registry import register_default_intents
-    register_default_intents()
+    set_shared_clients(db=app.state.db_client)
 
     from app.services.documents.registry import register_default_document_types
     register_default_document_types()
@@ -128,10 +120,6 @@ async def lifespan(app: FastAPI):
     container = AppContainer.build(supabase_client=supabase_client, cfg=_cfg, hooks=get_hooks())
     app.state.container = container
     set_container(container)
-    # The lifespan always builds the composition root, and with it PEARL runs on task
-    # outcomes (PatternService): the legacy user_tasks detectors (memory/pearl.py) are
-    # not registered. Their callers (the deprecated v1 routes) use them only without a
-    # composition root (tests, scripts). Retired in the next plan.
     if supabase_client is not None:
         print(" ✅ Repositories: Supabase")
 

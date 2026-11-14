@@ -130,7 +130,7 @@ def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None
     clock = _Clock(MONDAY_7_05)
     bus = EventBus()
     planner = planner or PlanningGraphReplanner(
-        repos.drafts, db_provider=lambda: FakeDBClient(fake), memory_provider=lambda: None
+        repos.drafts, db_provider=lambda: FakeDBClient(fake)
     )
     patterns = PatternService(
         repos.task_events, repos.memories, repos.profiles, bus,

@@ -43,9 +43,6 @@ def to_horizon(clock_min: int) -> int:
     return (clock_min - DAY_START_MIN) % MINUTES_PER_DAY
 
 
-_to_horizon = to_horizon  # this module's own name for it
-
-
 def parse_time_range(text: str) -> tuple[int, int] | None:
     """Extract a time range from natural language constraint text.
 
@@ -122,9 +119,6 @@ def parse_time_range(text: str) -> tuple[int, int] | None:
     return None
 
 
-_parse_time_range = parse_time_range  # this module's own name for it
-
-
 def _bounded_range(start_clock: int, end_clock: int) -> tuple[int, int] | None:
     """Convert a wall-clock window to horizon minutes, dropping unusable ones.
 
@@ -133,89 +127,10 @@ def _bounded_range(start_clock: int, end_clock: int) -> tuple[int, int] | None:
     zero- or negative-length block would reach OR-Tools as a malformed interval,
     and a wrapped one lands almost entirely inside the sleep window anyway.
     """
-    start, end = _to_horizon(start_clock), _to_horizon(end_clock)
+    start, end = to_horizon(start_clock), to_horizon(end_clock)
     if end <= start:
         return None
     return (start, end)
-
-
-def _parse_hour_from_pattern(text: str) -> int | None:
-    """Extract hour from a PEARL pattern like 'avoids tasks during hour 8'."""
-    match = re.search(r"hour\s+(\d{1,2})", text)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def memories_to_constraints(user_id: str, memory_store) -> list[TimeSlot]:
-    """Convert relevant memories into TimeSlot constraints for OR-Tools (legacy, v1).
-
-    The v2 planning path uses ``memory_slots`` over ``MemoryService.list_active``.
-
-    Called during _run_plan_day_flow, BEFORE run_schedule.
-    Queries both explicit constraints and PEARL-inferred behavioral patterns —
-    and *only* those two types. A goal memory ("tidy the inbox this evening")
-    says what the user wants to do, not when they are unavailable; letting one
-    block time would carve a hole out of the very day it was meant to fill.
-
-    All emitted slots carry horizon minutes (0 = DAY_START_HOUR) and are marked
-    ``recurring``: these are standing rules ("never studies before 11am"), not
-    one-off calendar entries.
-    """
-    constraints: list[TimeSlot] = []
-
-    # 1. Explicit constraints (user stated)
-    explicit = memory_store.get_memories_by_type(user_id, "constraint")
-    for mem in explicit:
-        time_range = _parse_time_range(mem.get("content", ""))
-        if time_range:
-            start_min, end_min = time_range
-            constraints.append(TimeSlot(
-                name=f"memory_constraint_{mem.get('id', '')}",
-                start_min=start_min,
-                end_min=end_min,
-                availability="blocked",
-                recurring=True,
-                source="user",
-            ))
-
-    # 2. PEARL behavioral patterns (system inferred)
-    patterns = memory_store.get_memories_by_type(
-        user_id, "behavioral_pattern", min_confidence=0.6
-    )
-    for pattern in patterns:
-        content = pattern.get("content", "")
-
-        # Pattern: "avoids tasks during hour X"
-        hour = _parse_hour_from_pattern(content)
-        if hour is not None:
-            # PEARL reports wall-clock hours; TimeSlot wants horizon minutes.
-            # Derive the end from the start so an hour that straddles the 08:00
-            # anchor (hour 7 -> 1380-1440) stays a forward-going interval.
-            start_min = _to_horizon(hour * 60)
-            constraints.append(TimeSlot(
-                name=f"pearl_pattern_{pattern.get('id', '')}",
-                start_min=start_min,
-                end_min=start_min + 60,
-                availability="minimal_work",
-                recurring=True,
-                source="pearl_inferred",
-            ))
-
-        # Pattern: time range in pattern text
-        time_range = _parse_time_range(content)
-        if time_range and hour is None:  # Don't duplicate if hour already matched
-            start_min, end_min = time_range
-            constraints.append(TimeSlot(
-                name=f"pearl_pattern_{pattern.get('id', '')}",
-                start_min=start_min,
-                end_min=end_min,
-                availability="minimal_work",
-                recurring=True,
-                source="pearl_inferred",
-            ))
-
-    return constraints
 
 
 def _skip_window_hour(pattern_key: str | None) -> int | None:
@@ -235,7 +150,7 @@ def _claimed_window(text: str) -> tuple[int, int] | None:
     """The window (horizon minutes) a stated rule claims for focused work, or None."""
     if not _FOCUSED_WORK.search(text) or _NEGATION.search(text):
         return None
-    window = _parse_time_range(text)
+    window = parse_time_range(text)
     if window is None and (bare := _BARE_HOURS.search(text)):
         start_h, end_h = (_bare_hour(int(h)) for h in bare.groups())
         if start_h <= 23 and end_h <= 24:
@@ -276,7 +191,7 @@ def memory_slots(
         if memory.memory_type == "constraint":
             if memory.id in covered:
                 continue
-            time_range = _parse_time_range(memory.content)
+            time_range = parse_time_range(memory.content)
             if time_range and _claimed_window(memory.content) is None:
                 slots.append(TimeSlot(
                     name=f"memory_constraint_{memory.id}",
@@ -293,9 +208,9 @@ def memory_slots(
             hour = _skip_window_hour(memory.pattern_key)
             if hour is None:
                 continue
-            # As in the legacy bridge: the end follows the start, so hour 7
-            # (1380-1440) stays a forward-going interval.
-            start_min = _to_horizon(hour * 60)
+            # The end follows the start, so hour 7 (1380-1440) stays a
+            # forward-going interval.
+            start_min = to_horizon(hour * 60)
             if any(start < start_min + 60 and start_min < end for start, end in claims):
                 continue  # the user keeps this hour for focused work
             slots.append(TimeSlot(

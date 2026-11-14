@@ -27,10 +27,13 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.domain.ports import TextEmbedder
 from app.utils.embedding import cosine_similarity
+
+if TYPE_CHECKING:
+    from app.container import AppContainer
 
 # Canned LLM output shared by every test that mocks the model boundary.
 # Asserting this sentinel (rather than merely `is not None`) matters because
@@ -93,7 +96,7 @@ def _unique_violation(index: str) -> Exception:
 # NOT NULL column defaults the fake fills on insert when a row leaves them out, as {table:
 # {column: value}}, so a row written without them reads back through a repository as it
 # would from the real table. user_tasks: 20261114000001_capstone_lld.sql; user_memories:
-# 20261115000002_memory_lifecycle_and_vectors.sql (rows the legacy MemoryStore writes).
+# 20261115000002_memory_lifecycle_and_vectors.sql (rows a test inserts without them).
 _COLUMN_DEFAULTS = {
     "user_tasks": {"difficulty_weight": 0.5},
     "user_memories": {"status": "active", "provenance": "said"},
@@ -417,6 +420,27 @@ class FakeDBClient:
 
     async def check_connection(self) -> bool:
         return True
+
+
+def build_test_container(supabase: FakeSupabase | None = None) -> "AppContainer":
+    """The composition root as the lifespan builds it, for a test: no model, no network.
+
+    Over ``supabase`` it uses the Supabase repositories; ``None`` means the InMemory
+    family. Memories are embedded by ``BagOfWordsEmbedder``, and the LLM chain is built
+    but not installed, so a test keeps whichever chain it scripted. (Not ``test_…``:
+    pytest would collect it in every module that imports it.)
+    """
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+
+    return AppContainer.build(
+        supabase_client=supabase,
+        cfg=cfg,
+        hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
 
 
 def make_jarvis_state(**overrides: Any) -> dict:

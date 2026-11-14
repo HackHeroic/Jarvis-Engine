@@ -91,7 +91,6 @@ async def _api(monkeypatch, jarvis=None):
         from app.orchestrator.hooks import ActionHooks
 
         monkeypatch.setattr(app.state, "db_client", jarvis.state.db_client, raising=False)
-        monkeypatch.setattr(app.state, "memory_store", jarvis.memory_store, raising=False)
         # The composition root the lifespan builds, over the same database.
         container = AppContainer.build(supabase_client=jarvis.db, cfg=cfg, hooks=ActionHooks())
         monkeypatch.setattr(app.state, "container", container, raising=False)
@@ -570,61 +569,34 @@ async def test_anti_guilt__skipping_tasks__every_reply_is_blame_free(jarvis, mon
 
 
 @pytest.mark.asyncio
-async def test_anti_guilt__learned_skip_pattern__insight_and_note_are_blame_free(
-    jarvis, embeddings, monkeypatch
-):
-    from app.services.memory.pearl import (
-        detect_patterns,
-        generate_proactive_insights,
-        pearl_registry,
-        register_default_patterns,
-    )
+async def test_anti_guilt__learned_skip_pattern__insight_and_note_are_blame_free(jarvis):
+    from app.domain.entities import TaskEvent, TaskEventType
 
-    # The legacy detectors, for this test only: the app no longer registers them.
-    monkeypatch.setattr(pearl_registry, "_entries", {})
-    register_default_patterns()
+    patterns = jarvis.state.container.patterns
+    today = datetime.now(IST).date()
+    events = []
+    for days_ago in (3, 2, 1):
+        day = today - timedelta(days=days_ago)
+        slot = datetime(day.year, day.month, day.day, 9, 0, tzinfo=IST)  # 9 AM, the user's clock
+        events.append(TaskEvent(
+            user_id="alice", task_id=f"t{days_ago}", event_type=TaskEventType.SKIPPED,
+            occurred_at=slot + timedelta(minutes=25),
+            scheduled_start=slot, scheduled_end=slot + timedelta(minutes=25),
+            metadata={"title": "Revise graphs", "goal_id": "g1", "deadline_hint": None},
+        ))
+    await jarvis.state.container.repos.task_events.append_many("alice", events)
 
-    for i in range(3):
-        jarvis.db.table("user_tasks").insert({
-            "user_id": "alice", "task_id": f"t{i}", "status": "skipped",
-            "scheduled_start": f"2026-11-1{i}T09:00:00+05:30",  # 9 AM on the user's clock
-        }).execute()
+    await patterns.observe("alice")  # remembered: only a remembered pattern is told
+    views = await patterns.current("alice")
+    (view,) = views
+    note = patterns.noticed(view.pattern)  # the skip window's own "I noticed ..." line
+    (insight,) = [i["insight"] for i in patterns.insights_of(views)]
+    (memory,) = [m["content"] for m in jarvis.rows("user_memories", user_id="alice")]
 
-    detect_patterns("alice", jarvis.db, jarvis.memory_store)
-
-    (note,) = [m["content"] for m in jarvis.rows("user_memories", user_id="alice")]
-    (insight,) = generate_proactive_insights("alice", jarvis.memory_store)
+    assert view.pattern.pattern_key == "skip_time_window:9"
     assert "9 AM" in insight
     assert blame_phrases_in(note) == [] and blame_phrases_in(insight) == []
-
-
-def test_anti_guilt__deprecated_v1_planner__every_user_facing_literal_is_blame_free():
-    """The deprecated v1 planner (POST /chat) has its own INFEASIBLE, missed-deadline
-    and replan replies. It cannot be driven offline without its whole pipeline, so its
-    templates are checked where they are written: every string literal in the module
-    except docstrings and the arguments of logging calls."""
-    import ast
-    import inspect
-
-    from app.services.analytical import control_policy
-
-    tree = ast.parse(inspect.getsource(control_policy))
-    log_calls = {"debug", "info", "warning", "error", "exception", "critical", "log_step", "print"}
-    skipped: set[int] = set()
-    for node in ast.walk(tree):
-        is_log = isinstance(node, ast.Call) and (
-            getattr(node.func, "attr", None) in log_calls or getattr(node.func, "id", None) in log_calls
-        )
-        is_docstring = isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
-        if is_log or is_docstring:
-            skipped.update(id(n) for n in ast.walk(node))
-    literals = [
-        n.value for n in ast.walk(tree)
-        if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in skipped
-    ]
-
-    assert any("mathematically impossible" in text for text in literals)  # the sweep sees them
-    assert [t for t in literals if blame_phrases_in(t)] == []
+    assert blame_phrases_in(memory) == []
 
 
 def test_anti_guilt__model_instructions__forbid_blame():
@@ -775,6 +747,8 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
     default night was skipped too."""
     from fastapi import HTTPException
 
+    from app.services.memory.memory_service import MemoryCandidate
+
     clock.freeze(MONDAY_8AM, schedule_endpoint)
     jarvis.db.table("behavioral_constraints").insert({
         "user_id": "alice", "constraint_type": "habit", "raw_text": "I sleep from 11 PM to 7 AM",
@@ -785,8 +759,11 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
     ]})
     # Days are taken 08:00-23:00, so only 07:00-08:00 is free on each day before
     # the sleep habit is honoured.
-    jarvis.memory_store.store_memory(
-        "alice", {"type": "constraint", "content": "No study between 8 AM and 11 PM", "confidence": 0.9}
+    await jarvis.state.container.memory_service.remember(
+        "alice",
+        MemoryCandidate(
+            memory_type="constraint", content="No study between 8 AM and 11 PM", confidence=0.9
+        ),
     )
     real_run_schedule = schedule_endpoint.run_schedule
     horizons: list[int] = []

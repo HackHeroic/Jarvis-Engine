@@ -25,7 +25,6 @@ from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.llm.transport import strip_fences, translated_errors
-from tests.fakes import FakeDBClient, FakeSupabase
 
 
 class ScriptedModel(LLMProvider):
@@ -90,29 +89,6 @@ def llm():
 def _down() -> LLMUnavailableError:
     """A fresh model outage (an exception instance is not shared between raises)."""
     return LLMUnavailableError("scripted outage")
-
-
-# --- memory extraction --------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_memory_extraction__routes_through_the_chain__returns_memory_dicts(llm):
-    from unittest.mock import MagicMock
-
-    from app.services.memory.extractor import extract_memories_from_turn
-
-    model = llm(memory_extraction={"memories": [{"type": "fact", "content": "Studies CS", "confidence": 0.8}]})
-    store = MagicMock()
-    store.get_active_memories.return_value = []
-    store.find_similar_memory.return_value = None
-
-    result = await extract_memories_from_turn("u1", "I study CS", "Noted, sir.", store)
-
-    assert model.tasks == ["memory_extraction"]
-    assert model.calls[0].role == "fast"
-    assert result == [
-        {"type": "fact", "content": "Studies CS", "confidence": 0.8, "contradicts": None, "expires_at": None}
-    ]
 
 
 # --- Voice of Jarvis synthesis ------------------------------------------------------
@@ -296,103 +272,6 @@ async def test_habit_translation__model_down__raises_to_the_caller(llm, habit_tr
 
     with pytest.raises(LLMUnavailableError):
         await habit_translator.translate_habits_to_slots("I swim on Saturdays")
-
-
-# --- edit / reorder parsing -----------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_schedule_modification__routes_through_the_chain__returns_the_modification(llm):
-    from app.services.analytical.schedule_modifier import (
-        ScheduleModification,
-        parse_modification_request,
-    )
-
-    model = llm(task_edit_parsing={
-        "action": "change_duration", "target_task_title": "Graphs", "new_duration_minutes": 15,
-    })
-
-    result = await parse_modification_request("make graphs 15 minutes", [{"title": "Graphs"}])
-
-    assert model.tasks == ["task_edit_parsing"]
-    assert model.calls[0].role == "fast"
-    assert isinstance(result, ScheduleModification)
-    assert (result.action, result.new_duration_minutes) == ("change_duration", 15)
-
-
-@pytest.mark.asyncio
-async def test_schedule_modification__model_down__returns_none(llm):
-    from app.services.analytical.schedule_modifier import parse_modification_request
-
-    llm(task_edit_parsing=_down())
-
-    assert await parse_modification_request("make graphs 15 minutes", [{"title": "Graphs"}]) is None
-
-
-def _pending_tasks() -> FakeSupabase:
-    return FakeSupabase({"user_tasks": [
-        {"id": "r1", "user_id": "alice", "task_id": "t1", "title": "Graphs", "status": "pending",
-         "duration_minutes": 25, "scheduled_start": "2026-11-14T09:00:00+00:00"},
-        {"id": "r2", "user_id": "alice", "task_id": "t2", "title": "Heaps", "status": "pending",
-         "duration_minutes": 25, "scheduled_start": "2026-11-14T10:00:00+00:00"},
-    ]})
-
-
-@pytest.mark.asyncio
-async def test_task_edit__routes_through_the_chain__applies_the_edit(llm):
-    from app.services.analytical.task_editor import handle_edit_task
-
-    model = llm(task_edit_parsing='{"task_keyword": "graphs", "field": "duration_minutes", "new_value": 15}')
-    db = _pending_tasks()
-
-    out = await handle_edit_task("alice", "make graphs 15 minutes", None, FakeDBClient(db), None)
-
-    assert model.tasks == ["task_edit_parsing"]
-    assert out["intent"] == "EDIT_TASK"
-    assert next(r for r in db.rows["user_tasks"] if r["task_id"] == "t1")["duration_minutes"] == 15
-
-
-@pytest.mark.asyncio
-async def test_task_edit__model_down__asks_to_rephrase(llm):
-    from app.services.analytical.task_editor import handle_edit_task
-
-    llm(task_edit_parsing=_down())
-
-    out = await handle_edit_task("alice", "make graphs 15 minutes", None, FakeDBClient(_pending_tasks()), None)
-
-    assert out == {
-        "intent": "EDIT_TASK",
-        "message": "Sorry, I couldn't understand which task to edit. Could you rephrase?",
-    }
-
-
-@pytest.mark.asyncio
-async def test_task_rearrange__routes_through_the_chain__swaps_the_slots(llm):
-    from app.services.analytical.task_rearranger import handle_rearrange
-
-    model = llm(task_edit_parsing="[2, 1]")
-    db = _pending_tasks()
-
-    out = await handle_rearrange("alice", "do heaps first", None, FakeDBClient(db), None)
-
-    assert model.tasks == ["task_edit_parsing"]
-    assert out["intent"] == "REARRANGE"
-    starts = {r["task_id"]: r["scheduled_start"] for r in db.rows["user_tasks"]}
-    assert starts == {"t1": "2026-11-14T10:00:00+00:00", "t2": "2026-11-14T09:00:00+00:00"}
-
-
-@pytest.mark.asyncio
-async def test_task_rearrange__model_down__asks_to_rephrase(llm):
-    from app.services.analytical.task_rearranger import handle_rearrange
-
-    llm(task_edit_parsing=_down())
-
-    out = await handle_rearrange("alice", "do heaps first", None, FakeDBClient(_pending_tasks()), None)
-
-    assert out == {
-        "intent": "REARRANGE",
-        "message": "Sorry, I couldn't understand your rearrangement request. Could you rephrase?",
-    }
 
 
 # --- workspace practice quiz -----------------------------------------------------------

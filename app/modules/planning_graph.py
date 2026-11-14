@@ -117,7 +117,7 @@ async def mark_missed(state: PlanningState) -> dict:
 
     Anti-Guilt: runs at PLAN_DAY entry so stale tasks stop poisoning TMT
     weights, and the synthesis layer gets a blame-free framing to surface.
-    Ported from control_policy._run_plan_day_flow — v2 previously never
+    Ported from the retired v1 planner — v2 previously never
     marked anything overdue.
 
     A replan (the morning brief, an accepted rule) runs no deadline scan: it changes
@@ -383,7 +383,8 @@ async def _memory_slots(state: PlanningState) -> list:
     blocks time, with the user's habits (fetched by ``fetch_constraints``), so an
     hour they keep for focused work is never soft-blocked by a learned pattern. A
     constraint memory a stored rule is linked to adds nothing: the plan has that rule
-    from the rules already. Otherwise (tests, scripts) the legacy memory store and bridge.
+    from the rules already. Without a composition root (tests, scripts) there are no
+    memories to read: no slots.
     """
     container = registered_container()
     if container is not None:
@@ -396,15 +397,7 @@ async def _memory_slots(state: PlanningState) -> list:
         rules = state.get("constraints") or []
         habits = [c.get("raw_text", "") for c in rules if c.get("constraint_type") == "habit"]
         return memory_slots(memories, habits=habits, covered=covered_memory_ids(rules))
-    user_model = state.get("user_model")
-    memory_store = await user_model.get_memory_store() if user_model else None
-    if not memory_store:
-        return []
-    from app.services.memory.constraint_bridge import memories_to_constraints
-
-    return await asyncio.to_thread(
-        memories_to_constraints, state.get("user_id", "demo"), memory_store
-    )
+    return []
 
 
 async def memory_to_constraints(state: PlanningState) -> dict:
@@ -532,9 +525,9 @@ async def decompose_goal(state: PlanningState) -> dict:
         # deleted them for good (F5, live run 2026-08-08). Without the run token a
         # re-plan of the SAME goal re-emits the ids of tasks the user already
         # finished, which accept keeps, and the unique key on user_tasks refuses
-        # the plan. The helpers are imported from the v1 flow, never
-        # re-implemented, so the two pipelines cannot drift.
-        from app.services.analytical.control_policy import (
+        # the plan. The helpers live in services/planning/goal_ids, never
+        # re-implemented here.
+        from app.services.planning.goal_ids import (
             namespace_chunk,
             derive_goal_id,
             mint_run_token,
@@ -571,9 +564,8 @@ async def fuse_tasks(state: PlanningState) -> dict:
     `{goal_id}_` id prefix only for rows written before goal_id travelled), not
     by task_id equality. Equality was F5: the decomposer's ids are positional, so
     "does this pending row share an id with a new chunk?" answered *yes* for
-    unrelated tasks from an earlier plan, dropped them from the fusion, and
-    `_persist_fused_tasks`'s delete-then-replace deleted them from `user_tasks`
-    on accept. The bare prefix was wrong too: goal `learn` claimed every task of
+    unrelated tasks from an earlier plan, dropped them from the fusion, and the
+    accept's delete-then-replace deleted them from `user_tasks`. The bare prefix was wrong too: goal `learn` claimed every task of
     goal `learn_dsa`.
 
     Rows carried forward from other goals keep their ids and their own goal_id.

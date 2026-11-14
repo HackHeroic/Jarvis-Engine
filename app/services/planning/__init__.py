@@ -1,1 +1,1 @@
-"""Planning helpers with no I/O, shared by draft acceptance and the deprecated v1 flow."""
+"""Planning helpers: goal ids, the brain-dump prompt, task rows and the user's clock."""

@@ -1,8 +1,7 @@
 """From planned task chunks to ``user_tasks`` rows. Pure: no I/O.
 
-Two writers share this builder: draft acceptance (``DraftService``) and the
-deprecated v1 ``_persist_fused_tasks``. With one builder, the rows the two paths
-write cannot drift apart.
+Draft acceptance (``DraftService``), the one writer of ``user_tasks`` rows, builds
+them here.
 """
 
 import logging

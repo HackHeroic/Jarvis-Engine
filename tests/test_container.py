@@ -224,23 +224,3 @@ def test_container__pearl_detectors__chosen_here_and_only_here():
     ]
     detectors = inspect.signature(PatternService).parameters["detectors"]
     assert detectors.default is inspect.Parameter.empty
-
-
-@pytest.mark.asyncio
-async def test_lifespan__composition_root_built__legacy_pearl_detectors_not_registered(
-    monkeypatch, tmp_path
-):
-    """PEARL runs on task outcomes (PatternService); the legacy user_tasks detectors are
-    reachable only without a composition root, so the app never registers them."""
-    from fastapi import FastAPI
-
-    from app.services.memory.pearl import pearl_registry
-    from tests.test_anticipation_scheduler import _offline_lifespan
-
-    monkeypatch.setattr(pearl_registry, "_entries", {})
-    main = _offline_lifespan(monkeypatch, tmp_path)
-    app = FastAPI()
-
-    async with main.lifespan(app):
-        assert app.state.container is not None
-        assert pearl_registry.registered_names() == []

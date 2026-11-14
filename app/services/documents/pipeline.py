@@ -56,7 +56,6 @@ async def document_intelligence_pipeline(
     extracted_text: str,
     source: str,
     source_id: str,
-    memory_store=None,
 ) -> DocumentClassification | None:
     """Universal document processing pipeline.
 
@@ -68,14 +67,12 @@ async def document_intelligence_pipeline(
     2. Look up handler from registry
     3. Execute handler
     4. Trigger replan if handler metadata says so
-    5. Store ingestion event as memory
 
     Args:
         user_id: Owner of the document.
         extracted_text: Text extracted from the document (via Docling or raw).
         source: Where the document came from ("direct_upload", "slack", "email", "api").
         source_id: Unique ID for this document.
-        memory_store: Optional MemoryStore instance for storing ingestion memory.
 
     Returns:
         DocumentClassification result, or None if classification failed.
@@ -91,16 +88,6 @@ async def document_intelligence_pipeline(
         # 3. Execute handler
         extraction = {"classification": classification}
         await entry.handler(user_id, extraction, source_id)
-
-        # 4. Store ingestion event as memory
-        if memory_store:
-            topics_str = ", ".join(classification.topics_covered[:5])
-            memory_store.store_memory(user_id, {
-                "type": "fact",
-                "content": f"Uploaded {classification.document_type}: topics {topics_str}",
-                "source": "ingestion",
-                "source_id": source_id,
-            })
 
         return classification
 

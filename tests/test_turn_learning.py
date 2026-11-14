@@ -10,7 +10,7 @@ memory created, reinforced or superseded and one ``pattern_detected`` frame per
 pattern change, all before ``complete``. ``complete`` also carries PEARL's insights,
 a re-plan hint and the honest status of a plan that could not be made.
 
-These drive the real ``/chat/v2/stream`` handler through the behaviour harness
+These drive the real ``/chat/stream`` handler through the behaviour harness
 (``tests/behaviour/conftest.py``): a scripted model, ``FakeSupabase`` and the
 composition root.
 """
@@ -28,10 +28,9 @@ import app.core.observation as observation
 import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from app.schemas.context import BrainDumpExtraction
-from tests.behaviour.conftest import (  # noqa: F401 - embeddings, jarvis and llm are fixtures
+from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtures
     brain_dump,
     decomposition,
-    embeddings,
     jarvis,
     llm,
     said,
@@ -631,7 +630,7 @@ async def test_turn__rule_from_inline_habits__recalled_in_a_new_conversation(jar
 
 
 def test_brain_dump_prompt__memories_first__never_exclusive_of_inline_habits():
-    from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT as prompt
+    from app.services.planning.brain_dump_prompt import BRAIN_DUMP_EXTRACTION_PROMPT as prompt
 
     assert isinstance(prompt, str)
     # Read before the field list a low-effort model skims, with worked examples that fill
@@ -690,7 +689,7 @@ async def test_turn__store_reads__memories_listed_once_pearl_looks_once_profile_
 COMPLETE_FIELDS = {  # exactly what the frontend reads today
     "intent", "message", "schedule", "execution_graph", "ingestion_result",
     "action_proposals", "search_result", "suggested_action", "thinking_process",
-    "awaiting_task_confirmation", "schedule_status", "conflict_summary", "draft_id",
+    "schedule_status", "conflict_summary", "draft_id",
     "saved_constraints", "conversation_id", "message_id", "clarification_options",
     "memories", "since_last_spoke", "pearl_insights", "generation_metrics",
 }
