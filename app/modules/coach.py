@@ -9,8 +9,10 @@ CRITICAL CONSTRAINTS (from research):
 
 import asyncio
 import json
+from datetime import timedelta
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.core.runtime import registered_container
 
 MASTERY_COACHING_SYSTEM_PROMPT = """You are Jarvis's coaching module. Your responses MUST follow these rules:
 
@@ -52,6 +54,30 @@ def _identify_sources_used(mastery: dict, trend: str, streak: int, energy: float
     return sources
 
 
+async def _completion_streak(user_id: str) -> int:
+    """Consecutive days, ending today on the user's clock, with a completed task.
+
+    Read from the outcome history (``task_events``) of the last STREAK_WINDOW_DAYS, never
+    from task statuses. Without a composition root (tests, scripts) there is no history
+    to read: 0.
+    """
+    from app.services.analytical.mastery_tracker import (
+        OUTCOME_TYPES, STREAK_WINDOW_DAYS, compute_streak_from_events,
+    )
+    from app.services.planning.local_time import user_zone
+    from app.services.task_service import utc_now
+
+    container = registered_container()
+    if container is None:
+        return 0
+    now = utc_now()
+    zone = user_zone(await container.repos.profiles.get_or_create(user_id))
+    events = await container.repos.task_events.list_for_user(
+        user_id, since=now - timedelta(days=STREAK_WINDOW_DAYS), types=set(OUTCOME_TYPES)
+    )
+    return compute_streak_from_events(events, zone, now.astimezone(zone).date())
+
+
 async def run_coaching_response(state: dict) -> dict:
     """Generate coaching response using Bandura's 4 Sources of Self-Efficacy.
 
@@ -79,7 +105,7 @@ async def run_coaching_response(state: dict) -> dict:
 
     try:
         from app.services.analytical.mastery_tracker import (
-            get_mastery_summary, _calculate_sr, compute_quality_trend, compute_streak,
+            get_mastery_summary, _calculate_sr, compute_quality_trend,
         )
 
         db = user_model._db.supabase  # explicit path — avoids wiring bug
@@ -87,7 +113,7 @@ async def run_coaching_response(state: dict) -> dict:
         mastery = await asyncio.to_thread(get_mastery_summary, user_model.user_id, db)
         sr = await asyncio.to_thread(_calculate_sr, user_model.user_id, None, db)
         trend = await asyncio.to_thread(compute_quality_trend, user_model.user_id, db)
-        streak = await asyncio.to_thread(compute_streak, user_model.user_id, db)
+        streak = await _completion_streak(user_model.user_id)
         energy = await user_model.get_estimated_energy()
 
         all_tasks = await user_model.get_all_tasks()

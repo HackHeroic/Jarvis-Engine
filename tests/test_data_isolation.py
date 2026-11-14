@@ -9,7 +9,7 @@ list and never the exception's text.
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.fakes import FakeDBClient, FakeSupabase
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 _UNSET = object()
 
@@ -36,12 +36,21 @@ class _RaisingSupabase:
 
 
 @pytest.fixture
-def app_state():
+def app_state(monkeypatch):
+    import app.core.config as cfg
+    from app.container import AppContainer
     from app.main import app
+    from app.orchestrator.hooks import ActionHooks
 
     original = getattr(app.state, "db_client", _UNSET)
     supabase = FakeSupabase(_seed())
     app.state.db_client = FakeDBClient(supabase)
+    # The composition root over the same database (routes read the user's profile there).
+    container = AppContainer.build(
+        supabase_client=supabase, cfg=cfg, hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(), install_chain=False,
+    )
+    monkeypatch.setattr(app.state, "container", container, raising=False)
     yield app, supabase
     if original is _UNSET:
         delattr(app.state, "db_client")

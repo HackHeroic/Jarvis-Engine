@@ -29,6 +29,7 @@ from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
 from app.services.memory.patterns import PatternObserver, PatternService
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
+from app.services.user_model_service import UserModelService
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class AppContainer:
     consent: ConsentPolicy
     actions: ActionFactory
     anticipation: AnticipationService
+    user_model_service: UserModelService
 
     @classmethod
     def build(
@@ -93,6 +95,8 @@ class AppContainer:
         observer = PatternObserver(patterns)  # PEARL looks again after every outcome
         for outcome in (TaskCompleted, TaskSkipped, TaskMissed):
             events.subscribe(outcome, observer)
+        # The focus profile: the solver leans on it, the You page shows it.
+        energy = HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator())
         # Triggers register themselves with the service; each one's action kind with
         # the factory, so an accepted suggestion can be rebuilt from its payload.
         consent = ConsentPolicy.default()
@@ -106,7 +110,7 @@ class AppContainer:
             usage_ledger=usage_ledger,
             task_service=task_service,
             sweeps=[SlotPassedSweep(task_service), MemoryDecaySweep(memory_service)],
-            energy=HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
+            energy=energy,
             embedder=embedder,
             memory_service=memory_service,
             patterns=patterns,
@@ -114,5 +118,8 @@ class AppContainer:
             actions=actions,
             anticipation=AnticipationService(
                 {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints
+            ),
+            user_model_service=UserModelService(
+                repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
             ),
         )

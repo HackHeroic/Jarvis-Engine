@@ -3,9 +3,10 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, require_supabase
+from app.api.deps import CurrentUser, get_container, require_supabase
 from app.domain import errors
 from app.services.analytical.sm2_engine import get_due_trackers, record_completion
+from app.services.planning.local_time import user_zone
 
 router = APIRouter()
 
@@ -48,18 +49,20 @@ async def complete_tracker(
 @router.get(
     "/tracker/due",
     summary="List habit trackers due for review",
-    description="Returns trackers where last_done_at + next_interval_days <= today.",
+    description=(
+        "Returns trackers where last_done_at + next_interval_days <= today, both as dates "
+        "in the user's timezone."
+    ),
 )
-async def list_due_trackers(
-    http_request: Request,
-    user_id: str = Query(..., description="User ID"),
-) -> dict:
+async def list_due_trackers(http_request: Request, user: CurrentUser) -> dict:
     """List SM-2 trackers due for review today or earlier; 503 when the database is down.
 
-    An outage is never an empty list: "nothing due" would be a false answer.
+    "Today" is the user's: the zone comes from their profile. An outage is never an
+    empty list: "nothing due" would be a false answer.
     """
     supabase = require_supabase(http_request)
-    due = await get_due_trackers(user_id=user_id, supabase_client=supabase)
+    profile = await get_container(http_request).repos.profiles.get_or_create(user)
+    due = await get_due_trackers(user_id=user, supabase_client=supabase, zone=user_zone(profile))
     return {"due_trackers": due}
 
 

@@ -1,0 +1,225 @@
+"""The You page API: one read of what Jarvis knows about the user, and their settings.
+
+The composition root runs on the Supabase repositories over ``FakeSupabase``, with
+the bag-of-words embedder. Every error is the one envelope, and an outage is a 503,
+never an empty page.
+"""
+
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from app.domain.entities import (
+    BehavioralConstraint,
+    LLMLocation,
+    LLMUsageEvent,
+    MemorySource,
+    TaskEvent,
+    TaskEventType,
+)
+from app.services.memory.memory_service import MemoryCandidate
+from tests.behaviour.conftest import blame_phrases_in
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+
+SECRET = "postgres://admin:hunter2@db.internal"
+MARATHON = "Training for the Mumbai marathon in March"
+
+_TOP_LEVEL = {"profile", "patterns", "rules", "memories", "focus", "receipt"}
+_PROFILE = {"display_name", "timezone", "wake_time", "autonomy_mode"}
+_PATTERN = {
+    "memory_id", "pattern_key", "detector", "description", "confidence", "occurrences",
+    "evidence", "confirmed",
+}
+_RULE = {"id", "text", "provenance", "created_at"}
+_MEMORY = {
+    "memory_id", "memory_type", "content", "confidence", "provenance", "freshness",
+    "noted_at", "last_confirmed_at", "observation_count", "pattern_key",
+}
+_FOCUS = {"source", "observations", "hours"}
+_HOUR = {"hour", "score", "done", "not_done"}
+_RECEIPT = {"on_device_calls", "cloud_calls", "pii_redactions", "input_tokens", "output_tokens"}
+
+
+def _container(supabase):
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+
+    return AppContainer.build(
+        supabase_client=supabase,
+        cfg=cfg,
+        hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+
+
+@asynccontextmanager
+async def _api(monkeypatch, container, supabase):
+    """The app over ``container``, its database client over ``supabase`` (None: no database)."""
+    from app.main import app
+
+    db_client = FakeDBClient(supabase) if supabase is not None else SimpleNamespace(supabase=None)
+    monkeypatch.setattr(app.state, "container", container, raising=False)
+    monkeypatch.setattr(app.state, "db_client", db_client, raising=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+async def _skips_at_nine(container, user_id: str = "alice") -> None:
+    """Three slots at 09:00 IST set aside on the last three days: a learnable habit."""
+    now = datetime.now(timezone.utc)
+    for days_ago in (3, 2, 1):
+        day = (now - timedelta(days=days_ago)).date()
+        slot = datetime(day.year, day.month, day.day, 3, 30, tzinfo=timezone.utc)  # 09:00 IST
+        await container.repos.task_events.append(user_id, TaskEvent(
+            user_id=user_id,
+            task_id=f"t{days_ago}",
+            event_type=TaskEventType.SKIPPED if days_ago != 1 else TaskEventType.MISSED,
+            occurred_at=slot + timedelta(minutes=25),
+            scheduled_start=slot,
+            scheduled_end=slot + timedelta(minutes=25),
+            metadata={"title": "Morning task", "goal_id": "g1"},
+        ))
+
+
+@pytest.mark.asyncio
+async def test_you_api__get__matches_response_model(monkeypatch):
+    from app.api.v1.endpoints.you import YouResponse
+
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    await _skips_at_nine(container)
+    await container.memory_service.remember(
+        "alice", MemoryCandidate(memory_type="goal", content=MARATHON, confidence=0.8)
+    )
+    await container.repos.constraints.add("alice", BehavioralConstraint(
+        id="00000000-0000-4000-8000-0000000a11ce", user_id="alice",
+        raw_text="No work after 10 PM", constraint_type="sleep", source="said",
+    ))
+    await container.repos.usage.record(LLMUsageEvent(
+        user_id="alice", task="voice_of_jarvis", role="fast", provider="local", model="gemma",
+        location=LLMLocation.LOCAL, input_tokens=120, output_tokens=30, latency_ms=40,
+        created_at=datetime.now(timezone.utc),
+    ))
+
+    async with _api(monkeypatch, container, supabase) as api:
+        resp = await api.get("/api/v1/you", params={"user_id": "alice"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    YouResponse.model_validate(body)
+    assert set(body) == _TOP_LEVEL
+    assert set(body["profile"]) == _PROFILE
+    assert body["profile"] == {
+        "display_name": None, "timezone": "Asia/Kolkata", "wake_time": "07:00",
+        "autonomy_mode": "ask_first",
+    }
+    (pattern,) = body["patterns"]
+    assert set(pattern) == _PATTERN
+    assert pattern["pattern_key"] == "skip_time_window:9"
+    assert pattern["memory_id"]  # remembered by the observe the read runs first
+    assert [line.split(" ", 2)[:2] for line in pattern["evidence"]] == [["set", "aside"]] * 3
+    for line in [pattern["description"], *pattern["evidence"]]:
+        assert "missed" not in line and "skipped" not in line
+        assert blame_phrases_in(line) == []
+    (rule,) = body["rules"]
+    assert set(rule) == _RULE
+    assert (rule["text"], rule["provenance"]) == ("No work after 10 PM", "said")
+    (memory,) = body["memories"]  # the pattern's own memory shows under "patterns" only
+    assert set(memory) == _MEMORY
+    assert (memory["content"], memory["provenance"]) == (MARATHON, MemorySource.SAID.value)
+    assert memory["freshness"] == pytest.approx(1.0, abs=1e-3)
+    assert set(body["focus"]) == _FOCUS
+    assert body["focus"]["source"] == "prior"
+    assert [h["hour"] for h in body["focus"]["hours"]] == list(range(24))
+    assert set(body["focus"]["hours"][9]) == _HOUR
+    assert (body["focus"]["hours"][9]["done"], body["focus"]["hours"][9]["not_done"]) == (0, 3)
+    assert body["receipt"] == {
+        "on_device_calls": 1, "cloud_calls": 0, "pii_redactions": 0,
+        "input_tokens": 120, "output_tokens": 30,
+    }
+    assert set(body["receipt"]) == _RECEIPT
+
+
+@pytest.mark.asyncio
+async def test_you_api__bad_timezone__422_envelope(monkeypatch):
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    params = {"user_id": "alice"}
+
+    async with _api(monkeypatch, container, supabase) as api:
+        unknown = await api.patch(
+            "/api/v1/you/settings", params=params,
+            json={"timezone": "Mars/Olympus_Mons", "wake_time": "06:30"},
+        )
+        too_long = await api.patch(
+            "/api/v1/you/settings", params=params, json={"timezone": "A" * 65}
+        )
+        not_a_time = await api.patch(
+            "/api/v1/you/settings", params=params, json={"wake_time": "25:99"}
+        )
+        fine = await api.patch(
+            "/api/v1/you/settings", params=params,
+            json={"autonomy_mode": "suggest_only", "wake_time": "06:30",
+                  "timezone": "Europe/London"},
+        )
+
+    for resp in (unknown, too_long, not_a_time):
+        assert resp.status_code == 422
+        error = resp.json()["error"]
+        assert set(error) == {"code", "message", "details", "request_id"}
+        assert error["code"] == "validation_error"
+    assert unknown.json()["error"]["details"] == {"fields": ["timezone"]}
+    assert fine.status_code == 200
+    assert fine.json() == {
+        "display_name": None, "timezone": "Europe/London", "wake_time": "06:30",
+        "autonomy_mode": "suggest_only",
+    }
+    (row,) = supabase.rows["user_profiles"]
+    assert (row["timezone"], row["wake_time"]) == ("Europe/London", "06:30:00")
+
+
+class _BrokenTable:
+    """A table whose every query fails with a planted secret."""
+
+    def __getattr__(self, _name):
+        def fail(*_args, **_kwargs):
+            raise RuntimeError(f"connection to {SECRET} refused")
+
+        return fail
+
+
+class _EventsDown(FakeSupabase):
+    def table(self, name: str):
+        return _BrokenTable() if name == "task_events" else super().table(name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outage", ["store_raises", "no_database"])
+async def test_you_api__store_down__503_envelope(monkeypatch, outage):
+    if outage == "store_raises":
+        supabase = _EventsDown()
+        container = _container(supabase)
+    else:  # what the lifespan builds with Supabase unreachable: in-memory repositories
+        supabase, container = None, _container(None)
+
+    async with _api(monkeypatch, container, supabase) as api:
+        responses = [
+            await api.get("/api/v1/you", params={"user_id": "alice"}),
+            *([await api.patch(
+                "/api/v1/you/settings", params={"user_id": "alice"},
+                json={"autonomy_mode": "suggest_only"},
+            )] if outage == "no_database" else []),
+        ]
+
+    for resp in responses:
+        assert resp.status_code == 503
+        error = resp.json()["error"]
+        assert set(error) == {"code", "message", "details", "request_id"}
+        assert error["code"] == "persistence_unavailable"
+        assert SECRET not in resp.text and "refused" not in resp.text

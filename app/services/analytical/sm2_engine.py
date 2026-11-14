@@ -2,11 +2,13 @@
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.domain.errors import PersistenceError
+from app.services.planning.local_time import user_zone
 from supabase import create_client
 
 logger = logging.getLogger(__name__)
@@ -109,18 +111,34 @@ async def record_completion(
         return {"status": "error", "reason": "database error"}
 
 
+def _local_date(moment: datetime | date, zone: ZoneInfo) -> date:
+    """The date of ``moment`` on the user's clock.
+
+    A naive datetime is taken as the user's wall time; a bare date is already local.
+    """
+    if not isinstance(moment, datetime):
+        return moment
+    return moment.astimezone(zone).date() if moment.tzinfo is not None else moment.date()
+
+
 async def get_due_trackers(
     user_id: str,
-    as_of_date: Optional[datetime] = None,
     supabase_client: Any = None,
+    as_of_date: datetime | None = None,
+    zone: ZoneInfo | None = None,
 ) -> list[dict[str, Any]]:
-    """Return list of habit trackers due for review on or before as_of_date."""
+    """Return the user's habit trackers due for review on or before ``as_of_date``'s local date.
+
+    Both sides of the comparison are dates on the user's clock (``zone``, default
+    ``user_zone()``): the day the habit was last done plus its interval, against the
+    day it is now (or ``as_of_date``) there. A tracker never done is due.
+    """
     client = supabase_client or _get_supabase()
     if not client:
         return []
 
-    ref = as_of_date or datetime.now(timezone.utc)
-    ref_date = ref.date() if hasattr(ref, "date") else ref
+    zone = zone or user_zone()
+    today = _local_date(as_of_date or datetime.now(timezone.utc), zone)
 
     try:
         result = (
@@ -142,10 +160,10 @@ async def get_due_trackers(
         try:
             interval = int(row.get("next_interval_days") or 1)
             last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if last_dt.tzinfo:
-                last_dt = last_dt.astimezone(timezone.utc)
-            next_due = (last_dt + timedelta(days=interval)).date()
-            if next_due <= ref_date:
+            if last_dt.tzinfo is None:  # stored instants are UTC
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            next_due = last_dt.astimezone(zone).date() + timedelta(days=interval)
+            if next_due <= today:
                 due.append(row)
         except (ValueError, TypeError):
             due.append(row)
