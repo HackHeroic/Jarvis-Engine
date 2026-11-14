@@ -57,6 +57,7 @@ from app.services.memory.patterns import (
     SkipTimeWindowDetector,
 )
 from app.services.task_service import TaskService
+from tests.behaviour.conftest import blame_phrases_in
 from tests.fakes import BagOfWordsEmbedder
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -244,7 +245,7 @@ def test_skip_window__three_of_three_at_nine__pattern_hour_9():
     assert pattern.pattern_key == "skip_time_window:9"
     assert pattern.hour == 9
     assert (pattern.occurrences, pattern.confidence) == (3, 1.0)
-    assert pattern.description == "User avoids tasks during hour 9 (3 of 3 set aside)"
+    assert pattern.description == "You tend to set work aside around 9 AM"
     assert pattern.evidence == [  # newest first, on the user's clock, in the user's words
         "set aside Sun 15 Nov 09:00 · Morning task",
         "set aside Sat 14 Nov 09:00 · Morning task",
@@ -264,7 +265,7 @@ def test_skip_window__missed_counts_as_set_aside():
 
     (pattern,) = SkipTimeWindowDetector().detect(events, IST)
 
-    assert pattern.description == "User avoids tasks during hour 9 (3 of 3 set aside)"
+    assert pattern.description == "You tend to set work aside around 9 AM"
     assert pattern.evidence[0] == "set aside Sun 15 Nov 09:00 · Morning task"
     assert not [line for line in pattern.evidence if "missed" in line or "skipped" in line]
 
@@ -298,7 +299,7 @@ def test_peak_hour__evening_completions__exactly_one_pattern():
     (pattern,) = PeakHourDetector().detect(events, IST)
 
     assert (pattern.detector, pattern.pattern_key, pattern.hour) == ("peak_hour", "peak_hour:19", 19)
-    assert pattern.description == "User does their best work around hour 19 (4 of 4 done)"
+    assert pattern.description == "Your evenings around 7 PM go well"
     assert (pattern.occurrences, pattern.confidence) == (4, 1.0)
     assert pattern.evidence[0] == "done Sun 15 Nov 19:00 · Morning task"
 
@@ -318,7 +319,7 @@ def test_deadline_crunch__last_day_completions__pattern():
     assert (pattern.detector, pattern.pattern_key, pattern.hour) == (
         "deadline_crunch", "deadline_crunch", None
     )
-    assert pattern.description == "User tends to finish deadlined work in the last day (3 of 4)"
+    assert pattern.description == "You tend to finish close to deadlines"
     assert (pattern.occurrences, pattern.confidence) == (4, 0.75)
     assert pattern.evidence == [  # when each was finished
         "done Sat 14 Nov 10:25 · Quiz",
@@ -337,9 +338,84 @@ def test_repeated_skip__same_task_three_times__pattern_names_title():
 
     assert (pattern.detector, pattern.pattern_key) == ("repeated_skip", "repeated_skip:essay_t1")
     assert pattern.description == (
-        "'Draft the essay intro' has been set aside 3 times; smaller steps may help"
+        "You've set 'Draft the essay intro' aside 3 times; smaller steps may help"
     )
     assert (pattern.occurrences, pattern.confidence) == (3, 1.0)
+
+
+def test_copy__every_detector__speaks_to_the_user_plainly_and_without_blame():
+    """Descriptions and insights are shown to the user: second person, a human time,
+    never "User", "hour 9", "avoids", "missed" or "failed"."""
+    events = [
+        *_skips_at_nine(3, 2, 1),
+        *[_outcome("completed", _slot(d, 19)) for d in (3, 2, 1)],
+        *[_outcome("completed", _slot(d, h), title=t, deadline_hint=dl)
+          for d, h, t, dl in ((6, 20, "Essay", "2026-11-10"), (4, 21, "Lab", "2026-11-12"),
+                              (2, 22, "Quiz", "2026-11-14"))],
+        *[_outcome("skipped", _slot(d, h), task_id="essay_t1", title="Draft the essay intro")
+          for d, h in ((5, 14), (3, 15), (1, 16))],
+    ]
+    detectors = [
+        SkipTimeWindowDetector(), PeakHourDetector(), DeadlineCrunchDetector(),
+        RepeatedSkipDetector(),
+    ]
+    found = [(d, p) for d in detectors for p in d.detect(events, IST)]
+
+    assert [p.pattern_key for _, p in found] == [
+        "skip_time_window:9", "peak_hour:19", "deadline_crunch", "repeated_skip:essay_t1"
+    ]
+    for detector, pattern in found:
+        for text in (pattern.description, detector.insight(pattern), *pattern.evidence):
+            assert text.split()[0] in {"You", "Your", "You've", "I", "set", "done"}, text
+            for banned in ("User", "user", "hour 9", "hour 19", "avoid", "missed", "failed"):
+                assert banned not in text, (banned, text)
+            assert blame_phrases_in(text) == [], text
+
+
+@pytest.mark.parametrize(
+    "key, stored, reads",
+    [
+        ("skip_time_window:9", "User avoids tasks during hour 9 (3 of 3 set aside)",
+         "You tend to set work aside around 9 AM"),
+        ("peak_hour:19", "User does their best work around hour 19 (4 of 4 done)",
+         "Your evenings around 7 PM go well"),
+        ("peak_hour:9", "User does their best work around hour 9 (3 of 3 done)",
+         "Your mornings around 9 AM go well"),
+        ("peak_hour:23", "User does their best work around hour 23 (3 of 3 done)",
+         "Your nights around 11 PM go well"),
+        ("deadline_crunch", "User tends to finish deadlined work in the last day (3 of 4)",
+         "You tend to finish close to deadlines"),
+        # The title lives only in the words: a repeated skip reads as stored.
+        ("repeated_skip:essay_t1", "'Draft' has been set aside 3 times; smaller steps may help",
+         "'Draft' has been set aside 3 times; smaller steps may help"),
+    ],
+    ids=["skip", "peak_evening", "peak_morning", "peak_night", "crunch", "repeated_skip"],
+)
+def test_describe__row_stored_in_older_words__reads_in_todays_where_the_key_allows(
+    service, key, stored, reads
+):
+    remembered = Memory(
+        user_id="alice", memory_type="behavioral_pattern", content=stored, pattern_key=key,
+        provenance=MemorySource.INFERRED, strength_as_of=NOW, created_at=NOW,
+    )
+
+    assert service.describe(remembered) == reads
+
+
+def test_describe__not_a_pattern_or_forgotten__reads_as_stored(service):
+    said = Memory(
+        user_id="alice", memory_type="preference", content="Prefers mornings for hour 9 work",
+        provenance=MemorySource.SAID, strength_as_of=NOW, created_at=NOW,
+        pattern_key="skip_time_window:9",
+    )
+    forgotten = Memory(
+        user_id="alice", memory_type="behavioral_pattern", content="", status=MemoryStatus.FORGOTTEN,
+        pattern_key="skip_time_window:9", provenance=MemorySource.INFERRED,
+        strength_as_of=NOW, created_at=NOW,
+    )
+
+    assert service.describe(said) == "Prefers mornings for hour 9 work"
+    assert service.describe(forgotten) == ""
 
 
 # --- observe -------------------------------------------------------------------------
@@ -358,7 +434,7 @@ async def test_observe__first_time__created_and_pattern_detected_published(
     assert memory.memory_type == "behavioral_pattern"
     assert (memory.provenance, memory.origin) == (MemorySource.INFERRED, "behavior")
     assert memory.pattern_key == "skip_time_window:9"
-    assert memory.content == "User avoids tasks during hour 9 (3 of 3 set aside)"
+    assert memory.content == "You tend to set work aside around 9 AM"
     assert (memory.confidence, memory.observation_count) == (0.9, 3)  # capped below certainty
     assert memory.applied_as == "soft_preference"
     assert [(e.user_id, e.pattern) for e in detected.events] == [("alice", change.pattern)]
@@ -394,7 +470,7 @@ async def test_observe__more_evidence__strengthened(service, repos, detected, cl
 
     assert (change.action, change.memory_id) == ("strengthened", created.memory_id)
     memory = await repos.memories.get("alice", created.memory_id)
-    assert memory.content == "User avoids tasks during hour 9 (4 of 4 set aside)"
+    assert memory.content == "You tend to set work aside around 9 AM"
     assert (memory.observation_count, memory.confidence) == (4, 0.9)
     assert (memory.status, memory.strength, memory.strength_as_of) == (
         MemoryStatus.ACTIVE, 1.0, clock.now
