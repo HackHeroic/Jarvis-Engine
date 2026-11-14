@@ -23,7 +23,11 @@ from app.domain.errors import LLMUnavailableError
 from app.domain.events import EventBus, NullEventBus
 from app.domain.ports import LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
-from app.infrastructure.llm.decorators import redacting_with
+from app.infrastructure.llm.decorators import (  # noqa: F401  (ServedModels: re-export)
+    ServedModels,
+    recording_served_models,
+    redacting_with,
+)
 from app.infrastructure.llm.factory import LLMProviderFactory, current_chain, set_chain
 from app.infrastructure.llm.transport import strip_fences  # noqa: F401  (re-export)
 from app.orchestrator.hooks import ActionHooks, HookDecision, get_hooks

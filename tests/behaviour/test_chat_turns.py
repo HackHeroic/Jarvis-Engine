@@ -296,3 +296,43 @@ async def test_chat__research_while_web_search_is_down__says_so_plainly_with_no_
     assert "web results are unavailable" in turn.reply.lower()
     assert "http" not in turn.reply.lower() and "www." not in turn.reply.lower()
     assert turn.payload["schedule"] is None
+
+
+# --- which model answered ----------------------------------------------------------
+
+
+def _metered_as(llm, name: str, location, model: str) -> None:
+    """Serve every call from ``llm``, metered as the provider ``name`` running ``model``."""
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.decorators import MeteredProvider
+    from app.infrastructure.llm.factory import set_chain
+
+    llm.name = name
+    llm.location = location
+    set_chain(FallbackChainProvider([MeteredProvider(llm, NullEventBus(), lambda _role: model)]))
+
+
+@pytest.mark.asyncio
+async def test_chat__claude_answers__reply_names_claude_not_gemini(jarvis, llm, monkeypatch):
+    import app.core.config as config
+    from app.domain.entities import LLMLocation
+
+    monkeypatch.setattr(config, "GEMINI_PRIMARY", True)  # LM Studio down: cloud-first
+    _metered_as(llm, "claude", LLMLocation.CLOUD, "claude-sonnet-5-5")
+
+    turn = await jarvis.say("What do you think about learning Rust this year?")
+
+    assert turn.payload["generation_metrics"]["model"] == "claude-sonnet-5-5"
+    (done,) = [d for e, d in turn.events if e == "step" and d.get("stage") == "pipeline_done"]
+    assert done["synthesis_model"] == "claude-sonnet-5-5"
+
+
+@pytest.mark.asyncio
+async def test_chat__local_model_answers__reply_names_the_local_model(jarvis, llm):
+    from app.domain.entities import LLMLocation
+
+    _metered_as(llm, "local", LLMLocation.LOCAL, "openai/google/gemma-4-e2b")
+
+    turn = await jarvis.say("What do you think about learning Rust this year?")
+
+    assert turn.payload["generation_metrics"]["model"] == "openai/google/gemma-4-e2b"
