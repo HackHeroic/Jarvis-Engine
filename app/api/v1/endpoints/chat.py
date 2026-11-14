@@ -2,9 +2,7 @@
 
 Routing and parsing only. The turn itself (the LangGraph orchestrator run, its lock, its
 frames) is ``ChatTurnService`` (``app/services/chat_turn/``); every frame is a model in
-``app/schemas/chat_stream.py``. ``/api/v1/chat/v2/stream`` is the same handler under its
-old path, hidden from the schema and deprecated, kept so a frontend and a backend
-restarted in either order keep talking.
+``app/schemas/chat_stream.py``.
 """
 
 from fastapi import APIRouter, Request
@@ -42,9 +40,6 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connect
         **json_error_responses(),  # a refusal before the stream starts is the JSON envelope
     },
 )
-# The old path of this same handler, hidden and deprecated: a frontend and a backend
-# restarted in either order keep talking. It goes once the new path has passed a live run.
-@router.post("/v2/stream", include_in_schema=False, deprecated=True)
 async def chat_stream(
     request: ChatStreamRequest, http_request: Request
 ) -> EventStreamResponse:
