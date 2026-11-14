@@ -188,3 +188,91 @@ class TestBridgeMemoryTypeFiltering:
         slot = memories_to_constraints("u1", mock_store)[0]
 
         assert (slot.start_min, slot.end_min) == (0, 60)
+
+
+# --- memory_slots: the v2 bridge, over Memory entities ----------------------------------
+
+
+def _memory(memory_type: str, content: str, **fields):
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from app.domain.entities import Memory, MemorySource
+
+    now = datetime(2026, 11, 16, 2, 30, tzinfo=timezone.utc)
+    return Memory(
+        id=str(uuid4()),
+        user_id="u1",
+        memory_type=memory_type,
+        content=content,
+        provenance=fields.pop("provenance", MemorySource.INFERRED),
+        strength_as_of=now,
+        created_at=now,
+        **fields,
+    )
+
+
+def test_memory_slots__peak_hour_pattern__never_blocks_that_hour():
+    """A best-work hour is where demanding work belongs; reading "hour 19" off the text
+    used to turn it into a minimal-work window."""
+    from app.services.memory.constraint_bridge import memory_slots
+
+    peak = _memory(
+        "behavioral_pattern",
+        "User does their best work around hour 19 (4 of 4 done)",
+        pattern_key="peak_hour:19",
+        confidence=0.9,
+    )
+    crunch = _memory(
+        "behavioral_pattern",
+        "User tends to finish deadlined work in the last day (3 of 4)",
+        pattern_key="deadline_crunch",
+        confidence=0.75,
+    )
+
+    assert memory_slots([peak, crunch]) == []
+
+
+def test_memory_slots__skip_pattern__minimal_work_hour():
+    from app.services.memory.constraint_bridge import memory_slots
+
+    skips = _memory(
+        "behavioral_pattern",
+        "User avoids tasks during hour 9 (3 of 3 set aside)",
+        pattern_key="skip_time_window:9",
+        confidence=0.9,
+    )
+    unsure = _memory(
+        "behavioral_pattern",
+        "User avoids tasks during hour 14 (3 of 5 set aside)",
+        pattern_key="skip_time_window:14",
+        confidence=0.55,  # below the 0.6 gate
+    )
+
+    (slot,) = memory_slots([skips, unsure])
+
+    # 09:00 local is horizon minute 60 (minute 0 is 08:00).
+    assert (slot.start_min, slot.end_min) == (60, 120)
+    assert slot.availability == "minimal_work"
+    assert (slot.recurring, slot.source) == (True, "pearl_inferred")
+    assert slot.name == f"pearl_pattern_{skips.id}"
+
+
+def test_memory_slots__constraint_memory__hard_block():
+    from app.domain.entities import MemorySource
+    from app.services.memory.constraint_bridge import memory_slots
+
+    rule = _memory(
+        "constraint",
+        "No tasks between 14:00 and 15:00 (has class)",
+        provenance=MemorySource.SAID,
+        confidence=0.9,
+    )
+    goal = _memory("goal", "Tidy the inbox before 6 PM", provenance=MemorySource.SAID)
+
+    (slot,) = memory_slots([rule, goal])
+
+    assert (slot.start_min, slot.end_min) == (360, 420)
+    assert slot.availability == "blocked"
+    assert (slot.recurring, slot.source) == (True, "user")
+    assert slot.name == f"memory_constraint_{rule.id}"

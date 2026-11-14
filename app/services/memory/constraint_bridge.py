@@ -13,10 +13,14 @@ STOP SCHEDULING deep work before 10 AM.
 import re
 
 from app.core.config import DAY_START_HOUR
+from app.domain.entities import Memory
 from app.schemas.context import TimeSlot
+from app.services.memory.patterns import SkipTimeWindowDetector
 
 MINUTES_PER_DAY = 1440
 DAY_START_MIN = DAY_START_HOUR * 60  # horizon minute 0 == 08:00 on the user's clock
+# A learned skip window at least this sure becomes a minimal-work hour.
+SKIP_WINDOW_MIN_CONFIDENCE = 0.6
 
 
 def _to_horizon(clock_min: int) -> int:
@@ -128,7 +132,9 @@ def _parse_hour_from_pattern(text: str) -> int | None:
 
 
 def memories_to_constraints(user_id: str, memory_store) -> list[TimeSlot]:
-    """Convert relevant memories into TimeSlot constraints for OR-Tools.
+    """Convert relevant memories into TimeSlot constraints for OR-Tools (legacy, v1).
+
+    The v2 planning path uses ``memory_slots`` over ``MemoryService.list_active``.
 
     Called during _run_plan_day_flow, BEFORE run_schedule.
     Queries both explicit constraints and PEARL-inferred behavioral patterns —
@@ -194,3 +200,56 @@ def memories_to_constraints(user_id: str, memory_store) -> list[TimeSlot]:
             ))
 
     return constraints
+
+
+def _skip_window_hour(pattern_key: str | None) -> int | None:
+    """The local hour of a ``skip_time_window:{h}`` pattern key; None for any other key."""
+    kind, _, hour = (pattern_key or "").partition(":")
+    if kind != SkipTimeWindowDetector.name or not hour.isdigit() or int(hour) > 23:
+        return None
+    return int(hour)
+
+
+def memory_slots(memories: list[Memory]) -> list[TimeSlot]:
+    """Turn the user's memories in use into solver constraints.
+
+    A ``constraint`` memory that names a clock range becomes a hard block. A learned
+    skip window (pattern key ``skip_time_window:{h}``) at least 0.6 sure becomes a
+    minimal-work hour. Nothing else blocks time: not a goal or a fact, and not any
+    other pattern. A peak hour is where demanding work belongs, and reading "hour N"
+    off a pattern's words used to turn it into a minimal-work window.
+
+    Slots carry horizon minutes (0 = DAY_START_HOUR) and are ``recurring``: these are
+    standing rules, not one-off calendar entries.
+    """
+    slots: list[TimeSlot] = []
+    for memory in memories:
+        if memory.memory_type == "constraint":
+            time_range = _parse_time_range(memory.content)
+            if time_range:
+                slots.append(TimeSlot(
+                    name=f"memory_constraint_{memory.id}",
+                    start_min=time_range[0],
+                    end_min=time_range[1],
+                    availability="blocked",
+                    recurring=True,
+                    source="user",
+                ))
+        elif (
+            memory.memory_type == "behavioral_pattern"
+            and memory.confidence >= SKIP_WINDOW_MIN_CONFIDENCE
+        ):
+            hour = _skip_window_hour(memory.pattern_key)
+            if hour is not None:
+                # As in the legacy bridge: the end follows the start, so hour 7
+                # (1380-1440) stays a forward-going interval.
+                start_min = _to_horizon(hour * 60)
+                slots.append(TimeSlot(
+                    name=f"pearl_pattern_{memory.id}",
+                    start_min=start_min,
+                    end_min=start_min + 60,
+                    availability="minimal_work",
+                    recurring=True,
+                    source="pearl_inferred",
+                ))
+    return slots
