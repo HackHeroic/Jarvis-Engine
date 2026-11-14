@@ -2,12 +2,27 @@
 
 3 signals: quality scores (SM-2), success ratio, reschedule penalty.
 Same output interface as future DKT: compute_mastery(user_id, topic) → float.
+
+The reschedule penalty and the streak read the outcome history (``task_events``),
+never task statuses, keeping only the latest outcome of each slot (task, scheduled
+start). Every history read stays inside a time window, under the store's row cap.
+A streak's days are dates on the user's clock.
 """
 
-import asyncio
+from datetime import date, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
+import app.core.config as config
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.domain.entities import TaskEvent, TaskEventType
+from app.services.memory.patterns import _aware, _settled_outcomes
+from app.services.task_service import utc_now
+
+# The outcomes a slot can come to: scheduled and rescheduled events are not outcomes.
+OUTCOME_TYPES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
+# How far back a streak is counted: a longer run reads as this many days.
+STREAK_WINDOW_DAYS = 60
 
 
 def _calculate_sr(user_id: str, goal_id: Optional[str], db) -> float:
@@ -49,18 +64,42 @@ def _get_avg_quality(user_id: str, goal_id: Optional[str], db) -> float:
         return 2.5
 
 
+def _event_from_row(row: dict) -> TaskEvent:
+    """A task_events row as a TaskEvent: declared fields only; NULL means the default."""
+    return TaskEvent.model_validate(
+        {k: v for k, v in row.items() if k in TaskEvent.model_fields and v is not None}
+    )
+
+
 def _get_reschedule_count(user_id: str, goal_id: Optional[str], db) -> int:
-    """Total reschedule count for tasks in a goal."""
+    """How many of the goal's slots were set aside by a skip (all goals when None).
+
+    Read from the user's outcome events of the last FOCUS_WINDOW_DAYS, newest first so
+    a row cap drops the oldest. A slot counts once, as what happened last: skipped,
+    then completed after all, is not a push. Slots that passed unattended are not
+    counted (nobody pushed them).
+    """
+    since = utc_now() - timedelta(days=config.FOCUS_WINDOW_DAYS)
     try:
-        query = db.table("user_tasks").select("reschedule_count").eq("user_id", user_id)
-        if goal_id:
-            query = query.eq("goal_id", goal_id)
-        result = query.execute()
-        tasks = result.data or []
-        return sum(t.get("reschedule_count", 0) for t in tasks)
+        result = (
+            db.table("task_events")
+            .select("*")
+            .eq("user_id", user_id)
+            .in_("event_type", sorted(t.value for t in OUTCOME_TYPES))
+            .gte("occurred_at", since.isoformat())
+            .order("occurred_at", desc=True)
+            .execute()
+        )
+        events = [_event_from_row(row) for row in result.data or []]
     except Exception as e:
-        logger.warning(f"Reschedule count query failed: {e}")
+        logger.warning(f"Reschedule count query failed: {type(e).__name__}")
         return 0
+    return sum(
+        1
+        for event in _settled_outcomes(events)
+        if event.event_type is TaskEventType.SKIPPED
+        and (goal_id is None or event.metadata.get("goal_id") == goal_id)
+    )
 
 
 def _get_mastery_target(user_id: str, goal_id: Optional[str], db) -> Optional[int]:
@@ -176,38 +215,21 @@ def compute_quality_trend(user_id: str, db) -> str:
         return "stable"
 
 
-def compute_streak(user_id: str, db) -> int:
-    """Count consecutive days with at least 1 task completion."""
-    try:
-        from datetime import date, timedelta
-        result = (
-            db.table("user_tasks")
-            .select("completed_at")
-            .eq("user_id", user_id)
-            .eq("status", "completed")
-            .not_.is_("completed_at", "null")
-            .order("completed_at", desc=True)
-            .limit(60)
-            .execute()
-        )
-        tasks = result.data or []
-        if not tasks:
-            return 0
-        dates = set()
-        for t in tasks:
-            try:
-                d = date.fromisoformat(t["completed_at"][:10])
-                dates.add(d)
-            except (ValueError, TypeError):
-                continue
-        if not dates:
-            return 0
-        today = date.today()
-        streak = 0
-        check = today
-        while check in dates:
-            streak += 1
-            check -= timedelta(days=1)
-        return streak
-    except Exception:
-        return 0
+def compute_streak_from_events(events: list[TaskEvent], zone: ZoneInfo, today: date) -> int:
+    """Consecutive local dates, ending ``today``, with at least one completion.
+
+    ``events`` is the outcome history; each slot counts as its latest outcome, and a
+    completion's day is the date it happened on in ``zone`` (00:30 IST is that IST day,
+    not the previous UTC one). No completion today is a streak of 0.
+    """
+    days = {
+        _aware(event.occurred_at).astimezone(zone).date()
+        for event in _settled_outcomes(events)
+        if event.event_type is TaskEventType.COMPLETED
+    }
+    streak = 0
+    day = today
+    while day in days:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
