@@ -187,6 +187,40 @@ def _no_anticipation_scheduler(monkeypatch):
     monkeypatch.setattr(config, "ANTICIPATION_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _solver_runs_to_proof(monkeypatch):
+    """CP-SAT's idle stop is off in every test unless the test turns it on.
+
+    The idle stop ends a search after a stretch of wall-clock time without a better
+    schedule, so on a busy machine it can stop before the placement a test asserts.
+    Off, a solve runs to a proof (or the cap), as it did before the idle stop existed.
+    """
+    import app.core.config as config
+
+    monkeypatch.setattr(config, "SOLVER_IDLE_STOP_SECONDS", None)
+
+
+@pytest.fixture
+def deterministic_solver(monkeypatch):
+    """CP-SAT on one worker with a fixed seed: the same schedule on every run.
+
+    For tests that assert a placement on a model with equally good alternatives: the
+    parallel portfolio picks among them by thread timing. The wall-clock cap is raised
+    so a busy machine cannot cut the single worker short of its proof.
+    """
+    import app.core.config as config
+    from app.core.or_tools import solver as solver_mod
+
+    class _OneWorkerSeeded(solver_mod.cp_model.CpSolver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.parameters.num_workers = 1
+            self.parameters.random_seed = 7
+
+    monkeypatch.setattr(solver_mod.cp_model, "CpSolver", _OneWorkerSeeded)
+    monkeypatch.setattr(config, "SOLVER_MAX_TIME_SECONDS", 60.0)
+
+
 @pytest.fixture
 def recording_llm():
     """Install a ``RecordingModel`` as the only provider; returns it for inspection.

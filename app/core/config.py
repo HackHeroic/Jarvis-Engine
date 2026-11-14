@@ -224,8 +224,14 @@ SOLVER_MAX_TIME_SECONDS: float = float(os.getenv("JARVIS_SOLVER_MAX_TIME_SECONDS
 # Inside that cap, the search stops once no better schedule has turned up for this many
 # seconds. The best schedule usually arrives in a fraction of a second; the rest of the
 # search goes to proving nothing beats it. The wait starts at the first schedule found,
-# so a search that has found none yet still runs to the cap.
-SOLVER_IDLE_STOP_SECONDS: float = float(os.getenv("JARVIS_SOLVER_IDLE_STOP_SECONDS", "0.75"))
+# so a search that has found none yet still runs to the cap. It is wall-clock time, so
+# a busy machine finds improvements more slowly: under heavy load (load average ~30), a
+# 12-task, 3-day plan stopped short of its best in 8 of 20 solves at 0.75 s and 3 of 20
+# at 1.0 s (each by at most 0.03%). 1.0 s costs ~0.25 s per solve over 0.75 s. 0 (or
+# None) turns the idle stop off: the search then runs to a proof or the cap.
+SOLVER_IDLE_STOP_SECONDS: float | None = float(
+    os.getenv("JARVIS_SOLVER_IDLE_STOP_SECONDS", "1.0")
+)
 
 # Mental-health safeguard: max scheduled deep-work minutes per day to avoid cramming
 MAX_DEEP_WORK_MINUTES_PER_DAY: int = 360  # 6 hours (legacy; pacing module takes precedence)
