@@ -30,13 +30,8 @@ class _RecordingSupabase(FakeSupabase):
 
 
 @pytest.fixture
-def app_with_db(monkeypatch):
+def app_with_db():
     from app.main import app
-
-    async def _no_replan(*_args, **_kwargs) -> bool:
-        return False
-
-    monkeypatch.setattr("app.api.v1.endpoints.tasks._try_trigger_replan", _no_replan)
 
     originals = {name: getattr(app.state, name, _UNSET) for name in ("db_client", "memory_store")}
     supabase = FakeSupabase(

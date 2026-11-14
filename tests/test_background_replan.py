@@ -1,7 +1,8 @@
 """The background replan (`trigger_replan`) must not undo goal ids.
 
-Task endpoints (complete, skip, edit, delete) fire `trigger_replan`, which
-re-solves the user's pending tasks and rewrites them through
+The task endpoints (complete, skip, edit, delete) are meant to fire
+`trigger_replan` — they do not while it cannot run — which re-solves the user's
+pending tasks and rewrites them through
 `_persist_fused_tasks` → `build_task_rows`. The pending tasks come back from
 `user_tasks` as TaskChunks, which have no goal_id field. If the goal is not
 carried alongside, `build_task_rows` re-reads it off the id prefix, and every

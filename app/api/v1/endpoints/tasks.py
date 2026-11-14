@@ -63,6 +63,8 @@ class TaskResponse(BaseModel):
     task_id: str
     status: str
     message: str
+    # Always False: the background replan (control_policy.trigger_replan) is off
+    # until it can run to completion. Kept because the frontend reads it.
     replan_triggered: bool = False
 
 
@@ -124,14 +126,14 @@ async def _update_task_status(
     "/{task_id}/complete",
     response_model=TaskResponse,
     summary="Mark a task as completed",
-    description="Records completion with quality rating. Triggers background replan of remaining tasks.",
+    description="Records completion with quality rating.",
 )
 async def complete_task(
     task_id: str,
     body: TaskCompleteRequest,
     request: Request,
 ) -> TaskResponse:
-    """Complete a task and trigger replan of remaining schedule."""
+    """Complete a task and record its quality signal."""
     supabase = _get_supabase(request)
 
     extra = {}
@@ -148,12 +150,6 @@ async def complete_task(
         supabase, task_id, body.user_id, body.quality, body.actual_duration_minutes,
     )
 
-    # Trigger background replan
-    db_client = getattr(request.app.state, "db_client", None)
-    replan_triggered = await _try_trigger_replan(
-        body.user_id, db_client, reason=f"task_completed:{task_id}",
-    )
-
     # Fire-and-forget: detect behavioral patterns from task history
     memory_store = getattr(request.app.state, "memory_store", None)
     if memory_store and supabase:
@@ -165,8 +161,8 @@ async def complete_task(
     return TaskResponse(
         task_id=task_id,
         status="completed",
-        message="Task completed. Remaining schedule updated.",
-        replan_triggered=replan_triggered,
+        message="Task completed.",
+        replan_triggered=False,
     )
 
 
@@ -175,8 +171,8 @@ async def complete_task(
     response_model=TaskResponse,
     summary="Skip / reschedule a task (anti-guilt)",
     description="Marks task as pacing_pushed (not 'overdue' or 'failed'). "
-    "Applies slippery deadline logic: buffer reallocation, energy decay, "
-    "and re-decomposition memory if pushed 3+ times.",
+    "Suggests today's buffer or tomorrow morning for it (nothing is re-placed), "
+    "and stores a re-decomposition memory if pushed 3+ times.",
 )
 async def skip_task(
     task_id: str,
@@ -225,12 +221,19 @@ async def skip_task(
     from app.utils.pacing import compute_adaptive_daily_cap
     daily_cap = compute_adaptive_daily_cap(horizon_minutes=2880, total_task_minutes=480)
     buffer_minutes = daily_cap * 0.25  # 25% anti-guilt reserve
+    # Advice, not a claim: nothing re-places the task on the schedule here.
     if task_duration <= buffer_minutes:
         reassignment = "today_buffer"
-        message = f"Life happened — I've slotted '{task_title}' into today's buffer time."
+        message = (
+            f"Life happened — '{task_title}' is off the list for now. "
+            f"It's short enough for today's buffer time if you want it back."
+        )
     else:
         reassignment = "tomorrow_morning_peak"
-        message = f"Life happened — '{task_title}' moves to tomorrow morning. No stress."
+        message = (
+            f"Life happened — '{task_title}' is off the list for now, "
+            f"and tomorrow morning suits it well. No stress."
+        )
 
     # 4. Reschedule count >= 3 → memory: needs re-decomposition
     if new_count >= 3:
@@ -246,13 +249,7 @@ async def skip_task(
             except Exception as e:
                 logger.warning(f"Failed to store re-decomposition memory: {e}")
 
-    # 5. Trigger background replan
-    db_client = getattr(request.app.state, "db_client", None)
-    replan_triggered = await _try_trigger_replan(
-        body.user_id, db_client, reason=f"pacing_pushed:{task_id}",
-    )
-
-    # 6. Fire-and-forget: detect behavioral patterns
+    # 5. Fire-and-forget: detect behavioral patterns
     memory_store = getattr(request.app.state, "memory_store", None)
     if memory_store and supabase:
         from app.services.memory.pearl import detect_patterns
@@ -264,7 +261,7 @@ async def skip_task(
         task_id=task_id,
         status="pacing_pushed",
         message=message,
-        replan_triggered=replan_triggered,
+        replan_triggered=False,
     )
 
 
@@ -325,16 +322,11 @@ async def update_task(
         "task_id", task_id
     ).eq("user_id", body.user_id).execute()
 
-    # Trigger background replan when schedule-affecting fields change
+    # Schedule-affecting edits feed pattern detection (duration edits feed
+    # detect_duration_preference). No replan runs: the background replan is off.
     schedule_affecting = {"duration_minutes", "difficulty_weight", "deadline_hint", "status"}
-    replan_triggered = False
     if schedule_affecting & set(update_payload.keys()):
-        db_client = getattr(request.app.state, "db_client", None)
-        replan_triggered = await _try_trigger_replan(
-            body.user_id, db_client, reason=f"task_edited:{task_id}",
-        )
-
-        # Fire-and-forget: detect behavioral patterns (duration edits feed detect_duration_preference)
+        # Fire-and-forget: detect behavioral patterns
         memory_store = getattr(request.app.state, "memory_store", None)
         if memory_store and supabase:
             from app.services.memory.pearl import detect_patterns
@@ -346,7 +338,7 @@ async def update_task(
         task_id=task_id,
         status=body.status or "updated",
         message="Task updated.",
-        replan_triggered=replan_triggered,
+        replan_triggered=False,
     )
 
 
@@ -354,14 +346,14 @@ async def update_task(
     "/{task_id}",
     response_model=TaskResponse,
     summary="Delete a task",
-    description="Remove a task permanently and trigger replan.",
+    description="Remove a task permanently.",
 )
 async def delete_task(
     task_id: str,
     user_id: str = Query(..., description="User ID (required for IDOR protection)"),
     request: Request = None,
 ) -> TaskResponse:
-    """Delete a task and trigger replan."""
+    """Delete a task."""
     supabase = _get_supabase(request)
     if not supabase:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -382,16 +374,11 @@ async def delete_task(
         "task_id", task_id
     ).eq("user_id", user_id).execute()
 
-    db_client = getattr(request.app.state, "db_client", None)
-    replan_triggered = await _try_trigger_replan(
-        user_id, db_client, reason=f"task_deleted:{task_id}",
-    )
-
     return TaskResponse(
         task_id=task_id,
         status="deleted",
-        message="Task removed. Schedule adjusted.",
-        replan_triggered=replan_triggered,
+        message="Task removed.",
+        replan_triggered=False,
     )
 
 
@@ -518,21 +505,3 @@ def _record_completion_signal(
         }).execute()
     except Exception as exc:
         logger.warning(f"Failed to record completion signal for task {task_id}: {exc}")
-
-
-async def _try_trigger_replan(
-    user_id: str,
-    db_client: Any,
-    reason: str,
-) -> bool:
-    """Attempt to trigger a background replan. Returns True if triggered.
-
-    Uses trigger_replan from control_policy. If it fails (e.g., no pending tasks),
-    returns False without raising.
-    """
-    try:
-        from app.services.analytical.control_policy import trigger_replan
-        asyncio.create_task(trigger_replan(user_id, db_client, reason))
-        return True
-    except Exception:
-        return False

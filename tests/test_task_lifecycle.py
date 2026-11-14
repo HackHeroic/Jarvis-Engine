@@ -233,15 +233,11 @@ def test_patch_task__unknown_status__422():
 
 
 @pytest.mark.parametrize("status", ["missed", "pacing_pushed"])
-def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status, monkeypatch):
+def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status):
     from fastapi.testclient import TestClient
     from app.main import app
     from tests.fakes import FakeSupabase
 
-    async def _no_replan(*args, **kwargs):
-        return False
-
-    monkeypatch.setattr("app.api.v1.endpoints.tasks._try_trigger_replan", _no_replan)
     fake = FakeSupabase({"user_tasks": [
         {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending"},
     ]})
@@ -258,3 +254,53 @@ def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status, monke
         assert fake.rows["user_tasks"][0]["status"] == status
     finally:
         app.state.db_client = original
+
+
+# The background replan (control_policy.trigger_replan) has never run to completion
+# and stays off. The task endpoints must not schedule it, nor tell the user their
+# schedule was updated. The response keys stay: the frontend reads them.
+_REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to", "rescheduled")
+
+
+@pytest.mark.parametrize(
+    "method, path, body",
+    [
+        ("post", "/api/v1/tasks/t1/complete", {"user_id": "u1", "quality": 4}),
+        ("post", "/api/v1/tasks/t1/skip", {"user_id": "u1"}),
+        ("post", "/api/v1/tasks/t2/skip", {"user_id": "u1"}),
+        ("patch", "/api/v1/tasks/t1", {"user_id": "u1", "duration_minutes": 20}),
+        ("delete", "/api/v1/tasks/t1?user_id=u1", None),
+    ],
+)
+def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
+    method, path, body, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from tests.fakes import FakeDBClient, FakeSupabase
+
+    replans: list[tuple] = []
+
+    async def recording_replan(*args, **kwargs):
+        replans.append(args)
+
+    monkeypatch.setattr("app.services.analytical.control_policy.trigger_replan", recording_replan)
+    fake = FakeSupabase({"user_tasks": [
+        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending",
+         "duration_minutes": 25},
+        {"user_id": "u1", "task_id": "t2", "title": "Write the essay", "status": "pending",
+         "duration_minutes": 90},
+    ]})
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(fake), raising=False)
+    monkeypatch.setattr(app.state, "memory_store", None, raising=False)
+
+    client = TestClient(app)
+    response = client.request(method.upper(), path, json=body)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload) == {"task_id", "status", "message", "replan_triggered"}
+    assert payload["replan_triggered"] is False
+    assert [c for c in _REPLAN_CLAIMS if c in payload["message"].lower()] == []
+    assert replans == []
