@@ -20,7 +20,7 @@ import re
 from collections.abc import Iterable
 
 from app.domain import errors
-from app.domain.entities import BehavioralConstraint
+from app.domain.entities import BehavioralConstraint, Memory
 from app.domain.ports import ConstraintRepository
 from app.services.memory.memory_service import MemoryService
 
@@ -47,6 +47,11 @@ def rule_memory_id(rule: BehavioralConstraint | dict | None) -> str | None:
 def _normalised(text: str | None) -> str:
     """A rule's words for comparing two rules: case, spacing and punctuation aside."""
     return " ".join(re.findall(r"[a-z0-9']+", (text or "").lower()))
+
+
+def _adopted(rule: BehavioralConstraint) -> bool:
+    """Whether the rule was adopted from a learned pattern (it names the pattern's key)."""
+    return bool((rule.structured_semantics or {}).get("pattern_key"))
 
 
 def covered_memory_ids(rules: Iterable[BehavioralConstraint | dict]) -> frozenset[str]:
@@ -81,6 +86,9 @@ class StatedRules:
         deleted. Forgetting it again deletes whatever linked rule is left (none).
         """
         await self._memory.forget(user_id, memory_id)
+        return await self._delete_linked(user_id, memory_id)
+
+    async def _delete_linked(self, user_id: str, memory_id: str) -> list[str]:
         linked = [
             r for r in await self._rules.list_active(user_id) if rule_memory_id(r) == memory_id
         ]
@@ -88,15 +96,28 @@ class StatedRules:
             await self._rules.delete(user_id, rule.id)
         return [rule.id for rule in linked]
 
+    async def dismiss_memory(self, user_id: str, memory_id: str) -> tuple[Memory, list[str]]:
+        """Dismiss the memory (``MemoryService.dismiss``: the user says it does not hold)
+        and delete every rule linked to it; return the memory and the ids of the rules
+        deleted.
+
+        A rule adopted from a learned pattern goes with the pattern. A forgotten memory is
+        InvalidStateTransition (409), and nothing is deleted.
+        """
+        dismissed = await self._memory.dismiss(user_id, memory_id)
+        return dismissed, await self._delete_linked(user_id, memory_id)
+
     async def delete_rule(self, user_id: str, rule_id: str) -> bool:
         """Delete the user's rule, with any copy of it said again in the same words; never
         a differently worded rule.
 
         The memory of stating it is forgotten too, unless a differently worded rule still
         rests on it (one memory of saying two rules at once, or a later rule reinforced
-        into the same memory): then the memory stays for that rule. The memory goes
-        first, so a retry after a failure in between still finds the rule and finishes.
-        Returns whether the rule was there to delete (another user's is not).
+        into the same memory): then the memory stays for that rule. A rule adopted from
+        a learned pattern dismisses the pattern instead (kept, never proposed again).
+        The memory goes first, so a retry after a failure in between still finds the
+        rule and finishes. Returns whether the rule was there to delete (another
+        user's is not).
         """
         rules = await self._rules.list_active(user_id)
         rule = next((r for r in rules if r.id == rule_id), None)
@@ -107,14 +128,22 @@ class StatedRules:
         linked = [r for r in rules if rule_memory_id(r) == memory_id]
         copies = [r for r in linked if r.id != rule_id and _normalised(r.raw_text) == words]
         if all(_normalised(r.raw_text) == words for r in linked):
-            try:
-                await self._memory.forget(user_id, memory_id)
-            except errors.NotFoundError:  # the memory is gone already
-                logger.info("A deleted rule's memory was already gone")
+            await self._let_go_of(user_id, memory_id, learned=_adopted(rule))
         deleted = await self._rules.delete(user_id, rule_id)
         for copy in copies:
             await self._rules.delete(user_id, copy.id)
         return deleted
+
+    async def _let_go_of(self, user_id: str, memory_id: str, *, learned: bool) -> None:
+        """Forget the memory of saying a rule; dismiss a learned pattern a rule came from.
+        One already let go of (or gone) stays as it is."""
+        try:
+            if learned:
+                await self._memory.dismiss(user_id, memory_id)
+            else:
+                await self._memory.forget(user_id, memory_id)
+        except (errors.NotFoundError, errors.InvalidStateTransition):
+            logger.info("A deleted rule's memory was already gone or let go of")
 
     async def _find(self, user_id: str, rule_id: str) -> BehavioralConstraint | None:
         return next(

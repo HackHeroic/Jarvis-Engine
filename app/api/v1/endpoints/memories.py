@@ -180,8 +180,11 @@ async def confirm_memory(memory_id: str, request: Request, user: CurrentUser) ->
     summary="Dismiss a memory",
     description=(
         "The user says it does not hold: it is hidden for good, and the same fact said or "
-        "noticed again is not stored. A forgotten memory: 409."
+        "noticed again is not stored. A rule resting on it goes too (a rule adopted from a "
+        "learned pattern, or the rule the user stated). A forgotten memory: 409."
     ),
 )
 async def dismiss_memory(memory_id: str, request: Request, user: CurrentUser) -> MemoryOut:
-    return MemoryOut.of(await _memories(request).dismiss(user, memory_id), _now())
+    _memories(request)  # the database first (503), as on every route
+    dismissed, _rules = await get_container(request).stated_rules.dismiss_memory(user, memory_id)
+    return MemoryOut.of(dismissed, _now())
