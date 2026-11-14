@@ -319,6 +319,16 @@ class MemoryRepository(ABC):
         """Return the user's memory with this pattern_key, whatever its status, or None."""
 
     @abstractmethod
+    async def find_by_pattern_keys(self, user_id: str, pattern_keys: list[str]) -> list[Memory]:
+        """Return the user's memories holding any of ``pattern_keys``, whatever their status.
+
+        At most one memory per key (a key is unique per user), in no particular order;
+        a key no memory holds is simply absent. One read for any realistic number of
+        keys (a store may split a very long list into a few bounded reads); no read
+        at all for no keys.
+        """
+
+    @abstractmethod
     async def nearest(
         self,
         user_id: str,

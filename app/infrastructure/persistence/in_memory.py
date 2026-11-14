@@ -545,6 +545,14 @@ class InMemoryMemoryRepository(MemoryRepository):
             None,
         )
 
+    async def find_by_pattern_keys(self, user_id: str, pattern_keys: list[str]) -> list[Memory]:
+        keys = set(pattern_keys)
+        return [
+            m.model_copy(deep=True)
+            for m in self._store.memories
+            if m.user_id == user_id and m.pattern_key is not None and m.pattern_key in keys
+        ]
+
     async def nearest(
         self,
         user_id: str,

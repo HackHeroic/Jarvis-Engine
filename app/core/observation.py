@@ -13,9 +13,10 @@ On every non-trivial turn, after the reply and before the stream's ``complete`` 
    supersede is two writes).
 2. One ``memory_extracted`` frame per memory created, reinforced or superseded.
 3. PEARL looks at the outcome history (``PatternService.observe``) and cognitive state
-   updates, together capped at 500 ms: one ``pattern_detected`` frame per learning
-   moment held for the user, this turn's and those PEARL learned in the background
-   since the last turn (after a Complete, a Skip or a passed slot).
+   updates, together capped at PEARL_INLINE_TIMEOUT_S. Then, whether or not the cap cut
+   the look short: one ``pattern_detected`` frame per learning moment held for the
+   user, this turn's and those PEARL learned in the background since the last turn
+   (after a Complete, a Skip or a passed slot).
 
 Without a registered composition root (tests, scripts) nothing is learned: the legacy
 detectors read ``user_tasks`` and would bring back patterns the user dismissed.
@@ -49,6 +50,8 @@ MEMORY_PERSIST_TIMEOUT_S = 2.0
 MEMORY_WRITE_TIMEOUT_S = 5.0
 # PEARL's insights for the complete frame: one read, skipped past this.
 PEARL_INSIGHTS_TIMEOUT_S = 0.5
+# PEARL's look at the outcome history (and the cognitive update) within a turn.
+PEARL_INLINE_TIMEOUT_S = 0.5
 # The outcomes the user is told about; a suppressed memory is told nothing.
 _ANNOUNCED = ("created", "reinforced", "superseded")
 # How sure Jarvis is of a habit the user stated in their own words.
@@ -323,25 +326,49 @@ def _pattern_frame(change: PatternChange) -> dict:
     }
 
 
-async def detect_pearl_patterns(state: dict) -> list[dict]:
-    """This turn's PEARL learning moments, as ``pattern_detected`` frames.
+async def look_for_patterns(state: dict) -> None:
+    """PEARL's look at the outcome history for this turn (``PatternService.observe``).
 
-    PEARL reads the outcome history (``PatternService.observe``); then every moment
-    held for the user (``drain_pending``) is returned, once: the ones this look found
-    and the ones PEARL learned in the background since the last turn. Only the drained
-    moments are told, never observe's own return as well, which holds the same moments.
-    A failed look still tells what was held. Never a pattern the user dismissed or
-    forgot. No composition root: nothing.
+    What it learns is held for the user (``drain_pending``), as it lands: a look cut
+    short by the turn's cap still holds every write that finished, and a write in
+    flight finishes and is held for the next turn. A failed look is logged by its type.
+    No composition root: nothing.
     """
     container = registered_container()
-    user_id = state.get("user_id") or getattr(state.get("user_model"), "user_id", None)
+    user_id = _user_of(state)
     if container is None or not user_id:
-        return []
+        return
     try:
         await container.patterns.observe(user_id)
     except Exception as e:
         logger.warning(f"PEARL pattern detection failed (non-fatal): {type(e).__name__}")
+
+
+def drain_pattern_frames(state: dict) -> list[dict]:
+    """Every learning moment held for the user, as ``pattern_detected`` frames, once.
+
+    The moments PEARL learned in the background since the last turn (after a Complete,
+    a Skip or a passed slot) and this turn's own. Never a pattern the user dismissed or
+    forgot. No composition root: nothing.
+    """
+    container = registered_container()
+    user_id = _user_of(state)
+    if container is None or not user_id:
+        return []
     return [_pattern_frame(change) for change in container.patterns.drain_pending(user_id)]
+
+
+async def detect_pearl_patterns(state: dict) -> list[dict]:
+    """This turn's PEARL learning moments: ``look_for_patterns``, then
+    ``drain_pattern_frames``. Only the drained moments are told, never observe's own
+    return as well, which holds the same moments. A failed look still tells what was
+    held. No composition root: nothing."""
+    await look_for_patterns(state)
+    return drain_pattern_frames(state)
+
+
+def _user_of(state: dict) -> str | None:
+    return state.get("user_id") or getattr(state.get("user_model"), "user_id", None)
 
 
 async def update_cognitive_state(state: dict) -> None:
@@ -353,28 +380,6 @@ async def update_cognitive_state(state: dict) -> None:
     # Future: update UserModel with fresh energy estimate
 
 
-async def bridge_patterns_to_constraints(state: dict, patterns: list[dict]) -> int:
-    """Persist high-confidence PEARL patterns as memory constraints.
-
-    Patterns with rate/confidence >= 0.7 are already stored in the memory store
-    by the PEARL detectors themselves. This function logs the count and returns it
-    so the caller can report how many were bridged.
-
-    The actual memory → TimeSlot conversion happens in planning_graph.memory_to_constraints
-    (called during _run_plan_day_flow before solve_schedule).
-    """
-    bridged = 0
-    for pattern in patterns:
-        # Normalise: PEARL detectors use "rate"; generic patterns use "confidence"
-        confidence = pattern.get("rate", pattern.get("confidence", 0.0))
-        if confidence < 0.7:
-            continue
-        pattern_type = pattern.get("pattern", pattern.get("type", ""))
-        logger.debug(f"PEARL pattern '{pattern_type}' (conf={confidence:.2f}) stored in memory — will apply on next replan")
-        bridged += 1
-    return bridged
-
-
 async def run_observation_loop(state: dict) -> dict:
     """Learn from the turn, inline, before the stream completes.
 
@@ -382,8 +387,11 @@ async def run_observation_loop(state: dict) -> dict:
     - Skips entirely on trivial inputs (greetings/emotional) — no memories from "hi".
     - Remembers the turn's memories (no write starts after MEMORY_PERSIST_TIMEOUT_S;
       the one in flight is never cut short), then emits their frames.
-    - PEARL + cognitive update run next with a real 500ms cap (no shield —
-      cancellation must propagate so we honor the cap).
+    - PEARL's look + the cognitive update run next under a real PEARL_INLINE_TIMEOUT_S
+      cap (no shield: cancellation must propagate so the cap is honoured).
+    - Then, whether or not the look finished, every learning moment held for the user
+      is drained and emitted: the ones PEARL learned in the background since the last
+      turn are told even when the store is slow enough for the cap to cut the look.
     - Every learning frame is on the queue before this returns. The only work that can
       outlive it is a memory write past MEMORY_WRITE_TIMEOUT_S, left to finish.
     """
@@ -403,33 +411,31 @@ async def run_observation_loop(state: dict) -> dict:
     for frame in frames:
         _emit_event(state, "memory_extracted", frame)
 
-    # PEARL + cognitive state are cheap stats/math; run inline with a REAL 500ms cap.
+    # PEARL + cognitive state are cheap stats/math; run inline with a REAL cap.
     # No asyncio.shield — we want the work cancelled when the cap fires, not leaked.
+    timed_out = False
     try:
-        result = await asyncio.wait_for(_run_inline_observation(state), timeout=0.5)
+        await asyncio.wait_for(_run_inline_observation(state), timeout=PEARL_INLINE_TIMEOUT_S)
     except asyncio.TimeoutError:
-        logger.warning("Inline observation (PEARL+cognitive) exceeded 500ms — cancelled and skipped")
-        _emit_event(state, "phase_end", {"phase": "learning", "timeout": True})
-        return {"needs_followup": False, "memories_extracted_count": len(frames)}
-    _emit_event(state, "phase_end", {"phase": "learning"})
-    return {**result, "memories_extracted_count": len(frames)}
-
-
-async def _run_inline_observation(state: dict) -> dict:
-    """Cheap inline work — PEARL stats + cognitive math. Targets <500ms.
-
-    The moments are drained and put on the queue with no await in between, so the cap
-    can never take a drained moment away before it is sent: a look the cap cuts short
-    leaves its moments held for the next turn.
-    """
-    patterns = await detect_pearl_patterns(state)
+        timed_out = True
+        logger.warning(
+            f"Inline observation (PEARL+cognitive) exceeded {PEARL_INLINE_TIMEOUT_S}s"
+            " — cancelled; the moments already held are told"
+        )
+    # Drained and queued with no await in between: nothing can take a drained moment
+    # away before it is sent.
+    patterns = drain_pattern_frames(state)
     for frame in patterns:
         _emit_event(state, "pattern_detected", frame)
-
-    await update_cognitive_state(state)
-    await bridge_patterns_to_constraints(state, patterns)
-
+    _emit_event(state, "phase_end", {"phase": "learning", **({"timeout": True} if timed_out else {})})
     return {
         "needs_followup": False,
+        "memories_extracted_count": len(frames),
         "patterns_detected_count": len(patterns),
     }
+
+
+async def _run_inline_observation(state: dict) -> None:
+    """Cheap inline work — PEARL's look + cognitive math, under the caller's cap."""
+    await look_for_patterns(state)
+    await update_cognitive_state(state)

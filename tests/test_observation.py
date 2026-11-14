@@ -2,13 +2,14 @@
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import app.core.config as config
+import app.core.observation as observation
 from app.container import AppContainer
 from app.core.observation import (
     detect_pearl_patterns,
@@ -16,13 +17,15 @@ from app.core.observation import (
     run_observation_loop,
 )
 from app.core.runtime import set_container
-from app.domain.entities import UserProfile
+from app.domain.entities import TaskEvent, TaskEventType, UserProfile
 from app.domain.errors import EmbeddingUnavailableError
 from app.orchestrator.hooks import ActionHooks
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
 from app.schemas.context import BrainDumpExtraction
 from app.schemas.memory import ExtractedMemory
 from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def _make_state(**overrides):
@@ -268,3 +271,59 @@ async def test_persist_turn_memories__no_composition_root__learns_nothing():
     state, _queue = _turn(MORNINGS)
 
     assert await persist_turn_memories(state) == []
+
+
+# --- PEARL's learning moments reach the turn, however slow the store ----------------
+
+
+def _a_week_of_outcomes(user_id: str = "alice") -> list[TaskEvent]:
+    """Seven days of 09:00 IST set-asides and 19:00 IST completions, ending yesterday."""
+    events = []
+    today = datetime.now(IST).date()
+    for days_ago in range(1, 8):
+        day = today - timedelta(days=days_ago)
+        for hour, kind in ((9, TaskEventType.MISSED), (19, TaskEventType.COMPLETED)):
+            start = datetime(day.year, day.month, day.day, hour, tzinfo=IST)
+            events.append(TaskEvent(
+                user_id=user_id, task_id=f"t_{days_ago}_{hour}", event_type=kind,
+                occurred_at=start + timedelta(minutes=40), scheduled_start=start,
+                scheduled_end=start + timedelta(minutes=25), metadata={"title": "Morning task"},
+            ))
+    return events
+
+
+def _slow(monkeypatch, obj: object, name: str, seconds: float) -> None:
+    """Every call of ``obj.name`` takes ``seconds`` longer: a store with real latency."""
+    fast = getattr(obj, name)
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(seconds)
+        return await fast(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, slow)
+
+
+@pytest.mark.asyncio
+async def test_observation__slow_store_outlasts_the_cap__held_moments_told_this_turn(monkeypatch):
+    container = _register(_SpyEmbedder())
+    await container.repos.task_events.append_many("alice", _a_week_of_outcomes())
+    held = await container.patterns.observe("alice")  # PEARL after an outcome, in the background
+    monkeypatch.setattr(observation, "PEARL_INLINE_TIMEOUT_S", 0.05)
+    repos = container.repos
+    for obj, name in (
+        (repos.profiles, "get_or_create"),
+        (repos.task_events, "list_for_user"),
+        (repos.memories, "find_by_pattern_key"),
+        (repos.memories, "find_by_pattern_keys"),
+    ):
+        _slow(monkeypatch, obj, name, 0.04)  # the turn's own look takes longer than the cap
+    state, queue = _turn()
+
+    result = await run_observation_loop(state)
+
+    frames = [e for e in _drain(queue) if e["_event_type"] == "pattern_detected"]
+    assert sorted(f["pattern_key"] for f in frames) == sorted(
+        c.pattern.pattern_key for c in held
+    ) == ["peak_hour:19", "skip_time_window:9"]
+    assert result["patterns_detected_count"] == 2
+    assert container.patterns.drain_pending("alice") == []  # told once

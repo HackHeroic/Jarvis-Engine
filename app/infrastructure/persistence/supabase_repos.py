@@ -106,6 +106,9 @@ _STATUS_CAS_ATTEMPTS = 3
 USAGE_PAGE_ROWS = 1000
 # Pages one summary may read (20,000 calls); past it the summary says it is truncated.
 USAGE_MAX_PAGES = 20
+# Pattern keys one memory read asks for: each key matches at most one row, so a read
+# is bounded by its keys, and the request line stays short.
+PATTERN_KEYS_PER_READ = 100
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -623,6 +626,20 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
             .limit(1)
         )
         return _read_memory(rows[0]) if rows else None
+
+    async def find_by_pattern_keys(self, user_id: str, pattern_keys: list[str]) -> list[Memory]:
+        keys = sorted(set(pattern_keys))
+        found: list[Memory] = []
+        for first in range(0, len(keys), PATTERN_KEYS_PER_READ):
+            chunk = keys[first : first + PATTERN_KEYS_PER_READ]
+            rows = await self._run(
+                lambda q, chunk=chunk: q.select(_MEMORY_SELECT)
+                .eq("user_id", user_id)
+                .in_("pattern_key", chunk)
+                .limit(len(chunk))
+            )
+            found.extend(_read_memory(r) for r in rows)
+        return found
 
     async def nearest(
         self,
