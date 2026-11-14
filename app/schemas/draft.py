@@ -87,6 +87,16 @@ class DraftAcceptResponse(BaseModel):
     )
     draft_id: str = Field(description="The draft accepted.")
     task_count: int = Field(ge=0, description="Tasks written to the user's plan.")
+    moved: bool = Field(
+        default=False,
+        description=(
+            "True when some of the draft's times had already gone by: its tasks were"
+            " re-solved from now before it was put in place."
+        ),
+    )
+    message: Optional[str] = Field(
+        default=None, description="What to tell the user when times were moved; null otherwise."
+    )
 
 
 class DraftRejectRequest(BaseModel):

@@ -18,13 +18,18 @@ belonging to somebody else simply reads as absent (house IDOR rule).
 """
 
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
 from app.domain import errors
+from app.domain.clock import utc_now
+from app.domain.entities import DraftStatus
 from app.domain.events import NullEventBus
-from app.services.draft_service import DraftService
+from app.services.draft_service import DraftService, slot_starts
+from app.services.task_service import as_aware
 # Moved to app.services.planning.task_rows; planning_graph still imports it from here.
 from app.services.planning.task_rows import to_task_chunk  # noqa: F401
 
@@ -91,6 +96,99 @@ def _count_persisted(supabase: Any, user_id: str, plan_id: str) -> int:
     return len(result.data or [])
 
 
+# What the user is told when an accept moved times that had gone by, or could not.
+MOVED_ON_ACCEPT = "A few of those times had already gone by, so I moved them — it's locked in now."
+NO_ROOM_ON_ACCEPT = (
+    "A few of those times had already gone by, and the rest no longer fits around now, so"
+    " I haven't locked it in. The draft is still open: tell me what to drop or move."
+)
+
+
+@dataclass(frozen=True)
+class AcceptOutcome:
+    """What accepting a draft did: tasks written, and whether passed times were moved."""
+
+    written: int
+    moved: bool = False
+
+
+async def accept_on_time(
+    service: DraftService, user_id: str, draft_id: str, *, supabase: Any = None
+) -> AcceptOutcome:
+    """Accept the draft, never with a slot that has already begun (both accept paths).
+
+    No slot begun: ``DraftService.accept`` as drafted. Some begun: the draft's own tasks
+    are re-solved from now first (the draft-edit re-solve: its horizon, the user's
+    habits, their clock and learned focus profile), the new times put on the draft and
+    the draft accepted, ``moved``. Written as drafted, the passed slots would be set
+    aside by the next sweep as if the user had, feeding PEARL and the focus profile
+    evidence that never happened. Every slot begun: ``DraftOutdatedError``, as before.
+
+    Raises ScheduleInfeasibleError (NO_ROOM_ON_ACCEPT) when the re-solve finds no room:
+    nothing is accepted and the draft stays open. Otherwise as ``DraftService.accept``.
+    """
+    draft = await service.get(user_id, draft_id)
+    draft.transition(DraftStatus.ACCEPTED)  # a closed draft fails fast, as accept does
+    starts = slot_starts(draft)
+    now = as_aware(utc_now())
+    begun = [task for task, start in starts.items() if start <= now]
+    if not begun or len(begun) == len(starts):
+        return AcceptOutcome(written=await service.accept(user_id, draft_id))
+    schedule = await _resolved_from_now(user_id, draft, supabase)
+    if schedule is None:
+        raise errors.ScheduleInfeasibleError(NO_ROOM_ON_ACCEPT, details={"draft_id": draft_id})
+    await service.reschedule(user_id, draft_id, schedule)
+    return AcceptOutcome(written=await service.accept(user_id, draft_id), moved=True)
+
+
+async def _resolved_from_now(user_id: str, draft: Any, supabase: Any) -> Optional[dict]:
+    """The draft's tasks re-solved from now on its own horizon; None if they no longer fit."""
+    from app.services.analytical.schedule_modifier import draft_constraints, resolve_from_now
+    from app.services.energy import solver_focus
+    from app.services.planning.local_time import stored_user_zone
+
+    container = registered_container()
+    zone = await stored_user_zone(
+        container.repos.profiles if container is not None else None, user_id
+    )
+    horizon_start = datetime.fromisoformat(draft.horizon_start)
+    if horizon_start.tzinfo is None:  # a legacy horizon without an offset was UTC
+        horizon_start = horizon_start.replace(tzinfo=timezone.utc)
+    slots = await draft_constraints(user_id, supabase, horizon_start)
+    focus = await solver_focus(
+        container.energy if container is not None else None, user_id, zone, now=utc_now()
+    )
+    resolved = await asyncio.to_thread(
+        resolve_from_now, draft.tasks, slots, horizon_start, focus_by_hour=focus, zone=zone
+    )
+    if resolved is None:
+        return None
+    _graph, schedule = resolved
+    return schedule.model_dump(mode="json")
+
+
+async def accept_draft_on_time(
+    draft_store: Any, user_id: str, draft: dict, supabase: Any
+) -> Optional[AcceptOutcome]:
+    """``accept_draft_and_persist``, also saying whether passed times were moved.
+
+    ``written`` 0: nothing schedulable, nothing written. None: the write did not land
+    (the draft is still open). Raises as ``accept_on_time``.
+    """
+    service = _draft_service(supabase)
+    if service is None:
+        logger.error(f"Draft {draft_id_of(draft)} not accepted: no Supabase client to write through")
+        return None
+    try:
+        return await accept_on_time(service, user_id, draft_id_of(draft), supabase=supabase)
+    except errors.ValidationError:
+        logger.warning(f"Draft {draft_id_of(draft)} holds no persistable tasks — nothing accepted")
+        return AcceptOutcome(written=0)
+    except errors.PersistenceError:
+        logger.error(f"Draft {draft_id_of(draft)} accept did not land — left open for retry")
+        return None
+
+
 async def accept_draft_and_persist(
     draft_store: Any, user_id: str, draft: dict, supabase: Any
 ) -> Optional[int]:
@@ -114,21 +212,12 @@ async def accept_draft_and_persist(
 
     ``DraftService.accept`` writes the tasks and flips the status in one
     transaction, so they land together or not at all. A second accept therefore
-    finds the draft closed instead of writing every task again. ``draft_store``
+    finds the draft closed instead of writing every task again. A draft some of whose
+    slots have begun is re-solved from now first (``accept_on_time``). ``draft_store``
     is unused; it stays in the signature for the callers.
     """
-    service = _draft_service(supabase)
-    if service is None:
-        logger.error(f"Draft {draft_id_of(draft)} not accepted: no Supabase client to write through")
-        return None
-    try:
-        return await service.accept(user_id, draft_id_of(draft))
-    except errors.ValidationError:
-        logger.warning(f"Draft {draft_id_of(draft)} holds no persistable tasks — nothing accepted")
-        return 0
-    except errors.PersistenceError:
-        logger.error(f"Draft {draft_id_of(draft)} accept did not land — left open for retry")
-        return None
+    outcome = await accept_draft_on_time(draft_store, user_id, draft, supabase)
+    return outcome.written if outcome is not None else None
 
 
 async def reject_draft(

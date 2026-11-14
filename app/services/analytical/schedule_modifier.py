@@ -5,10 +5,13 @@ re-running the full decomposition pipeline. Uses the 4B SLM for fast
 intent parsing, then applies changes to the execution graph and re-schedules.
 """
 
+import logging
 import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class ScheduleModification(BaseModel):
@@ -160,9 +163,6 @@ def apply_modification(
     user's learned focus profile (``solver_focus``): the re-solve leans on it as the
     plan did, so an edit does not drop it.
     """
-    from app.schemas.decomposition import ExecutionGraph, TaskChunk
-    from app.api.v1.endpoints.schedule import run_schedule
-
     decomposition = execution_graph.get("decomposition", [])
     action = modification.action
 
@@ -214,10 +214,50 @@ def apply_modification(
     execution_graph["decomposition"] = decomposition
 
     # Re-schedule with updated tasks
+    resolved = resolve_from_now(
+        decomposition,
+        time_slots,
+        horizon_start,
+        focus_by_hour=focus_by_hour,
+        goal_metadata=execution_graph.get("goal_metadata"),
+        cognitive_load=execution_graph.get("cognitive_load_estimate"),
+    )
+    if resolved is not None:
+        graph, new_schedule = resolved
+        return graph.model_dump(mode="json"), new_schedule.model_dump(mode="json")
+    # Return updated graph with original schedule if re-scheduling failed
+    return execution_graph, schedule_data
+
+
+# The re-solve's horizon ladder past the default horizon, in minutes (3 d, 5 d, 7 d).
+_LONGER_HORIZONS = (4320, 7200, 10080)
+
+
+def resolve_from_now(
+    tasks: list[dict[str, Any]],
+    time_slots: list,
+    horizon_start: Any,
+    *,
+    focus_by_hour: Optional[list[float]] = None,
+    zone: Any = None,
+    goal_metadata: Optional[dict] = None,
+    cognitive_load: Optional[dict] = None,
+) -> Optional[tuple[Any, Any]]:
+    """Re-solve ``tasks`` on the draft's own horizon, never before now: the draft-edit
+    re-solve. ``(ExecutionGraph, GenerateScheduleResponse)``, or None when no rung of
+    the horizon ladder fits them (or they cannot be read as tasks).
+
+    ``horizon_start`` is the draft's minute 0; the minutes already gone by are blocked
+    (``block_past``). ``focus_by_hour`` is the user's learned focus profile, ``zone``
+    their clock. CPU-bound (CP-SAT): an async caller runs it with ``asyncio.to_thread``.
+    """
+    from app.api.v1.endpoints.schedule import run_schedule
+    from app.core.config import DEFAULT_HORIZON_MINUTES, MAX_HORIZON_MINUTES
+    from app.schemas.decomposition import ExecutionGraph, TaskChunk
+
     try:
-        chunks = []
-        for t in decomposition:
-            chunks.append(TaskChunk(
+        chunks = [
+            TaskChunk(
                 task_id=t.get("task_id", "unknown"),
                 title=t.get("title", "Task"),
                 duration_minutes=t.get("duration_minutes", 15),
@@ -226,43 +266,55 @@ def apply_modification(
                 completion_criteria=t.get("completion_criteria"),
                 implementation_intention=t.get("implementation_intention"),
                 deadline_hint=t.get("deadline_hint"),
-            ))
-
+            )
+            for t in tasks
+        ]
         avg_load = sum(c.difficulty_weight for c in chunks) / max(len(chunks), 1)
         graph = ExecutionGraph(
-            goal_metadata=execution_graph.get("goal_metadata"),
+            goal_metadata=goal_metadata or {},
             decomposition=chunks,
-            cognitive_load_estimate=execution_graph.get("cognitive_load_estimate", {"intrinsic_load": round(avg_load, 3)}),
+            cognitive_load_estimate=cognitive_load or {"intrinsic_load": round(avg_load, 3)},
         )
-
-        from app.core.config import DEFAULT_HORIZON_MINUTES, MAX_HORIZON_MINUTES
-        horizon_steps = [DEFAULT_HORIZON_MINUTES, 4320, 7200, 10080]
-        new_schedule = None
-        for horizon_min in horizon_steps:
-            if horizon_min > MAX_HORIZON_MINUTES:
-                break
-            try:
-                new_schedule = run_schedule(
-                    graph,
-                    time_slots,
-                    horizon_minutes=horizon_min,
-                    horizon_start=horizon_start,
-                    # The draft's horizon began earlier: a re-schedule now must not
-                    # put tasks before now.
-                    block_past=True,
-                    focus_by_hour=focus_by_hour,
-                )
-                break
-            except Exception:
-                continue
-
-        if new_schedule:
-            return (
-                graph.model_dump(mode="json"),
-                new_schedule.model_dump(mode="json"),
+    except Exception as exc:  # tasks that cannot be read as tasks cannot be re-solved
+        logger.warning("Re-solve skipped: the tasks could not be read (%s)", type(exc).__name__)
+        return None
+    for horizon_min in (DEFAULT_HORIZON_MINUTES, *_LONGER_HORIZONS):
+        if horizon_min > MAX_HORIZON_MINUTES:
+            break
+        try:
+            schedule = run_schedule(
+                graph,
+                time_slots,
+                horizon_minutes=horizon_min,
+                horizon_start=horizon_start,
+                zone=zone,
+                # The draft's horizon began earlier: a re-solve now must not put
+                # tasks before now.
+                block_past=True,
+                focus_by_hour=focus_by_hour,
             )
-    except Exception as e:
-        print(f"[ScheduleModifier] Re-schedule failed: {e}")
+        except Exception:  # INFEASIBLE on this rung: try a longer horizon
+            continue
+        return graph, schedule
+    return None
 
-    # Return updated graph with original schedule if re-scheduling failed
-    return execution_graph, schedule_data
+
+async def draft_constraints(user_id: str, supabase: Any, horizon_start: Any) -> list:
+    """The time slots a draft re-solve respects: the user's stored habits, translated and
+    expanded over the default horizon from ``horizon_start`` (weekdays counted from its
+    own first day). Habits that cannot be read or translated give none, logged."""
+    from app.core.config import DEFAULT_HORIZON_MINUTES
+    from app.services.analytical.habit_translator import translate_habits_to_slots
+    from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
+    from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
+
+    semantic_slots: list = []
+    try:
+        habits = await get_behavioral_context_for_calendar(user_id, supabase)
+        if habits and habits.strip():
+            semantic_slots = await translate_habits_to_slots(habits)
+    except Exception as exc:  # the re-solve goes on without them
+        logger.warning("Habits unread for a re-solve (%s)", type(exc).__name__)
+    return expand_semantic_slots_to_time_slots(
+        semantic_slots, horizon_minutes=DEFAULT_HORIZON_MINUTES, plan_start=horizon_start
+    )

@@ -335,6 +335,25 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             raise not_found("draft", draft_id)
         raise draft_closed(draft_id, current.status)
 
+    async def replace_schedule(
+        self, user_id: str, draft_id: str, schedule: dict
+    ) -> DraftSchedule:
+        if not is_uuid(draft_id):
+            raise not_found("draft", draft_id)
+        # As replace_tasks: the status filter makes the check and the write one statement.
+        rows = await self._run(
+            lambda q: q.update({"schedule": schedule})
+            .eq("id", draft_id)
+            .eq("user_id", user_id)
+            .in_("status", [s.value for s in OPEN_DRAFT_STATUSES])
+        )
+        if rows:
+            return _read(DraftSchedule, rows[0])
+        current = await self.get(user_id, draft_id)
+        if current is None:
+            raise not_found("draft", draft_id)
+        raise draft_closed(draft_id, current.status)
+
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
     ) -> DraftSchedule:

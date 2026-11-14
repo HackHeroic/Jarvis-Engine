@@ -523,6 +523,23 @@ async def test_drafts__replace_tasks__persists(repos):
 
 
 @pytest.mark.asyncio
+async def test_drafts__replace_schedule__open_draft_only_and_user_scoped(repos):
+    draft = await _new_draft(repos)
+    moved = {"g1_t1": {"start_min": 200, "end_min": 225}}
+
+    updated = await repos.drafts.replace_schedule(U1, draft.id, moved)
+
+    assert updated.schedule == moved and updated.status is draft.status
+    assert (await repos.drafts.get(U1, draft.id)).schedule == moved
+    with pytest.raises(errors.NotFoundError):
+        await repos.drafts.replace_schedule(U2, draft.id, {})
+    await repos.drafts.accept_atomic(U1, draft.id, [_row("x")])
+    with pytest.raises(errors.InvalidStateTransition):
+        await repos.drafts.replace_schedule(U1, draft.id, {"g1_t1": {"start_min": 0, "end_min": 25}})
+    assert (await repos.drafts.get(U1, draft.id)).schedule == moved
+
+
+@pytest.mark.asyncio
 async def test_drafts__caller_mutates_tasks_after_write__stored_draft_unchanged(repos):
     created_tasks = [{"task_id": "g1_t1", "title": "Read chapter 1"}]
     draft = await repos.drafts.create(

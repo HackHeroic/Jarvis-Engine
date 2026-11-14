@@ -165,6 +165,16 @@ class DraftRepository(ABC):
         """
 
     @abstractmethod
+    async def replace_schedule(
+        self, user_id: str, draft_id: str, schedule: dict
+    ) -> DraftSchedule:
+        """Replace an open draft's solved schedule (a re-solve) and return the draft.
+
+        Its status is left as it is. Raises NotFoundError if the user has no such draft,
+        and InvalidStateTransition if it is no longer open.
+        """
+
+    @abstractmethod
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
     ) -> DraftSchedule:

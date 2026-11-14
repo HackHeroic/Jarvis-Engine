@@ -14,6 +14,7 @@ from app.domain.errors import (
     DraftOutdatedError,
     InvalidStateTransition,
     NotFoundError,
+    ScheduleInfeasibleError,
 )
 
 from langgraph.graph import END, StateGraph
@@ -579,7 +580,8 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     """The body of handle_draft_action; see there for the contract."""
     from app.schemas.context import IntentType
     from app.services.draft_actions import (
-        accept_draft_and_persist,
+        MOVED_ON_ACCEPT,
+        accept_draft_on_time,
         draft_id_of,
         reject_draft,
         resolve_draft,
@@ -609,11 +611,15 @@ async def _apply_draft_action(state: JarvisState) -> dict:
 
     if intent_value == IntentType.ACCEPT_DRAFT.value:
         try:
-            count = await accept_draft_and_persist(
+            outcome = await accept_draft_on_time(
                 draft_store, user_id, draft, _supabase_of(state)
             )
         except InvalidStateTransition:
             return await _closed_draft_reply(draft_store, user_id, draft_id)
+        except ScheduleInfeasibleError as exc:
+            # Some times had gone by and the rest no longer fits around now: nothing was
+            # accepted and the draft is still open, so the negotiation stays open too.
+            return {"response_message": exc.message, "draft_id": draft_id}
         except DraftOutdatedError as exc:  # every slot has gone by: say so, plainly
             return {
                 "response_message": exc.message,
@@ -631,6 +637,7 @@ async def _apply_draft_action(state: JarvisState) -> dict:
                 "negotiation_state": NegotiationPhase.NONE,
                 "draft_id": None,
             }
+        count = outcome.written if outcome is not None else None
         if count is None:
             # The write did not land and the draft is still pending. Keep the
             # phase (omitted, not reset) so "accept" retries — and say what
@@ -651,11 +658,14 @@ async def _apply_draft_action(state: JarvisState) -> dict:
                 "negotiation_state": NegotiationPhase.NONE,
                 "draft_id": None,
             }
+        on_schedule = (
+            f"{count} task is on your schedule." if count == 1
+            else f"{count} tasks are on your schedule."
+        )
         return {
             "response_message": (
-                f"Locked in, sir — {count} task is on your schedule."
-                if count == 1
-                else f"Locked in, sir — {count} tasks are on your schedule."
+                f"{MOVED_ON_ACCEPT} {on_schedule}" if outcome.moved
+                else f"Locked in, sir — {on_schedule}"
             ),
             "negotiation_state": NegotiationPhase.ACCEPTED,
             # Kept, not cleared: a repeated "looks good" on this thread must find
