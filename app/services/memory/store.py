@@ -20,8 +20,9 @@ from app.utils.embedding import cosine_similarity, embed_text
 def _get_supabase():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    from supabase import create_client
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    from app.db.supabase_py import build_supabase_client
+
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 MAX_STABILITY = 20.0

@@ -241,3 +241,76 @@ async def test_you_api__store_down__503_envelope(monkeypatch, outage):
         assert set(error) == {"code", "message", "details", "request_id"}
         assert error["code"] == "persistence_unavailable"
         assert SECRET not in resp.text and "refused" not in resp.text
+
+
+# --- several page loads at once (React's double mount sends two) --------------------
+
+
+def _delayed(monkeypatch, obj: object, name: str, seconds: float) -> None:
+    """Each call of ``obj.name`` waits ``seconds`` first, so concurrent requests overlap."""
+    import asyncio
+
+    fast = getattr(obj, name)
+
+    async def slow(*args, **kwargs):
+        await asyncio.sleep(seconds)
+        return await fast(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, slow)
+
+
+@pytest.mark.asyncio
+async def test_you_api__three_loads_at_once__all_200_same_content_and_one_look(monkeypatch):
+    import asyncio
+
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    await _skips_at_nine(container)
+    patterns = container.patterns
+    looks: list[str] = []
+    look_now = patterns._look_now
+
+    async def counted(user_id, **kwargs):
+        looks.append(user_id)
+        return await look_now(user_id, **kwargs)
+
+    monkeypatch.setattr(patterns, "_look_now", counted)
+    _delayed(monkeypatch, container.repos.task_events, "list_for_user", 0.05)
+
+    async with _api(monkeypatch, container, supabase) as api:
+        responses = await asyncio.gather(
+            *(api.get("/api/v1/you", params={"user_id": "alice"}) for _ in range(3))
+        )
+
+    assert [r.status_code for r in responses] == [200, 200, 200]
+    bodies = [r.json() for r in responses]
+    assert all(b["patterns"] == bodies[0]["patterns"] for b in bodies)
+    assert all(b["rules"] == bodies[0]["rules"] and b["focus"] == bodies[0]["focus"] for b in bodies)
+    (pattern,) = bodies[0]["patterns"]
+    assert pattern["pattern_key"] == "skip_time_window:9" and pattern["memory_id"]
+    assert looks == ["alice"], "one look at the history for all three loads"
+    assert [r["pattern_key"] for r in supabase.rows["user_memories"]] == ["skip_time_window:9"]
+
+
+@pytest.mark.asyncio
+async def test_you_api__pattern_write_lost_to_another_process__200_not_503(monkeypatch):
+    """Another server stored the same pattern a moment earlier: someone else did it."""
+    from app.domain import errors
+
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    await _skips_at_nine(container)
+
+    async def taken(user_id, memory, **kwargs):
+        raise errors.ConflictError(
+            "That pattern is already remembered.", details={"pattern_key": memory.pattern_key}
+        )
+
+    monkeypatch.setattr(container.repos.memories, "add", taken)
+
+    async with _api(monkeypatch, container, supabase) as api:
+        resp = await api.get("/api/v1/you", params={"user_id": "alice"})
+
+    assert resp.status_code == 200
+    (pattern,) = resp.json()["patterns"]
+    assert pattern["pattern_key"] == "skip_time_window:9"
