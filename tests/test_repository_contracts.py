@@ -2106,7 +2106,7 @@ async def test_supabase_repos__unreadable_stored_row__raises_persistence_error(f
 
 @pytest.mark.asyncio
 async def test_supabase_memories__legacy_row_with_null_columns__reads_with_defaults(fake_client):
-    """Rows the v1 path wrote before 20261115000002 may hold NULL in these columns
+    """Rows written before 20261115000002 may hold NULL in these columns
     (the migration fills them), or a fake row may not carry them at all."""
     legacy = ("confidence", "strength", "stability", "observation_count", "source", "created_at")
     base = {

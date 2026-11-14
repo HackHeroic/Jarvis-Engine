@@ -628,8 +628,8 @@ async def test_draft_action__store_failure__keeps_the_draft_open(_captured_persi
 # ---------------------------------------------------------------------------
 # Draft-verb matcher precision (Task 10 review)
 #
-# ACCEPT_DRAFT is the only intent in v2 that writes user_tasks, and
-# _persist_fused_tasks deletes every pending row before inserting. So a false
+# ACCEPT_DRAFT is the only intent that writes user_tasks, and accepting
+# replaces every pending row with the draft's tasks. So a false
 # positive here does not merely mis-answer — it destroys the user's task list.
 # These utterances are ordinary mid-review conversation and must never match.
 # ---------------------------------------------------------------------------

@@ -128,7 +128,7 @@ def extract_thinking_process(raw_text: str) -> tuple[str, str | None]:
 def build_summary_from_state(state: dict, intent: str = "") -> dict[str, Any]:
     """Build the dict that _build_voj_parts can consume from raw orchestrator state.
 
-    Bridges v2 graph state (which carries `schedule`, `execution_graph`, etc.)
+    Bridges the orchestrator's state (which carries `schedule`, `execution_graph`, etc.)
     to the boolean-flag contract `_build_voj_parts` expects (`schedule_generated`,
     `knowledge_ingested`, etc.). Used by both the orchestrator's
     voice_of_jarvis_synthesis node AND the chat-stream fallback path so they

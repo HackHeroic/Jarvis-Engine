@@ -6,6 +6,7 @@
 
 import ast
 import importlib
+import re
 import importlib.util
 from pathlib import Path
 
@@ -85,7 +86,7 @@ def _callers_of(function: str) -> list[str]:
 def test_off_turn_resolve__only_the_replanner_calls_resolve_from_now():
     """The one solve outside a planning turn is the replanner's re-slot from now, built on
     the planning module's own time slots. The draft-edit re-solves that rebuilt their
-    constraints from habit text alone (/chat/modify-schedule, the v1 modify flow) are gone."""
+    constraints from habit text alone (/chat/modify-schedule, the retired modify flow) are gone."""
     assert _callers_of("resolve_from_now") == ["modules/planning_replan.py"]
 
 
@@ -108,3 +109,42 @@ REMOVED_DEAD_CODE = [
 def test_dead_code__removed__absent_and_called_nowhere(module, name):
     assert not hasattr(importlib.import_module(module), name)
     assert _callers_of(name) == []
+
+
+# What the retired architecture was called. Nothing in app/ or scripts/ names it any more,
+# in code or in prose: a comment citing a deleted function sends a reader looking for it.
+RETIRED_NAMES = re.compile(
+    r"_run_plan_day_flow|execute_agentic_flow|control_policy|\bDraftStore\b|\bMemoryStore\b"
+    r"|runtime\.set_container|v2 pipeline|both pipelines|\bv[12]\b(?! ?/)|chat/v2"
+)
+
+
+def _names_the_retired_architecture(path: Path) -> list[str]:
+    hits = []
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        # The API's version (/api/v1/..., "API v1") and model names (all-MiniLM-L6-v2,
+        # /v1/models) are not it.
+        cleaned = re.sub(r"(?i)api[./ ]v1|MiniLM-L6-v2|/v1\b", "", line)
+        if RETIRED_NAMES.search(cleaned):
+            hits.append(f"{path.relative_to(_APP_DIR.parent).as_posix()}:{number}")
+    return hits
+
+
+def test_source__names_nothing_of_the_retired_architecture():
+    root = _APP_DIR.parent
+    files = [*sorted(_APP_DIR.rglob("*.py")), *sorted((root / "scripts").rglob("*.py"))]
+
+    assert [hit for path in files for hit in _names_the_retired_architecture(path)] == []
+
+
+def test_test_names__chat_tests_name_the_one_chat_stream():
+    tests = Path(__file__).resolve().parent
+    stale = sorted(
+        f"{path.name}:{node.name}"
+        for path in tests.rglob("test_*.py")
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_chat_v2__")
+    )
+
+    assert stale == []

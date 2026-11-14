@@ -112,12 +112,10 @@ def _horizon_start_of(state: PlanningState) -> Any:
 
 
 async def mark_missed(state: PlanningState) -> dict:
-    """Mark pending tasks whose deadline has passed as `missed` (v1 parity).
+    """Mark pending tasks whose deadline has passed as `missed`.
 
     Anti-Guilt: runs at PLAN_DAY entry so stale tasks stop poisoning TMT
     weights, and the synthesis layer gets a blame-free framing to surface.
-    Ported from the retired v1 planner — v2 previously never
-    marked anything overdue.
 
     A replan (the morning brief, an accepted rule) runs no deadline scan: it changes
     no task's status, and a task whose deadline passed stays as it is until the user
@@ -523,7 +521,7 @@ async def decompose_goal(state: PlanningState) -> dict:
             clean = re.sub(r"```json|```", "", str(result)).strip()
             data = json.loads(clean)
             graph = ExecutionGraph.model_validate(data)
-        # v1 parity (CLAUDE.md → "Namespace goal tasks"): chunks leave
+        # Namespace goal tasks (CLAUDE.md): chunks leave
         # decomposition already prefixed `{goal_id}_{run}_{task_id}`, dependencies
         # included. The decomposer only ever emits POSITIONAL ids (task_1…task_N),
         # so without the goal prefix every plan collides with the last one —
@@ -563,7 +561,7 @@ async def decompose_goal(state: PlanningState) -> dict:
 
 
 async def fuse_tasks(state: PlanningState) -> dict:
-    """Multi-goal fusion, v1 parity: keep tasks from OTHER goals, drop tasks
+    """Multi-goal fusion: keep tasks from OTHER goals, drop tasks
     from THIS goal — the fresh decomposition replaces them.
 
     Membership is decided by each row's own goal_id (`belongs_to_goal`; the
@@ -721,7 +719,7 @@ async def solve_schedule(state: PlanningState) -> dict:
 
 
 async def create_draft(state: PlanningState) -> dict:
-    """v1 parity: a feasible schedule is *proposed* as a draft, not committed.
+    """A feasible schedule is *proposed* as a draft, not committed.
 
     Nothing is written to ``user_tasks`` here — ``DraftService.accept`` writes
     only when the user accepts. The draft is proposed through the sub-graph's
@@ -777,7 +775,7 @@ async def create_draft(state: PlanningState) -> dict:
 # reporting a plan it did not have. The margin covers model building.
 SOLVE_STEP_TIMEOUT_MS = int(SOLVER_MAX_TIME_SECONDS * 1000) + 15_000
 
-# v1 parity ladder: 3d -> 5d -> 7d -> 14d -> 30d (MAX_HORIZON_MINUTES).
+# The horizon ladder: 3d -> 5d -> 7d -> 14d -> 30d (MAX_HORIZON_MINUTES).
 HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]
 
 

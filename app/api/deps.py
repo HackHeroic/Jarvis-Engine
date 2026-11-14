@@ -1,4 +1,4 @@
-"""Request dependencies shared by the v1 routes.
+"""Request dependencies shared by the /api/v1 routes.
 
 ``CurrentUser`` is the single seam for caller identity. Today it reads a
 required ``user_id`` query parameter; when auth lands, a verified JWT subject

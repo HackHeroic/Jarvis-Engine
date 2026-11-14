@@ -7,7 +7,7 @@ Two callers act on the same drafts and must behave identically:
 * ``app/api/v1/endpoints/drafts.py`` — ``POST /api/v1/drafts/{id}/accept``,
   which the frontend calls from the review UI.
 
-Accepting is the *only* moment v2 writes to ``user_tasks``: the planning
+Accepting is the *only* moment anything writes to ``user_tasks``: the planning
 sub-graph proposes a draft and persists nothing. Accepting is
 ``DraftService.accept``, one atomic write. Both callers hand these functions the
 composition root's ``DraftService`` (and its ``DraftPlanner``, for a draft some of

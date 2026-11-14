@@ -59,8 +59,8 @@ MEMORY_EMBEDDING_DIMENSIONS = 384
 # Postgres still rejects a value that is not a UUID, so both families check the form.
 _MEMORY_UUID_FIELDS = ("source_session_id", "source_message_id", "superseded_by")
 
-# The entity's origin is the legacy user_memories.source column, which the v1 memory
-# path still writes; the new provenance column says whether the user said it.
+# The entity's origin is stored in user_memories.source, a column named before the
+# provenance column (which says whether the user said it) existed.
 _MEMORY_COLUMN_FOR = {"origin": "source"}
 _MEMORY_FIELD_FOR = {column: name for name, column in _MEMORY_COLUMN_FOR.items()}
 
