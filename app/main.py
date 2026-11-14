@@ -154,11 +154,33 @@ async def lifespan(app: FastAPI):
         f"GEMINI_PRIMARY {'on' if _cfg.GEMINI_PRIMARY else 'off'}"
     )
 
+    # Anticipation: one in-process loop runs every subsystem's sweeps, then the
+    # proactive triggers. The first tick comes a full tick after startup.
+    # JARVIS_ANTICIPATION=false keeps it off.
+    from app.services.anticipation.scheduler import AnticipationScheduler
+
+    anticipation_scheduler = AnticipationScheduler(
+        container.anticipation,
+        container.repos.profiles,
+        container.sweeps,
+        tick_s=_cfg.ANTICIPATION_TICK_SECONDS,
+    )
+    app.state.anticipation_scheduler = anticipation_scheduler
+    if _cfg.ANTICIPATION_ENABLED:
+        anticipation_scheduler.start()
+        print(
+            f" ✅ Anticipation scheduler started: a tick every {_cfg.ANTICIPATION_TICK_SECONDS}s"
+        )
+    else:
+        print("    Anticipation scheduler off (JARVIS_ANTICIPATION=false)")
+
     try:
         yield
     finally:
         print("Shutting down Jarvis Reasoning Engine.")
         embedder_warm_up.cancel()  # a no-op once it is done
+        # First: a tick in progress may still be recording model calls.
+        await anticipation_scheduler.stop()
         # Bounded: in-flight usage records get a moment to land, never a hang.
         await container.usage_ledger.shutdown()
         await checkpoint_stack.aclose()

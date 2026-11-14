@@ -196,9 +196,14 @@ class SuggestionRepository(ABC):
 
     @abstractmethod
     async def list(
-        self, user_id: str, *, status: SuggestionStatus | None = None
+        self, user_id: str, *, status: SuggestionStatus | None = None, limit: int = 100
     ) -> list[Suggestion]:
-        """Return the user's suggestions, optionally only those with ``status``."""
+        """Return the user's newest ``limit`` suggestions (only ``status``, if given), newest first.
+
+        A store may cap one read below ``limit`` (PostgREST answers at most 1000 rows
+        and says nothing); the read is newest first, so a cap drops only the oldest.
+        A negative ``limit`` raises ValidationError.
+        """
 
     @abstractmethod
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
@@ -206,13 +211,30 @@ class SuggestionRepository(ABC):
 
     @abstractmethod
     async def set_status(
-        self, user_id: str, suggestion_id: str, to: SuggestionStatus
+        self,
+        user_id: str,
+        suggestion_id: str,
+        to: SuggestionStatus,
+        *,
+        expected: SuggestionStatus | None = None,
     ) -> Suggestion:
-        """Set the suggestion's status and return it; raise NotFoundError if absent."""
+        """Set the status if it is ``expected`` (when given) and return the suggestion.
+
+        A compare-and-set: of two racing calls expecting the same status, one wins.
+        Raises NotFoundError if the user has no such suggestion, and StaleVersionError
+        if its status is no longer ``expected``.
+        """
 
     @abstractmethod
-    async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
-        """Return whether ``trigger`` already produced a suggestion for the user on ``day``."""
+    async def exists_today(
+        self, user_id: str, trigger: str, day: date, *, tz: str = "UTC"
+    ) -> bool:
+        """Return whether ``trigger`` already made the user a suggestion on ``day``.
+
+        ``day`` is a calendar day on the clock of ``tz`` (an IANA zone name), so
+        00:30 in India is the new day there while still yesterday in UTC. An unknown
+        zone raises ValidationError.
+        """
 
 
 class MemoryMatch(BaseModel):

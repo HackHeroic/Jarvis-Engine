@@ -17,6 +17,7 @@ from app.domain import errors
 from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
+    ConsentReasonKind,
     DraftStatus,
     LLMLocation,
     LLMUsageEvent,
@@ -880,6 +881,78 @@ async def test_suggestions__exists_today__true_after_add(repos):
     assert await repos.suggestions.exists_today(U1, "evening_review", day + timedelta(days=1)) is False
     assert await repos.suggestions.exists_today(U1, "morning_brief", day) is False
     assert await repos.suggestions.exists_today(U2, "evening_review", day) is False
+
+
+@pytest.mark.asyncio
+async def test_suggestions__exists_today__ist_half_past_midnight_is_new_local_day(repos):
+    """00:30 on 15 November in India is 19:00 on 14 November in UTC.
+
+    Read on the user's clock it belongs to the 15th, so a brief made then is the
+    15th's, and the 14th's brief (made at 23:30 IST) does not count for the 15th.
+    """
+    ist = "Asia/Kolkata"
+    late_on_14th = datetime(2026, 11, 14, 18, 0, tzinfo=timezone.utc)  # 23:30 IST, 14th
+    await repos.suggestions.add(U1, _suggestion(U1, trigger="morning_brief", created_at=late_on_14th))
+    day_14, day_15 = late_on_14th.date(), late_on_14th.date() + timedelta(days=1)
+
+    assert await repos.suggestions.exists_today(U1, "morning_brief", day_15, tz=ist) is False
+
+    half_past_midnight = datetime(2026, 11, 14, 19, 0, tzinfo=timezone.utc)  # 00:30 IST, 15th
+    await repos.suggestions.add(
+        U1, _suggestion(U1, trigger="morning_brief", created_at=half_past_midnight)
+    )
+
+    assert await repos.suggestions.exists_today(U1, "morning_brief", day_15, tz=ist) is True
+    assert await repos.suggestions.exists_today(U1, "morning_brief", day_14, tz=ist) is True
+    # Both fall on the 14th by the UTC date, and neither on the 15th.
+    assert await repos.suggestions.exists_today(U1, "morning_brief", day_15) is False
+
+
+@pytest.mark.asyncio
+async def test_suggestions__set_status_expected_mismatch__stale_version(repos):
+    stored = await repos.suggestions.add(U1, _suggestion(U1))
+
+    claimed = await repos.suggestions.set_status(
+        U1, stored.id, SuggestionStatus.ACCEPTED, expected=SuggestionStatus.PENDING
+    )
+    with pytest.raises(errors.StaleVersionError):
+        await repos.suggestions.set_status(
+            U1, stored.id, SuggestionStatus.DISMISSED, expected=SuggestionStatus.PENDING
+        )
+    with pytest.raises(errors.NotFoundError):
+        await repos.suggestions.set_status(
+            U2, stored.id, SuggestionStatus.ACCEPTED, expected=SuggestionStatus.PENDING
+        )
+
+    assert claimed.status is SuggestionStatus.ACCEPTED
+    assert (await repos.suggestions.get(U1, stored.id)).status is SuggestionStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_suggestions__consent_kind__round_trips(repos):
+    typed = _suggestion(U1).model_copy(update={"consent_kind": ConsentReasonKind.RULE_MATCH})
+
+    stored = await repos.suggestions.add(U1, typed)
+    untyped = await repos.suggestions.add(U1, _suggestion(U1))
+
+    assert (await repos.suggestions.get(U1, stored.id)).consent_kind is ConsentReasonKind.RULE_MATCH
+    assert (await repos.suggestions.get(U1, untyped.id)).consent_kind is None
+
+
+@pytest.mark.asyncio
+async def test_suggestions__list__limit_and_read_cap__keep_the_newest(repos, fake_client):
+    fake_client.max_rows = 3
+    times = [T0 + timedelta(minutes=m) for m in range(5)]
+    for at in times:
+        await repos.suggestions.add(U1, _suggestion(U1, created_at=at))
+
+    capped = [s.created_at for s in await repos.suggestions.list(U1)]
+    limited = [s.created_at for s in await repos.suggestions.list(U1, limit=2)]
+
+    assert capped == list(reversed(times))[: len(capped)] and len(capped) >= 3
+    assert limited == [times[4], times[3]]
+    with pytest.raises(errors.ValidationError):
+        await repos.suggestions.list(U1, limit=-1)
 
 
 # --- Usage -------------------------------------------------------------------

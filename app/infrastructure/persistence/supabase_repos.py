@@ -66,6 +66,7 @@ from app.infrastructure.persistence._mapping import (
     pattern_key_taken,
     prepare_new,
     prepare_new_memory,
+    suggestion_changed,
     summarize_usage,
     task_from_row,
     task_id_clash,
@@ -435,15 +436,19 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         return _read(Suggestion, rows[0]) if rows else stored
 
     async def list(
-        self, user_id: str, *, status: SuggestionStatus | None = None
+        self, user_id: str, *, status: SuggestionStatus | None = None, limit: int = 100
     ) -> list[Suggestion]:
-        """Return the user's suggestions, newest first."""
+        """Return the user's newest ``limit`` suggestions, newest first.
+
+        Newest first, so PostgREST's silent read cap could only drop the oldest.
+        """
+        check_limit(limit)
 
         def build(q: Any) -> Any:
             q = q.select("*").eq("user_id", user_id)
             if status is not None:
                 q = q.eq("status", SuggestionStatus(status).value)
-            return q.order("created_at", desc=True)
+            return q.order("created_at", desc=True).limit(limit)
 
         return [_read(Suggestion, r) for r in await self._run(build)]
 
@@ -456,22 +461,35 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
         return _read(Suggestion, rows[0]) if rows else None
 
     async def set_status(
-        self, user_id: str, suggestion_id: str, to: SuggestionStatus
+        self,
+        user_id: str,
+        suggestion_id: str,
+        to: SuggestionStatus,
+        *,
+        expected: SuggestionStatus | None = None,
     ) -> Suggestion:
         if not is_uuid(suggestion_id):
             raise not_found("suggestion", suggestion_id)
-        rows = await self._run(
-            lambda q: q.update({"status": SuggestionStatus(to).value})
-            .eq("id", suggestion_id)
-            .eq("user_id", user_id)
-        )
-        if not rows:
-            raise not_found("suggestion", suggestion_id)
-        return _read(Suggestion, rows[0])
 
-    async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
-        """``day`` is a UTC calendar day."""
-        start, end = day_bounds(day)
+        def build(q: Any) -> Any:
+            q = q.update({"status": SuggestionStatus(to).value}).eq("id", suggestion_id).eq(
+                "user_id", user_id
+            )
+            if expected is not None:  # compare-and-set: only a row still in ``expected``
+                q = q.eq("status", SuggestionStatus(expected).value)
+            return q
+
+        rows = await self._run(build)
+        if rows:
+            return _read(Suggestion, rows[0])
+        if expected is None or await self.get(user_id, suggestion_id) is None:
+            raise not_found("suggestion", suggestion_id)
+        raise suggestion_changed(suggestion_id, expected)
+
+    async def exists_today(
+        self, user_id: str, trigger: str, day: date, *, tz: str = "UTC"
+    ) -> bool:
+        start, end = day_bounds(day, tz)
         rows = await self._run(
             lambda q: q.select("id")
             .eq("user_id", user_id)

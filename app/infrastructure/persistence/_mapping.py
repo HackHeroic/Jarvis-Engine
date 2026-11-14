@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, TypeVar
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
@@ -25,6 +26,7 @@ from app.domain.entities import (
     LLMUsageEvent,
     Memory,
     OPEN_DRAFT_STATUSES,  # noqa: F401  (re-exported to the repositories)
+    SuggestionStatus,
     Task,
     TaskStatus,
     UserProfile,
@@ -74,10 +76,20 @@ def iso(dt: datetime) -> str:
     return utc(dt).isoformat()
 
 
-def day_bounds(day: date) -> tuple[datetime, datetime]:
-    """Return the UTC instants [start, end) of ``day``."""
-    start = datetime.combine(day, time(0), tzinfo=timezone.utc)
-    return start, start + timedelta(days=1)
+def day_bounds(day: date, zone: str) -> tuple[datetime, datetime]:
+    """Return the instants [start, end), in UTC, of ``day`` on the clock of ``zone``.
+
+    ``zone`` is an IANA name: ``day_bounds(15 Nov, "Asia/Kolkata")`` starts at 18:30
+    UTC on the 14th. Each bound is local midnight, so a day with a daylight-saving
+    change is 23 or 25 hours long. An unknown zone raises ValidationError.
+    """
+    try:
+        tz = ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise errors.ValidationError("That is not a known timezone.", details={"tz": zone}) from exc
+    start = datetime.combine(day, time(0), tzinfo=tz)
+    end = datetime.combine(day + timedelta(days=1), time(0), tzinfo=tz)
+    return utc(start), utc(end)
 
 
 def is_uuid(value: str) -> bool:
@@ -91,6 +103,14 @@ def is_uuid(value: str) -> bool:
 
 def not_found(what: str, entity_id: str) -> errors.NotFoundError:
     return errors.NotFoundError(f"That {what} does not exist.", details={f"{what}_id": entity_id})
+
+
+def suggestion_changed(suggestion_id: str, expected: SuggestionStatus) -> errors.StaleVersionError:
+    """A compare-and-set on a suggestion's status lost: it is no longer ``expected``."""
+    return errors.StaleVersionError(
+        "That suggestion was already handled, so nothing changed.",
+        details={"suggestion_id": suggestion_id, "expected": SuggestionStatus(expected).value},
+    )
 
 
 def draft_closed(draft_id: str, status: DraftStatus | str | None) -> errors.InvalidStateTransition:
