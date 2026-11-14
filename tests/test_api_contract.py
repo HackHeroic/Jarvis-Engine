@@ -225,6 +225,7 @@ async def test_missing_record__404_not_found_envelope(api, method, path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path"), [
+    ("get", "/api/v1/sessions/"),
     ("get", "/api/v1/sessions/00000000-0000-4000-8000-000000000001"),
     ("get", "/api/v1/sessions/00000000-0000-4000-8000-000000000001/messages"),
     ("delete", "/api/v1/sessions/"),
@@ -239,6 +240,67 @@ async def test_no_database__503_persistence_unavailable_envelope(api, monkeypatc
 
     assert response.status_code == 503
     assert _error(response)["code"] == "persistence_unavailable"
+
+
+class _UnreachableTable:
+    """A table whose every query fails, as on a network blip."""
+
+    def __getattr__(self, _name):
+        def fail(*_args, **_kwargs):
+            raise ConnectionError("[SSL] could not reach db.internal")
+
+        return fail
+
+
+class _Unreachable(FakeSupabase):
+    """A database whose named tables cannot be reached; the rest answer."""
+
+    def __init__(self, *unreachable: str) -> None:
+        super().__init__()
+        self._unreachable = set(unreachable)
+
+    def table(self, name: str):
+        return _UnreachableTable() if name in self._unreachable else super().table(name)
+
+
+_SESSION = "00000000-0000-4000-8000-000000000001"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "unreachable"), [
+    ("/api/v1/sessions/", ("chat_sessions",)),
+    (f"/api/v1/sessions/{_SESSION}/messages", ("chat_messages",)),
+    (f"/api/v1/sessions/{_SESSION}", ("chat_messages",)),
+])
+async def test_sessions_read__database_unreachable__503_envelope_never_an_empty_list(
+    api, monkeypatch, path, unreachable
+):
+    """An outage is a 503, as on every other route: an empty list would tell the user
+    their conversations are gone."""
+    from app.main import app
+
+    supabase = _Unreachable(*unreachable)
+    FakeSupabase.table(supabase, "chat_sessions").insert(  # the session row exists
+        {"id": _SESSION, "user_id": "u1", "title": "DSA"}
+    ).execute()
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(supabase), raising=False)
+
+    response = await api.get(path, params={"user_id": "u1"})
+
+    assert response.status_code == 503
+    assert _error(response)["code"] == "persistence_unavailable"
+    assert "SSL" not in response.text and "db.internal" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_chat_context_window__messages_unreachable__the_turn_goes_on_with_no_history(caplog):
+    """The chat turn reads the same messages: there an outage degrades to no history, logged."""
+    from app.services.chat_history import build_context_messages
+
+    window = await build_context_messages(_SESSION, "u1", supabase=_Unreachable("chat_messages"))
+
+    assert window == []
+    assert "history could not be read" in caplog.text
 
 
 # --- the schedule: infeasible is a scope problem, in the envelope ------------------------

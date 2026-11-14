@@ -2,8 +2,9 @@
 
 The session and message rows have no repository yet (Plan 3 cut Task 6): these routes
 read and write ``chat_sessions`` through the app's Supabase client, a documented
-leftover of the layering test's raw-table allow-list. No database is 503
-``persistence_unavailable``; a session that is not the caller's is 404 ``not_found``.
+leftover of the layering test's raw-table allow-list. No database, or one that cannot
+be reached, is 503 ``persistence_unavailable`` on every route, reads included (an outage
+is never an empty list); a session that is not the caller's is 404 ``not_found``.
 """
 
 import asyncio
@@ -107,9 +108,8 @@ async def _run(call: Any) -> Any:
 async def get_sessions(
     user_id: str, http_request: Request, limit: int = 50
 ) -> SessionListResponse:
-    """List user's chat sessions ordered by most recent (none without a database)."""
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = getattr(db_client, "supabase", None)
+    """List user's chat sessions ordered by most recent."""
+    supabase = require_supabase(http_request)
     sessions = await list_sessions(user_id, limit=limit, supabase=supabase)
     return SessionListResponse(sessions=sessions)
 
