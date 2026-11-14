@@ -19,7 +19,9 @@ from uuid import uuid4
 from app.domain import errors
 from app.domain.entities import (
     BehavioralConstraint,
+    ChatMessage,
     ConsentDecision,
+    ConversationSession,
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
@@ -34,8 +36,10 @@ from app.domain.entities import (
     UserProfile,
 )
 from app.domain.ports import (
+    RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
     ConstraintRepository,
+    ConversationRepository,
     DraftRepository,
     MemoryMatch,
     MemoryRepository,
@@ -52,6 +56,7 @@ from app.infrastructure.persistence._mapping import (
     apply_memory_update,
     apply_profile_update,
     check_limit,
+    checked_summary,
     day_bounds,
     draft_closed,
     embedding_values,
@@ -85,6 +90,9 @@ class InMemoryStore:
     suggestions: list[Suggestion] = field(default_factory=list)
     usage: list[LLMUsageEvent] = field(default_factory=list)
     memories: list[Memory] = field(default_factory=list)
+    # Conversations, as the chat endpoint writes them (no port writes these two).
+    chat_sessions: list[ConversationSession] = field(default_factory=list)
+    chat_messages: list[ChatMessage] = field(default_factory=list)
     # Each memory's embedding, keyed by (user_id, memory id); held apart, as no read returns it.
     memory_embeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     # Serialises draft status changes, as the row lock does in the database.
@@ -606,3 +614,78 @@ class InMemoryUsageRepository(UsageRepository):
             for e in self._store.usage
             if e.user_id == user_id and (since is None or e.created_at >= since)
         )
+
+
+class InMemoryConversationRepository(ConversationRepository):
+    """Reads the store's sessions and messages; writes only the summary columns."""
+
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, session_id: str) -> int | None:
+        return next(
+            (
+                i
+                for i, s in enumerate(self._store.chat_sessions)
+                if s.id == session_id and s.user_id == user_id
+            ),
+            None,
+        )
+
+    async def get_session(self, user_id: str, session_id: str) -> ConversationSession | None:
+        i = self._index(user_id, session_id)
+        return normalized(self._store.chat_sessions[i]) if i is not None else None
+
+    async def previous_session(
+        self, user_id: str, before_session_id: str
+    ) -> ConversationSession | None:
+        others = [
+            m
+            for m in self._store.chat_messages
+            if m.user_id == user_id and m.session_id != before_session_id
+        ]
+        if not others:
+            return None
+        newest = max(others, key=lambda m: (utc(m.created_at), m.id))
+        return await self.get_session(user_id, newest.session_id)
+
+    async def messages(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        after: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ChatMessage]:
+        check_limit(limit)
+        found = [
+            m
+            for m in self._store.chat_messages
+            if m.user_id == user_id
+            and m.session_id == session_id
+            and (after is None or utc(m.created_at) > utc(after))
+        ]
+        newest = sorted(found, key=lambda m: (utc(m.created_at), m.id), reverse=True)[:limit]
+        return [normalized(m) for m in reversed(newest)]
+
+    async def set_summary(
+        self, user_id: str, session_id: str, summary: str, through: datetime
+    ) -> None:
+        summary, through = checked_summary(summary, through)
+        i = self._index(user_id, session_id)
+        if i is None:
+            raise not_found("session", session_id)
+        self._store.chat_sessions[i] = self._store.chat_sessions[i].model_copy(
+            update={"summary": summary, "summary_through": through, "summary_updated_at": now_utc()}
+        )
+
+    async def recent_sessions(
+        self, user_id: str, *, since: datetime
+    ) -> list[ConversationSession]:
+        found = [
+            s
+            for s in self._store.chat_sessions
+            if s.user_id == user_id and utc(s.updated_at) >= utc(since)
+        ]
+        found.sort(key=lambda s: (utc(s.updated_at), s.id), reverse=True)
+        return [normalized(s) for s in found[:RECENT_SESSIONS_LIMIT]]

@@ -44,6 +44,8 @@ VOICE_OF_JARVIS_PROMPT = (
     "the user's own words; '(I noticed, 3 days ago; seen 4 times)' is your reading of "
     "what they did.\n"
     "- <since>: what happened since you last spoke.\n"
+    "- <earlier>: a summary of this conversation's earlier turns, which are no longer "
+    "shown; the conversation you can see follows on from it.\n"
     "- <plate>: tasks still ahead of them, with any due hints.\n"
     "- <documents>: passages from the user's own files that match the message.\n"
     "- <now>: the date and time on the user's clock, for greetings and for words like "

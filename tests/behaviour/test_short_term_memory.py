@@ -119,3 +119,63 @@ async def test_chat__new_conversation__starts_with_no_history_and_no_draft_under
     # "looks good" here is small talk: the other conversation's draft is untouched.
     assert jarvis.draft(planned.draft_id)["status"] == "pending"
     assert jarvis.rows("user_tasks") == []
+
+
+@pytest.mark.asyncio
+async def test_short_term__new_session__model_told_since_we_last_spoke(jarvis, llm, clock):
+    import app.services.chat_history as chat_history
+    import app.services.task_service as task_service
+
+    ist = ZoneInfo("Asia/Kolkata")
+    clock.freeze(datetime(2026, 11, 15, 20, 0, tzinfo=ist), chat_history, task_service)
+    first = await jarvis.say("I'm revising graph algorithms this week")
+    assert first.payload["since_last_spoke"] is None  # a first conversation: nothing to pick up
+    clock.advance(hours=13)  # 09:00 the next morning
+    calls_before = len(llm.calls)
+
+    fresh = await jarvis.say("good morning")  # a new conversation
+
+    since = (
+        'Since we last spoke (yesterday): you were talking about '
+        '"I\'m revising graph algorithms this week".'
+    )
+    (reply,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis"]
+    note = reply.conversation_history[-1]
+    assert note["role"] == "system"
+    assert f"<since>{since}</since>" in note["content"]
+    assert reply.system_prompt.count("<since>") == 1  # the prompt explains the tag, nothing more
+    assert since not in reply.system_prompt
+    assert fresh.payload["since_last_spoke"] == since  # what the model was told
+    assert not any(c.task == "session_summary" for c in llm.calls)  # no model call for it
+
+    calls_before = len(llm.calls)
+    second = await jarvis.say("what should I start with?", session=fresh.conversation_id)
+
+    (reply,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis"]
+    assert "<since>" not in reply.conversation_history[-1]["content"]
+    assert second.payload["since_last_spoke"] is None
+
+
+@pytest.mark.asyncio
+async def test_short_term__window_unreadable__plain_newest_ten_and_the_turn_goes_on(
+    jarvis, llm, monkeypatch
+):
+    first = await jarvis.say("I'm revising graph algorithms today")
+    calls_before = len(llm.calls)
+
+    async def unreadable(*args, **kwargs):  # e.g. the summary columns not migrated yet
+        from app.domain.errors import PersistenceError
+
+        raise PersistenceError("Could not reach the database.")
+
+    monkeypatch.setattr(jarvis.state.container.conversation_memory, "build_history", unreadable)
+    second = await jarvis.say("what was I revising?", session=first.conversation_id)
+
+    (reply,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis"]
+    *turns, note = reply.conversation_history
+    assert turns == [
+        {"role": "user", "content": "I'm revising graph algorithms today"},
+        {"role": "assistant", "content": "Very good, sir."},
+    ]
+    assert "<earlier>" not in note["content"] and "<since>" not in note["content"]
+    assert second.reply == "Very good, sir."

@@ -21,6 +21,8 @@ from pydantic_core import PydanticSerializationError, to_jsonable_python
 from app.domain import errors
 from app.domain.entities import (
     BehavioralConstraint,
+    ChatMessage,
+    ConversationSession,
     DraftSchedule,
     DraftStatus,
     LLMLocation,
@@ -33,6 +35,7 @@ from app.domain.entities import (
     TaskStatus,
     UserProfile,
 )
+from app.domain.ports import SESSION_SUMMARY_MAX_CHARS
 
 M = TypeVar("M", bound=BaseModel)
 
@@ -403,3 +406,29 @@ def constraint_to_row(constraint: BehavioralConstraint) -> dict:
     if row.get("created_at") is None:
         row.pop("created_at", None)
     return row
+
+
+# --- Conversations ------------------------------------------------------------------
+
+# The chat_sessions / chat_messages columns the entities are built from, named in every
+# read so a wide row (metadata, flags) is never fetched for nothing.
+SESSION_COLUMNS = tuple(ConversationSession.model_fields)
+MESSAGE_COLUMNS = tuple(ChatMessage.model_fields)
+
+
+def checked_summary(summary: str, through: datetime) -> tuple[str, datetime]:
+    """``(summary, through)`` as stored; ValidationError for a value the table rejects.
+
+    A summary must have text and fit chat_sessions' CHECK (SESSION_SUMMARY_MAX_CHARS);
+    ``through`` must be an instant (offset-aware), and is held in UTC.
+    """
+    if not summary or not summary.strip():
+        raise errors.ValidationError("A summary needs some text.")
+    if len(summary) > SESSION_SUMMARY_MAX_CHARS:
+        raise errors.ValidationError(
+            f"A summary can be at most {SESSION_SUMMARY_MAX_CHARS} characters.",
+            details={"length": len(summary)},
+        )
+    if through.tzinfo is None:
+        raise errors.ValidationError("A summary's reach must be an instant with a UTC offset.")
+    return summary, utc(through)

@@ -1,8 +1,9 @@
 """The context note: everything about this turn that changes, in one system message.
 
-Memories, "since we last spoke", the plate, the user's documents and the time change
-from turn to turn, so none of them may sit in a system prompt: a byte changed there
-and the provider's prompt cache is never read. They travel as one ``system`` entry
+Memories, "since we last spoke", the summary of this conversation's earlier turns, the
+plate, the user's documents and the time change from turn to turn, so none of them may
+sit in a system prompt: a byte changed there and the provider's prompt cache is never
+read. They travel as one ``system`` entry
 after the history instead (``with_context_note``), which every provider folds into the
 final user turn. The layout, each section left out when it has nothing to say::
 
@@ -13,7 +14,8 @@ final user turn. The layout, each section left out when it has nothing to say::
     Relevant now:
     - (I noticed, 3 days ago; seen 4 times) ...
     </memory>
-    <since>...</since>
+    <since>Since we last spoke (yesterday): ... Since then: 3 done, 1 set aside.</since>
+    <earlier>Earlier in this conversation: ...</earlier>
     <plate>
     - up to 8 pending task titles, with due hints
     </plate>
@@ -24,8 +26,9 @@ final user turn. The layout, each section left out when it has nothing to say::
 
 The clock is always known, so the note always ends with ``<now>``.
 
-Memories, the plate, "since" and documents are text from the user or a third party (a
-document can be anyone's), so ``_data`` turns their angle brackets into look-alikes
+Memories, the plate, "since", "earlier" and documents are text from the user, a model's
+summary of it, or a third party (a document can be anyone's), so ``_data`` turns their
+angle brackets into look-alikes
 (``‹ ›``): no text inside the note can close a section or fake one, and the header
 says that everything inside the tags is data, not instructions.
 """
@@ -78,6 +81,19 @@ def _data(text: str) -> str:
     never open or close a section. The length is unchanged.
     """
     return text.replace("<", "‹").replace(">", "›")
+
+
+def as_data(text: str) -> str:
+    """``text`` with its angle brackets made look-alikes, for any prompt that tags data."""
+    return _data(text)
+
+
+def note_line(text: str | None) -> str:
+    """``text`` as one line of a note section: whitespace collapsed, brackets made safe.
+
+    Exactly what ``render_context_note`` puts inside ``<since>`` and ``<earlier>``.
+    """
+    return _data(" ".join((text or "").split()))
 
 
 def _age(then: datetime, now: datetime) -> str:
@@ -151,22 +167,27 @@ def render_context_note(
     now: datetime,
     zone: ZoneInfo,
     since: str | None = None,
+    earlier: str | None = None,
     plate: list[str] | None = None,
     documents: list[str] | None = None,
 ) -> str | None:
     """The turn's context note, in the layout above; ``now`` is shown on ``zone``'s clock.
 
-    ``plate`` holds task lines (title and due hint), of which the first 8 are shown;
-    ``documents`` holds passages, of which the first 3 are shown, 600 characters each.
-    Every text inside a tag goes through ``_data``. Empty sections are left out. The
-    clock is always known, so today this always returns a note; the result can go
-    straight to ``with_context_note`` either way.
+    ``since`` is "since we last spoke" and ``earlier`` the summary of this conversation's
+    turns no longer shown; each arrives within its own token budget (the caller fits it)
+    and is shown as one line. ``plate`` holds task lines (title and due hint), of which
+    the first 8 are shown; ``documents`` holds passages, of which the first 3 are shown,
+    600 characters each. Every text inside a tag goes through ``_data``. Empty sections
+    are left out. The clock is always known, so today this always returns a note; the
+    result can go straight to ``with_context_note`` either way.
     """
-    since_text = _data(" ".join((since or "").split()))
+    since_text = note_line(since)
+    earlier_text = note_line(earlier)
     sections = [
         _HEADER,
         _memory_section(recall, now),
         f"<since>{since_text}</since>" if since_text else None,
+        f"<earlier>{earlier_text}</earlier>" if earlier_text else None,
         _plate_section(plate),
         _documents_section(documents),
         _now_section(now, zone),

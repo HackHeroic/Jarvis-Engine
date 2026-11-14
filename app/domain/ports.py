@@ -19,7 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.entities import (
     BehavioralConstraint,
+    ChatMessage,
     ConsentDecision,
+    ConversationSession,
     DraftSchedule,
     DraftStatus,
     FocusProfile,
@@ -41,6 +43,11 @@ from app.domain.entities import (
 # The most tasks one read by status returns: the newest, so a bound (or PostgREST's
 # 1000-row cap) only ever leaves out the oldest.
 TASK_LIST_LIMIT = 500
+# The most sessions one ``ConversationRepository.recent_sessions`` read returns: the
+# most recently active, so the bound only ever leaves out the oldest.
+RECENT_SESSIONS_LIMIT = 100
+# The longest summary a conversation may store (chat_sessions' CHECK).
+SESSION_SUMMARY_MAX_CHARS = 4000
 
 
 class TaskRepository(ABC):
@@ -348,6 +355,64 @@ class MemoryRepository(ABC):
         unknown field (``id`` and ``user_id`` included), a value the memory rejects or
         a reference that is not a UUID, and ConflictError if a new pattern_key is
         already the user's.
+        """
+
+
+class ConversationRepository(ABC):
+    """The user's conversations: read, plus the running summary of each.
+
+    Sessions and messages are written by the chat endpoint; this port only reads them
+    and writes the three summary columns. Session and message ids are UUID strings: an
+    id that is not one matches nothing.
+    """
+
+    @abstractmethod
+    async def get_session(self, user_id: str, session_id: str) -> ConversationSession | None:
+        """Return the user's session with this id, or None."""
+
+    @abstractmethod
+    async def previous_session(
+        self, user_id: str, before_session_id: str
+    ) -> ConversationSession | None:
+        """Return the user's other session with the newest message, or None.
+
+        Any session but ``before_session_id`` counts, if it has at least one message;
+        "newest" is by its latest message.
+        """
+
+    @abstractmethod
+    async def messages(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        after: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ChatMessage]:
+        """Return the session's newest ``limit`` messages created after ``after``, oldest first.
+
+        The read is newest first, so a bound (or PostgREST's 1000-row cap) only ever
+        leaves out the oldest. A negative ``limit`` raises ValidationError.
+        """
+
+    @abstractmethod
+    async def set_summary(
+        self, user_id: str, session_id: str, summary: str, through: datetime
+    ) -> None:
+        """Store the session's summary, the last message it covers, and when it was written.
+
+        The session's ``updated_at`` (its last activity) does not change. Raises
+        ValidationError for a blank summary, one over SESSION_SUMMARY_MAX_CHARS, or a
+        naive ``through``; NotFoundError if the user has no such session.
+        """
+
+    @abstractmethod
+    async def recent_sessions(
+        self, user_id: str, *, since: datetime
+    ) -> list[ConversationSession]:
+        """Return the user's sessions active at or after ``since``, most recent first.
+
+        At most RECENT_SESSIONS_LIMIT of them: the most recently active.
         """
 
 

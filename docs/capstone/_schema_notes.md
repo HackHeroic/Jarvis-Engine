@@ -5,7 +5,7 @@ These notes cover the two migrations that complete the Supabase schema:
 - `supabase/migrations/20260101000000_baseline_legacy_tables.sql`
 - `supabase/migrations/20261114000001_capstone_lld.sql`
 
-Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own section below ("Plan 2: Skip writes `skipped`"), and so does its memory change, `20261115000002_memory_lifecycle_and_vectors.sql` ("Plan 2: Memory lifecycle and vectors").
+Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own section below ("Plan 2: Skip writes `skipped`"), and so do its memory change, `20261115000002_memory_lifecycle_and_vectors.sql` ("Plan 2: Memory lifecycle and vectors"), and its conversation summaries, `20261115000003_session_summaries.sql` ("Plan 2: Session summaries").
 
 They record why each choice was made. They are also the source for the ER diagram: every key, relationship and constraint below was checked by introspecting a database built from `supabase/migrations/` alone (PostgreSQL 18, local).
 
@@ -74,13 +74,14 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `proactive_suggestions` | `Suggestion` | `SupabaseSuggestionRepository` |
 | `llm_usage_events` | `LLMUsageEvent` | `SupabaseUsageRepository` |
 | `user_memories` | `Memory` | `SupabaseMemoryRepository`; the v1 memory store and PEARL (until plan 2 moves them) |
+| `chat_sessions` | `ConversationSession` | `chat_history` (sessions, titles, activity); `SupabaseConversationRepository.set_summary` (the summary columns only) |
+| `chat_messages` | `ChatMessage` | `chat_history` (read by `SupabaseConversationRepository`) |
 
 `Pattern` is computed and never stored. The other user tables have no domain entity yet:
 
 | Table | Written by |
 |---|---|
 | `habit_trackers` | SM-2 (`sm2_engine`) |
-| `chat_sessions`, `chat_messages` | `chat_history` |
 | `task_materials` | `task_material_linker` |
 | `ingested_documents` | ingestion orchestrator |
 | `pending_calendar_updates` | calendar extraction |
@@ -257,6 +258,28 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 
 **Fake vs SQL.** `FakeSupabase` mirrors `match_memories` with cosine similarity over the stored lists and the same filters. It also enforces `user_memories_pkey` and the unique `(user_id, pattern_key)` index on `insert` and `update`, in that order, raising the database's messages. The repositories validate embeddings before either store sees them.
 
+## Plan 2: Session summaries
+
+`supabase/migrations/20261115000003_session_summaries.sql` gives each conversation a running summary of its older turns, read and written through `ConversationRepository` (`SupabaseConversationRepository` / `InMemoryConversationRepository`, one contract suite). The repository reads `chat_sessions` and `chat_messages` (which `app/services/chat_history.py` still writes) and writes only the three summary columns. Entities: `ConversationSession`, `ChatMessage`.
+
+**Apply note.** Apply it with the code that reads it: `SupabaseConversationRepository` names the summary columns in every session read, so until it is applied each of those reads fails. The chat turn then falls back to the plain newest-ten window, with no summary and no "since we last spoke", and logs a warning each turn. The migration never wipes or rewrites a row.
+
+| Column | Type | Entity field |
+|---|---|---|
+| `summary` | `text`, CHECK `summary is null or char_length(summary) <= 4000` | `summary` |
+| `summary_through` | `timestamptz`; CHECK `(summary is null) = (summary_through is null)` | `summary_through` |
+| `summary_updated_at` | `timestamptz` | `summary_updated_at` |
+
+- `summary` is the model's paragraph, then one `- ` line per open thread (at most 1200 + 5 x 200 characters, well under the CHECK).
+- `summary_through` is the `created_at` of the last message the summary covers. The history window starts after it, so a summary that lags only makes the window longer.
+- **`updated_at` stays the conversation's last activity.** The capstone's `set_updated_at()` stamped `now()` on every update, so a summary write would have read as activity: the idle summary's 30 minutes would restart, and "since we last spoke" would count from the write instead of the last message. `chat_sessions` now fires `set_chat_session_updated_at()` instead (same trigger name, `create or replace trigger`). It keeps `old.updated_at` when the update changes the summary columns and nothing else (compared as `to_jsonb(row)` minus those columns and `updated_at`); every other update, including the message-save bump that sets only `updated_at`, still stamps `now()`.
+- RLS and `owner_all` on `chat_sessions` come from the capstone; the file restates them idempotently.
+- No new index: the reads use `idx_chat_sessions_user_id (user_id, updated_at desc)`, `idx_chat_messages_session (session_id, created_at)` and `idx_chat_messages_user (user_id, created_at desc)`. Every read is bounded and newest first (PostgREST's 1000-row cap can only drop the oldest).
+
+**Checked against PostgreSQL 18 (local, throwaway database).** The whole set, then the whole set again, applies cleanly. A summary-only update left `updated_at` unchanged; an update setting only `updated_at` (a new message) and one moving it back both ended at `now()`; a 4001-character summary and a summary cleared without `summary_through` were rejected by their CHECKs; the trigger on `chat_sessions` is `set_chat_session_updated_at`, and RLS is on.
+
+**Fake vs SQL.** `FakeSupabase` has no triggers, so `updated_at` simply stays as written; the repositories never send it with a summary.
+
 ## Triggers
 
 | Function | Fires | Purpose |
@@ -264,9 +287,10 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 | `ensure_user_profile()` | `BEFORE INSERT` on the 18 tables that reference `user_profiles` | `insert into user_profiles(user_id) … on conflict do nothing`. The first row a user writes anywhere creates their profile, so the FKs hold without every legacy insert path creating a profile first. A NULL `user_id` (allowed only on `llm_usage_events`) is skipped. |
 | `ensure_goal()` | `BEFORE INSERT` on `user_tasks`, `draft_schedules`, `user_plan_updates` | When `goal_id` is set, inserts `(user_id, goal_id, title = goal_id)` into `goals`, `on conflict do nothing`. `goals` has its own `ensure_user_profile` trigger, so the firing order on one table does not matter. The brief named the first two tables; `user_plan_updates` also carries a `goal_id` (read from `user_tasks`) and gets the same FK, so it gets the same trigger. |
 | `ensure_ingested_document()` | `BEFORE INSERT` on `task_materials` | The ingestion orchestrator links a document to tasks *before* it upserts the `ingested_documents` row. Without this trigger, `task_materials_document_fkey` would reject every link, and the linker swallows errors, so linking would fail silently. The trigger inserts the `(user_id, source_id)` row; the pipeline's later upsert on `(user_id, source_id)` fills in file name, topics, chunk count and `s3_key`. |
-| `set_updated_at()` | `BEFORE UPDATE` on the tables that already had `updated_at`: `user_profiles`, `user_preferences`, `user_memories`, `habit_trackers`, `chat_sessions` | Keeps `updated_at` current. On `chat_sessions` this means renaming, pinning or archiving a session now also bumps `updated_at`, and the session list is ordered by it. |
+| `set_updated_at()` | `BEFORE UPDATE` on the tables that already had `updated_at`: `user_profiles`, `user_preferences`, `user_memories`, `habit_trackers` (and `chat_sessions` until plan 2) | Keeps `updated_at` current. |
+| `set_chat_session_updated_at()` | `BEFORE UPDATE` on `chat_sessions` (plan 2, `20261115000003`) | As `set_updated_at()`, except that an update changing only the summary columns keeps `updated_at`: a summary is not activity. Renaming, pinning or archiving a session still bumps `updated_at`, and the session list is ordered by it. |
 
-All four functions are `SECURITY INVOKER` with `search_path = public`. When a signed-in user inserts their own rows under RLS, the profile and goal inserts pass the same `owner_all` check.
+All five functions are `SECURITY INVOKER` with `search_path = public`. When a signed-in user inserts their own rows under RLS, the profile and goal inserts pass the same `owner_all` check.
 
 ## Row-level security
 

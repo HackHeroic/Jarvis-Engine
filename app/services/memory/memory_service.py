@@ -61,6 +61,8 @@ _PROFILE_TYPES = ("constraint", "preference", "goal")
 _PROFILE_MIN_CONFIDENCE = 0.6
 # How many of the nearest memories recall considers for the message.
 _RECALL_CANDIDATES = 12
+# How many drop_suppressed answers are kept (oldest dropped first).
+_KEPT_CACHE_SIZE = 256
 
 
 class MemoryCandidate(BaseModel):
@@ -148,6 +150,8 @@ class MemoryService:
         self._memories = memories
         self._embedder = embedder
         self._clock = clock
+        # drop_suppressed's answers: (user, texts, let-go ids, threshold) -> texts kept.
+        self._kept: dict[tuple, tuple[str, ...]] = {}
 
     async def remember(
         self,
@@ -374,6 +378,55 @@ class MemoryService:
             [match.memory for match in candidates], now, config.MEMORY_RECALL_TOKENS
         )
         return Recall(profile=profile, relevant=relevant, tokens=profile_tokens + relevant_tokens)
+
+    async def drop_suppressed(
+        self,
+        user_id: str,
+        texts: list[str],
+        *,
+        min_similarity: float = config.SUMMARY_SUPPRESS_SIMILARITY,
+    ) -> list[str]:
+        """``texts``, in order, less each one close to a memory the user forgot or dismissed.
+
+        For text Jarvis wrote from the user's words (a conversation summary), so it never
+        brings back a fact the user let go of. Close means at least ``min_similarity`` to
+        the memory's embedding, which a forgotten memory keeps after losing its words.
+        One read when the user has let nothing go, and nothing is embedded then. The
+        answer is kept for the same texts and the same set of let-go memories (their
+        embeddings never change), so a summary shown on every turn is checked once.
+
+        Raises EmbeddingUnavailableError when there is something to check against and
+        the embedder is down: the caller must not show the texts unchecked.
+        """
+        texts = list(texts)
+        if not texts:
+            return []
+        let_go = await self._memories.list(user_id, statuses=SUPPRESSING_STATUSES)
+        if not let_go:
+            return texts
+        key = (user_id, tuple(texts), frozenset(m.id for m in let_go), min_similarity)
+        if key in self._kept:
+            return list(self._kept[key])
+        worded = [text for text in texts if _has_words(text)]
+        vectors = await asyncio.to_thread(self._embedder.embed, worded) if worded else []
+        hits = await asyncio.gather(
+            *(
+                self._memories.nearest(
+                    user_id,
+                    vector,
+                    statuses=SUPPRESSING_STATUSES,
+                    limit=1,
+                    min_similarity=min_similarity,
+                )
+                for vector in vectors
+            )
+        )
+        dropped = {text for text, hit in zip(worded, hits, strict=True) if hit}
+        kept = tuple(text for text in texts if text not in dropped)
+        if len(self._kept) >= _KEPT_CACHE_SIZE:
+            self._kept.pop(next(iter(self._kept)))
+        self._kept[key] = kept
+        return list(kept)
 
     async def fade_stale(self, user_id: str, now: datetime) -> int:
         """Persist each active memory's decay as of ``now``; return how many faded.

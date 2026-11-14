@@ -19,7 +19,9 @@ from pydantic import ValidationError as PydanticValidationError
 from app.domain import errors
 from app.domain.entities import (
     BehavioralConstraint,
+    ChatMessage,
     ConsentDecision,
+    ConversationSession,
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
@@ -34,8 +36,10 @@ from app.domain.entities import (
     UserProfile,
 )
 from app.domain.ports import (
+    RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
     ConstraintRepository,
+    ConversationRepository,
     DraftRepository,
     MemoryMatch,
     MemoryRepository,
@@ -48,11 +52,14 @@ from app.domain.ports import (
 from app.infrastructure.persistence._mapping import (
     EMBEDDING,
     MEMORY_COLUMNS,
+    MESSAGE_COLUMNS,
     OPEN_DRAFT_STATUSES,
+    SESSION_COLUMNS,
     accepted_task_rows,
     apply_memory_update,
     apply_profile_update,
     check_limit,
+    checked_summary,
     constraint_to_row,
     day_bounds,
     draft_closed,
@@ -89,6 +96,8 @@ _UNREADABLE = "Stored data is not readable."
 _PATTERN_KEY_INDEX = "idx_user_memories_user_pattern_key"
 _MEMORY_PRIMARY_KEY = "user_memories_pkey"
 _MEMORY_SELECT = ", ".join(MEMORY_COLUMNS)
+_SESSION_SELECT = ", ".join(SESSION_COLUMNS)
+_MESSAGE_SELECT = ", ".join(MESSAGE_COLUMNS)
 # A lost compare-and-set on a draft's status is retried against the status that won.
 _STATUS_CAS_ATTEMPTS = 3
 
@@ -134,12 +143,11 @@ class _SupabaseRepository:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    async def _run(self, build: Callable[[Any], Any]) -> list[dict]:
-        """Execute ``build(client.table(self.table))`` on a worker thread; return its rows."""
+    async def _run(self, build: Callable[[Any], Any], *, table: str | None = None) -> list[dict]:
+        """Execute ``build`` on ``table`` (default: this repository's) off the loop; its rows."""
+        name = table or self.table
         try:
-            result = await asyncio.to_thread(
-                lambda: build(self._client.table(self.table)).execute()
-            )
+            result = await asyncio.to_thread(lambda: build(self._client.table(name)).execute())
         except Exception as exc:  # any transport or PostgREST failure
             raise errors.PersistenceError(_UNREACHABLE) from exc
         return result.data or []
@@ -715,3 +723,86 @@ class SupabaseUsageRepository(_SupabaseRepository, UsageRepository):
             if len(batch) < USAGE_PAGE_ROWS:
                 return summarize_usage_rows(rows)
         return summarize_usage_rows(rows, truncated=True)
+
+
+class SupabaseConversationRepository(_SupabaseRepository, ConversationRepository):
+    """Reads chat_sessions and chat_messages, naming their columns; writes only the
+    summary columns of chat_sessions (its trigger leaves updated_at alone for that)."""
+
+    table = "chat_sessions"
+    _MESSAGES = "chat_messages"
+
+    async def get_session(self, user_id: str, session_id: str) -> ConversationSession | None:
+        if not is_uuid(session_id):
+            return None
+        rows = await self._run(
+            lambda q: q.select(_SESSION_SELECT).eq("id", session_id).eq("user_id", user_id).limit(1)
+        )
+        return _read(ConversationSession, rows[0]) if rows else None
+
+    async def previous_session(
+        self, user_id: str, before_session_id: str
+    ) -> ConversationSession | None:
+        """Two reads: the session of the user's newest message elsewhere, then that session."""
+
+        def build(q: Any) -> Any:
+            q = q.select("session_id").eq("user_id", user_id)
+            if is_uuid(before_session_id):  # any other id matches no session anyway
+                q = q.neq("session_id", before_session_id)
+            return q.order("created_at", desc=True).order("id", desc=True).limit(1)
+
+        rows = await self._run(build, table=self._MESSAGES)
+        return await self.get_session(user_id, str(rows[0]["session_id"])) if rows else None
+
+    async def messages(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        after: datetime | None = None,
+        limit: int = 50,
+    ) -> list[ChatMessage]:
+        """Newest first, so PostgREST's silent read cap could only drop the oldest."""
+        check_limit(limit)
+        if not is_uuid(session_id):
+            return []
+
+        def build(q: Any) -> Any:
+            q = q.select(_MESSAGE_SELECT).eq("session_id", session_id).eq("user_id", user_id)
+            if after is not None:
+                q = q.gt("created_at", iso(after))
+            return q.order("created_at", desc=True).order("id", desc=True).limit(limit)
+
+        rows = await self._run(build, table=self._MESSAGES)
+        return [_read(ChatMessage, row) for row in reversed(rows)]
+
+    async def set_summary(
+        self, user_id: str, session_id: str, summary: str, through: datetime
+    ) -> None:
+        summary, through = checked_summary(summary, through)
+        if not is_uuid(session_id):
+            raise not_found("session", session_id)
+        payload = {
+            "summary": summary,
+            "summary_through": through.isoformat(),
+            "summary_updated_at": iso(now_utc()),
+        }
+        rows = await self._run(
+            lambda q: q.update(payload).eq("id", session_id).eq("user_id", user_id)
+        )
+        if not rows:
+            raise not_found("session", session_id)
+
+    async def recent_sessions(
+        self, user_id: str, *, since: datetime
+    ) -> list[ConversationSession]:
+        """Most recently active first, at most RECENT_SESSIONS_LIMIT."""
+        rows = await self._run(
+            lambda q: q.select(_SESSION_SELECT)
+            .eq("user_id", user_id)
+            .gte("updated_at", iso(since))
+            .order("updated_at", desc=True)
+            .order("id", desc=True)
+            .limit(RECENT_SESSIONS_LIMIT)
+        )
+        return [_read(ConversationSession, row) for row in rows]

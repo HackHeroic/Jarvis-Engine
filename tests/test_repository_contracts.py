@@ -8,7 +8,9 @@ caller holding a ``TaskRepository`` cannot tell which family it was given.
 
 import asyncio
 from datetime import datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError as PydanticValidationError
@@ -17,7 +19,9 @@ from app.domain import errors
 from app.domain.entities import (
     AutonomyMode,
     BehavioralConstraint,
+    ChatMessage,
     ConsentDecision,
+    ConversationSession,
     ConsentReasonKind,
     DraftStatus,
     LLMLocation,
@@ -1438,6 +1442,123 @@ async def test_memories__guarded_update__forgotten_after_the_read__stale_and_kep
     assert (row["status"], row["content"], row["confidence"]) == ("forgotten", "", 0.5)
 
 
+# --- Conversations (chat_sessions / chat_messages: read, plus the summary) -----
+
+
+@pytest.fixture
+def seed_chat(memory_store, fake_client):
+    """Write a session, or messages, into whichever store backs ``repos``.
+
+    No port writes sessions or messages (``chat_history`` does, outside the domain),
+    so, like ``expire_draft``, this reaches behind the ports and writes both stores.
+    """
+
+    def _session(user_id: str, *, updated_at: datetime = T0, title: str | None = None) -> str:
+        session = ConversationSession(
+            id=str(uuid4()), user_id=user_id, title=title,
+            created_at=T0 - timedelta(days=1), updated_at=updated_at,
+        )
+        memory_store.chat_sessions.append(session)
+        fake_client.rows.setdefault("chat_sessions", []).append(
+            {**session.model_dump(mode="json"), "is_archived": False, "metadata": {}}
+        )
+        return session.id
+
+    def _message(user_id: str, session_id: str, at: datetime, role: str = "user") -> ChatMessage:
+        message = ChatMessage(
+            id=str(uuid4()), session_id=session_id, user_id=user_id, role=role,
+            content=f"said at {at:%H:%M}", created_at=at,
+        )
+        memory_store.chat_messages.append(message)
+        fake_client.rows.setdefault("chat_messages", []).append(
+            {**message.model_dump(mode="json"), "intent": None, "metadata": {}}
+        )
+        return message
+
+    return SimpleNamespace(session=_session, message=_message)
+
+
+@pytest.mark.asyncio
+async def test_conversations__previous_session__newest_other_with_messages(repos, seed_chat):
+    older = seed_chat.session(U1, updated_at=T0 - timedelta(days=2))
+    seed_chat.message(U1, older, T0 - timedelta(days=2))
+    newest = seed_chat.session(U1, updated_at=T0 - timedelta(hours=3))
+    seed_chat.message(U1, newest, T0 - timedelta(hours=3))
+    seed_chat.session(U1, updated_at=T0 - timedelta(hours=1))  # newer, but no message
+    other = seed_chat.session(U2, updated_at=T0)
+    seed_chat.message(U2, other, T0)
+    current = seed_chat.session(U1, updated_at=T0)
+    seed_chat.message(U1, current, T0)
+
+    previous = await repos.conversations.previous_session(U1, current)
+
+    assert previous is not None and previous.id == newest
+    assert (await repos.conversations.previous_session(U1, newest)).id == current
+    assert await repos.conversations.previous_session(U2, other) is None
+
+
+@pytest.mark.asyncio
+async def test_conversations__other_user__invisible(repos, seed_chat):
+    theirs = seed_chat.session(U2, title="Their plans")
+    seed_chat.message(U2, theirs, T0)
+
+    assert await repos.conversations.get_session(U1, theirs) is None
+    assert await repos.conversations.messages(U1, theirs) == []
+    assert await repos.conversations.recent_sessions(U1, since=T0 - timedelta(days=7)) == []
+    assert await repos.conversations.previous_session(U1, str(uuid4())) is None
+    with pytest.raises(errors.NotFoundError):
+        await repos.conversations.set_summary(U1, theirs, "Mine now.", T0)
+    assert (await repos.conversations.get_session(U2, theirs)).summary is None
+
+
+@pytest.mark.asyncio
+async def test_conversations__set_summary__roundtrip(repos, seed_chat):
+    session_id = seed_chat.session(U1, updated_at=T0, title="Plan my week.")
+    ist_instant = datetime(2026, 11, 14, 14, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+    summary = "You planned the week.\n- Gym?"
+    await repos.conversations.set_summary(U1, session_id, summary, ist_instant)
+
+    session = await repos.conversations.get_session(U1, session_id)
+    assert session.summary == summary
+    assert session.summary_through == ist_instant  # the same instant, held in UTC
+    assert session.summary_through.tzinfo is not None
+    assert session.summary_updated_at is not None
+    # The summary is not activity: the session's last activity is unchanged.
+    assert (session.title, session.updated_at) == ("Plan my week.", T0)
+    for bad in ("   ", "x" * 4001):
+        with pytest.raises(errors.ValidationError):
+            await repos.conversations.set_summary(U1, session_id, bad, T0)
+    assert (await repos.conversations.get_session(U1, session_id)).summary.startswith("You planned")
+
+
+@pytest.mark.asyncio
+async def test_conversations__messages__newest_limit_after_through_oldest_first(repos, seed_chat):
+    session_id = seed_chat.session(U1)
+    sent = [seed_chat.message(U1, session_id, T0 + timedelta(minutes=m)) for m in range(6)]
+
+    newest_three = await repos.conversations.messages(U1, session_id, limit=3)
+    after_second = await repos.conversations.messages(U1, session_id, after=sent[1].created_at)
+
+    assert [m.id for m in newest_three] == [m.id for m in sent[3:]]
+    assert [m.id for m in after_second] == [m.id for m in sent[2:]]
+    assert await repos.conversations.messages(U1, "not-a-uuid") == []
+    with pytest.raises(errors.ValidationError):
+        await repos.conversations.messages(U1, session_id, limit=-1)
+
+
+@pytest.mark.asyncio
+async def test_conversations__recent_sessions__since_newest_first(repos, seed_chat):
+    old = seed_chat.session(U1, updated_at=T0 - timedelta(days=9))
+    mid = seed_chat.session(U1, updated_at=T0 - timedelta(days=2))
+    new = seed_chat.session(U1, updated_at=T0 - timedelta(hours=1))
+
+    recent = await repos.conversations.recent_sessions(U1, since=T0 - timedelta(days=7))
+
+    assert [s.id for s in recent] == [new, mid]
+    assert old not in {s.id for s in recent}
+
+
 # --- Supabase family only: transport failures ---------------------------------
 
 
@@ -1464,6 +1585,8 @@ class _UnreachableClient:
         lambda r: r.usage.record(_usage(U1, LLMLocation.LOCAL, 1, 1)),
         lambda r: r.memories.list(U1),
         lambda r: r.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE),
+        lambda r: r.conversations.messages(U1, str(uuid4())),
+        lambda r: r.conversations.set_summary(U1, str(uuid4()), "Summary.", T0),
     ],
 )
 async def test_supabase_repos__transport_error__raises_persistence_error_chained(call):

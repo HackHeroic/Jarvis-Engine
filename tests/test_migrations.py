@@ -30,6 +30,7 @@ CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
 SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
 ACCEPT_DRAFT_RESLOTS = MIGRATIONS / "20261115000001_accept_draft_reslots_missed.sql"
 MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
+SESSION_SUMMARIES = MIGRATIONS / "20261115000003_session_summaries.sql"
 SUGGESTION_CONSENT_KIND = MIGRATIONS / "20261115000004_suggestion_consent_kind.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
@@ -510,3 +511,56 @@ def test_migrations__consent_kind__column_and_check_match_the_enum():
     assert _check_values(sql, "proactive_suggestions_consent_kind_check") == {
         k.value for k in ConsentReasonKind
     }
+
+
+# --- Session summaries (20261115000003) ---------------------------------------------
+
+
+def test_migrations__session_summaries__columns_and_check():
+    sql = _sql(SESSION_SUMMARIES)
+
+    for column, kind in (
+        ("summary", "text"),
+        ("summary_through", "timestamptz"),
+        ("summary_updated_at", "timestamptz"),
+    ):
+        assert re.search(
+            rf"alter table {_TABLE}chat_sessions\s+add column if not exists {column} {kind}\b",
+            sql,
+        ), column
+    check = re.search(
+        r"add constraint chat_sessions_summary_length_check\s+"
+        r"check \(summary is null or char_length\(summary\) <= 4000\)",
+        sql,
+    )
+    assert check, "summary length CHECK"
+    # A summary always says how far it reaches, and only then.
+    assert re.search(
+        r"add constraint chat_sessions_summary_through_check\s+"
+        r"check \(\(summary is null\) = \(summary_through is null\)\)",
+        sql,
+    )
+    # Writing the summary is not activity: the trigger keeps updated_at for a write that
+    # changes only the summary columns, so idle detection and "since then" stay true.
+    trigger = re.search(
+        rf"create or replace trigger set_updated_at before update on {_TABLE}chat_sessions\s+"
+        rf"for each row execute function {_TABLE}set_chat_session_updated_at\(\)",
+        sql,
+    )
+    assert trigger
+    body = re.search(r"function (?:public\.)?set_chat_session_updated_at\(\).*?\$\$;", sql, re.S)
+    assert body and "old.updated_at" in body.group(0) and "now()" in body.group(0)
+    for column in ("summary", "summary_through", "summary_updated_at", "updated_at"):
+        assert f"'{column}'" in body.group(0), column
+    # Owner-only, restated so the file stands alone.
+    assert re.search(rf"alter table {_TABLE}chat_sessions\s+enable row level security", sql)
+    assert re.search(rf"create policy owner_all\s+on {_TABLE}chat_sessions\s", sql)
+
+
+def test_migrations__session_summaries__columns_match_the_entity():
+    from app.domain.entities import ConversationSession
+    from app.infrastructure.persistence._mapping import SESSION_COLUMNS
+
+    added = set(re.findall(r"add column if not exists (\w+)", _sql(SESSION_SUMMARIES)))
+    assert set(SESSION_COLUMNS) == set(ConversationSession.model_fields)
+    assert {"summary", "summary_through", "summary_updated_at"} == added

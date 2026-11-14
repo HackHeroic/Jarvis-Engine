@@ -111,6 +111,45 @@ def _wall_clock(slot: Any, horizon: datetime) -> tuple[str, str] | None:
     )
 
 
+def draft_slots(
+    tasks: list, schedule: dict | None, horizon_start: str | None
+) -> dict[str, dict] | None:
+    """A draft's solved slots, task_id -> {task_id, title, start_min, end_min, start, end,
+    duration_minutes}, in task order; None when the draft has no usable horizon or slots.
+
+    ``start``/``end`` are ``horizon_start + minutes``, on the horizon's own offset (08:00
+    in the user's zone), exactly the instants accepting the draft writes. A task the
+    solver did not place has no slot.
+    """
+    if not schedule or not horizon_start:
+        return None
+    try:
+        horizon = datetime.fromisoformat(horizon_start)
+    except (TypeError, ValueError):
+        return None
+    if horizon.tzinfo is None:
+        horizon = horizon.replace(tzinfo=timezone.utc)
+    slots: dict[str, dict] = {}
+    for index, task in enumerate(tasks):
+        task_id = _from_dict(task, "task_id") or f"t{index}"
+        wall = _wall_clock(schedule.get(task_id), horizon)
+        if wall is None:
+            continue
+        slot = schedule[task_id]
+        start_min = int(_minutes(slot, "start_min", "start"))
+        end_min = int(_minutes(slot, "end_min", "end"))
+        slots[task_id] = {
+            "task_id": task_id,
+            "title": _from_dict(task, "title"),
+            "start_min": start_min,
+            "end_min": end_min,
+            "start": wall[0],
+            "end": wall[1],
+            "duration_minutes": end_min - start_min,
+        }
+    return slots or None
+
+
 def build_task_rows(
     user_id: str, chunks: list, *, schedule: dict | None, horizon_start: str | None
 ) -> tuple[str, list[dict]]:

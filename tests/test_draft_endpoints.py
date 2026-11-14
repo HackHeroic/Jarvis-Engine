@@ -87,6 +87,48 @@ def test_get_draft(client):
     assert body["horizon_start"] == HORIZON
 
 
+def test_get_draft__solved_draft__schedule_slots_with_local_times(client):
+    store = client.app.state.draft_store
+    draft = store.create_draft(
+        user_id="test_user",
+        tasks=[
+            {"task_id": "t1", "title": "Read ch1", "duration_minutes": 25},
+            {"task_id": "t2", "title": "Practice problems", "duration_minutes": 20},
+            {"task_id": "t3", "title": "Not placed", "duration_minutes": 25},
+        ],
+        horizon_start="2026-11-16T08:00:00+05:30",
+        schedule={"t1": {"start_min": 60, "end_min": 85}, "t2": {"start_min": 0, "end_min": 20}},
+    )
+
+    body = client.get(f"/api/v1/drafts/{draft['id']}?user_id=test_user").json()
+
+    # The chat complete payload's shape (horizon_start + task_id -> minutes), plus the
+    # wall-clock start and end on the user's clock and each slot's length.
+    assert body["schedule"] == {
+        "horizon_start": "2026-11-16T08:00:00+05:30",
+        "schedule": {
+            "t1": {
+                "task_id": "t1", "title": "Read ch1", "start_min": 60, "end_min": 85,
+                "start": "2026-11-16T09:00:00+05:30", "end": "2026-11-16T09:25:00+05:30",
+                "duration_minutes": 25,
+            },
+            "t2": {
+                "task_id": "t2", "title": "Practice problems", "start_min": 0, "end_min": 20,
+                "start": "2026-11-16T08:00:00+05:30", "end": "2026-11-16T08:20:00+05:30",
+                "duration_minutes": 20,
+            },
+        },
+    }
+
+
+def test_get_draft__no_solved_slots__schedule_null(client):
+    draft_id = client.app.state._test_draft_id
+
+    body = client.get(f"/api/v1/drafts/{draft_id}?user_id=test_user").json()
+
+    assert body["schedule"] is None
+
+
 def test_get_draft_wrong_user(client):
     """A non-owner must never read the draft."""
     draft_id = client.app.state._test_draft_id
