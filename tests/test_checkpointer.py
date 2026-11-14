@@ -22,7 +22,7 @@ from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtur
     jarvis,
     llm,
 )
-from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, make_jarvis_state
+from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, build_test_container, make_jarvis_state
 
 
 def _live_state(msg: str, **overrides) -> dict:
@@ -67,69 +67,66 @@ async def test_checkpointer__transient_objects_do_not_break_serialization(no_llm
         assert stored["user_id"] == "u1"
 
 
-def test_scrub_transients__nulls_the_draft_store():
-    """The allowlist itself must cover draft_store, not just the serde fallback.
+def test_scrub_transients__nulls_the_container_and_the_planning_services():
+    """The allowlist itself must cover the live collaborators, not just the serde fallback.
 
     Asserting only on what lands in SQLite proves nothing about
     ``_TRANSIENT_KEYS``: ``_make_serializable`` nulls anything the serde
     rejects, so the turn-level test passes either way. This pins the fast path
-    directly — remove ``draft_store`` from the tuple and only this fails.
+    directly — remove ``container`` or ``planning`` from the tuple and only this fails.
     """
     from app.orchestrator.checkpoint import scrub_transients
-    from app.services.draft_store import DraftStore
 
-    store = DraftStore(supabase_client=object())
+    container = build_test_container()
 
-    assert scrub_transients({"draft_store": store})["draft_store"] is None
+    assert scrub_transients({"container": container})["container"] is None
+    assert scrub_transients({"planning": container.planning})["planning"] is None
     # Nested one level down, the way LangGraph stores a turn's `__start__` input.
-    nested = scrub_transients({"__start__": {"draft_store": store, "user_id": "u1"}})
-    assert nested["__start__"]["draft_store"] is None
+    nested = scrub_transients({"__start__": {"planning": container.planning, "user_id": "u1"}})
+    assert nested["__start__"]["planning"] is None
     assert nested["__start__"]["user_id"] == "u1"
 
 
 @pytest.mark.asyncio
-async def test_checkpointer__draft_store_is_scrubbed_but_draft_id_survives(
+async def test_checkpointer__container_is_scrubbed_but_draft_id_survives(
     no_llm, tmp_path, caplog
 ):
-    """The live DraftStore holds a Supabase client; only the id may persist.
+    """The turn's container holds the Supabase client; only the draft id may persist.
 
-    ``draft_store`` is re-supplied per turn from ``app.state`` (chat.py), so
-    checkpointing it buys nothing and costs a
-    ``TypeError: Type is not msgpack serializable``. ``draft_id`` is a plain
-    string and *must* survive — the accept turn resolves the draft by it.
+    ``container`` is re-supplied every turn by ChatTurnService, so checkpointing it
+    buys nothing and costs a ``TypeError: Type is not msgpack serializable``.
+    ``draft_id`` is a plain string and *must* survive — the accept turn resolves the
+    draft by it.
 
     The caplog assertion is the load-bearing one: it proves the *allowlist*
-    handled the store. Without it the test passes on the serde fallback alone,
+    handled the container. Without it the test passes on the serde fallback alone,
     which logs a warning and would fire for any unlisted live object.
     """
     import logging
 
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
-    from app.services.draft_store import DraftStore
 
     caplog.set_level(logging.WARNING, logger="app.orchestrator.checkpoint")
-
-    class _LiveClient:  # stands in for the Supabase client: not serializable
-        def __init__(self):
-            self.lock = asyncio.Lock()
 
     async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
         graph = build_jarvis_graph(checkpointer=saver)
         cfg = {"configurable": {"thread_id": "u1:sess-1"}}
 
-        state = _live_state("hi", draft_store=DraftStore(supabase_client=_LiveClient()))
+        state = _live_state("hi", container=build_test_container())
         result = await graph.ainvoke(state, config=cfg)
 
         assert result["response_message"] == CANNED_LLM_REPLY
 
         await graph.aupdate_state(cfg, {"draft_id": "d-42"})
         stored = (await graph.aget_state(cfg)).values
-        assert stored["draft_store"] is None
+        assert stored["container"] is None
         assert stored["draft_id"] == "d-42"
-        # The allowlist handled it, so the serde never saw the store and the
+        # The allowlist handled it, so the serde never saw the container and the
         # "dropping non-serializable state key" fallback never fired.
-        assert "draft_store" not in caplog.text
+        fallback = [r.getMessage() for r in caplog.records
+                    if r.name == "app.orchestrator.checkpoint"]
+        assert not [m for m in fallback if "container" in m]
 
 
 @pytest.mark.asyncio

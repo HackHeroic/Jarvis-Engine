@@ -35,7 +35,6 @@ def initial_state(
     user_model: Any,
     progress_callback: Callable[..., None],
     progress_queue: asyncio.Queue,
-    draft_store: Any,
     container: Any,
     force_cloud_request: bool,
 ) -> dict:
@@ -55,11 +54,11 @@ def initial_state(
         "initiated_by": "user",
         "execution_graph": None,
         "schedule": None,
-        # Live store in, draft id out: create_draft fills draft_id. draft_id itself is
-        # deliberately absent, like the phase fields: a resumed thread's "looks good" must
-        # resolve the draft that thread proposed, and a None here would overwrite it.
-        "draft_store": draft_store,
-        # The composition root, for nodes that need it; transient, never checkpointed.
+        # The composition root, for nodes that need it (planning proposes its draft
+        # through it, draft_action accepts through it); transient, never checkpointed.
+        # draft_id itself is deliberately absent, like the phase fields: a resumed
+        # thread's "looks good" must resolve the draft that thread proposed, and a None
+        # here would overwrite it.
         "container": container,
         "saved_constraints": None,
         "saved_rule_ids": None,

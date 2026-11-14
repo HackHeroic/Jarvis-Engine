@@ -270,7 +270,7 @@ class InMemoryDraftRepository(DraftRepository):
     ) -> DraftSchedule:
         draft = new_draft(
             user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
-        )
+        ).model_copy(update={"created_at": now_utc()})  # stamped as the table's default does
         self._store.drafts.append(draft)
         return draft.model_copy(deep=True)
 

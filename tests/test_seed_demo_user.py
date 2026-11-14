@@ -777,13 +777,11 @@ def _brief_world(fake, repos, now: datetime):
     from app.services.anticipation.triggers import MorningBriefTrigger, PatternRuleTrigger
     from app.services.draft_service import DraftService
     from app.services.memory.memory_service import MemoryService
-    from tests.fakes import FakeDBClient
+    from tests.fakes import planning_services
 
     clock = lambda: now  # noqa: E731
     bus = EventBus()
-    planner = PlanningGraphReplanner(
-        repos.drafts, db_provider=lambda: FakeDBClient(fake)
-    )
+    planner = PlanningGraphReplanner(planning_services(repos))
     patterns = PatternService(
         repos.task_events, repos.memories, repos.profiles, bus,
         detectors=default_pattern_detectors(), clock=clock,

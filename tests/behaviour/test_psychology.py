@@ -745,8 +745,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
     """Habit slots used to be expanded for the first attempt's 48 h only. On a retry
     out to 7 days, days 3+ had no sleep block, and because a sleep habit existed the
     default night was skipped too."""
-    from fastapi import HTTPException
-
+    from app.domain.errors import ScheduleInfeasibleError
     from app.services.memory.memory_service import MemoryCandidate
 
     clock.freeze(MONDAY_8AM, schedule_endpoint)
@@ -771,7 +770,7 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
     def only_a_week_fits(graph, daily_context, horizon_minutes, **kwargs):
         horizons.append(horizon_minutes)
         if horizon_minutes < 7 * MINUTES_PER_DAY:
-            raise HTTPException(status_code=422, detail="Schedule infeasible")
+            raise ScheduleInfeasibleError("Schedule infeasible")
         return real_run_schedule(graph, daily_context, horizon_minutes=horizon_minutes, **kwargs)
 
     monkeypatch.setattr(schedule_endpoint, "run_schedule", only_a_week_fits)

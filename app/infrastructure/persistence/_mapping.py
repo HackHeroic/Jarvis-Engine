@@ -41,7 +41,8 @@ from app.domain.ports import SESSION_SUMMARY_MAX_CHARS
 
 M = TypeVar("M", bound=BaseModel)
 
-# Matches the draft_schedules.expires_at column default (now() + 24 hours).
+# How long a draft holds: the one constant (every new draft's expires_at is stamped from
+# it), matching the draft_schedules.expires_at column default (now() + 24 hours).
 DRAFT_TTL = timedelta(hours=24)
 
 # Legacy user_tasks.status values, and the status each one reads as.
@@ -250,6 +251,15 @@ def new_draft(
         status=DraftStatus.PENDING,
         expires_at=now_utc() + DRAFT_TTL,
     )
+
+
+def draft_to_row(draft: DraftSchedule) -> dict:
+    """``draft`` as a draft_schedules row; an unset created_at is left out, so the
+    column's default (now) stamps it."""
+    row = to_row(draft)
+    if row.get("created_at") is None:
+        row.pop("created_at", None)
+    return row
 
 
 def apply_profile_update(profile: UserProfile, fields: dict[str, Any]) -> UserProfile:

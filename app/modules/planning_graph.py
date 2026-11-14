@@ -8,17 +8,13 @@ from typing import Annotated, Any, Optional, TypedDict
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
-from app.domain.errors import public_message
-
-# Shared with the orchestrator's draft_action node and the /drafts REST API —
-# the tasks this module hands the solver are the same tasks those two read back
-# off the draft, so the row-shape and coercion rules live in one place.
-from app.services.draft_actions import (
-    draft_id_of as _draft_id_of,
-    to_task_chunk as _to_task_chunk,
-)
+from app.domain.errors import ScheduleInfeasibleError, public_message
 from app.services.memory.context import with_context_note, with_documents
-from app.services.planning.task_rows import belongs_to_goal
+
+# Shared with draft acceptance: the tasks this module hands the solver are the same
+# tasks accept reads back off the draft, so the row-shape and coercion rules live in
+# one place.
+from app.services.planning.task_rows import belongs_to_goal, to_task_chunk as _to_task_chunk
 
 
 def _merge_lists(left: list, right: list) -> list:
@@ -72,9 +68,10 @@ class PlanningState(TypedDict):
     error: Optional[str]
     progress_callback: Any
     progress_queue: Any
-    # Live Supabase-backed store, re-supplied per turn from app.state — never
-    # checkpointed (see _TRANSIENT_KEYS in app/orchestrator/checkpoint.py).
-    draft_store: Any
+    # The sub-graph's collaborators (PlanningServices): copied from the turn's container
+    # by planning_state_in, or handed in by the replanner. Transient, never checkpointed
+    # (see _TRANSIENT_KEYS in app/orchestrator/checkpoint.py).
+    planning: Any
     draft_id: Optional[str]
 
 
@@ -632,7 +629,6 @@ async def solve_schedule(state: PlanningState) -> dict:
     .claude/rules/code-style.md it is imported and called, never reimplemented.
     """
     from pydantic import ValidationError
-    from fastapi import HTTPException
     from app.api.v1.endpoints import schedule as schedule_ep
     from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
     from app.schemas.context import TimeSlot
@@ -685,7 +681,7 @@ async def solve_schedule(state: PlanningState) -> dict:
         # Off-thread: run_schedule is a synchronous CP-SAT solve, and a bare
         # call freezes the event loop for its whole duration — on the streaming
         # path every queued SSE frame stalls behind it, so the user watches a
-        # dead spinner mid-plan. Same reason create_draft's insert is threaded.
+        # dead spinner mid-plan.
         resp = await asyncio.to_thread(
             schedule_ep.run_schedule,
             graph,
@@ -696,14 +692,12 @@ async def solve_schedule(state: PlanningState) -> dict:
             block_past=True,
             focus_by_hour=state.get("focus_by_hour"),
         )
-    except HTTPException as exc:
-        if exc.status_code == 422:
-            return {
-                "schedule": None,
-                "error": "INFEASIBLE",
-                "_tool_detail": {"status": "INFEASIBLE", "horizon_h": horizon // 60},
-            }
-        raise
+    except ScheduleInfeasibleError:  # a scope problem: the horizon ladder takes it from here
+        return {
+            "schedule": None,
+            "error": "INFEASIBLE",
+            "_tool_detail": {"status": "INFEASIBLE", "horizon_h": horizon // 60},
+        }
 
     payload = resp.model_dump(mode="json")
     return {
@@ -725,13 +719,15 @@ async def create_draft(state: PlanningState) -> dict:
     """v1 parity: a feasible schedule is *proposed* as a draft, not committed.
 
     Nothing is written to ``user_tasks`` here — ``DraftService.accept`` writes
-    only when the user accepts. Failure is non-fatal by design: a draft id is a
+    only when the user accepts. The draft is proposed through the sub-graph's
+    ``PlanningServices.drafts``; without them (no container: unit tests, scripts)
+    there is no draft. Failure is non-fatal by design: a draft id is a
     convenience for the review turn, and losing it must never cost the user the
     schedule the solver just spent seconds producing.
     """
-    draft_store = state.get("draft_store")
+    planning = state.get("planning")
     schedule = state.get("schedule")
-    if not draft_store or not schedule:
+    if planning is None or not schedule:
         return {"draft_id": None}
     if state.get("replan_only") and habits_unread(state):
         return {"draft_id": None}  # never stored: the replanner refuses a plan without them
@@ -748,14 +744,8 @@ async def create_draft(state: PlanningState) -> dict:
         return {"draft_id": None}
 
     try:
-        # DraftStore.create_draft is a sync Supabase HTTP round-trip. Called
-        # bare it would stall the event loop for the whole insert — and
-        # _wrap_step's asyncio.wait_for cannot interrupt a blocking call, so the
-        # step's timeout would be advisory only. Same to_thread pattern as
-        # UserModel.get_behavioral_constraints (user_model.py:48).
-        row = await asyncio.to_thread(
-            draft_store.create_draft,
-            user_id=state.get("user_id", "demo"),
+        draft = await planning.drafts.propose(
+            state.get("user_id", "demo"),
             tasks=state.get("task_chunks", []),
             horizon_start=horizon_start,
             # draft_schedules.goal_id has existed since 20260329000002 and is the
@@ -766,11 +756,10 @@ async def create_draft(state: PlanningState) -> dict:
             # these to wall-clock scheduled_start/end via build_task_rows.
             schedule=compact_schedule(state.get("schedule")),
         )
-        draft_id = _draft_id_of(row)
-        return {"draft_id": draft_id, "_tool_detail": {"draft_id": draft_id}}
     except Exception as e:
         logger.warning(f"Draft creation failed (non-fatal): {e}")
         return {"draft_id": None}
+    return {"draft_id": draft.id, "_tool_detail": {"draft_id": draft.id}}
 
 
 # The solve step must outlive CP-SAT's own wall-clock cap: when the cap expires the
@@ -876,9 +865,9 @@ def planning_state_in(state) -> dict:
         "error": None,
         "progress_callback": state.get("progress_callback"),
         "progress_queue": state.get("progress_queue"),
-        # Live store handed down from the parent turn (chat.py reads it off
-        # app.state); None in degraded startup and in tests.
-        "draft_store": state.get("draft_store"),
+        # The sub-graph's collaborators, from the turn's composition root; None without
+        # one (unit tests, scripts), and then no draft is proposed.
+        "planning": getattr(state.get("container"), "planning", None),
         "draft_id": None,
     }
 

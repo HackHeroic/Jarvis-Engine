@@ -445,22 +445,6 @@ async def _negotiation_precheck(state: JarvisState) -> dict:
     return {"intent": intent if intent is not None else IntentType.PLAN_DAY}
 
 
-def _supabase_of(state: JarvisState):
-    """The Supabase client for this turn, or None when running degraded.
-
-    Prefers the facade wired for this request; falls back to the registry the
-    lifespan populates, which is what a checkpoint-resumed turn has. Matches the
-    ``getattr(user_model, "_db", None)`` access observation.py already uses.
-    """
-    user_model = state.get("user_model")
-    db = getattr(user_model, "_db", None) if user_model is not None else None
-    if db is None:
-        from app.core.runtime import get_db
-
-        db = get_db()
-    return getattr(db, "supabase", None)
-
-
 async def _store_rule(state: JarvisState, habit: str) -> dict:
     """Store one stated habit as a rule: ``{"status": "stored", "id": ...}`` or not stored.
 
@@ -572,7 +556,6 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     from app.services.draft_actions import (
         MOVED_ON_ACCEPT,
         accept_draft_on_time,
-        draft_id_of,
         reject_draft,
         resolve_draft,
     )
@@ -580,16 +563,18 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     user_id = state.get("user_id") or "demo"
     intent = state.get("intent")
     intent_value = getattr(intent, "value", intent)
-    draft_store = state.get("draft_store")
+    container = state.get("container")
 
-    if draft_store is None:
+    if container is None:  # no composition root (unit tests, scripts): no drafts to act on
+        logger.debug("draft_action: no container in the turn's state, so no draft system")
         return {
             "response_message": "The draft system is offline at the moment, sir. Nothing to accept.",
             "negotiation_state": NegotiationPhase.NONE,
             "draft_id": None,
         }
+    drafts, planner = container.draft_service, container.planner
 
-    draft = await resolve_draft(draft_store, user_id, state.get("draft_id"))
+    draft = await resolve_draft(drafts, user_id, state.get("draft_id"))
     if not draft:
         return {
             "response_message": "There's no draft awaiting review, sir. Tell me what to plan.",
@@ -597,15 +582,13 @@ async def _apply_draft_action(state: JarvisState) -> dict:
             "draft_id": None,
         }
 
-    draft_id = draft_id_of(draft)
+    draft_id = draft.id
 
     if intent_value == IntentType.ACCEPT_DRAFT.value:
         try:
-            outcome = await accept_draft_on_time(
-                draft_store, user_id, draft, _supabase_of(state)
-            )
+            outcome = await accept_draft_on_time(drafts, planner, user_id, draft)
         except InvalidStateTransition:
-            return await _closed_draft_reply(draft_store, user_id, draft_id)
+            return await _closed_draft_reply(drafts, user_id, draft_id)
         except (ScheduleInfeasibleError, LLMUnavailableError) as exc:
             # Some times had gone by and the rest no longer fits around now, or the
             # user's habits could not be read to fit them again: nothing was accepted
@@ -670,11 +653,9 @@ async def _apply_draft_action(state: JarvisState) -> dict:
         # (accepted from the review UI while this thread still says REVIEWING)
         # is not discarded, and the reply must not say it was.
         try:
-            await reject_draft(
-                draft_store, user_id, draft_id, state.get("user_message"), _supabase_of(state)
-            )
+            await reject_draft(drafts, user_id, draft_id, state.get("user_message"))
         except (InvalidStateTransition, NotFoundError):
-            return await _closed_draft_reply(draft_store, user_id, draft_id, attempted="discard")
+            return await _closed_draft_reply(drafts, user_id, draft_id, attempted="discard")
         return {
             "response_message": "Draft discarded, sir. Tell me what to aim for instead.",
             "negotiation_state": NegotiationPhase.NONE,
@@ -694,18 +675,24 @@ async def _apply_draft_action(state: JarvisState) -> dict:
 
 
 async def _closed_draft_reply(
-    draft_store: Any, user_id: str, draft_id: str | None, attempted: str = "apply"
+    drafts: Any, user_id: str, draft_id: str | None, attempted: str = "apply"
 ) -> dict:
     """Answer an accept (or a reject) that found the draft closed. Nothing changed this turn.
 
     Usually it was accepted already: from the review UI, or by a double-click.
     It may instead have expired or been rejected, and then none of its tasks
-    were ever written, so "locked in" would be false. Re-read the draft rather
-    than trust the copy from before the action: a concurrent accept may have
-    closed it since. Either way the negotiation ends here.
+    were ever written, so "locked in" would be false. Re-read the draft (through
+    ``drafts``, the ``DraftService``) rather than trust the copy from before the
+    action: a concurrent accept may have closed it since. Either way the negotiation
+    ends here.
     """
-    current = await asyncio.to_thread(draft_store.get_draft, draft_id, user_id) if draft_id else None
-    if current and current.get("status") == "accepted":
+    from app.domain.entities import DraftStatus
+
+    try:
+        current = await drafts.get(user_id, draft_id) if draft_id else None
+    except NotFoundError:
+        current = None
+    if current is not None and current.status is DraftStatus.ACCEPTED:
         return {
             "response_message": (
                 "That plan is already locked in, sir."

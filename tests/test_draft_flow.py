@@ -4,7 +4,6 @@ Integration tests for the draft reject lifecycle.
 
 import sys
 import pytest
-import uuid
 from unittest.mock import MagicMock
 
 # ── Pre-import mocks for modules that crash/are missing in test env ─────────
@@ -23,42 +22,22 @@ for _pkg, _submodules in _unavailable_packages.items():
         sys.modules[_mod] = _pkg_mock
 
 
-@pytest.fixture
-def mock_supabase():
-    client = MagicMock()
-    def make_query(data=None):
-        q = MagicMock()
-        q.select.return_value = q
-        q.insert.return_value = q
-        q.update.return_value = q
-        q.delete.return_value = q
-        q.eq.return_value = q
-        q.in_.return_value = q
-        q.single.return_value = q
-        q.order.return_value = q
-        q.limit.return_value = q
-        result = MagicMock()
-        result.data = data or []
-        q.execute.return_value = result
-        return q
-    client.table.return_value = make_query()
-    return client
-
-
 class TestDraftReject:
-    def test_draft_reject__stores_reason(self, mock_supabase):
-        from app.services.draft_store import DraftStore
+    @pytest.mark.asyncio
+    async def test_draft_reject__stores_reason(self):
+        from app.domain.entities import DraftStatus
+        from app.domain.events import NullEventBus
+        from app.infrastructure.persistence.factory import RepositoryFactory
+        from app.services.draft_service import DraftService
 
-        store = DraftStore(mock_supabase)
-        draft_id = str(uuid.uuid4())
+        repos = RepositoryFactory.in_memory()
+        service = DraftService(repos.drafts, NullEventBus())
         user_id = "test-user-reject"
+        draft = await service.propose(
+            user_id, tasks=[], horizon_start="2026-03-29T08:00:00Z", goal_id=None, schedule=None
+        )
 
-        mock_supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.single.return_value.execute.return_value.data = {
-            "id": draft_id,
-            "user_id": user_id,
-            "status": "pending",
-            "tasks": [],
-        }
+        await service.reject(user_id, draft.id, reason="Tasks too long")
 
-        result = store.reject_draft(draft_id, user_id, reason="Tasks too long")
-        mock_supabase.table.assert_any_call("draft_schedules")
+        stored = await repos.drafts.get(user_id, draft.id)
+        assert (stored.status, stored.rejection_reason) == (DraftStatus.REJECTED, "Tasks too long")

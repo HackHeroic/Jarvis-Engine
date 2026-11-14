@@ -35,7 +35,7 @@ event: phase
 data: {"phase": "learning", "status": "done"}
 
 event: phase
-data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 0, "patterns_detected": 0}}
+data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 1, "patterns_detected": 1}}
 
 event: step
 data: {"intent": "CHAT", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}

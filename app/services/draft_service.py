@@ -1,4 +1,8 @@
-"""Draft lifecycle: accept and reject are moves of the draft state machine.
+"""Draft lifecycle: proposing, editing, accepting, rejecting and discarding a draft.
+
+Every draft is stored and read through ``DraftRepository``, and every status change is a
+move of the draft state machine (``DraftSchedule.transition``): a closed draft is refused
+before anything is written.
 
 Accepting a draft is the only write path to the user's tasks. It is one
 repository call that writes the tasks and marks the draft ACCEPTED together, or
@@ -9,12 +13,16 @@ write leaves the draft open for a retry.
 Once the accept has committed, each task it gave a slot is recorded in the outcome
 history: SCHEDULED the first time, RESCHEDULED when the slot moved.
 
+An accept may name the ``version`` of the draft the client read; if the draft changed
+since (an edit, a re-solve), nothing is written (``StaleVersionError``).
+
 A plan whose every slot has already begun is never accepted (``DraftOutdatedError``):
 it would only hand the slot sweep tasks to set aside, as if the user had. ``currency``
 says how far a drafted re-plan has fallen behind (a slot begun, a task finished since),
 for a caller that can draft it again instead.
 """
 
+import copy
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,7 +35,12 @@ from app.domain.entities import (
     TaskEventType,
     TaskStatus,
 )
-from app.domain.errors import DraftOutdatedError, NotFoundError, ValidationError
+from app.domain.errors import (
+    DraftOutdatedError,
+    NotFoundError,
+    StaleVersionError,
+    ValidationError,
+)
 from app.domain.events import DraftAccepted, EventBus
 from app.domain.ports import DraftRepository, TaskEventRepository, TaskRepository
 from app.services.planning.task_rows import build_task_rows, draft_slots, to_task_chunk
@@ -43,6 +56,19 @@ _ALL_PASSED = (
     "Every time in this plan has already gone by, so I didn't put it in place."
     " Ask me for a fresh plan and I'll fit it around now."
 )
+PLAN_CHANGED = "This plan changed since you looked — here is the latest."
+
+
+def check_version(draft: DraftSchedule, expected: str | None) -> None:
+    """Refuse a draft that is no longer the one the client read (``StaleVersionError``).
+
+    ``expected`` None: the caller named no version, so there is nothing to compare.
+    """
+    if expected is not None and expected != draft.version:
+        raise StaleVersionError(
+            PLAN_CHANGED,
+            details={"draft_id": draft.id, "expected_version": expected, "version": draft.version},
+        )
 
 
 @dataclass(frozen=True)
@@ -82,6 +108,20 @@ class DraftService:
         self._tasks = tasks
         self._clock = clock
 
+    async def propose(
+        self,
+        user_id: str,
+        *,
+        tasks: list[dict],
+        horizon_start: str,
+        goal_id: str | None,
+        schedule: dict | None,
+    ) -> DraftSchedule:
+        """Store a new PENDING draft for the user to review; nothing reaches their tasks."""
+        return await self._drafts.create(
+            user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
+        )
+
     async def get(self, user_id: str, draft_id: str) -> DraftSchedule:
         """The user's draft; NotFoundError if they have no such draft."""
         draft = await self._drafts.get(user_id, draft_id)
@@ -89,20 +129,77 @@ class DraftService:
             raise NotFoundError("That draft does not exist.", details={"draft_id": draft_id})
         return draft
 
-    async def accept(self, user_id: str, draft_id: str) -> int:
+    async def open_draft(
+        self, user_id: str, draft_id: str | None = None
+    ) -> DraftSchedule | None:
+        """The draft a turn is about: the named one (whatever its status), else the user's
+        newest open one; None when there is neither.
+
+        The named draft wins: orphaned open drafts can pile up (a re-plan proposes a
+        second without resolving the first), so the newest open one is only the fallback.
+        """
+        if draft_id:
+            draft = await self._drafts.get(user_id, draft_id)
+            if draft is not None:
+                return draft
+        return await self._drafts.get_open(user_id)
+
+    async def edit_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
+        """Replace the draft's task list and mark it MODIFIED; return the draft as stored.
+
+        A closed draft is refused by the state machine before anything is written
+        (InvalidStateTransition): an edit must never reopen an accepted draft, or a second
+        accept would write its tasks again. NotFoundError if the user has no such draft.
+        """
+        draft = await self.get(user_id, draft_id)
+        draft.transition(DraftStatus.MODIFIED)
+        await self._drafts.replace_tasks(user_id, draft_id, tasks)
+        return await self._drafts.set_status(user_id, draft_id, DraftStatus.MODIFIED)
+
+    async def edit_task(
+        self, user_id: str, draft_id: str, task_id: str, edits: dict
+    ) -> DraftSchedule:
+        """Apply ``edits`` (its non-None values) to one task of the draft, as ``edit_tasks``.
+
+        NotFoundError, writing nothing, when the draft holds no task ``task_id``.
+        """
+        draft = await self.get(user_id, draft_id)
+        draft.transition(DraftStatus.MODIFIED)  # a closed draft first: 409 before 404
+        tasks = copy.deepcopy(draft.tasks)
+        task = next((t for t in tasks if t.get("task_id") == task_id), None)
+        if task is None:
+            raise NotFoundError(
+                "That task is not in this draft.",
+                details={"draft_id": draft_id, "task_id": task_id},
+            )
+        task.update({key: value for key, value in edits.items() if value is not None})
+        return await self.edit_tasks(user_id, draft_id, tasks)
+
+    async def discard(self, user_id: str, draft_id: str) -> DraftSchedule:
+        """The user set the draft aside: it becomes EXPIRED and its row stays.
+
+        InvalidStateTransition if it is already closed, NotFoundError if absent.
+        """
+        return await self._drafts.set_status(user_id, draft_id, DraftStatus.EXPIRED)
+
+    async def accept(
+        self, user_id: str, draft_id: str, *, expected_version: str | None = None
+    ) -> int:
         """Write the draft's tasks and mark it ACCEPTED, atomically; return tasks written.
 
         Raises NotFoundError if the user has no such draft, InvalidStateTransition
-        if it is no longer open (accepted, rejected, expired...), ValidationError
-        if it holds no task that can be scheduled, DraftOutdatedError if every one of
-        its slots has already begun (a plan only of the past; nothing is written and
-        the draft stays as it was), and ConflictError if one of its task ids is
-        already held by a task the user finished (or repeats).
+        if it is no longer open (accepted, rejected, expired...), StaleVersionError if
+        ``expected_version`` is given and the draft has changed since it was read,
+        ValidationError if it holds no task that can be scheduled, DraftOutdatedError
+        if every one of its slots has already begun (a plan only of the past; nothing is
+        written and the draft stays as it was), and ConflictError if one of its task ids
+        is already held by a task the user finished (or repeats).
         """
         draft = await self.get(user_id, draft_id)
         # Fails fast on a closed draft. accept_atomic checks again under its lock,
         # and that second check is what stops a concurrent accept.
         draft.transition(DraftStatus.ACCEPTED)
+        check_version(draft, expected_version)
 
         chunks = _chunks_of(draft)
         if not chunks:

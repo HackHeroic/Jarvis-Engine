@@ -139,8 +139,7 @@ def _stub_chat_io(monkeypatch) -> None:
 
 async def _scripted_turn(monkeypatch, script: list[tuple], **body) -> str:
     _stub_chat_io(monkeypatch)
-    state = {"jarvis_graph": _ScriptedGraph(script), "db_client": None, "container": None,
-             "draft_store": None}
+    state = {"jarvis_graph": _ScriptedGraph(script), "db_client": None, "container": None}
     return await _post(monkeypatch, state, user_prompt=body.pop("user_prompt", "hello there"),
                        **body)
 
@@ -316,7 +315,7 @@ async def test_sse_golden__jarvis_error__envelope_frame_bytes_unchanged(monkeypa
 
 def _harness_state(jarvis) -> dict:
     return {name: getattr(jarvis.state, name)
-            for name in ("jarvis_graph", "db_client", "draft_store", "container")}
+            for name in ("jarvis_graph", "db_client", "container")}
 
 
 @pytest.mark.asyncio

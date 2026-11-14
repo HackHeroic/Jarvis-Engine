@@ -54,6 +54,7 @@ from app.services.memory.patterns import (
     SkipTimeWindowDetector,
 )
 from app.services.memory.stated_rules import StatedRules
+from app.services.planning.services import PlanningServices
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 from app.services.user_model_service import UserModelService
@@ -88,6 +89,7 @@ class AppContainer:
     patterns: PatternService
     pattern_observer: PatternObserver
     consent: ConsentPolicy
+    planning: PlanningServices
     planner: DraftPlanner
     actions: ActionFactory
     anticipation: AnticipationService
@@ -149,7 +151,18 @@ class AppContainer:
         # accepted suggestion can be rebuilt from its payload; the triggers with the
         # service. A skip window PEARL finds is offered as a rule right away.
         consent = ConsentPolicy.default()
-        planner = PlanningGraphReplanner(repos.drafts)
+        # What the planning sub-graph works with: a planning turn reaches it through the
+        # turn's state, the replanner through its constructor.
+        planning = PlanningServices(
+            drafts=draft_service,
+            tasks=task_service,
+            task_repo=repos.tasks,
+            constraints=repos.constraints,
+            profiles=repos.profiles,
+            memory=memory_service,
+            energy=energy,
+        )
+        planner = PlanningGraphReplanner(planning)
         actions = build_action_factory(
             drafts=draft_service,
             constraints=repos.constraints,
@@ -196,6 +209,7 @@ class AppContainer:
             patterns=patterns,
             pattern_observer=observer,
             consent=consent,
+            planning=planning,
             planner=planner,
             actions=actions,
             anticipation=anticipation,

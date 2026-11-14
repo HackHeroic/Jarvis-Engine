@@ -49,7 +49,7 @@ from app.services.memory.memory_service import MemoryService
 from app.services.memory.patterns import PatternService
 from app.services.planning.local_time import end_of_local_day
 from tests.behaviour.conftest import blame_phrases_in
-from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase, planning_services
 
 IST = ZoneInfo("Asia/Kolkata")
 U = "alice"
@@ -129,9 +129,7 @@ class _World:
 def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None = None) -> _World:
     clock = _Clock(MONDAY_7_05)
     bus = EventBus()
-    planner = planner or PlanningGraphReplanner(
-        repos.drafts, db_provider=lambda: FakeDBClient(fake)
-    )
+    planner = planner or PlanningGraphReplanner(planning_services(repos))
     patterns = PatternService(
         repos.task_events, repos.memories, repos.profiles, bus,
         detectors=default_pattern_detectors(), clock=clock,

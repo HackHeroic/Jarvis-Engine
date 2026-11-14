@@ -5,52 +5,60 @@ from unittest.mock import MagicMock
 from app.core.registry import BaseRegistry, RegistryEntry
 
 
-class TestDraftStore:
-    """Test DraftStore with mock Supabase."""
+class TestDraftService:
+    """Test DraftService over the in-memory repositories."""
 
-    def test_create_and_get_draft(self, mock_supabase):
-        from app.services.draft_store import DraftStore
+    @staticmethod
+    def _service():
+        from app.domain.events import NullEventBus
+        from app.infrastructure.persistence.factory import RepositoryFactory
+        from app.services.draft_service import DraftService
+
+        return DraftService(RepositoryFactory.in_memory().drafts, NullEventBus())
+
+    @pytest.mark.asyncio
+    async def test_create_and_get_draft(self):
         from app.schemas.draft import DraftTask
 
-        mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [
-            {"id": "d1", "user_id": "u1", "status": "pending"}
-        ]
-
-        store = DraftStore(supabase_client=mock_supabase)
+        service = self._service()
         tasks = [DraftTask(
             task_id="t1", title="Test", start_min=0,
             duration_minutes=25, difficulty_weight=0.5,
             completion_criteria="Done",
-        )]
-        result = store.create_draft("u1", tasks, "2026-03-29T08:00:00Z")
+        ).model_dump()]
+        result = await service.propose(
+            "u1", tasks=tasks, horizon_start="2026-03-29T08:00:00Z", goal_id=None, schedule=None
+        )
         assert result is not None
+        assert (await service.get("u1", result.id)).tasks == tasks
 
-    def test_edit_task_in_draft(self, mock_supabase):
-        from app.services.draft_store import DraftStore
+    @pytest.mark.asyncio
+    async def test_edit_task_in_draft(self):
+        service = self._service()
+        draft = await service.propose(
+            "u1",
+            tasks=[
+                {"task_id": "t1", "title": "Original", "start_min": 0,
+                 "duration_minutes": 25, "difficulty_weight": 0.5,
+                 "completion_criteria": "Done"},
+            ],
+            horizon_start="2026-03-29T08:00:00Z", goal_id=None, schedule=None,
+        )
 
-        mock_supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
-            {
-                "id": "d1", "user_id": "u1",
-                "tasks": [
-                    {"task_id": "t1", "title": "Original", "start_min": 0,
-                     "duration_minutes": 25, "difficulty_weight": 0.5,
-                     "completion_criteria": "Done"},
-                ],
-                "status": "pending",
-            }
-        ]
-
-        store = DraftStore(supabase_client=mock_supabase)
-        result = store.edit_task_in_draft("d1", "u1", "t1", {"title": "Edited"})
+        result = await service.edit_task("u1", draft.id, "t1", {"title": "Edited"})
         assert result is not None
+        assert result.tasks[0]["title"] == "Edited"
 
-    def test_reject_draft(self, mock_supabase):
-        from app.services.draft_store import DraftStore
+    @pytest.mark.asyncio
+    async def test_reject_draft(self):
+        from app.domain.entities import DraftStatus
 
-        mock_supabase.table.return_value.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [{"id": "d1", "status": "rejected"}]
-        store = DraftStore(supabase_client=mock_supabase)
-        result = store.reject_draft("d1", "u1", reason="Too much work")
-        assert result is True
+        service = self._service()
+        draft = await service.propose(
+            "u1", tasks=[], horizon_start="2026-03-29T08:00:00Z", goal_id=None, schedule=None
+        )
+        result = await service.reject("u1", draft.id, reason="Too much work")
+        assert result.status is DraftStatus.REJECTED
 
 
 class TestTimeSlotSchema:

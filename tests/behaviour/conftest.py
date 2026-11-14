@@ -247,14 +247,10 @@ class Jarvis:
     """The app as one user's browser sees it: the real chat handler over fakes."""
 
     def __init__(self, graph: Any, supabase: FakeSupabase) -> None:
-        from app.services.draft_store import DraftStore
-
         self.db = supabase
-        self.draft_store = DraftStore(supabase_client=supabase)
         self.state = SimpleNamespace(
             jarvis_graph=graph,
             db_client=FakeDBClient(supabase),
-            draft_store=self.draft_store,
         )
 
     async def say(self, text: str, *, user: str = "alice", session: str | None = None) -> Turn:
