@@ -13,14 +13,42 @@ CamelCase (NewIntVar, etc.) — they raise AttributeError.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Optional
 
 from ortools.sat.python import cp_model
 
 from app.core.or_tools.constraints import energy_objective_terms, merge_time_windows
+from app.domain.entities import HOURS_PER_DAY
 
 MINUTES_PER_DAY = 1440
-HOURS_PER_DAY = 24
+
+
+class _StopWhenIdle(cp_model.CpSolverSolutionCallback):
+    """Stops the search once no better schedule has turned up for ``idle_seconds``.
+
+    CP-SAT calls this on each improving solution, one call at a time; each call
+    restarts the wait. Before the first solution there is no wait, so a search that
+    finds nothing (UNKNOWN, INFEASIBLE) is left to the wall-clock cap as before.
+    """
+
+    def __init__(self, solver: cp_model.CpSolver, idle_seconds: float) -> None:
+        super().__init__()
+        self._solver = solver
+        self._idle_seconds = idle_seconds
+        self._timer: threading.Timer | None = None
+
+    def on_solution_callback(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self._idle_seconds, self._solver.stop_search)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def cancel(self) -> None:
+        """Drop a pending stop once the search has ended."""
+        if self._timer is not None:
+            self._timer.cancel()
 
 
 class JarvisScheduler:
@@ -233,6 +261,8 @@ class JarvisScheduler:
         high-focus hours.
 
         The search is capped at ``SOLVER_MAX_TIME_SECONDS``; see config for why.
+        Once it has a schedule, it also stops after ``SOLVER_IDLE_STOP_SECONDS``
+        without a better one: the schedule is returned as FEASIBLE, unproven.
         An expired cap yields FEASIBLE (best schedule found so far, returned as
         normal) or UNKNOWN, which joins the INFEASIBLE branch — "I ran out of
         time" and "no such schedule exists" leave the caller the same two moves,
@@ -242,7 +272,7 @@ class JarvisScheduler:
             Dict mapping task_id to {"start": start_min, "end": end_min}
             if FEASIBLE or OPTIMAL; otherwise "INFEASIBLE".
         """
-        from app.core.config import SOLVER_MAX_TIME_SECONDS
+        from app.core.config import SOLVER_IDLE_STOP_SECONDS, SOLVER_MAX_TIME_SECONDS
 
         # Collect all interval variables (Anti-Guilt: user does one thing at a time)
         all_intervals = (
@@ -286,7 +316,11 @@ class JarvisScheduler:
         if self._focus_penalties is not None:
             obj_expr += sum(
                 energy_objective_terms(
-                    self.model, self.tasks, self._focus_penalties, self._day_start_hour
+                    self.model,
+                    self.tasks,
+                    self._focus_penalties,
+                    self._day_start_hour,
+                    self.horizon,
                 )
             )
 
@@ -294,7 +328,11 @@ class JarvisScheduler:
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = SOLVER_MAX_TIME_SECONDS
-        status = solver.solve(self.model)
+        idle_stop = _StopWhenIdle(solver, SOLVER_IDLE_STOP_SECONDS)
+        try:
+            status = solver.solve(self.model, idle_stop)
+        finally:
+            idle_stop.cancel()
 
         if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
             schedule = {

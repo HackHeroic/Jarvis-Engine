@@ -1165,6 +1165,18 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
     # Build execution graph dict
     eg = request.execution_graph or {"decomposition": request.current_tasks, "goal_metadata": {}}
 
+    # The re-solve leans on the user's learned focus profile, as the plan did.
+    from app.core.runtime import registered_container
+    from app.services.energy import solver_focus
+
+    container = registered_container()
+    focus_by_hour = await solver_focus(
+        container.energy if container is not None else None,
+        request.user_id,
+        user_zone(),
+        now=datetime.now(timezone.utc),
+    )
+
     # Apply modification and re-schedule
     updated_graph, updated_schedule = apply_modification(
         modification=modification,
@@ -1172,6 +1184,7 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
         schedule_data=request.current_schedule or {"schedule": {}},
         time_slots=expanded_slots,
         horizon_start=horizon_start,
+        focus_by_hour=focus_by_hour,
     )
 
     return {

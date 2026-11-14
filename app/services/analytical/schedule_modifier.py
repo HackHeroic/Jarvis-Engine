@@ -150,12 +150,15 @@ def apply_modification(
     schedule_data: dict[str, Any],
     time_slots: list,
     horizon_start: Any,
+    focus_by_hour: Optional[list[float]] = None,
 ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
     """Apply parsed modification to execution graph, then re-schedule.
 
     Returns (modified_execution_graph, modified_schedule_or_None).
     For rename_task, no re-scheduling is needed.
-    For everything else, calls run_schedule() to recompute.
+    For everything else, calls run_schedule() to recompute. ``focus_by_hour`` is the
+    user's learned focus profile (``solver_focus``): the re-solve leans on it as the
+    plan did, so an edit does not drop it.
     """
     from app.api.v1.endpoints.reasoning import ExecutionGraph, TaskChunk
     from app.api.v1.endpoints.schedule import run_schedule
@@ -247,6 +250,7 @@ def apply_modification(
                     # The draft's horizon began earlier: a re-schedule now must not
                     # put tasks before now.
                     block_past=True,
+                    focus_by_hour=focus_by_hour,
                 )
                 break
             except Exception:

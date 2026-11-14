@@ -53,7 +53,7 @@ class _RecordingSolver:
         self._status = cp_model.UNKNOWN if status is None else status
         _RecordingSolver.instances.append(self)
 
-    def solve(self, _model):
+    def solve(self, _model, _callback=None):
         return self._status
 
     def value(self, _var):  # pragma: no cover - only reached on FEASIBLE
@@ -386,14 +386,15 @@ def _overlaps(task, start: int, end: int) -> bool:
 def test_energy_term__two_free_slots__hard_task_takes_high_focus_slot(before_the_horizon):
     from app.api.v1.endpoints import schedule as sep
 
-    # Listed B first: on TMT alone the two are tied and this order puts A at 09:00.
-    graph = _graph(("B", 25, 0.1, IN_3_DAYS), ("A", 25, 0.9, IN_3_DAYS))
+    def starts(peak_hour: int) -> tuple[int, int]:
+        graph = _graph(("A", 25, 0.9, IN_3_DAYS), ("B", 25, 0.1, IN_3_DAYS))
+        resp = sep.run_schedule(graph, _blocked_except(NINE_AND_SEVEN_PM), horizon_minutes=1440,
+                                focus_by_hour=_peak_at(peak_hour))
+        return resp.schedule["A"].start_min, resp.schedule["B"].start_min
 
-    resp = sep.run_schedule(graph, _blocked_except(NINE_AND_SEVEN_PM), horizon_minutes=1440,
-                            focus_by_hour=_peak_at(19))
-
-    assert resp.schedule["A"].start_min == 660
-    assert resp.schedule["B"].start_min == 60
+    # On TMT alone the two slots tie; the hard task follows the peak, either way round.
+    assert starts(19) == (660, 60)
+    assert starts(9) == (60, 660)
 
 
 def test_energy_term__flag_off__identical_to_no_profile(before_the_horizon, monkeypatch):
@@ -416,6 +417,7 @@ def test_energy_term__flag_off__identical_to_no_profile(before_the_horizon, monk
 
 
 def test_energy_term__task_due_today__tmt_order_kept(before_the_horizon, monkeypatch):
+    import app.core.config as config
     from app.api.v1.endpoints import schedule as sep
 
     weights: dict[str, int] = {}
@@ -434,7 +436,7 @@ def test_energy_term__task_due_today__tmt_order_kept(before_the_horizon, monkeyp
                             focus_by_hour=_peak_at(10, rest=0.0))
 
     assert resp.schedule["today"].start_min < resp.schedule["later"].start_min
-    assert weights == {"later": 4, "today": 0}
+    assert weights == {"later": round(config.ENERGY_OBJECTIVE_WEIGHT * 0.1), "today": 0}
 
 
 @pytest.mark.parametrize(
@@ -482,3 +484,143 @@ def test_energy_term__minimal_work_window_at_peak__hard_task_still_kept_out(befo
     assert not _overlaps(resp.schedule["hard"], 660, 690)
     assert resp.schedule["hard"].start_min == 60
     assert resp.schedule["easy"].start_min == 660
+
+
+# --- a learned evening person: what the estimator makes of their history -------------
+
+
+def _learned_evening_person() -> list[float]:
+    """The focus profile HistoryEnergyEstimator learns from an evening person.
+
+    Over four weeks, their 18:00-20:00 slots were mostly done (19:00 most of all) and
+    their daytime slots, 08:00-17:00, mostly set aside. The peak is 19:00.
+    """
+    import asyncio
+    from datetime import datetime, timedelta
+
+    from app.domain.entities import TaskEvent, TaskEventType
+    from app.infrastructure.persistence.factory import RepositoryFactory
+    from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
+
+    now = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
+    outcomes = [(TaskEventType.COMPLETED, h) for h, n in ((18, 4), (19, 6), (20, 4))
+                for _ in range(n)]
+    outcomes += [(TaskEventType.SKIPPED, h) for h in range(8, 18) for _ in range(2)]
+
+    async def build() -> list[float]:
+        repo = RepositoryFactory.in_memory().task_events
+        for i, (kind, hour) in enumerate(outcomes):
+            slot = (now - timedelta(days=1 + i % 27)).replace(hour=hour)
+            await repo.append("u1", TaskEvent(
+                user_id="u1", task_id=f"past_{i}", event_type=kind,
+                occurred_at=slot + timedelta(minutes=25), scheduled_start=slot,
+                scheduled_end=slot + timedelta(minutes=25),
+            ))
+        profile = await HistoryEnergyEstimator(repo, HeuristicEnergyEstimator()).estimate(
+            "u1", IST, now=now
+        )
+        assert profile.source == "learned"
+        return profile.scores()
+
+    return asyncio.run(build())
+
+
+def _eight_tasks():
+    """Eight 25-minute tasks, hardest first, none due within a day."""
+    difficulties = [0.9, 0.8, 0.7, 0.6, 0.5, 0.3, 0.2, 0.1]
+    return _graph(*[(f"t{i}", 25, d, None) for i, d in enumerate(difficulties)])
+
+
+def test_solve__learned_profile_eight_tasks_48h__stops_when_idle_with_the_same_objective(
+    before_the_horizon, monkeypatch
+):
+    """The best schedule turns up in a fraction of a second; proving it best can take
+    the whole 10 s cap. The search stops once nothing better has turned up for
+    SOLVER_IDLE_STOP_SECONDS, and the schedule is just as good."""
+    import time
+
+    import app.core.config as config
+    from app.api.v1.endpoints import schedule as sep
+    from app.core.or_tools import solver as solver_mod
+
+    objectives: list[float] = []
+
+    class _Recording(solver_mod.cp_model.CpSolver):
+        def solve(self, model, *args):
+            status = super().solve(model, *args)
+            objectives.append(self.objective_value)
+            return status
+
+    monkeypatch.setattr(solver_mod.cp_model, "CpSolver", _Recording)
+    focus = _learned_evening_person()
+
+    started = time.perf_counter()
+    sep.run_schedule(_eight_tasks(), [], horizon_minutes=2880, focus_by_hour=focus)
+    elapsed = time.perf_counter() - started
+    # Idle stop out of reach: the search runs until it proves the optimum or hits the cap.
+    monkeypatch.setattr(config, "SOLVER_IDLE_STOP_SECONDS", 60.0)
+    sep.run_schedule(_eight_tasks(), [], horizon_minutes=2880, focus_by_hour=focus)
+
+    assert elapsed < 3.0
+    assert objectives[0] == objectives[1]
+
+
+def _local_minute(start_min: int) -> int:
+    """Minute of the local day a plan minute falls on (minute 0 is 08:00)."""
+    return (8 * 60 + start_min) % 1440
+
+
+def _in_peak_window(start_min: int, peak_hour: int = 19) -> bool:
+    """Starts within peak_hour ± 1.5 h, on whichever day."""
+    return peak_hour * 60 - 90 <= _local_minute(start_min) <= peak_hour * 60 + 90
+
+
+def test_schedule__learned_evening_peak__hard_tasks_land_in_peak_window(before_the_horizon):
+    from app.api.v1.endpoints import schedule as sep
+
+    graph = _eight_tasks()
+    hard = {c.task_id for c in graph.decomposition if c.difficulty_weight >= 0.7}
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880, focus_by_hour=_learned_evening_person())
+
+    assert len(hard) == 3
+    off_peak = {tid: _local_minute(resp.schedule[tid].start_min) for tid in hard
+                if not _in_peak_window(resp.schedule[tid].start_min)}
+    assert off_peak == {}, off_peak
+
+
+def test_schedule__learned_evening_peak__easy_tasks_not_dragged_there_at_the_cost_of_an_idle_day(
+    before_the_horizon,
+):
+    from app.api.v1.endpoints import schedule as sep
+
+    graph = _eight_tasks()
+    easy = {c.task_id for c in graph.decomposition if c.difficulty_weight <= 0.3}
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880, focus_by_hour=_learned_evening_person())
+
+    assert [tid for tid in easy if _in_peak_window(resp.schedule[tid].start_min)] == []
+    # No day sits idle waiting for its evening: each day of the plan starts before the peak.
+    first_by_day: dict[int, int] = {}
+    for task in resp.schedule.values():
+        day = task.start_min // 1440
+        first_by_day[day] = min(first_by_day.get(day, 1440), _local_minute(task.start_min))
+    assert all(first < (19 * 60 - 90) for first in first_by_day.values()), first_by_day
+
+
+def test_energy_term__learned_profile__dependencies_still_hold(before_the_horizon):
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.api.v1.endpoints import schedule as sep
+
+    # Each step needs the one before; the hard steps would rather be in the evening.
+    difficulties = [0.2, 0.9, 0.3, 0.8, 0.1, 0.7]
+    chunks = [TaskChunk(task_id=f"s{i}", title=f"s{i}", duration_minutes=25, difficulty_weight=d,
+                        dependencies=[f"s{i - 1}"] if i else [], completion_criteria="done")
+              for i, d in enumerate(difficulties)]
+    graph = ExecutionGraph(goal_metadata=GoalMetadata(), decomposition=chunks,
+                           cognitive_load_estimate={"intrinsic_load": 0.5})
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880, focus_by_hour=_learned_evening_person())
+
+    for i in range(1, len(difficulties)):
+        assert resp.schedule[f"s{i}"].start_min >= resp.schedule[f"s{i - 1}"].end_min

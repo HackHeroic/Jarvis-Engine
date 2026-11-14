@@ -9,18 +9,39 @@ the prior. Below ``MIN_FOCUS_OBSERVATIONS`` outcomes the profile is labelled
 "prior", and only a "learned" profile steers the solver.
 """
 
+import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import app.core.config as config
 from app.core.config import FOCUS_PRIOR_STRENGTH, FOCUS_WINDOW_DAYS, MIN_FOCUS_OBSERVATIONS
-from app.domain.entities import FocusProfile, HourFocus, TaskEventType
+from app.domain.entities import HOURS_PER_DAY, FocusProfile, HourFocus, TaskEvent, TaskEventType
 from app.domain.ports import EnergyEstimator, TaskEventRepository
 
-HOURS_PER_DAY = 24
+logger = logging.getLogger(__name__)
 
 # The outcomes a slot can have. Skipped and missed (the slot passed) both count as
 # "not done"; a deadline miss is about a date, not an hour, so it is not one of them.
 _OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
+
+
+def _latest_outcome_per_slot(events: list[TaskEvent]) -> list[tuple[datetime, TaskEvent]]:
+    """The last outcome of each slot (task, scheduled start), with the slot's aware start.
+
+    A slot can have more than one outcome: the sweep marks it missed, then the user
+    completes it after all. It still counts once, as what happened last. ``events``
+    come oldest first, so a later event replaces an earlier one. Events without a slot
+    have no hour to learn about and are left out.
+    """
+    latest: dict[tuple[str, datetime], TaskEvent] = {}
+    for event in events:
+        start = event.scheduled_start
+        if start is None:
+            continue
+        if start.tzinfo is None:  # stored instants are UTC
+            start = start.replace(tzinfo=timezone.utc)
+        latest[(event.task_id, start)] = event
+    return [(start, event) for (_, start), event in latest.items()]
 
 
 class HeuristicEnergyEstimator(EnergyEstimator):
@@ -76,12 +97,7 @@ class HistoryEnergyEstimator(EnergyEstimator):
         )
         done = [0] * HOURS_PER_DAY
         not_done = [0] * HOURS_PER_DAY
-        for event in events:
-            start = event.scheduled_start
-            if start is None:  # no slot, no hour to learn about
-                continue
-            if start.tzinfo is None:  # stored instants are UTC
-                start = start.replace(tzinfo=timezone.utc)
+        for start, event in _latest_outcome_per_slot(events):
             hour = start.astimezone(zone).hour
             if event.event_type == TaskEventType.COMPLETED:
                 done[hour] += 1
@@ -111,3 +127,23 @@ class HistoryEnergyEstimator(EnergyEstimator):
             return prior
         k = self._prior_strength
         return (done + k * prior) / (done + not_done + k)
+
+
+async def solver_focus(
+    estimator: EnergyEstimator | None, user_id: str, zone: ZoneInfo, *, now: datetime
+) -> list[float] | None:
+    """The focus scores a solve may lean on: the user's learned profile, or None.
+
+    None when there is no estimator (no composition root: tests, scripts), when the
+    energy term is off, or while the profile is still the prior: a prior never steers
+    the solver. A failed read is None too. The plan is then made on TMT alone, never
+    lost. Every solve for the user (a plan, a draft edit) reads its profile here.
+    """
+    if estimator is None or not config.ENERGY_OBJECTIVE_ENABLED:
+        return None
+    try:
+        profile = await estimator.estimate(user_id, zone, now=now)
+    except Exception as exc:
+        logger.warning("Focus profile read failed (planning on TMT alone): %r", exc)
+        return None
+    return profile.scores() if profile.source == "learned" else None
