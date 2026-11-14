@@ -1,4 +1,4 @@
-"""The ``complete`` frame of ``POST /api/v1/chat/v2/stream``: the turn's one typed contract.
+"""The ``complete`` frame of ``POST /api/v1/chat/stream``: the turn's one typed contract.
 
 The handler validates the frame against ``ChatCompletePayload`` before sending it, so
 the contract the frontend is built against is explicit and cannot drift: the fields are
@@ -83,7 +83,6 @@ class ChatCompletePayload(BaseModel):
     thinking_process: str | None = Field(
         description="The model's own reasoning, when it gave any; never made up."
     )
-    awaiting_task_confirmation: bool = Field(description="Always false on this route.")
     schedule_status: Literal["draft", "infeasible"] | None = Field(
         description="'draft': a plan awaits the user's accept (draft_id); 'infeasible': it "
         "did not fit (conflict_summary says why); null when the turn did not plan."

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 from app.core.config import DEFAULT_HORIZON_MINUTES
-from app.core.runtime import get_db, get_memory_store
+from app.core.runtime import get_db
 from app.core.user_model import UserModel
 from app.domain import errors
 from app.domain.entities import DraftSchedule
@@ -36,11 +36,9 @@ class PlanningGraphReplanner(DraftPlanner):
         drafts: DraftRepository,
         *,
         db_provider: Callable[[], Any] = get_db,
-        memory_provider: Callable[[], Any] = get_memory_store,
     ) -> None:
         self._drafts = drafts
         self._db_provider = db_provider
-        self._memory_provider = memory_provider
         self._graph: Any = None
 
     async def replan(self, user_id: str, *, reslot_task_ids: list[str]) -> DraftSchedule | None:
@@ -62,7 +60,6 @@ class PlanningGraphReplanner(DraftPlanner):
         from app.modules.planning_graph import habits_unread, planning_state_in
 
         user_model = UserModel(user_id, db)  # fresh: planning sets aside overdue tasks first
-        user_model.set_memory_store(self._memory_provider())
         state = planning_state_in({
             "user_model": user_model,
             "user_message": "",
@@ -104,7 +101,6 @@ class PlanningGraphReplanner(DraftPlanner):
         if getattr(db, "supabase", None) is None:
             raise errors.PersistenceError("Could not reach the database.")
         user_model = UserModel(user_id, db)
-        user_model.set_memory_store(self._memory_provider())
         horizon_start = datetime.fromisoformat(draft.horizon_start)
         if horizon_start.tzinfo is None:  # a legacy horizon without an offset was UTC
             horizon_start = horizon_start.replace(tzinfo=timezone.utc)

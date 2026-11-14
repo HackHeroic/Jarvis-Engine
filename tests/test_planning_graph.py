@@ -436,7 +436,7 @@ async def test_solve_schedule__real_solver__single_small_task__is_feasible():
 
 # --- create_draft: a feasible solve becomes a reviewable draft ---------------
 # v1 parity: the schedule is proposed, never silently committed. Persistence
-# (_persist_fused_tasks) happens on accept only — never in this node.
+# (DraftService.accept) happens on accept only — never in this node.
 
 
 class _FakeDraftStore:
@@ -1003,7 +1003,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
 # demo user's pending tasks vanished on a plain "plan X" → "accept".
 #
 # v1 never had this hole: it namespaces every fresh chunk as `{goal_id}_{task_id}`
-# before fusion (control_policy._run_plan_day_flow), which is the only thing that
+# before fusion (the retired v1 planner), which is the only thing that
 # makes "tasks belonging to THIS goal" decidable. These tests port that rule.
 
 
@@ -1016,7 +1016,7 @@ def _run_token(task_id: str, goal_id: str) -> str:
 
 
 class _PendingUserModel:
-    """A UserModel with pending rows and nothing else — no DB, no memory store."""
+    """A UserModel with pending rows and nothing else — no DB."""
 
     def __init__(self, rows: list[dict]):
         self.user_id = "u1"
@@ -1027,9 +1027,6 @@ class _PendingUserModel:
 
     async def get_behavioral_constraints(self) -> list[dict]:
         return []
-
-    async def get_memory_store(self):
-        return None
 
 
 @pytest.mark.asyncio
@@ -1136,15 +1133,14 @@ async def test_fuse_tasks__no_goal_id__falls_back_to_id_dedupe():
 async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_tasks(monkeypatch):
     """The whole F5 chain: decompose → fuse → accept must not delete prior work.
 
-    `_persist_fused_tasks` wipes every pending row and re-inserts the fused list,
-    so anything fusion drops is gone from the database permanently. The draft is
-    built here exactly as `create_draft` builds it (`tasks=state["task_chunks"]`);
+    Accepting (`DraftService.accept`) replaces every pending row with the draft's
+    tasks, so anything fusion drops is gone from the database permanently. The draft
+    is built here exactly as `create_draft` builds it (`tasks=state["task_chunks"]`);
     the solver is skipped because scheduling is not what F5 is about.
     """
     from app.core.user_model import UserModel
     from app.modules.planning_graph import decompose_goal, fuse_tasks
-    from app.services.draft_actions import accept_draft_and_persist
-    from tests.fakes import FakeDBClient, FakeSupabase
+    from tests.fakes import FakeDBClient, FakeSupabase, build_test_container
 
     supabase = FakeSupabase({"user_tasks": [
         {"user_id": "u1", "task_id": "task_1", "title": "read chapter 1",
@@ -1173,7 +1169,7 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
         "horizon_start": "2026-08-08T08:00:00+00:00",
     }
     supabase.rows["draft_schedules"] = [draft]
-    landed = await accept_draft_and_persist(_FakeDraftStore(), "u1", draft, supabase)
+    landed = await build_test_container(supabase).draft_service.accept("u1", draft["id"])
 
     run = _run_token(decomposed["task_chunks"][0]["task_id"], "revise_graph_algorithms")
     assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == [
@@ -1191,7 +1187,7 @@ async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft
     """The longer ids must travel the whole v2 chain unchanged.
 
     `_to_task_chunk` → `run_schedule` → `create_draft` is newer than v1's path,
-    and the solver keys its output map by task_id — `_persist_fused_tasks` then
+    and the solver keys its output map by task_id — `DraftService.accept` then
     looks `scheduled_start` up by that key. An id regenerated or truncated
     anywhere in between would silently drop every wall-clock time, so this drives
     the compiled sub-graph with the real OR-Tools solver and pins both ends.

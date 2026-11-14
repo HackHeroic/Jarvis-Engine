@@ -357,9 +357,9 @@ def test_complete_and_skip__no_database__same_503_envelope_as_list(monkeypatch):
     assert shape(skipped) == shape(listed)
 
 
-# The background replan (control_policy.trigger_replan) has never run to completion
-# and stays off. The task endpoints must not schedule it, nor tell the user their
-# schedule was updated. The response keys stay: the frontend reads them.
+# No task endpoint starts a replan (the v1 background replan is retired), so none may
+# tell the user their schedule was updated. The response keys stay: the frontend
+# reads them.
 _REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to", "rescheduled")
 
 
@@ -376,19 +376,10 @@ _REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to"
 def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
     method, path, body, monkeypatch
 ):
-    from app.main import app
-
-    replans: list[tuple] = []
-
-    async def recording_replan(*args, **kwargs):
-        replans.append(args)
-
-    monkeypatch.setattr("app.services.analytical.control_policy.trigger_replan", recording_replan)
     fake = FakeSupabase({"user_tasks": [
         _task_row("t1", title="Study CNNs", minutes=25),
         _task_row("t2", title="Write the essay", minutes=90),
     ]})
-    monkeypatch.setattr(app.state, "memory_store", None, raising=False)
 
     client = _client_over(fake, monkeypatch)
     response = client.request(method.upper(), path, json=body)
@@ -398,7 +389,6 @@ def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
     assert set(payload) == {"task_id", "status", "message", "replan_triggered"}
     assert payload["replan_triggered"] is False
     assert [c for c in _REPLAN_CLAIMS if c in payload["message"].lower()] == []
-    assert replans == []
 
 
 # --- the skip reason (spec 9.1), one error type, typed responses ----------------------

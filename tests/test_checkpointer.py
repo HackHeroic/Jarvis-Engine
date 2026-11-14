@@ -16,10 +16,9 @@ import pytest
 
 from app.orchestrator.routing import check_negotiation_shortcut
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
-from tests.behaviour.conftest import (  # noqa: F401 - embeddings, jarvis and llm are fixtures
+from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtures
     brain_dump,
     decomposition,
-    embeddings,
     jarvis,
     llm,
 )
@@ -616,7 +615,7 @@ def test_thread_id__is_user_scoped():
 
 
 class _CapturingGraph:
-    """Records what chat_stream_v2 hands to the orchestrator."""
+    """Records what chat_stream hands to the orchestrator."""
 
     def __init__(self, existing_values: dict | None = None):
         self.existing_values = existing_values or {}
@@ -638,10 +637,10 @@ class _CapturingGraph:
 
 
 async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
-    """Drive chat_stream_v2 with every I/O boundary stubbed."""
+    """Drive chat_stream with every I/O boundary stubbed."""
     from types import SimpleNamespace
 
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
 
     async def _session(*args, **kwargs):
         return session_id
@@ -657,10 +656,10 @@ async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
     monkeypatch.setattr("app.services.chat_history.save_assistant_message", _noop)
     monkeypatch.setattr("app.services.chat_history.build_context_messages", _history)
 
-    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
-    response = await chat_stream_v2(
+    response = await chat_stream(
         ChatRequest(user_prompt="hi", user_id=user_id), http_request
     )
     async for _chunk in response.body_iterator:  # drain the SSE stream

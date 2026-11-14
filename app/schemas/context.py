@@ -1,29 +1,11 @@
 """Universal Semantic Router and timetable schemas for dynamic scheduling."""
 
-from dataclasses import dataclass, field as dc_field
 from enum import Enum
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.memory import ExtractedMemory, valid_memories
-
-
-@dataclass
-class IntentContext:
-    """Unified context object passed to every intent handler in the registry."""
-
-    user_id: str
-    user_prompt: str
-    brain_dump: Optional[Any] = None  # BrainDumpExtraction
-    memory_context: str = ""
-    db_client: Any = None
-    progress_callback: Any = None
-    model_mode: str = "auto"
-    draft_store: Any = None
-    memory_store: Any = None
-    conversation_history: list = dc_field(default_factory=list)
-    extra: dict = dc_field(default_factory=dict)
 
 
 class IntentType(str, Enum):
@@ -261,85 +243,3 @@ class IngestionPipelineResult(BaseModel):
     action_proposal: Optional[ActionItemProposal] = None
 
 
-class SchedulePayload(BaseModel):
-    """Typed schedule payload returned in ChatResponse."""
-
-    schedule: dict = Field(description="Map of task_id -> {start_min, end_min, tmt_score, title}")
-    horizon_start: str = Field(description="ISO-8601 datetime for minute-0 of the schedule")
-    horizon_minutes: int = Field(default=0, description="Total horizon length in minutes")
-    daily_cap_minutes: Optional[int] = Field(default=None, description="Adaptive daily cap used")
-    draft_id: Optional[str] = Field(default=None, description="Draft ID if schedule is a draft")
-    status: Optional[str] = Field(default=None, description="'draft' or 'final'")
-    applied_constraints: Optional[List[dict]] = Field(
-        default=None,
-        description="Memory-derived constraints that shaped this schedule",
-    )
-
-
-class ChatResponse(BaseModel):
-    """Unified response from the Control Policy for the /chat endpoint."""
-
-    intent: str = Field(
-        description="Classified intent (e.g. PLAN_DAY, BEHAVIORAL_CONSTRAINT)",
-    )
-    message: str = Field(description="Friendly agentic response for the user")
-    schedule: Optional[SchedulePayload] = Field(
-        default=None,
-        description="Typed schedule payload from OR-Tools solver",
-    )
-    execution_graph: Optional[dict] = Field(
-        default=None,
-        description="ExecutionGraph from reasoning",
-    )
-    ingestion_result: Optional[dict] = Field(
-        default=None,
-        description="IngestionPipelineResult when intent is ingestion",
-    )
-    action_proposals: Optional[List[dict]] = Field(
-        default=None,
-        description="ActionItemProposal list when we extracted action items from brain dump",
-    )
-    search_result: Optional[dict] = Field(
-        default=None,
-        description="When search_queries executed: queries and summaries",
-    )
-    suggested_action: Optional[str] = Field(
-        default=None,
-        description="Frontend hint: e.g. 'replan' when user saved a habit and may want to refresh schedule",
-    )
-    thinking_process: Optional[str] = Field(
-        default=None,
-        description="The extracted internal think monologue from the LLM.",
-    )
-    awaiting_task_confirmation: bool = Field(
-        default=False,
-        description="True when tasks are ready for user review before scheduling.",
-    )
-    schedule_status: Optional[str] = Field(
-        default=None,
-        description="'draft' = awaiting user accept; 'accepted' = finalized and persisted.",
-    )
-    draft_id: Optional[str] = Field(
-        default=None,
-        description="Draft identifier for review/accept/reject flow. Present when pipeline output is staged.",
-    )
-    conversation_id: Optional[str] = Field(
-        default=None,
-        description="Session ID for this conversation. Frontend should store and send back.",
-    )
-    message_id: Optional[str] = Field(
-        default=None,
-        description="Unique ID for this specific response message.",
-    )
-    clarification_options: Optional[List[str]] = Field(
-        default=None,
-        description="Quick-reply options when Jarvis needs clarification. Frontend renders as buttons.",
-    )
-    memories: Optional[List[dict]] = Field(
-        default=None,
-        description="Memories extracted from this conversation turn. Frontend renders in MemoryPanel.",
-    )
-    pearl_insights: Optional[List[dict]] = Field(
-        default=None,
-        description="Recently detected behavioral patterns from PEARL.",
-    )

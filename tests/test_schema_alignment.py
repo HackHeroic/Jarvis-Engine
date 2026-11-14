@@ -37,14 +37,13 @@ def app_with_db():
     from app.orchestrator.hooks import ActionHooks
 
     originals = {
-        name: getattr(app.state, name, _UNSET) for name in ("db_client", "memory_store", "container")
+        name: getattr(app.state, name, _UNSET) for name in ("db_client", "container")
     }
     supabase = FakeSupabase({"user_tasks": [{
         "id": "row-1", "task_id": "t1", "user_id": "alice", "status": "pending",
         "title": "Revise notes", "duration_minutes": 25, "difficulty_weight": 0.5,
     }]})
     app.state.db_client = FakeDBClient(supabase)
-    app.state.memory_store = None
     app.state.container = AppContainer.build(supabase_client=supabase, cfg=cfg, hooks=ActionHooks())
     yield app, supabase
     for name, original in originals.items():

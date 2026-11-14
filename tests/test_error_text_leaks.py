@@ -23,7 +23,6 @@ def app(monkeypatch):
     from app.main import app
 
     monkeypatch.setattr(app.state, "db_client", FakeDBClient(FakeSupabase()), raising=False)
-    monkeypatch.setattr(app.state, "memory_store", None, raising=False)
     return app
 
 
@@ -201,18 +200,6 @@ def test_workspace__jarvis_error__keeps_its_own_status_and_message(client, monke
 # --- chat ----------------------------------------------------------------------------
 
 
-def test_accept_schedule__invalid_tasks__fixed_message_no_validation_text(client):
-    resp = client.post(
-        "/api/v1/chat/accept-schedule",
-        json={"user_id": "u1", "tasks": [{"task_id": "t1", "title": SECRET}]},
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "error" and body["task_count"] == 0
-    _assert_no_leak(resp)
-
-
 class _ExplodingGraph:
     async def aget_state(self, config):
         return None
@@ -229,7 +216,7 @@ async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_excep
     import json
     from types import SimpleNamespace
 
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
 
     async def _session(*_a, **_k):
         return "sess-1"
@@ -244,9 +231,9 @@ async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_excep
     monkeypatch.setattr("app.services.chat_history.save_user_message", _nothing)
     monkeypatch.setattr("app.services.chat_history.save_assistant_message", _nothing)
     monkeypatch.setattr("app.services.chat_history.build_context_messages", _history)
-    state = SimpleNamespace(jarvis_graph=_ExplodingGraph(), db_client=None, memory_store=None)
+    state = SimpleNamespace(jarvis_graph=_ExplodingGraph(), db_client=None)
 
-    response = await chat_stream_v2(
+    response = await chat_stream(
         ChatRequest(user_prompt="hi", user_id="u1"),
         SimpleNamespace(app=SimpleNamespace(state=state)),
     )

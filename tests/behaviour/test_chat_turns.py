@@ -1,6 +1,6 @@
 """Chat turns: a brain dump becomes a draft, "looks good" locks it in, and nothing leaks.
 
-Every test drives the real ``/chat/v2/stream`` handler through the real
+Every test drives the real ``/chat/stream`` handler through the real
 orchestrator, planning sub-graph and CP-SAT solver, with a scripted LLM and an
 in-memory database (see ``conftest.py``). The assertions are what the user would
 notice: the reply, whether a draft is waiting, what landed in their task list,

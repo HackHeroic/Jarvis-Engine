@@ -201,15 +201,10 @@ def test_layering__services_orchestrator_modules_core_api__do_not_import_infrast
     assert _imports_under(_LEGACY_SHIM, "app.infrastructure"), "the shim is gone: drop the exception"
 
 
-# Services, the domain and infrastructure never reach up into the API layer. These
-# legacy imports remain (the list can only shrink): run_schedule and the horizon start
-# are reusable module-level functions of the schedule endpoint (CLAUDE.md), and the v1
-# control-policy flow still borrows the chunker's prompt and fence-stripper.
+# Services, the domain and infrastructure never reach up into the API layer. This
+# legacy import remains (the list can only shrink): run_schedule is a reusable
+# module-level function of the schedule endpoint (CLAUDE.md).
 _API_IMPORTS_ALLOWED: dict[str, frozenset[str]] = {
-    "services/analytical/control_policy.py": frozenset({
-        "app.api.v1.endpoints.reasoning",  # SYSTEM_PROMPT, _sanitize_llm_json (v1 only)
-        "app.api.v1.endpoints.schedule",  # run_schedule, current_horizon_start
-    }),
     "services/analytical/schedule_modifier.py": frozenset({
         "app.api.v1.endpoints.schedule",  # run_schedule
     }),
@@ -351,18 +346,8 @@ _LLM_TRANSPORT_FILES = frozenset(
     }
 )
 
-_V1_ONLY = "v1 control-policy flow, reached only from the deprecated /chat and /chat/stream"
-
 # (file under app/, enclosing top-level function) -> why it may still call the transport.
-_LEGACY_LLM_CALLS_ALLOWED: dict[tuple[str, str], str] = {
-    ("api/v1/endpoints/chat.py", "chat_stream"): "inside the deprecated v1 /chat/stream route",
-    ("api/v1/endpoints/chat.py", "_stream_direct_27b"): "called only by the deprecated /chat/stream",
-    ("services/analytical/control_policy.py", "_extract_and_stage_inline_habits"): _V1_ONLY,
-    ("services/analytical/control_policy.py", "_run_brain_dump_extraction"): _V1_ONLY,
-    ("services/analytical/control_policy.py", "_direct_qa_response"): _V1_ONLY,
-    ("services/analytical/control_policy.py", "_fallback_single_intent"): _V1_ONLY,
-    ("services/analytical/control_policy.py", "_run_plan_day_flow"): _V1_ONLY,
-}
+_LEGACY_LLM_CALLS_ALLOWED: dict[tuple[str, str], str] = {}
 
 
 # Grounded web search: Gemini only, outside the provider chain (no other provider can
@@ -373,9 +358,6 @@ _WEB_SEARCH_CALLS = frozenset({"gemini_web_search", "run_deep_research"})
 _WEB_SEARCH_CALLS_ALLOWED: dict[tuple[str, str], str] = {
     ("services/analytical/workspace_builder.py", "_search_web"): (
         "the shared search helper: PII gate first, metered, WebSearchUnavailableError"
-    ),
-    ("services/analytical/control_policy.py", "execute_agentic_flow"): (
-        f"{_V1_ONLY} (its run_deep_research)"
     ),
 }
 
@@ -450,7 +432,7 @@ def test_web_search_guard__a_direct_call_elsewhere__is_caught(tmp_path):
 
 def test_routes__no_raw_model_proxy__the_lm_studio_route_is_gone():
     """/lmstudio proxied straight to LM Studio over httpx: no chain, no ledger. Nothing
-    called it (the frontend talks to /chat/v2/stream), so it was deleted, not allowed."""
+    called it (the frontend talks to /chat/stream), so it was deleted, not allowed."""
     from app.main import app
 
     assert [r.path for r in app.routes if "/lmstudio" in getattr(r, "path", "")] == []

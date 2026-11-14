@@ -782,7 +782,7 @@ def _brief_world(fake, repos, now: datetime):
     clock = lambda: now  # noqa: E731
     bus = EventBus()
     planner = PlanningGraphReplanner(
-        repos.drafts, db_provider=lambda: FakeDBClient(fake), memory_provider=lambda: None
+        repos.drafts, db_provider=lambda: FakeDBClient(fake)
     )
     patterns = PatternService(
         repos.task_events, repos.memories, repos.profiles, bus,

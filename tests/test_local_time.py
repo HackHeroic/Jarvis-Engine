@@ -122,32 +122,6 @@ async def test_missed_deadlines__date_only_deadline__missed_after_local_midnight
     assert missed["task_id"] == "t1"
 
 
-def test_pearl__skips_at_nine_local__counted_as_hour_nine():
-    from app.services.memory.pearl import detect_skip_time_window
-
-    class _Store:
-        def __init__(self):
-            self.stored = []
-
-        def find_similar_memory(self, *_a, **_k):
-            return None
-
-        def store_memory(self, user_id, memory):
-            self.stored.append(memory)
-
-    tasks = [
-        {"task_id": f"t{i}", "status": "skipped",
-         "scheduled_start": f"2026-11-{5 + i:02d}T03:30:00+00:00"}  # 09:00 IST
-        for i in range(3)
-    ]
-    store = _Store()
-
-    detect_skip_time_window("u1", tasks, store)
-
-    (memory,) = store.stored
-    assert "hour 9" in memory["content"]
-
-
 def test_energy__read_on_the_users_clock(monkeypatch):
     import asyncio
 

@@ -250,19 +250,6 @@ async def test_load_context__hydrated_facade_can_query_the_registered_db():
 
 
 @pytest.mark.asyncio
-async def test_load_context__hydrated_facade_gets_the_registered_memory_store():
-    from app.core.runtime import set_shared_clients
-    from app.orchestrator.graph import _load_context
-
-    store = object()
-    set_shared_clients(db=FakeDBClient(), memory_store=store)
-
-    result = await _load_context(_make_state(user_id="u42", user_model=None))
-
-    assert await result["user_model"].get_memory_store() is store
-
-
-@pytest.mark.asyncio
 async def test_load_context__before_startup__degrades_to_a_db_less_facade():
     """No lifespan yet (tests, scripts) — hydrate anyway rather than crash."""
     from app.orchestrator.graph import _load_context
@@ -278,7 +265,7 @@ def test_runtime__accessors_are_none_before_registration():
     from app.core import runtime
 
     assert runtime.get_db() is None
-    assert runtime.get_memory_store() is None
+    assert runtime.registered_container() is None
 
 
 # ---------------------------------------------------------------------------
@@ -1201,7 +1188,7 @@ async def test_general_chat__with_progress_queue__streams_and_strips_think(monke
 
 
 def test_render_progress_event__token__lands_on_the_message_channel():
-    """Streamed content tokens use the same channel v1 /chat/stream uses."""
+    """Streamed content tokens ride the `message` channel."""
     import json
 
     from app.api.v1.endpoints.chat import render_progress_event

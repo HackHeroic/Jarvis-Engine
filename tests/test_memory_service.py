@@ -17,14 +17,11 @@ from app.domain import errors
 from app.domain.entities import Memory, MemorySource, MemoryStatus, SUPPRESSING_STATUSES
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryMemoryRepository, InMemoryStore
-from app.services.memory import store as legacy_store_module
 from app.services.memory.memory_service import (
     MemoryCandidate,
     MemoryDecaySweep,
     MemoryService,
 )
-from app.services.memory.retriever import compute_memory_strength
-from app.services.memory.store import MemoryStore
 from tests.fakes import BagOfWordsEmbedder, FakeSupabase
 
 NOW = datetime(2026, 11, 16, 9, 0, tzinfo=timezone.utc)
@@ -471,73 +468,6 @@ async def test_remember__supersede_retried_after_the_link_failed__one_new_memory
     assert sorted(stored) == sorted([old.id, outcome.memory.id])
     assert (await memories.get("alice", old.id)).superseded_by == outcome.memory.id
     assert [m.id for m in await service.list_active("alice")] == [outcome.memory.id]
-
-
-# --- the legacy store and retriever read the same decay --------------------------------
-
-
-def _freeze_legacy_clock(monkeypatch, when: datetime) -> None:
-    class _Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return when.astimezone(tz) if tz is not None else when.replace(tzinfo=None)
-
-    monkeypatch.setattr(legacy_store_module, "datetime", _Frozen)
-
-
-@pytest.fixture
-def legacy(monkeypatch):
-    """The v1 MemoryStore and the Supabase MemoryRepository over one database."""
-    supabase = FakeSupabase()
-    monkeypatch.setattr(legacy_store_module, "embed_text", lambda text: None)
-    return supabase, MemoryStore(supabase_client=supabase), RepositoryFactory.supabase(supabase).memories
-
-
-@pytest.mark.asyncio
-async def test_legacy_retriever__after_the_decay_sweep__reads_the_strength_the_service_reports(
-    legacy, monkeypatch
-):
-    supabase, store, memories = legacy
-    _freeze_legacy_clock(monkeypatch, NOW)
-    row = store.store_memory("alice", {"type": "goal", "content": MARATHON})
-    service = MemoryService(memories, BagOfWordsEmbedder(), clock=_Clock(NOW))
-
-    assert await service.fade_stale("alice", NOW + timedelta(days=10)) == 0
-
-    swept = await memories.get("alice", row["id"])
-    later = NOW + timedelta(days=12)
-    (stored,) = supabase.rows["user_memories"]
-    assert compute_memory_strength(stored, later) == pytest.approx(swept.strength_at(later))
-
-
-@pytest.mark.asyncio
-async def test_legacy_reinforce__then_the_decay_sweep__memory_not_faded(legacy, monkeypatch):
-    supabase, store, memories = legacy
-    _freeze_legacy_clock(monkeypatch, NOW)
-    row = store.store_memory("alice", {"type": "goal", "content": MARATHON})
-    _freeze_legacy_clock(monkeypatch, NOW + timedelta(days=21))
-    assert store.reinforce_memory(row["id"], user_id="alice")
-    service = MemoryService(memories, BagOfWordsEmbedder(), clock=_Clock(NOW))
-    forty_days_on = NOW + timedelta(days=40)
-
-    assert await service.fade_stale("alice", forty_days_on) == 0
-
-    assert (await memories.get("alice", row["id"])).status is MemoryStatus.ACTIVE
-    (stored,) = supabase.rows["user_memories"]
-    assert compute_memory_strength(stored, forty_days_on) >= 0.1
-
-
-@pytest.mark.asyncio
-async def test_legacy_store__memory_noticed_from_behaviour__stored_as_inferred(legacy):
-    _, store, memories = legacy
-
-    noticed = store.store_memory(
-        "alice", {"type": "behavioral_pattern", "content": SKIPS_AT_NINE, "source": "behavior"}
-    )
-    said = store.store_memory("alice", {"type": "goal", "content": MARATHON})
-
-    assert (await memories.get("alice", noticed["id"])).provenance is MemorySource.INFERRED
-    assert (await memories.get("alice", said["id"])).provenance is MemorySource.SAID
 
 
 # --- the turn's one read of the memories: bounded, and no words it does not need ------
