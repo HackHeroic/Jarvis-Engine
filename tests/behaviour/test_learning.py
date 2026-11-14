@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from tests.behaviour.conftest import brain_dump, decomposition, said
@@ -33,7 +33,7 @@ FIVE_TOPICS = ["Graphs", "DP", "Trees", "Heaps", "Mocks"]
 
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
-    clock.freeze(MONDAY_8AM, schedule_endpoint, utc_clock)
+    clock.freeze(MONDAY_8AM, scheduling, utc_clock)
 
 
 # What TaskService adds to an outcome's metadata, besides the task's title, goal and deadline.
@@ -275,16 +275,16 @@ async def test_energy__learned_evening_profile__teaching_a_rule_still_moves_the_
     import app.modules.planning_graph as planning_graph
     from app.services.energy import HeuristicEnergyEstimator
 
-    clock.freeze(MONDAY_8AM, schedule_endpoint, planning_graph)
+    clock.freeze(MONDAY_8AM, scheduling, planning_graph)
     await _seed_evening_completions(jarvis, 12)
     focus_seen: list = []
-    real_run_schedule = schedule_endpoint.run_schedule
+    real_run_schedule = scheduling.run_schedule
 
     def spy(*args, **kwargs):
         focus_seen.append(kwargs.get("focus_by_hour"))
         return real_run_schedule(*args, **kwargs)
 
-    monkeypatch.setattr(schedule_endpoint, "run_schedule", spy)
+    monkeypatch.setattr(scheduling, "run_schedule", spy)
     _script_plan(llm)
     _script_rule(llm)
 

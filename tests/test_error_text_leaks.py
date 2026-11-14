@@ -58,7 +58,9 @@ def _assert_no_leak(resp) -> None:
 # --- ingestion ---------------------------------------------------------------------
 
 
-def test_ingest__classifier_fails__502_fixed_message_no_exception_text(client, monkeypatch):
+def test_ingest__classifier_fails__503_llm_unavailable_fixed_message_no_exception_text(
+    client, monkeypatch
+):
     async def failing(**_kwargs):
         raise _planted()
 
@@ -66,16 +68,18 @@ def test_ingest__classifier_fails__502_fixed_message_no_exception_text(client, m
 
     resp = client.post("/api/v1/ingestion/ingest", json={"payload": "Lectures Mon 9-11"})
 
-    assert resp.status_code == 502
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "llm_unavailable"
     assert resp.json()["error"]["message"] == "Could not classify the payload. Try again shortly."
     _assert_no_leak(resp)
 
 
 @pytest.mark.parametrize("path", ["/api/v1/ingestion/ingest", "/api/v1/ingestion/process"])
-def test_ingestion__invalid_base64__400_fixed_message_no_decoder_text(client, path):
+def test_ingestion__invalid_base64__422_fixed_message_no_decoder_text(client, path):
     resp = client.post(path, json={"file_base64": "abc", "media_type": "pdf"})
 
-    assert resp.status_code == 400
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
     assert resp.json()["error"]["message"] == "file_base64 is not valid base64."
     assert "padding" not in resp.text.lower() and "multiple of 4" not in resp.text
 
@@ -163,7 +167,7 @@ def test_delete_rule__database_fails__503_fixed_message_no_exception_text(
 # --- reasoning ---------------------------------------------------------------------
 
 
-def test_decompose_goal__unparseable_reply__502_fixed_message_no_exception_text(
+def test_decompose_goal__unparseable_reply__503_llm_output_parse_no_exception_text(
     client, monkeypatch
 ):
     async def unparseable(**_kwargs):
@@ -173,7 +177,8 @@ def test_decompose_goal__unparseable_reply__502_fixed_message_no_exception_text(
 
     resp = client.post("/api/v1/reasoning/decompose-goal", json={"user_prompt": "Learn DSA"})
 
-    assert resp.status_code == 502
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "llm_output_parse"
     assert resp.json()["error"]["message"] == (
         "LLM Reasoning Error: the model returned content that "
         "could not be parsed into a valid ExecutionGraph."

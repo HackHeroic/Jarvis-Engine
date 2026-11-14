@@ -8,10 +8,8 @@ from app.schemas.context import (
     IntentType,
 )
 
-# ExecutionGraph lives in the reasoning endpoint module.
-# We use Any here to avoid importing from the API layer into the orchestrator.
 # The type annotation is preserved as a comment for documentation.
-ExecutionGraphType = Any  # app.api.v1.endpoints.reasoning.ExecutionGraph
+ExecutionGraphType = Any  # app.schemas.decomposition.ExecutionGraph
 
 
 class ConversationPhase(str, Enum):

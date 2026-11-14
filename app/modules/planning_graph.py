@@ -194,15 +194,15 @@ async def fetch_constraints(state: PlanningState) -> dict:
     turn's semantic slots until habit translation adds its own, so the rule holds even
     if translation times out.
     """
-    from app.api.v1.endpoints import schedule as schedule_ep
+    from app.services.planning import scheduling
 
     zone = await _user_zone(state)
-    start = schedule_ep.current_horizon_start(zone)
+    start = scheduling.current_horizon_start(zone)
     if state.get("replan_only"):
         # A replan is for today once the user is up: before DAY_START_HOUR the late-night
         # rule would start it on yesterday's day. From EVENING_CUTOFF_HOUR on it is still
         # tomorrow's.
-        start = max(start, schedule_ep._compute_horizon_start(zone=zone))
+        start = max(start, scheduling.logical_horizon_start(zone))
     horizon_start = start.isoformat()
     focus_by_hour = await _learned_focus(
         state.get("planning"), state.get("user_id", "demo"), zone
@@ -334,7 +334,7 @@ async def expand_slots(state: PlanningState) -> dict:
     if not semantic_slots:
         return {"time_slots": []}
     try:
-        from app.api.v1.endpoints import schedule as schedule_ep
+        from app.services.planning import scheduling
         from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
         from app.schemas.context import SemanticTimeSlot
         # Convert dicts back to SemanticTimeSlot objects
@@ -343,7 +343,7 @@ async def expand_slots(state: PlanningState) -> dict:
         # TypeError into the except below and silently dropped every habit block.
         # It is the horizon's own start — day 0's local date — not "now" in UTC,
         # which names the wrong weekday for half the user's night.
-        plan_start = _horizon_start_of(state) or schedule_ep.current_horizon_start(
+        plan_start = _horizon_start_of(state) or scheduling.current_horizon_start(
             await _user_zone(state)
         )
         time_slots = expand_semantic_slots_to_time_slots(
@@ -500,7 +500,7 @@ async def decompose_goal(state: PlanningState) -> dict:
 
     try:
         from app.core.model_router import route_llm_call
-        from app.api.v1.endpoints.reasoning import ExecutionGraph
+        from app.schemas.decomposition import ExecutionGraph
         result = await route_llm_call(
             task="socratic_chunker",
             prompt=goal,
@@ -631,8 +631,8 @@ async def solve_schedule(state: PlanningState) -> dict:
     .claude/rules/code-style.md it is imported and called, never reimplemented.
     """
     from pydantic import ValidationError
-    from app.api.v1.endpoints import schedule as schedule_ep
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
+    from app.services.planning import scheduling
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata
     from app.schemas.context import TimeSlot
 
     chunks = state.get("task_chunks", [])
@@ -685,7 +685,7 @@ async def solve_schedule(state: PlanningState) -> dict:
         # path every queued SSE frame stalls behind it, so the user watches a
         # dead spinner mid-plan.
         resp = await asyncio.to_thread(
-            schedule_ep.run_schedule,
+            scheduling.run_schedule,
             graph,
             daily_context,
             horizon_minutes=horizon,

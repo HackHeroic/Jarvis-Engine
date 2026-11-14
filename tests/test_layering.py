@@ -195,20 +195,16 @@ def test_layering__services_orchestrator_modules_core_api__do_not_import_infrast
     assert stale == [], "no longer imports infrastructure: drop it from the allow-list"
 
 
-# Services, the domain and infrastructure never reach up into the API layer. This
-# legacy import remains (the list can only shrink): run_schedule is a reusable
-# module-level function of the schedule endpoint (CLAUDE.md).
-_API_IMPORTS_ALLOWED: dict[str, frozenset[str]] = {
-    "services/analytical/schedule_modifier.py": frozenset({
-        "app.api.v1.endpoints.schedule",  # run_schedule
-    }),
-}
+# Nothing below the API layer reaches up into it: what is shared lives below it
+# (run_schedule in app/services/planning/scheduling.py, the schemas in app/schemas).
+_API_IMPORTS_ALLOWED: dict[str, frozenset[str]] = {}
+_BELOW_THE_API = [
+    "services", "domain", "infrastructure", "modules", "orchestrator", "core", "utils", "schemas",
+]
 
 
-def test_layering__services_domain_infrastructure__do_not_import_the_api():
-    unexpected, stale = _layer_report(
-        ["services", "domain", "infrastructure"], "app.api", _API_IMPORTS_ALLOWED
-    )
+def test_layering__nothing_below_the_api__imports_the_api():
+    unexpected, stale = _layer_report(_BELOW_THE_API, "app.api", _API_IMPORTS_ALLOWED)
 
     assert unexpected == [], "move what is shared below the API (e.g. app/schemas)"
     assert stale == [], "no longer imports the API: drop it from the allow-list"
@@ -243,6 +239,7 @@ def test_layering__plan_2_code__is_on_no_allow_list():
         *_INFRASTRUCTURE_IMPORTS_ALLOWED,
         *_API_IMPORTS_ALLOWED,
         *_SUPABASE_DRIVER_ALLOWED,
+        *_RAW_TABLE_CALLS_ALLOWED,
         *(file for file, _owner in _LEGACY_LLM_CALLS_ALLOWED),
         *(file for file, _owner in _WEB_SEARCH_CALLS_ALLOWED),
     ]
@@ -430,3 +427,98 @@ def test_routes__no_raw_model_proxy__the_lm_studio_route_is_gone():
     from app.main import app
 
     assert [r.path for r in app.routes if "/lmstudio" in getattr(r, "path", "")] == []
+
+
+# --- raw table calls --------------------------------------------------------------
+
+# Files that still call a Supabase table directly (``.table(``), and why. Everything
+# else reads and writes through a repository port the container built. The list can
+# only shrink: an entry that no longer calls a table is a failure too.
+_PLAN_3_CUT = "Plan 3 cut (Task 6): no repository yet for"
+_RAW_TABLE_CALLS_ALLOWED: dict[str, str] = {
+    "services/analytical/workspace_builder.py": (
+        "task_workspaces cache (decision 10); its user_tasks reads need topic_keywords and"
+        " implementation_intention, which the Task entity does not carry, and task_materials"
+        f" is {_PLAN_3_CUT.lower()} documents"
+    ),
+    "services/user_preferences.py": "learning_style read (decision 10)",
+    "services/chat_history.py": f"{_PLAN_3_CUT} chat_sessions / chat_messages",
+    "api/v1/endpoints/sessions.py": f"{_PLAN_3_CUT} chat_sessions",
+    "api/v1/endpoints/documents.py": f"{_PLAN_3_CUT} ingested_documents / task_materials",
+    "api/v1/endpoints/ingestion.py": f"{_PLAN_3_CUT} pending_calendar_updates",
+    "services/extraction/orchestrator.py": (
+        f"{_PLAN_3_CUT} pending_calendar_updates / ingested_documents"
+    ),
+    "services/extraction/task_material_linker.py": f"{_PLAN_3_CUT} task_materials",
+}
+_RAW_TABLE_DIRS = ["api", "services", "core", "modules", "orchestrator"]
+
+
+def _raw_table_calls(path: Path) -> list[int]:
+    """Lines of every ``<anything>.table(...)`` call in ``path``."""
+    return [
+        node.lineno
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "table"
+    ]
+
+
+def _raw_table_report(
+    allowed: dict[str, str], app_dir: Path | None = None
+) -> tuple[list[str], list[str]]:
+    """(files calling ``.table(`` outside ``allowed``, stale ``allowed`` entries)."""
+    root = app_dir or _APP_DIR
+    calling = {
+        path.relative_to(root).as_posix(): lines
+        for d in _RAW_TABLE_DIRS
+        for path in sorted((root / d).rglob("*.py"))
+        if (lines := _raw_table_calls(path))
+    }
+    unexpected = [f"{f}:{lines}" for f, lines in sorted(calling.items()) if f not in allowed]
+    stale = sorted(f for f in allowed if f not in calling)
+    return unexpected, stale
+
+
+def test_layering__no_raw_table_calls_outside_the_allow_list():
+    unexpected, stale = _raw_table_report(_RAW_TABLE_CALLS_ALLOWED)
+
+    assert unexpected == [], "read and write through a repository port"
+    assert stale == [], "no longer calls a table: drop it from the allow-list"
+
+
+def test_raw_table_report__a_call_off_the_list__is_caught_and_a_stale_entry_named(tmp_path):
+    for d in _RAW_TABLE_DIRS:
+        (tmp_path / d).mkdir()
+    (tmp_path / "core" / "facade.py").write_text(
+        "rows = self._db.supabase.table('user_tasks').select('*').execute()\n"
+    )
+    (tmp_path / "services" / "fine.py").write_text("x = repos.tasks.list_pending(u)\n")
+
+    unexpected, stale = _raw_table_report({"services/gone.py": "legacy"}, app_dir=tmp_path)
+
+    assert unexpected == ["core/facade.py:[1]"]
+    assert stale == ["services/gone.py"]
+
+
+def test_layering__allow_lists__are_exactly_the_documented_leftovers():
+    assert set(_INFRASTRUCTURE_IMPORTS_ALLOWED) == {"core/model_router.py"}
+    assert _API_IMPORTS_ALLOWED == {}
+    assert _SUPABASE_DRIVER_ALLOWED == {}
+    assert _LEGACY_LLM_CALLS_ALLOWED == {}
+    assert set(_WEB_SEARCH_CALLS_ALLOWED) == {
+        ("services/analytical/workspace_builder.py", "_search_web")
+    }
+    assert set(_RAW_TABLE_CALLS_ALLOWED) == {
+        "services/analytical/workspace_builder.py",
+        "services/user_preferences.py",
+        # Plan 3 cut Task 6 (sessions, messages, documents, pending calendar):
+        "services/chat_history.py",
+        "api/v1/endpoints/sessions.py",
+        "api/v1/endpoints/documents.py",
+        "api/v1/endpoints/ingestion.py",
+        "services/extraction/orchestrator.py",
+        "services/extraction/task_material_linker.py",
+    }
+    assert all(reason.strip() for reason in _RAW_TABLE_CALLS_ALLOWED.values())

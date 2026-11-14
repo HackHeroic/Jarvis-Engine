@@ -462,7 +462,7 @@ def test_build_task_rows__representative_chunks__exact_rows():
     """
     from datetime import datetime
 
-    from app.api.v1.endpoints.reasoning import ImplementationIntention, TaskChunk
+    from app.schemas.decomposition import ImplementationIntention, TaskChunk
     from app.services.planning.task_rows import build_task_rows
 
     chunks = [

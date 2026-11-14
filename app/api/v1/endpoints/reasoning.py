@@ -2,9 +2,10 @@
 
 Decomposes monolithic goals into sub-25-minute micro-tasks using
 Cognitive Load Theory, the WOOP framework, and Implementation Intentions.
-The strict Pydantic schemas (``app/schemas/decomposition.py``, where services may use
-them too; their names stay importable from here) are the JSON contract between the
-probabilistic LLM reasoning layer and the deterministic Python backend.
+The strict Pydantic schemas (``app/schemas/decomposition.py``, where services use them
+too) are the JSON contract between the probabilistic LLM reasoning layer and the
+deterministic Python backend. A model reply that never becomes a valid graph is
+``LLMOutputParseError`` (503 ``llm_output_parse`` in the envelope).
 """
 
 from __future__ import annotations
@@ -13,17 +14,12 @@ import json
 import logging
 import re
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body
 from pydantic import ValidationError
 
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMOutputParseError, LLMUnavailableError
-from app.schemas.decomposition import (  # noqa: F401  (re-exported)
-    ExecutionGraph,
-    GoalMetadata,
-    ImplementationIntention,
-    TaskChunk,
-)
+from app.schemas.decomposition import ExecutionGraph
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +93,16 @@ SYSTEM_PROMPT = (
 
 router = APIRouter()
 
+# Fixed texts: an exception's own message never goes on the wire (it is logged).
+_UNPARSEABLE = (
+    "LLM Reasoning Error: the model returned content that "
+    "could not be parsed into a valid ExecutionGraph."
+)
+_TOO_FEW_TASKS = (
+    "Model returned insufficient tasks (need at least 5). "
+    "Try again or set GEMINI_API_KEY for last-resort cloud fallback."
+)
+
 
 @router.post(
     "/decompose-goal",
@@ -143,35 +149,17 @@ async def decompose_goal(
             graph = await _decompose(force_cloud=True)
 
         if len(graph.decomposition) < 5:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Model returned insufficient tasks (need at least 5). "
-                    "Try again or set GEMINI_API_KEY for last-resort cloud fallback."
-                ),
-            )
+            raise LLMOutputParseError(_TOO_FEW_TASKS)
         return graph
-    except HTTPException:
+    except LLMOutputParseError:
         raise
     except (LLMUnavailableError, RuntimeError) as exc:
         if not _unparseable(exc):
             raise
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "LLM Reasoning Error: the model returned content that "
-                "could not be parsed into a valid ExecutionGraph."
-            ),
-        ) from exc
+        raise LLMOutputParseError(_UNPARSEABLE) from exc
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
         logger.warning("Decomposition reply did not parse as an ExecutionGraph", exc_info=exc)
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "LLM Reasoning Error: the model returned content that "
-                "could not be parsed into a valid ExecutionGraph."
-            ),
-        ) from exc
+        raise LLMOutputParseError(_UNPARSEABLE) from exc
 
 
 def _unparseable(exc: BaseException | None) -> bool:

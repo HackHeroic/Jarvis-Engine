@@ -28,6 +28,38 @@ REQUEST_ID_HEADER = "X-Request-ID"
 _INTERNAL_ERROR_MESSAGE = "Something went wrong on our side."
 _VALIDATION_MESSAGE = "The request is invalid."
 
+# What every route documents for its errors: the one envelope, never FastAPI's default
+# validation shape (which the API never sends). Set on the app (``FastAPI(responses=)``),
+# so every operation in the OpenAPI schema, included routers' too, says it.
+ERROR_RESPONSES: dict[int | str, dict] = {
+    422: {
+        "model": ErrorResponse,
+        "description": (
+            "The request is invalid (`validation_error`, the field errors in"
+            " `error.details.errors`), or a plan does not fit (`schedule_infeasible`)."
+        ),
+    },
+    "4XX": {"model": ErrorResponse, "description": "A client error, in the one envelope."},
+    "5XX": {
+        "model": ErrorResponse,
+        "description": "A server or dependency error, in the one envelope; never exception text.",
+    },
+}
+
+
+def json_error_responses() -> dict[int | str, dict]:
+    """``ERROR_RESPONSES`` as explicit JSON content, for a route whose own media type is
+    not JSON (the event stream): its errors before the stream starts are still the
+    envelope, as ``application/json``."""
+    envelope = {"$ref": "#/components/schemas/ErrorResponse"}
+    return {
+        status: {
+            "description": spec["description"],
+            "content": {"application/json": {"schema": envelope}},
+        }
+        for status, spec in ERROR_RESPONSES.items()
+    }
+
 
 class RequestIdMiddleware:
     """Gives every HTTP request an id: ``request.state.request_id`` and ``X-Request-ID``.

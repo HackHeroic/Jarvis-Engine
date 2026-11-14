@@ -32,9 +32,9 @@ def before_the_horizon(clock):
     08:00 UTC, and freezes the start of the local day instead (before 08:00 the
     logical day is yesterday's, most of it past).
     """
-    import app.api.v1.endpoints.schedule as schedule_endpoint
+    import app.services.planning.scheduling as scheduling
 
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), scheduling)
 
 
 def _chunk(task_id: str = "t1", **overrides) -> dict:
@@ -89,7 +89,7 @@ async def test_solve_schedule__delegates_to_run_schedule_with_tmt():
         "schedule": {"t1": {"start_min": 0, "end_min": 25, "tmt_score": 1.0}},
     }
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=fake_resp
+        "app.services.planning.scheduling.run_schedule", return_value=fake_resp
     ) as m:
         state = {
             "task_chunks": [_chunk()],
@@ -113,11 +113,11 @@ async def test_solve_schedule__builds_valid_execution_graph_for_run_schedule():
     `cognitive_load_estimate` is a Dict[str, float] (not a bare float) — passing
     the wrong shape raises ValidationError before the solver ever runs.
     """
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata
     from app.modules.planning_graph import solve_schedule
 
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=MagicMock()
+        "app.services.planning.scheduling.run_schedule", return_value=MagicMock()
     ) as m:
         await solve_schedule(
             {
@@ -153,7 +153,7 @@ async def test_solve_schedule__horizon_start_comes_from_run_schedule():
         "horizon_start": "2026-08-08T08:00:00+00:00",
     }
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=fake_resp
+        "app.services.planning.scheduling.run_schedule", return_value=fake_resp
     ) as m:
         result = await solve_schedule(
             {
@@ -193,7 +193,7 @@ async def test_solve_schedule__maps_time_slots_to_timeslot_objects():
     from app.modules.planning_graph import solve_schedule
 
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=MagicMock()
+        "app.services.planning.scheduling.run_schedule", return_value=MagicMock()
     ) as m:
         await solve_schedule(
             {
@@ -246,7 +246,7 @@ async def test_solve_schedule__fused_pending_task_missing_fields__still_schedule
         # no completion_criteria — fuse_tasks never sets one
     }
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=MagicMock()
+        "app.services.planning.scheduling.run_schedule", return_value=MagicMock()
     ) as m:
         result = await solve_schedule(
             {
@@ -270,7 +270,7 @@ async def test_solve_schedule__422_maps_to_infeasible():
     from app.modules.planning_graph import solve_schedule
 
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule",
+        "app.services.planning.scheduling.run_schedule",
         side_effect=ScheduleInfeasibleError("INFEASIBLE"),
     ):
         result = await solve_schedule(
@@ -287,16 +287,15 @@ async def test_solve_schedule__422_maps_to_infeasible():
 
 
 @pytest.mark.asyncio
-async def test_solve_schedule__non_422_http_error__propagates():
-    """Only infeasibility (422) means 'scope problem'. Anything else is a real failure."""
-    from fastapi import HTTPException
+async def test_solve_schedule__other_error__propagates():
+    """Only infeasibility means 'scope problem'. Anything else is a real failure."""
     from app.modules.planning_graph import solve_schedule
 
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule",
-        side_effect=HTTPException(status_code=500, detail="boom"),
+        "app.services.planning.scheduling.run_schedule",
+        side_effect=RuntimeError("boom"),
     ):
-        with pytest.raises(HTTPException):
+        with pytest.raises(RuntimeError):
             await solve_schedule(
                 {
                     "task_chunks": [_chunk()],
@@ -312,7 +311,7 @@ async def test_solve_schedule__no_tasks__returns_error_without_calling_solver():
     """ExecutionGraph.decomposition has min_length=1 — short-circuit first."""
     from app.modules.planning_graph import solve_schedule
 
-    with patch("app.api.v1.endpoints.schedule.run_schedule") as m:
+    with patch("app.services.planning.scheduling.run_schedule") as m:
         result = await solve_schedule(
             {"task_chunks": [], "time_slots": [], "horizon_minutes": 2880}
         )
@@ -365,7 +364,7 @@ async def test_solve_schedule__does_not_block_the_event_loop(monkeypatch):
     also makes `_wrap_step`'s `asyncio.wait_for` advisory only, since a blocking
     call cannot be interrupted by the scheduler.
     """
-    from app.api.v1.endpoints import schedule as schedule_ep
+    from app.services.planning import scheduling as schedule_ep
     from app.modules.planning_graph import solve_schedule
 
     idents: list[int] = []
@@ -712,7 +711,7 @@ async def test_solve_schedule__rule_copies_past_the_horizon__never_reach_the_sol
     rule = {"name": "no_study_before_11", "start_min": 0, "end_min": 180,
             "availability": "minimal_work", "recurring": True}
     with patch(
-        "app.api.v1.endpoints.schedule.run_schedule", return_value=MagicMock()
+        "app.services.planning.scheduling.run_schedule", return_value=MagicMock()
     ) as m:
         await solve_schedule(
             {
@@ -786,7 +785,7 @@ def test_planning_state_out__no_draft__leaves_negotiation_state_alone():
 
 async def _fake_decompose_transport(*args, **kwargs):
     """Return exactly what `hybrid_route_query` returns: a `model_dump()` dict."""
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
 
     return ExecutionGraph(
         goal_metadata=GoalMetadata(),
@@ -803,7 +802,7 @@ def _decompose_transport(chunks: list[dict], goal_metadata=None):
     """
 
     async def _transport(*args, **kwargs):
-        from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+        from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
 
         return ExecutionGraph(
             goal_metadata=goal_metadata if goal_metadata is not None else GoalMetadata(),
@@ -1008,7 +1007,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
         return ok
 
     monkeypatch.setattr(
-        "app.api.v1.endpoints.schedule.run_schedule", flaky_run_schedule
+        "app.services.planning.scheduling.run_schedule", flaky_run_schedule
     )
 
     module_state = planning_state_in(
@@ -1091,7 +1090,7 @@ async def test_decompose_goal__namespaces_task_ids_and_dependencies(monkeypatch)
 @pytest.mark.asyncio
 async def test_decompose_goal__goal_metadata_carries_an_id__it_wins_over_the_slug(monkeypatch):
     """v1 derivation order: goal_metadata.goal_id → slugified objective → uuid."""
-    from app.api.v1.endpoints.reasoning import GoalMetadata
+    from app.schemas.decomposition import GoalMetadata
     from app.modules.planning_graph import decompose_goal
 
     _patch_decompose_transport(

@@ -15,7 +15,14 @@ class _StubDBClient:
         return False
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.error_handlers import REQUEST_ID_HEADER, RequestIdMiddleware, register_error_handlers
+from pydantic import BaseModel, Field
+
+from app.api.error_handlers import (
+    ERROR_RESPONSES,
+    REQUEST_ID_HEADER,
+    RequestIdMiddleware,
+    register_error_handlers,
+)
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
 from app.domain.errors import PersistenceError
@@ -173,7 +180,12 @@ async def lifespan(app: FastAPI):
         await checkpoint_stack.aclose()
 
 
-app = FastAPI(title="Jarvis Reasoning Engine", lifespan=lifespan, redirect_slashes=False)
+app = FastAPI(
+    title="Jarvis Reasoning Engine",
+    lifespan=lifespan,
+    redirect_slashes=False,
+    responses=ERROR_RESPONSES,
+)
 
 # CORS: allow jarvis-demo (Next.js) to call the API from a different origin
 app.add_middleware(
@@ -197,14 +209,23 @@ register_error_handlers(app)
 app.include_router(api_router, prefix="/api/v1")
 
 
-@app.get("/")
-def root():
+class RootResponse(BaseModel):
+    message: str = Field(description="A greeting: the server is up.")
+
+
+class HealthResponse(BaseModel):
+    status: str = Field(description="'healthy': the server and its database answer.")
+    database: str = Field(description="'connected': the database answered the check.")
+
+
+@app.get("/", response_model=RootResponse)
+def root() -> RootResponse:
     """Root endpoint."""
-    return {"message": "Hello, Jarvis this side."}
+    return RootResponse(message="Hello, Jarvis this side.")
 
 
-@app.get("/health")
-async def health(request: Request):
+@app.get("/health", response_model=HealthResponse)
+async def health(request: Request) -> HealthResponse:
     """
     Health check endpoint. Uses pre-initialized database connection from startup.
     Returns 200 if healthy; 503 `persistence_unavailable` if the database is unreachable.
@@ -217,4 +238,4 @@ async def health(request: Request):
         raise unreachable from exc
     if not connected:
         raise unreachable
-    return {"status": "healthy", "database": "connected"}
+    return HealthResponse(status="healthy", database="connected")

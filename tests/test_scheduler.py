@@ -159,13 +159,13 @@ def before_the_horizon(clock):
     """
     from datetime import datetime
 
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), sep)
 
 
 def _five_task_graph():
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
 
     chunks = [TaskChunk(task_id=f"t{i}", title=f"part {i}", duration_minutes=25,
                         difficulty_weight=0.5, dependencies=[], completion_criteria="done")
@@ -177,7 +177,7 @@ def _five_task_graph():
 def test_run_schedule__horizon_from_now__nothing_starts_before_now_rounded_up(clock):
     from datetime import datetime
 
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=IST), sep)
 
@@ -191,7 +191,7 @@ def test_run_schedule__horizon_from_now__nothing_starts_before_now_rounded_up(cl
 def test_run_schedule__explicit_horizon_start__is_left_as_given(clock):
     from datetime import datetime
 
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=IST), sep)
     eight_am = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
@@ -203,8 +203,8 @@ def test_run_schedule__explicit_horizon_start__is_left_as_given(clock):
 
 
 def test_run_schedule__five_atoms_two_days__feasible(before_the_horizon):
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
-    from app.api.v1.endpoints import schedule as sep
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.services.planning import scheduling as sep
 
     chunks = [TaskChunk(task_id=f"t{i}", title=f"part {i}", duration_minutes=25,
                         difficulty_weight=0.5, dependencies=[], completion_criteria="done")
@@ -314,8 +314,8 @@ def test_run_schedule__memory_block_overlapping_habit_block__feasible(before_the
     """
     from datetime import datetime, timezone
 
-    from app.api.v1.endpoints import schedule as sep
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.services.planning import scheduling as sep
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
     from app.schemas.context import Availability, SemanticTimeSlot, TimeSlot
     from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
 
@@ -364,7 +364,7 @@ def _blocked_except(free: list[tuple[int, int]], horizon: int = 1440) -> list:
 
 def _graph(*tasks: tuple[str, int, float, str | None]):
     """An ExecutionGraph of (task_id, minutes, difficulty, deadline_hint) tasks."""
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
 
     chunks = [TaskChunk(task_id=tid, title=tid, duration_minutes=minutes,
                         difficulty_weight=difficulty, dependencies=[],
@@ -386,7 +386,7 @@ def _overlaps(task, start: int, end: int) -> bool:
 def test_energy_term__two_free_slots__hard_task_takes_high_focus_slot(
     before_the_horizon, deterministic_solver
 ):
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     def starts(peak_hour: int) -> tuple[int, int]:
         graph = _graph(("A", 25, 0.9, IN_3_DAYS), ("B", 25, 0.1, IN_3_DAYS))
@@ -403,7 +403,7 @@ def test_energy_term__flag_off__identical_to_no_profile(
     before_the_horizon, deterministic_solver, monkeypatch
 ):
     import app.core.config as config
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     def plan(focus):
         # B is shorter, so without a profile the hard task takes 09:00 (a smaller makespan).
@@ -424,7 +424,7 @@ def test_energy_term__task_due_today__tmt_order_kept(
     before_the_horizon, deterministic_solver, monkeypatch
 ):
     import app.core.config as config
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     weights: dict[str, int] = {}
 
@@ -451,7 +451,7 @@ def test_energy_term__task_due_today__tmt_order_kept(
     ids=["peak_in_lecture", "peak_in_gym", "peak_in_the_night", "mild_peak", "flat_zero"],
 )
 def test_energy_term__hard_blocks_never_violated(before_the_horizon, focus):
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
     from app.schemas.context import Availability, TimeSlot
 
     blocked = Availability.BLOCKED
@@ -477,7 +477,7 @@ def test_energy_term__hard_blocks_never_violated(before_the_horizon, focus):
 def test_energy_term__minimal_work_window_at_peak__hard_task_still_kept_out(
     before_the_horizon, deterministic_solver
 ):
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
     from app.schemas.context import Availability, TimeSlot
 
     # 19:00-19:30 is the peak hour, but a minimal-work window (a commute): only short,
@@ -553,7 +553,7 @@ def test_solve__idle_stop_on__feasible_plan_within_the_cap_and_blocks_hold(
     import time
 
     import app.core.config as config
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
     from app.schemas.context import Availability, TimeSlot
 
     monkeypatch.setattr(config, "SOLVER_IDLE_STOP_SECONDS", 1.0)
@@ -588,7 +588,7 @@ def _in_peak_window(start_min: int, peak_hour: int = 19) -> bool:
 def test_schedule__learned_evening_peak__hard_tasks_land_in_peak_window(
     before_the_horizon, deterministic_solver
 ):
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     graph = _eight_tasks()
     hard = {c.task_id for c in graph.decomposition if c.difficulty_weight >= 0.7}
@@ -607,7 +607,7 @@ def test_schedule__learned_evening_peak__easy_tasks_not_dragged_there_at_the_cos
     """Easy tasks keep their daytime places: pulling them into the evening as well
     would leave the user's day idle until the peak. (A medium task may tie between
     morning and evening; only the easy ones are pinned.)"""
-    from app.api.v1.endpoints import schedule as sep
+    from app.services.planning import scheduling as sep
 
     graph = _eight_tasks()
     easy = {c.task_id for c in graph.decomposition if c.difficulty_weight <= 0.3}
@@ -621,8 +621,8 @@ def test_schedule__learned_evening_peak__easy_tasks_not_dragged_there_at_the_cos
 
 
 def test_energy_term__learned_profile__dependencies_still_hold(before_the_horizon):
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
-    from app.api.v1.endpoints import schedule as sep
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.services.planning import scheduling as sep
 
     # Each step needs the one before; the hard steps would rather be in the evening.
     difficulties = [0.2, 0.9, 0.3, 0.8, 0.1, 0.7]
@@ -652,8 +652,8 @@ def _too_much_work_graph(tasks: int = 3) -> dict:
 
 def test_run_schedule__infeasible__raises_schedule_infeasible_error():
     """INFEASIBLE is a scope problem the domain names (spec section 10), not an HTTP detail."""
-    from app.api.v1.endpoints.reasoning import ExecutionGraph
-    from app.api.v1.endpoints.schedule import run_schedule
+    from app.schemas.decomposition import ExecutionGraph
+    from app.services.planning.scheduling import run_schedule
     from app.domain.errors import ScheduleInfeasibleError
     from app.schemas.context import TimeSlot
 

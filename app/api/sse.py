@@ -26,3 +26,13 @@ class ClosingStreamingResponse(StreamingResponse):
                 aclose = getattr(self.body_iterator, "aclose", None)
                 if aclose is not None:
                     await aclose()
+
+
+class EventStreamResponse(ClosingStreamingResponse):
+    """A server-sent event stream (``text/event-stream``) that always closes its stream.
+
+    Its media type is the class's own, so the OpenAPI schema documents a route that
+    returns it as an event stream.
+    """
+
+    media_type = "text/event-stream"

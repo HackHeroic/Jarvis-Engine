@@ -205,12 +205,17 @@ class DraftSchedule(BaseModel):
 
 
 class DraftTaskEdit(BaseModel):
-    """User edit to a single task in a draft."""
+    """User edit to a single task in a draft. Out of bounds is a 422, before anything changes."""
 
     title: str | None = None
-    duration_minutes: int | None = Field(default=None, le=25, description="Max 25 min per task chunk")
+    duration_minutes: int | None = Field(
+        default=None, ge=1, le=25,
+        description="1 to 25 minutes: a task chunk is one Pomodoro at most, and never empty.",
+    )
     difficulty_weight: float | None = Field(default=None, ge=0, le=1)
-    start_min: int | None = None
+    start_min: int | None = Field(
+        default=None, ge=0, description="Minutes from the draft's horizon start; never before it."
+    )
 
 
 class DraftRearrangeRequest(BaseModel):

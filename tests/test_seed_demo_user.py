@@ -174,8 +174,8 @@ async def test_seed__history__vision_end_to_end__pattern_profile_and_plan_lean_e
     """(a) PEARL holds a remembered morning-skip pattern, seen 3+ times at 70%+ and
     told to the user; (b) the focus profile is learned, evenings above mornings; (c) a
     fresh plan of mixed difficulty puts the hardest task in the evening peak (real CP-SAT)."""
-    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
-    from app.api.v1.endpoints.schedule import run_schedule
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.services.planning.scheduling import run_schedule
     from app.schemas.context import Availability, TimeSlot
 
     repos, _ = await _seed(today)
@@ -811,14 +811,14 @@ async def test_seed__demo_morning__brief_plans_today_reslots_and_leans_on_the_ev
     tasks a new slot, and puts the hardest task not due today in the learned evening
     peak; its words claim the strongest hour only when the hardest of today is there.
     The real pattern-rule trigger offers the 9 AM window."""
-    import app.api.v1.endpoints.schedule as schedule_endpoint
+    import app.services.planning.scheduling as scheduling
     import app.modules.planning_graph as planning_graph
     from app.services.anticipation.triggers import PEAK_CLAIM_MIN_SCORE
 
     fake = FakeSupabase()
     repos, _ = await _seed(repos=RepositoryFactory.supabase(fake))
     now = datetime.combine(TODAY, at, IST)
-    clock.freeze(now, schedule_endpoint, planning_graph)
+    clock.freeze(now, scheduling, planning_graph)
     # The replanner reads the focus profile through its own planning services.
     set_aside = {t.task_id for t in await _set_aside_yesterday(repos, TODAY)}
     pending = await repos.tasks.list_by_status(DEMO, frozenset({TaskStatus.PENDING}))

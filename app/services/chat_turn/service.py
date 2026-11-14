@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 
 # The LLM tasks whose model is credited with the reply.
 _REPLY_TASKS = ("voice_of_jarvis", "voice_of_jarvis_synthesis")
+# The model picker's choices that put the whole turn on the cloud providers: 'cloud',
+# and the aliases it has had ('gemini', the older '4b'). Every other mode is 'auto'.
+CLOUD_MODEL_MODES = frozenset({"cloud", "gemini", "4b"})
 # Graph node events ride the SAME queue as progress and token events, so the stream keeps
 # true emission order: draining only between astream() iterations would block for the
 # whole synthesis call and deliver every "streamed" token in one burst at the end.
@@ -258,7 +261,7 @@ class ChatTurnService:
         chose a cloud model), the session, and the usage attribution every LLM call of
         the turn is metered under. ``ChatTurn.finish`` ends them."""
         model_mode = request.model_mode or "auto"
-        force_cloud_request = model_mode in ("4b", "cloud", "gemini")
+        force_cloud_request = model_mode in CLOUD_MODEL_MODES
         force_cloud_token = None
         if force_cloud_request:
             # Set BEFORE the graph is invoked so every LLM call inherits it.

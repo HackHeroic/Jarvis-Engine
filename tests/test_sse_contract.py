@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from pydantic import BaseModel
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.domain.clock as utc_clock
 from app.domain.entities import TaskEvent, TaskEventType
 from app.schemas.chat_stream import (
@@ -154,7 +154,7 @@ async def test_chat_turn__every_frame_emitted__parses_into_its_model(
 ):
     """A planning turn (tool steps, a draft, a streamed reply) and a chat turn that learns
     a memory and a pattern, through the real handler and orchestrator."""
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), schedule_endpoint, utc_clock)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), scheduling, utc_clock)
     llm.script(
         "brain_dump_extraction",
         lambda req: brain_dump(planning_goal="Revise DSA for Friday's exam")

@@ -68,7 +68,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import httpx
 
 import app.core.config as config  # loads .env the way the app does
-from app.api.v1.endpoints.reasoning import TaskChunk
 from app.container import AppContainer, default_pattern_detectors
 from app.domain.entities import (
     AutonomyMode,
@@ -87,6 +86,7 @@ from app.domain.ports import (
 from app.infrastructure.embedding import MiniLMEmbedder
 from app.infrastructure.persistence.factory import Repositories
 from app.orchestrator.hooks import ActionHooks
+from app.schemas.decomposition import TaskChunk
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.memory_service import MemoryCandidate, MemoryService

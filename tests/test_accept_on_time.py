@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-import app.api.v1.endpoints.schedule as schedule_endpoint
+import app.services.planning.scheduling as scheduling
 import app.core.config as cfg
 import app.domain.clock as utc_clock
 from app.container import AppContainer
@@ -59,7 +59,7 @@ ALL_AHEAD = {
 
 @pytest.fixture(autouse=True)
 def _monday_eleven(clock):
-    clock.freeze(ELEVEN_AM, schedule_endpoint, utc_clock)
+    clock.freeze(ELEVEN_AM, scheduling, utc_clock)
 
 
 @pytest.fixture

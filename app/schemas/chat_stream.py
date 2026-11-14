@@ -34,9 +34,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from app.core.config import MAX_CHAT_PROMPT_CHARS, MAX_CHAT_UPLOAD_BYTES
+from app.core.config import MAX_CHAT_PROMPT_CHARS
 from app.domain.entities import MemorySource, MemoryType
 from app.schemas.errors import ErrorResponse
+from app.schemas.upload import UploadMediaType, within_upload_limit
+
+# What ``model_mode`` may say: 'auto', or 'cloud' and the aliases the turn reads as it
+# ('gemini', and the older '4b'). ChatTurnService.open_turn maps them.
+ModelMode = Literal["auto", "cloud", "gemini", "4b"]
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +49,9 @@ logger = logging.getLogger(__name__)
 class ChatStreamRequest(BaseModel):
     """Request body for ``POST /api/v1/chat/stream``: one message, and optionally a file.
 
-    A message longer than ``MAX_CHAT_PROMPT_CHARS`` or a file that decodes to more than
-    ``MAX_CHAT_UPLOAD_BYTES`` is refused with a 422 before the turn starts.
+    A message longer than ``MAX_CHAT_PROMPT_CHARS``, a file that decodes to more than
+    ``MAX_CHAT_UPLOAD_BYTES``, a file of another kind or a ``model_mode`` the turn does
+    not read is refused with a 422 before the turn starts.
     """
 
     user_prompt: str = Field(
@@ -60,7 +66,7 @@ class ChatStreamRequest(BaseModel):
         default=None,
         description="Base64-encoded PDF or image. Combined with user_prompt for brain dump.",
     )
-    media_type: str | None = Field(
+    media_type: UploadMediaType | None = Field(
         default=None,
         description="One of 'pdf', 'image', 'png', 'jpeg'. Required when file_base64 is set.",
     )
@@ -68,29 +74,17 @@ class ChatStreamRequest(BaseModel):
         default=None,
         description="Original filename of the uploaded file (for document management).",
     )
-    model_mode: str | None = Field(
+    model_mode: ModelMode = Field(
         default="auto",
         description=(
             "Which models answer this turn. 'auto' (the default): the local model first, "
             "the cloud providers when it cannot answer (cloud only while no local model is "
             "loaded). 'cloud' (also 'gemini', and the older '4b'): the cloud providers only, "
-            "for this turn. Any other value reads as 'auto'."
+            "for this turn."
         ),
     )
 
-    @field_validator("file_base64")
-    @classmethod
-    def _file_within_the_limit(cls, value: str | None) -> str | None:
-        if value is not None and _decoded_size(value) > MAX_CHAT_UPLOAD_BYTES:
-            limit_mb = MAX_CHAT_UPLOAD_BYTES // (1024 * 1024)
-            raise ValueError(f"The file can be at most {limit_mb} MB.")
-        return value
-
-
-def _decoded_size(encoded: str) -> int:
-    """The bytes a base64 string decodes to (exact for well-formed base64)."""
-    padding = len(encoded) - len(encoded.rstrip("="))
-    return len(encoded) * 3 // 4 - padding
+    _file_within_the_limit = field_validator("file_base64")(within_upload_limit)
 
 
 class MemoryShown(BaseModel):
