@@ -1,8 +1,10 @@
 """The suggestions API: list, accept, dismiss, and run a trigger on demand."""
 
+import asyncio
 from datetime import datetime, timezone
 from typing import ClassVar
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -139,3 +141,27 @@ def test_anticipation_api__run_registered_trigger__created_with_consent(client, 
         "kind": "mode_decision",
         "message": "This changes your schedule, so I'm asking first.",
     }
+
+
+@pytest.mark.asyncio
+async def test_anticipation_api__concurrent_run__one_suggestion(container, log):
+    from app.main import app
+
+    container.anticipation.register_trigger(_MorningBrief(action=FakeAction(log)))
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    "/api/v1/anticipation/run",
+                    params={"user_id": U1},
+                    json={"trigger": "morning_brief"},
+                )
+                for _ in range(2)
+            )
+        )
+
+    assert [r.status_code for r in responses] == [200, 200]
+    assert sorted(r.json()["status"] for r in responses) == ["already_done", "created"]
+    assert len(await container.repos.suggestions.list(U1, status=None)) == 1

@@ -140,16 +140,46 @@ async def test_tick__one_users_trigger_raises__others_still_run(caplog):
     repos = await _repos_with_users("u1", "u2", "u3")
     scheduler = _scheduler(repos, CountingTrigger(fail_for=frozenset({"u2"})), [])
 
-    with caplog.at_level(logging.WARNING, logger=SCHEDULER_LOGGER):
+    with caplog.at_level(logging.WARNING):
         report = await scheduler.tick(NOW)
 
     assert (report["outcomes"], report["errors"]) == (2, 1)
     assert len(await repos.suggestions.list("u1")) == 1
     assert await repos.suggestions.list("u2") == []
     assert len(await repos.suggestions.list("u3")) == 1
+    (record,) = [r for r in caplog.records if r.name.startswith("app.services.anticipation")]
+    message = record.getMessage()
+    assert "u2" in message and "counting" in message and "RuntimeError" in message
+    assert "secret" not in message and record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_tick__user_cannot_be_read__logged_and_the_others_still_run(caplog):
+    repos = await _repos_with_users("u1", "u2")
+
+    class _OneUnreadable(_FlakyProfiles):
+        async def get_or_create(self, user_id: str):
+            if user_id == "u1":
+                raise errors.PersistenceError("Could not reach the database.")
+            return await super().get_or_create(user_id)
+
+    profiles = _OneUnreadable(repos.profiles, failures=0)
+    service = AnticipationService(
+        {CountingTrigger.name: CountingTrigger()},
+        ActionFactory(),
+        ConsentPolicy.default(),
+        repos.suggestions,
+        profiles,
+        repos.constraints,
+    )
+    scheduler = AnticipationScheduler(service, repos.profiles, [])
+
+    with caplog.at_level(logging.WARNING, logger=SCHEDULER_LOGGER):
+        report = await scheduler.tick(NOW)
+
+    assert (report["outcomes"], report["errors"]) == (1, 1)
     (record,) = [r for r in caplog.records if r.name == SCHEDULER_LOGGER]
-    assert "u2" in record.getMessage() and "RuntimeError" in record.getMessage()
-    assert "secret" not in record.getMessage() and record.exc_info is None
+    assert "u1" in record.getMessage() and "PersistenceError" in record.getMessage()
 
 
 @pytest.mark.asyncio

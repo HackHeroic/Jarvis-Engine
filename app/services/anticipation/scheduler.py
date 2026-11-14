@@ -47,8 +47,9 @@ class AnticipationScheduler:
         """Run the sweeps that are due, then every user's due triggers, as of ``now``.
 
         Returns ``{"sweeps": {name: items changed}, "outcomes": n, "errors": n}``:
-        the sweeps that ran, how many trigger outcomes there were, and how many
-        failures were logged. A call made while a tick runs waits for it to finish.
+        the sweeps that ran, how many trigger runs finished, and how many failures
+        were logged (a sweep, a trigger, or a user who could not be read). A call
+        made while a tick runs waits for it to finish.
         """
         async with self._tick_lock:
             report: dict = {"sweeps": {}, "outcomes": 0, "errors": 0}
@@ -80,7 +81,10 @@ class AnticipationScheduler:
         for user_id in user_ids:
             end_attribution = attribute_llm_calls(user_id, None)
             try:
-                report["outcomes"] += len(await self._service.run_due(user_id, now))
+                outcomes = await self._service.run_due(user_id, now)
+                failed = sum(1 for outcome in outcomes if outcome.status == "failed")
+                report["outcomes"] += len(outcomes) - failed
+                report["errors"] += failed
             except Exception as exc:  # one user's failure never stops the others
                 logger.warning(
                     "Anticipation for user %s could not finish (%s)", user_id, type(exc).__name__

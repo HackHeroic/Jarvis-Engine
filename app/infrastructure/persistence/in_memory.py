@@ -19,6 +19,7 @@ from uuid import uuid4
 from app.domain import errors
 from app.domain.entities import (
     BehavioralConstraint,
+    ConsentDecision,
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
@@ -405,6 +406,13 @@ class InMemorySuggestionRepository(SuggestionRepository):
             for s in sorted(found, key=lambda s: s.created_at, reverse=True)[:limit]
         ]
 
+    async def dedupe_keys(
+        self, user_id: str, *, status: SuggestionStatus, limit: int = 500
+    ) -> list[str]:
+        newest = await self.list(user_id, status=status, limit=limit)
+        keys = (s.action.get("dedupe_key") for s in newest)
+        return [key for key in keys if isinstance(key, str)]
+
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
         i = self._index(user_id, suggestion_id)
         return self._store.suggestions[i].model_copy(deep=True) if i is not None else None
@@ -416,6 +424,7 @@ class InMemorySuggestionRepository(SuggestionRepository):
         to: SuggestionStatus,
         *,
         expected: SuggestionStatus | None = None,
+        consent: ConsentDecision | None = None,
     ) -> Suggestion:
         # No await between the check and the write: the compare-and-set is atomic.
         i = self._index(user_id, suggestion_id)
@@ -423,9 +432,14 @@ class InMemorySuggestionRepository(SuggestionRepository):
             raise not_found("suggestion", suggestion_id)
         if expected is not None and self._store.suggestions[i].status != expected:
             raise suggestion_changed(suggestion_id, expected)
-        self._store.suggestions[i] = self._store.suggestions[i].model_copy(
-            update={"status": SuggestionStatus(to)}
-        )
+        update: dict = {"status": SuggestionStatus(to)}
+        if consent is not None:
+            update |= {
+                "consent_behavior": consent.behavior,
+                "consent_reason": consent.message,
+                "consent_kind": consent.kind,
+            }
+        self._store.suggestions[i] = self._store.suggestions[i].model_copy(update=update)
         return self._store.suggestions[i].model_copy(deep=True)
 
     async def exists_today(

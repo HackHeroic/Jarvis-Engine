@@ -8,7 +8,10 @@ the user can read. The last link always decides, by the user's autonomy mode
 (``AutonomyPolicy``, a Strategy).
 """
 
+import asyncio
+import logging
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, ClassVar, Literal
@@ -18,12 +21,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.domain.entities import (
     HOURS_PER_DAY,
     AutonomyMode,
+    ConsentDecision,  # noqa: F401  (defined beside Suggestion; this module's public name)
     ConsentReasonKind,
     Suggestion,
     SuggestionStatus,
     UserProfile,
 )
 from app.domain.ports import SuggestionRepository
+
+logger = logging.getLogger(__name__)
 
 
 class ActionRisk(str, Enum):
@@ -32,16 +38,6 @@ class ActionRisk(str, Enum):
     READ_ONLY = "read_only"
     LOW_RISK = "low_risk"
     SCHEDULE_CHANGE = "schedule_change"
-
-
-class ConsentDecision(BaseModel):
-    """What the consent chain decided for one action, and why, in words the user can read."""
-
-    behavior: Literal["allow", "ask", "deny"] = Field(
-        description="Run it without asking, ask the user first, or drop it."
-    )
-    kind: ConsentReasonKind = Field(description="Which consent rule decided.")
-    message: str = Field(description="The reason, as shown to the user.")
 
 
 class ActionResult(BaseModel):
@@ -275,15 +271,42 @@ class SuggestionDraft(BaseModel):
 class TriggerOutcome(BaseModel):
     """How one trigger run ended."""
 
-    status: Literal["created", "already_done", "not_due", "nothing_to_say", "denied"] = Field(
-        description="Where the run stopped."
-    )
+    status: Literal[
+        "created", "already_done", "not_due", "nothing_to_say", "denied", "failed"
+    ] = Field(description="Where the run stopped; 'failed' means the trigger raised.")
     suggestion: Suggestion | None = Field(
         default=None, description="The suggestion stored, when one was."
     )
     decision: ConsentDecision | None = Field(
         default=None, description="The consent decision, when consent was asked."
     )
+
+
+# A suggestion whose automatic change did not go through waits for the user instead.
+ASK_AFTER_FAILED_APPLY = ConsentDecision(
+    behavior="ask",
+    kind=ConsentReasonKind.MODE_DECISION,
+    message="I couldn't make this change on my own, so I'm asking first.",
+)
+
+
+async def _ask_instead(suggestions: SuggestionRepository, user_id: str, suggestion_id: str) -> None:
+    """Release a claimed auto-apply back to PENDING, asking; a failure is logged, not raised."""
+    try:
+        await suggestions.set_status(
+            user_id,
+            suggestion_id,
+            SuggestionStatus.PENDING,
+            expected=SuggestionStatus.ACCEPTED,
+            consent=ASK_AFTER_FAILED_APPLY,
+        )
+    except Exception as exc:  # the caller raises the action's own error
+        logger.warning(
+            "Suggestion %s of user %s stays claimed: could not hand it back (%s)",
+            suggestion_id,
+            user_id,
+            type(exc).__name__,
+        )
 
 
 class Trigger(ABC):
@@ -300,16 +323,20 @@ class Trigger(ABC):
         ctx: TriggerContext,
         *,
         consent: ConsentPolicy,
-        consent_ctx: ConsentContext,
+        consent_ctx: ConsentContext | Callable[[], Awaitable[ConsentContext]],
         suggestions: SuggestionRepository,
     ) -> TriggerOutcome:
         """Run the trigger once; subclasses never override this.
 
-        An allowed action that changes something runs at once and its suggestion is
-        stored as AUTO_APPLIED; it is stored as PENDING first, so a failed run is
-        still never made twice in a day and stays for the user to accept. An allowed
-        read-only one is stored as PENDING: it is information. A denied one is not
-        stored; the decision is returned.
+        ``consent_ctx`` may be a loader, awaited only when a run reaches consent: a
+        run that stops earlier reads nothing for it.
+
+        An allowed action that changes something runs at once. Its suggestion is
+        stored already claimed (ACCEPTED), so no accept can run the action a second
+        time, and becomes AUTO_APPLIED once the action is done. If the action fails
+        or is cancelled, the suggestion goes back to PENDING, asking the user, and
+        the error is raised. An allowed read-only one is stored as PENDING: it is
+        information. A denied one is not stored; the decision is returned.
         """
         if await self.already_done(ctx, suggestions):
             return TriggerOutcome(status="already_done")
@@ -319,10 +346,13 @@ class Trigger(ABC):
         if gathered is None:
             return TriggerOutcome(status="nothing_to_say")
         draft = await self.build_suggestion(ctx, gathered)
+        if not isinstance(consent_ctx, ConsentContext):
+            consent_ctx = await consent_ctx()
         decision = consent.evaluate(draft.action, consent_ctx)
         if decision.behavior == "deny":
             return TriggerOutcome(status="denied", decision=decision)
 
+        applies_now = decision.behavior == "allow" and draft.action.risk is not ActionRisk.READ_ONLY
         stored = await suggestions.add(
             ctx.user_id,
             Suggestion(
@@ -332,7 +362,7 @@ class Trigger(ABC):
                 title=draft.title,
                 body=draft.body,
                 action=draft.action.to_payload(),
-                status=SuggestionStatus.PENDING,
+                status=SuggestionStatus.ACCEPTED if applies_now else SuggestionStatus.PENDING,
                 consent_behavior=decision.behavior,
                 consent_reason=decision.message,
                 consent_kind=decision.kind,
@@ -340,13 +370,18 @@ class Trigger(ABC):
                 expires_at=draft.expires_at,
             ),
         )
-        if decision.behavior == "allow" and draft.action.risk is not ActionRisk.READ_ONLY:
-            await draft.action.execute(ctx.user_id)
+        if applies_now:
+            try:
+                await draft.action.execute(ctx.user_id)
+            except BaseException:
+                # Whatever stopped it, cancellation included: hand it to the user.
+                await asyncio.shield(_ask_instead(suggestions, ctx.user_id, stored.id))
+                raise
             stored = await suggestions.set_status(
                 ctx.user_id,
                 stored.id,
                 SuggestionStatus.AUTO_APPLIED,
-                expected=SuggestionStatus.PENDING,
+                expected=SuggestionStatus.ACCEPTED,
             )
         return TriggerOutcome(status="created", suggestion=stored, decision=decision)
 
