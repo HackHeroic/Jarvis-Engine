@@ -56,7 +56,11 @@ PRIMARY (the heavy local model; never two at once) for `socratic_chunker`,
 `practice_generation` and `calendar_parsing`; FAST for `intent_classification`,
 `brain_dump_extraction`, `memory_extraction`, `voice_of_jarvis`, the reply
 synthesis, `goal_validation`, `task_edit_parsing` and `action_item_extraction`.
-Web search also redacts its query before it leaves the machine.
+Web search runs outside the chain (Gemini search grounding only) through one
+helper, `workspace_builder._search_web`, which redacts its query before it leaves
+the machine and meters each answered search into the same ledger (provider
+`gemini`, task `web_search`; zero tokens when the transport reports none). A guard
+test (`tests/test_layering.py`) keeps every other caller out.
 
 **Test suite: 1,034 tests in 61 files; the default run is 1,029 passed and 4 strict xfails in ~15 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
 socket guard that fails any non-localhost connect, so no test can reach

@@ -9,7 +9,8 @@ usage metering.
 """
 
 import contextvars
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing, nullcontext
 from enum import Enum
 from types import ModuleType
@@ -98,6 +99,52 @@ def build_chain(cfg: ModuleType, hooks: ActionHooks, bus: EventBus) -> FallbackC
     ``get_chain``'s lazy default both use it, so they cannot drift apart.
     """
     return LLMProviderFactory.build(cfg, PreCloudLLMRedactor(hooks), bus)
+
+
+async def metered_web_search(
+    search: Callable[[], Awaitable[str]], *, pii_redactions: int = 0
+) -> str:
+    """Run a grounded web search and meter it into the usage ledger like any chain call.
+
+    Web search is Gemini-only and runs outside the provider chain, so no
+    ``MeteredProvider`` sees it. An answered search publishes ``LLMCallCompleted``
+    (provider ``gemini``, task ``web_search``) to the composition root's bus, with
+    the tokens the transport reported (zero when it reported none) and this turn's
+    attribution. An empty answer — the search failed or never ran — publishes
+    nothing: no answer, and no billed tokens anyone could see.
+    """
+    from datetime import datetime, timezone
+
+    from app.core.runtime import registered_container
+    from app.domain.entities import LLMUsageEvent
+    from app.domain.events import LLMCallCompleted
+    from app.infrastructure.llm.transport import TokenTally, collecting_tokens
+
+    tally = TokenTally()
+    started = time.perf_counter()
+    with collecting_tokens(tally):
+        result = await search()
+    container = registered_container()
+    if not result or not result.strip() or container is None:
+        return result
+    now = datetime.now(timezone.utc)
+    usage = LLMUsageEvent(
+        user_id=current_user_var.get(),
+        session_id=current_session_var.get(),
+        task="web_search",
+        role=MODEL_ROUTING["web_search"].value,
+        provider="gemini",
+        model=_cfg.GEMINI_MODEL,
+        location=LLMLocation.CLOUD,
+        input_tokens=tally.input_tokens,
+        output_tokens=tally.output_tokens,
+        cache_read_tokens=tally.cache_read_tokens,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        pii_redactions=pii_redactions,
+        created_at=now,
+    )
+    await container.events.publish(LLMCallCompleted(occurred_at=now, user_id=usage.user_id, usage=usage))
+    return result
 
 
 def get_chain() -> FallbackChainProvider:

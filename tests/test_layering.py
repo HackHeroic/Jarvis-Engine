@@ -2,24 +2,24 @@
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 _DOMAIN_DIR = Path(__file__).resolve().parent.parent / "app" / "domain"
-_FORBIDDEN_PREFIXES = (
-    "app.api",
-    "app.services",
-    "app.orchestrator",
-    "app.infrastructure",
-    "app.core",
-    "fastapi",
-    "supabase",
-    "litellm",
-    "anthropic",
-)
+
+# The domain imports the standard library, Pydantic, and itself — nothing else. An
+# allow-list, so a new outer layer or framework is caught without anyone listing it.
+_DOMAIN_ALLOWED_THIRD_PARTY = ("pydantic", "pydantic_core")
 
 
 def _is_forbidden(module: str) -> bool:
-    return any(module == p or module.startswith(p + ".") for p in _FORBIDDEN_PREFIXES)
+    """Is ``module`` (absolute, dotted) off-limits to the domain?"""
+    top = module.split(".", 1)[0]
+    if module == "app" or module == "app.domain" or module.startswith("app.domain."):
+        return False  # bare "app" (``from app import x``): ``app.x`` is checked on its own
+    if top == "app":
+        return True  # every other part of the app is an outer layer
+    return top not in sys.stdlib_module_names and top not in _DOMAIN_ALLOWED_THIRD_PARTY
 
 
 _APP_DIR = _DOMAIN_DIR.parent
@@ -77,6 +77,33 @@ def test_domain__imports_nothing_from_outer_layers():
     assert _domain_violations(_DOMAIN_DIR) == []
 
 
+def test_domain_check__anything_off_the_allow_list__is_caught(tmp_path):
+    """Absolute imports the old deny-list let through: other app packages, any framework."""
+    domain = tmp_path / "app" / "domain"
+    domain.mkdir(parents=True)
+    (domain / "entities.py").write_text(
+        "import app.schemas.context\n"
+        "from app.db import supabase_py\n"
+        "import langgraph\n"
+        "from httpx import AsyncClient\n"
+        "from __future__ import annotations\n"
+        "import datetime, enum, typing\n"
+        "from collections.abc import Iterable\n"
+        "from pydantic import BaseModel\n"
+        "from pydantic_core import PydanticCustomError\n"
+        "from app.domain.errors import JarvisError\n"
+    )
+
+    assert _domain_violations(domain) == [
+        "entities.py: app.schemas.context",
+        "entities.py: app.db",
+        "entities.py: app.db.supabase_py",
+        "entities.py: langgraph",
+        "entities.py: httpx",
+        "entities.py: httpx.AsyncClient",
+    ]
+
+
 def test_domain_check__every_spelling_of_an_outer_import__is_caught(tmp_path):
     """The check itself: nested modules, ``from app import x`` and relative climbs."""
     domain = tmp_path / "app" / "domain"
@@ -91,7 +118,7 @@ def test_domain_check__every_spelling_of_an_outer_import__is_caught(tmp_path):
         "nested/rules.py: app.api",
         "nested/rules.py: app.api.deps",
         "nested/rules.py: relative import of app",
-        "nested/rules.py: relative import of app.utils",
+        "nested/rules.py: app.utils",
     ]
 
 
@@ -221,8 +248,23 @@ _LEGACY_LLM_CALLS_ALLOWED: dict[tuple[str, str], str] = {
 }
 
 
-def _legacy_llm_calls(path: Path) -> list[tuple[str, int]]:
-    """(enclosing top-level definition, line) of each call to a transport function."""
+# Grounded web search: Gemini only, outside the provider chain (no other provider can
+# search). One helper calls it — after the PII gate, metered into the usage ledger,
+# failing honestly — and nothing else may.
+_WEB_SEARCH_CALLS = frozenset({"gemini_web_search", "run_deep_research"})
+
+_WEB_SEARCH_CALLS_ALLOWED: dict[tuple[str, str], str] = {
+    ("services/analytical/workspace_builder.py", "_search_web"): (
+        "the shared search helper: PII gate first, metered, WebSearchUnavailableError"
+    ),
+    ("services/analytical/control_policy.py", "execute_agentic_flow"): (
+        f"{_V1_ONLY} (its run_deep_research)"
+    ),
+}
+
+
+def _calls_to(path: Path, names: frozenset[str]) -> list[tuple[str, int]]:
+    """(enclosing top-level definition, line) of each call in ``path`` to one of ``names``."""
     found: list[tuple[str, int]] = []
     for top in ast.parse(path.read_text(), filename=str(path)).body:
         owner = getattr(top, "name", "<module>")
@@ -231,25 +273,67 @@ def _legacy_llm_calls(path: Path) -> list[tuple[str, int]]:
                 continue
             func = node.func
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name in _LEGACY_LLM_CALLS:
+            if name in names:
                 found.append((owner, node.lineno))
     return found
 
 
-def test_llm_calls__outside_the_transport__go_through_route_llm_call():
+def _legacy_llm_calls(path: Path) -> list[tuple[str, int]]:
+    """(enclosing top-level definition, line) of each call to a transport function."""
+    return _calls_to(path, _LEGACY_LLM_CALLS)
+
+
+def _guard_report(
+    names: frozenset[str], allowed: dict[tuple[str, str], str], app_dir: Path = _APP_DIR
+) -> tuple[list[str], list[str]]:
+    """(calls outside the allow-list, allow-list entries that no longer call) under ``app_dir``."""
     calls: dict[tuple[str, str], list[int]] = {}
-    for path in sorted(_APP_DIR.rglob("*.py")):
+    for path in sorted(app_dir.rglob("*.py")):
         if path in _LLM_TRANSPORT_FILES:
             continue
-        for owner, line in _legacy_llm_calls(path):
-            calls.setdefault((path.relative_to(_APP_DIR).as_posix(), owner), []).append(line)
-
+        for owner, line in _calls_to(path, names):
+            calls.setdefault((path.relative_to(app_dir).as_posix(), owner), []).append(line)
     unexpected = [
         f"{file}:{lines} in {owner}"
         for (file, owner), lines in sorted(calls.items())
-        if (file, owner) not in _LEGACY_LLM_CALLS_ALLOWED
+        if (file, owner) not in allowed
     ]
-    stale = [f"{file} {owner}" for file, owner in _LEGACY_LLM_CALLS_ALLOWED if (file, owner) not in calls]
+    stale = [f"{file} {owner}" for file, owner in allowed if (file, owner) not in calls]
+    return unexpected, stale
+
+
+def test_llm_calls__outside_the_transport__go_through_route_llm_call():
+    unexpected, stale = _guard_report(_LEGACY_LLM_CALLS, _LEGACY_LLM_CALLS_ALLOWED)
 
     assert not unexpected, "call route_llm_call instead:\n" + "\n".join(unexpected)
     assert not stale, "no longer call the transport, drop from the allow-list:\n" + "\n".join(stale)
+
+
+def test_web_search__only_the_shared_search_helper__calls_it():
+    unexpected, stale = _guard_report(_WEB_SEARCH_CALLS, _WEB_SEARCH_CALLS_ALLOWED)
+
+    assert not unexpected, "go through workspace_builder._search_web:\n" + "\n".join(unexpected)
+    assert not stale, "no longer calls web search, drop from the allow-list:\n" + "\n".join(stale)
+
+
+def test_web_search_guard__a_direct_call_elsewhere__is_caught(tmp_path):
+    (tmp_path / "modules").mkdir()
+    (tmp_path / "modules" / "research.py").write_text(
+        "from app.models.brain import litellm_conf\n"
+        "async def execute_search(q):\n"
+        "    return await litellm_conf.gemini_web_search(user_prompt=q)\n"
+        "async def deep(qs):\n"
+        "    return await run_deep_research(qs)\n"
+    )
+
+    unexpected, _ = _guard_report(_WEB_SEARCH_CALLS, {}, app_dir=tmp_path)
+
+    assert unexpected == ["modules/research.py:[5] in deep", "modules/research.py:[3] in execute_search"]
+
+
+def test_routes__no_raw_model_proxy__the_lm_studio_route_is_gone():
+    """/lmstudio proxied straight to LM Studio over httpx: no chain, no ledger. Nothing
+    called it (the frontend talks to /chat/v2/stream), so it was deleted, not allowed."""
+    from app.main import app
+
+    assert [r.path for r in app.routes if "/lmstudio" in getattr(r, "path", "")] == []
