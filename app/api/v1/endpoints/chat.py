@@ -1107,7 +1107,8 @@ async def _accept_as_a_draft(
     ``DraftService`` (``accept_on_time``). Its slots are recorded as scheduled, the
     user's other open drafts (a morning brief) are superseded, and a time already gone
     by is moved first. A task id a finished task holds is 409; an outage, 503
-    ``{"status": "failed"}`` as before; nothing schedulable, the parse-error shape."""
+    ``{"status": "failed"}`` as before; nothing schedulable, the parse-error shape. A
+    failed accept expires the draft it made, so nothing can accept it later."""
     from app.domain import errors
     from app.services.draft_actions import MOVED_ON_ACCEPT, accept_on_time
 
@@ -1120,18 +1121,30 @@ async def _accept_as_a_draft(
             goal_id=(request.goal_metadata or {}).get("goal_id"),
             schedule=schedule,
         )
-        outcome = await accept_on_time(
-            container.draft_service, request.user_id, draft.id, supabase=supabase
-        )
     except errors.PersistenceError:
         logger.error(f"accept-schedule for {request.user_id} did not land — reporting failure")
         return _persist_failed()
-    except errors.ValidationError:
-        return {
-            "status": "error",
-            "message": "Invalid tasks: some tasks are not in the expected shape.",
-            "task_count": 0,
-        }
+    try:
+        outcome = await accept_on_time(
+            container.draft_service, request.user_id, draft.id, supabase=supabase
+        )
+    except Exception as failure:
+        # The draft was made only to be accepted now: a failed accept leaves no open
+        # draft for the newest-pending fallback to find and accept later.
+        try:
+            await container.draft_service.expire(request.user_id, draft.id)
+        except Exception as exc:  # the failure itself is still the answer
+            logger.warning(f"accept-schedule draft left open ({type(exc).__name__})")
+        if isinstance(failure, errors.PersistenceError):
+            logger.error(f"accept-schedule for {request.user_id} did not land — reporting failure")
+            return _persist_failed()
+        if isinstance(failure, errors.ValidationError):
+            return {
+                "status": "error",
+                "message": "Invalid tasks: some tasks are not in the expected shape.",
+                "task_count": 0,
+            }
+        raise
     return {
         "status": "accepted",
         "task_count": outcome.written,
