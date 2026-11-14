@@ -125,7 +125,7 @@ async def test_pearl__skips_at_nine__learned_only_from_enough_consistent_evidenc
     patterns = jarvis.rows("user_memories", user_id="alice", memory_type="behavioral_pattern")
     if learned:
         (pattern,) = patterns
-        assert "hour 9" in pattern["content"]
+        assert "9 AM" in pattern["content"]
         assert pattern["confidence"] >= 0.7
         assert [p["content"] for p in _patterns(turn)] == [pattern["content"]]
     else:

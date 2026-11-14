@@ -5,8 +5,9 @@ missed slot of the last ``FOCUS_WINDOW_DAYS``, each slot counted once as its lat
 outcome (``latest_outcome_per_slot``). Each ``PatternDetector`` is one strategy for
 reading that history, with hours on the user's clock. It owns everything particular
 to its pattern: the pattern's stable ``pattern_key`` (such as
-``skip_time_window:9``), how planning applies it, and what Jarvis tells the user
-about it. Adding a detector touches no other code.
+``skip_time_window:9``), how planning applies it, and the words: descriptions and
+insights speak to the user ("You tend to set work aside around 9 AM"), with a human
+time and no blame. Adding a detector touches no other code.
 
 ``PatternService.observe`` remembers patterns as inferred behavioural memories, looked
 up by key. A new pattern is created. One with an observation newer than its memory is
@@ -117,6 +118,23 @@ def _clock_hour(hour: int) -> str:
     return f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
 
 
+def _part_of_day(hour: int) -> str:
+    """Morning (5-11), afternoon (12-16), evening (17-20) or night."""
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 21:
+        return "evening"
+    return "night"
+
+
+def _key_hour(pattern_key: str) -> int | None:
+    """The hour in a ``{name}:{h}`` pattern key; None when there is none."""
+    _, _, hour = pattern_key.partition(":")
+    return int(hour) if hour.isdigit() and int(hour) < 24 else None
+
+
 class PatternDetector(ABC):
     """One way of reading the outcome history for a recurring behaviour (Strategy).
 
@@ -141,6 +159,11 @@ class PatternDetector(ABC):
         """What Jarvis tells the user about ``pattern``, from its live numbers."""
         return pattern.description
 
+    def text_for_key(self, pattern_key: str) -> str | None:
+        """The description of a pattern with this key, when the key holds everything the
+        words say; None when they say more (so a stored row keeps its own words)."""
+        return None
+
 
 class SkipTimeWindowDetector(PatternDetector):
     """An hour the user keeps setting aside: 3 or more outcomes, at least 70% skipped or missed."""
@@ -157,7 +180,7 @@ class SkipTimeWindowDetector(PatternDetector):
                 continue
             patterns.append(Pattern(
                 detector=self.name,
-                description=f"User avoids tasks during hour {hour} ({n} of {total} set aside)",
+                description=self._describe(hour),
                 occurrences=total,
                 confidence=n / total,
                 evidence=_evidence(set_aside, zone),
@@ -166,6 +189,14 @@ class SkipTimeWindowDetector(PatternDetector):
                 last_observed_at=_newest(set_aside),
             ))
         return patterns
+
+    @staticmethod
+    def _describe(hour: int) -> str:
+        return f"You tend to set work aside around {_clock_hour(hour)}"
+
+    def text_for_key(self, pattern_key: str) -> str | None:
+        hour = _key_hour(pattern_key)
+        return self._describe(hour) if hour is not None else None
 
     def insight(self, pattern: Pattern) -> str:
         n = round(pattern.confidence * pattern.occurrences)
@@ -197,9 +228,7 @@ class PeakHourDetector(PatternDetector):
         (rate, total), hour, done = best
         return [Pattern(
             detector=self.name,
-            description=(
-                f"User does their best work around hour {hour} ({len(done)} of {total} done)"
-            ),
+            description=self._describe(hour),
             occurrences=total,
             confidence=rate,
             evidence=_evidence(done, zone),
@@ -208,8 +237,19 @@ class PeakHourDetector(PatternDetector):
             last_observed_at=_newest(done),
         )]
 
+    @staticmethod
+    def _describe(hour: int) -> str:
+        return f"Your {_part_of_day(hour)}s around {_clock_hour(hour)} go well"
+
+    def text_for_key(self, pattern_key: str) -> str | None:
+        hour = _key_hour(pattern_key)
+        return self._describe(hour) if hour is not None else None
+
     def insight(self, pattern: Pattern) -> str:
         return f"You do your best work around {_clock_hour(pattern.hour)}."
+
+
+_FINISHES_CLOSE_TO_DEADLINES = "You tend to finish close to deadlines"
 
 
 class DeadlineCrunchDetector(PatternDetector):
@@ -237,13 +277,16 @@ class DeadlineCrunchDetector(PatternDetector):
             return []
         return [Pattern(
             detector=self.name,
-            description=f"User tends to finish deadlined work in the last day ({k} of {n})",
+            description=_FINISHES_CLOSE_TO_DEADLINES,
             occurrences=n,
             confidence=k / n,
             evidence=_evidence(last_day, zone, at=_done_time),
             pattern_key=self.name,
             last_observed_at=_newest(last_day),
         )]
+
+    def text_for_key(self, pattern_key: str) -> str | None:
+        return _FINISHES_CLOSE_TO_DEADLINES if pattern_key == self.name else None
 
     def insight(self, pattern: Pattern) -> str:
         return "You tend to finish deadlined work on the last day."
@@ -253,7 +296,8 @@ class RepeatedSkipDetector(PatternDetector):
     """One task set aside again and again: skipped 3 or more times.
 
     Confidence is the share of the task's outcomes that were skips. Jarvis tells the
-    user the description itself.
+    user the description itself. The title is only in the words, so a stored row keeps
+    its own (``text_for_key`` is None).
     """
 
     name: ClassVar[str] = "repeated_skip"
@@ -271,7 +315,7 @@ class RepeatedSkipDetector(PatternDetector):
             patterns.append(Pattern(
                 detector=self.name,
                 description=(
-                    f"'{_title(skipped[-1])}' has been set aside {n} times;"
+                    f"You've set '{_title(skipped[-1])}' aside {n} times;"
                     " smaller steps may help"
                 ),
                 occurrences=n,
@@ -363,6 +407,21 @@ class PatternService:
                     PatternDetected(occurred_at=now, user_id=user_id, pattern=pattern)
                 )
         return changes
+
+    def describe(self, memory: Memory) -> str:
+        """How a remembered pattern reads now.
+
+        A row stored in older words (before patterns spoke to the user) reads in
+        today's, re-rendered from its pattern key by its detector, when the key holds
+        everything the words say. Anything else reads as stored: another kind of
+        memory, a repeated skip (its title is only in the words), or a forgotten one.
+        """
+        keyed = memory.memory_type == "behavioral_pattern" and memory.pattern_key
+        if not keyed or not memory.content:  # not a pattern, or forgotten: no words to give
+            return memory.content
+        detector = self._by_name.get(memory.pattern_key.partition(":")[0])
+        text = detector.text_for_key(memory.pattern_key) if detector is not None else None
+        return text or memory.content
 
     def drain_pending(self, user_id: str) -> list[PatternChange]:
         """The learning moments held for the user since the last drain, oldest first; cleared.

@@ -180,7 +180,7 @@ async def test_snapshot__history__patterns_with_evidence_and_memory_ids(service,
     assert (pattern.detector, pattern.occurrences, pattern.confidence) == (
         "skip_time_window", 4, 1.0
     )
-    assert pattern.description == "User avoids tasks during hour 9 (4 of 4 set aside)"
+    assert pattern.description == "You tend to set work aside around 9 AM"
     assert pattern.evidence == [  # newest first, local time, never "missed" or "skipped"
         "set aside Sun 15 Nov 09:00 · Morning task",
         "set aside Sat 14 Nov 09:00 · Morning task",
