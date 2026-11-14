@@ -56,7 +56,11 @@ class ApplyDraftAction(ProactiveAction):
 
 
 class AdoptRuleAction(ProactiveAction):
-    """Keep an hour the user keeps setting aside free of demanding work, from now on.
+    """Keep an hour the user keeps setting aside clear of all work, from now on.
+
+    The rule is a hard block on that hour; the proposal's words say so ("keep that
+    hour clear"). A learned pattern alone only softens the hour (light work may still
+    go there); accepting the rule is what clears it.
 
     It carries the pattern's numbers as they were when it was proposed (``confidence``
     and ``occurrences``), for the suggestion to show.
@@ -89,7 +93,7 @@ class AdoptRuleAction(ProactiveAction):
         self._planner = planner
 
     def describe(self) -> str:
-        return f"Keep {_clock_hour(self._hour)} free of demanding work"
+        return f"Keep {_clock_hour(self._hour)} clear"
 
     def dedupe_key(self) -> str:
         return f"pattern_rule:{self._pattern_key}"
@@ -113,24 +117,32 @@ class AdoptRuleAction(ProactiveAction):
 
         The rule carries its blocked slot already worked out, so planning never spends a
         model call translating it. Nothing to plan, or nothing that fits, is no draft:
-        the rule still holds for every plan after it.
+        the rule still holds for every plan after it. Habits that can't be read right
+        now mean no draft yet, and the message says the redraft waits for them.
         """
         if not await self._rule_stored(user_id):
             await self._constraints.add(user_id, self._rule(user_id))
         await self._memory.confirm(user_id, self._memory_id)
+        h12 = _clock_hour(self._hour)
+        saved = f"Saved. Every plan from now on keeps {h12} clear"
         try:
             draft = await self._planner.replan(user_id, reslot_task_ids=[])
         except errors.ScheduleInfeasibleError:
             draft = None
-        h12 = _clock_hour(self._hour)
-        if draft is None:
+        except errors.LLMUnavailableError:  # the habits could not be read: no draft yet
             return ActionResult(
-                kind=self.kind, message=f"Saved. Every plan from now on keeps {h12} free."
+                kind=self.kind,
+                message=(
+                    f"{saved} — I'll draft today's around it as soon as I can read your"
+                    " habits again."
+                ),
             )
+        if draft is None:
+            return ActionResult(kind=self.kind, message=f"{saved}.")
         return ActionResult(
             kind=self.kind,
             message=(
-                f"Saved. I've drafted a plan that keeps {h12} free"
+                f"Saved. I've drafted a plan that keeps {h12} clear"
                 " — accept it when it suits you."
             ),
             draft_id=draft.id,
@@ -157,7 +169,7 @@ class AdoptRuleAction(ProactiveAction):
         return BehavioralConstraint(
             id=uuid4().hex,
             user_id=user_id,
-            raw_text=f"No demanding work between {h:02d}:00 and {h + 1:02d}:00",
+            raw_text=f"No work between {h:02d}:00 and {h + 1:02d}:00",
             constraint_type="habit",
             recurrence="daily",
             source="inferred",
@@ -169,23 +181,33 @@ class AdoptRuleAction(ProactiveAction):
 
 
 class ShareInsightAction(ProactiveAction):
-    """Something Jarvis noticed. Accepting it changes nothing."""
+    """Something Jarvis noticed. Accepting it changes nothing.
+
+    ``key`` is what it is about, so a dismissal holds for exactly that: a pattern's key
+    (dismissed once, never shared again, whatever its numbers become), or one day's
+    brief (``brief:{local day}``: tomorrow's is a new note).
+    """
 
     kind: ClassVar[str] = "share_insight"
     risk: ClassVar[ActionRisk] = ActionRisk.READ_ONLY
 
-    def __init__(self, insight: str) -> None:
+    def __init__(self, insight: str, *, key: str) -> None:
         self._insight = insight
+        self._key = key
 
     def describe(self) -> str:
         return self._insight
 
     def dedupe_key(self) -> str:
-        """The words themselves: a dismissed insight is not shared again."""
-        return f"share_insight:{self._insight}"
+        return f"share_insight:{self._key}"
 
     def to_payload(self) -> dict:
-        return {"kind": self.kind, "dedupe_key": self.dedupe_key(), "insight": self._insight}
+        return {
+            "kind": self.kind,
+            "dedupe_key": self.dedupe_key(),
+            "insight": self._insight,
+            "key": self._key,
+        }
 
     async def execute(self, user_id: str) -> ActionResult:
         return ActionResult(kind=self.kind, message="Noted.")
@@ -229,6 +251,7 @@ def build_action_factory(
         ),
     )
     factory.register(
-        ShareInsightAction.kind, lambda p: ShareInsightAction(_field(p, "insight", str))
+        ShareInsightAction.kind,
+        lambda p: ShareInsightAction(_field(p, "insight", str), key=_field(p, "key", str)),
     )
     return factory

@@ -279,6 +279,20 @@ class _HeldModel(LLMProvider):
         yield ("content", "ok")
 
 
+@pytest.fixture
+def local_first(monkeypatch):
+    """Calls may use the local model: the PRIMARY lock applies (it guards local memory)."""
+    import contextvars
+
+    import app.core.config as _cfg
+
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", False)
+    monkeypatch.setattr(_cfg, "CLAUDE_PRIMARY", False)
+    monkeypatch.setattr(
+        "app.core.model_router.force_cloud_var", contextvars.ContextVar("fc", default=False)
+    )
+
+
 def _install(model) -> None:
     from app.infrastructure.llm.chain import FallbackChainProvider
     from app.infrastructure.llm.factory import set_chain
@@ -297,7 +311,7 @@ async def _until(predicate, timeout: float = 2.0) -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_llm_call__two_primary_calls__never_overlap():
+async def test_route_llm_call__two_primary_calls__never_overlap(local_first):
     import asyncio
 
     from app.core.model_router import route_llm_call
@@ -320,7 +334,7 @@ async def test_route_llm_call__two_primary_calls__never_overlap():
 
 
 @pytest.mark.asyncio
-async def test_route_llm_call__fast_call__not_blocked_by_primary():
+async def test_route_llm_call__fast_call__not_blocked_by_primary(local_first):
     import asyncio
 
     from app.core.model_router import route_llm_call
@@ -340,7 +354,7 @@ async def test_route_llm_call__fast_call__not_blocked_by_primary():
 
 
 @pytest.mark.asyncio
-async def test_route_llm_call__primary_call_cancelled__lock_released_for_the_next():
+async def test_route_llm_call__primary_call_cancelled__lock_released_for_the_next(local_first):
     """A PRIMARY call cancelled mid-flight (a step timeout, a stopped turn) frees the lock."""
     import asyncio
 
@@ -363,9 +377,12 @@ async def test_route_llm_call__primary_call_cancelled__lock_released_for_the_nex
 
 
 @pytest.mark.asyncio
-async def test_route_llm_call__nested_primary_call__runs_under_the_outer_hold():
-    """A PRIMARY call made from inside one (same task, or a task it spawned) does not
-    wait for the lock its own caller holds: no deadlock."""
+async def test_route_llm_call__primary_call_nested_in_a_running_one__refused_never_deadlocks(
+    local_first,
+):
+    """A PRIMARY call made while another runs inside the same hold (in the same task, or
+    a task it spawned) would be two heavy calls at once: it is refused at once, without
+    waiting for a lock its own caller holds. The outer call is unaffected."""
     import asyncio
 
     from app.core.model_router import route_llm_call
@@ -374,11 +391,12 @@ async def test_route_llm_call__nested_primary_call__runs_under_the_outer_hold():
         async def complete(self, req):
             self.started.append(req.task)
             if req.task == "socratic_chunker":
-                inner = await route_llm_call(task="habit_translation", prompt="inner")
-                spawned = await asyncio.create_task(
-                    route_llm_call(task="calendar_parsing", prompt="spawned")
+                inner = await asyncio.gather(
+                    route_llm_call(task="habit_translation", prompt="inner"),
+                    asyncio.create_task(route_llm_call(task="calendar_parsing", prompt="spawned")),
+                    return_exceptions=True,
                 )
-                return f"outer({inner},{spawned})"
+                return "outer:" + ",".join(type(e).__name__ for e in inner)
             return "ok"
 
     model = _NestingModel()
@@ -386,5 +404,59 @@ async def test_route_llm_call__nested_primary_call__runs_under_the_outer_hold():
 
     result = await asyncio.wait_for(route_llm_call(task="socratic_chunker", prompt="p"), 2)
 
-    assert result == "outer(ok,ok)"
-    assert model.started == ["socratic_chunker", "habit_translation", "calendar_parsing"]
+    assert result == "outer:RuntimeError,RuntimeError"
+    assert model.started == ["socratic_chunker"]
+
+
+@pytest.mark.asyncio
+async def test_route_llm_call__cloud_first_primary_calls__never_wait_on_the_lock(monkeypatch):
+    """The lock protects the local model's memory: a call that skips it never queues."""
+    import asyncio
+
+    import app.core.config as _cfg
+    from app.core.model_router import route_llm_call
+
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", True)  # cloud-first: the local model is skipped
+    model = _HeldModel()
+    model.release = asyncio.Event()
+    _install(model)
+
+    first = asyncio.create_task(route_llm_call(task="socratic_chunker", prompt="plan"))
+    second = asyncio.create_task(route_llm_call(task="habit_translation", prompt="habits"))
+
+    await _until(lambda: len(model.started) == 2)  # both under way at once
+    model.release.set()
+    assert await asyncio.gather(first, second) == ["ok", "ok"]
+
+
+@pytest.mark.asyncio
+async def test_primary_hold__children_calling_at_once__refused_never_run_together(local_first):
+    """A planning step holds the lock and its handler's PRIMARY calls run under it, one
+    after another. Two at once under one hold would be two heavy calls together: refused."""
+    import asyncio
+
+    from app.core.model_router import hold_primary_model, route_llm_call
+
+    class _Recording(_HeldModel):
+        async def complete(self, req):
+            self.started.append(req.task)
+            await asyncio.sleep(0.01)
+            return "ok"
+
+    model = _Recording()
+    _install(model)
+
+    async with hold_primary_model():  # as the planning step holds it
+        one = await route_llm_call(task="habit_translation", prompt="first")
+        two = await route_llm_call(task="habit_translation", prompt="second")
+        assert (one, two) == ("ok", "ok")  # one after another: nested, no deadlock
+        results = await asyncio.gather(
+            route_llm_call(task="socratic_chunker", prompt="a"),
+            route_llm_call(task="calendar_parsing", prompt="b"),
+            return_exceptions=True,
+        )
+
+    refused = [r for r in results if isinstance(r, RuntimeError)]
+    assert len(refused) == 1, results
+    assert "one after another" in str(refused[0])
+    assert model.started.count("socratic_chunker") + model.started.count("calendar_parsing") == 1

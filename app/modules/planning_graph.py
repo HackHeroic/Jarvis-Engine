@@ -42,6 +42,9 @@ class PlanningState(TypedDict):
     reslot_task_ids: list
     anti_guilt_message: Optional[str]
     habits_text: str
+    # True once habit translation read habits_text: a plan made without it does not
+    # account for the user's habits (the replanner refuses one; a turn says so).
+    habits_translated: bool
     # Slots of habits stored with them already worked out (a learned rule): they skip
     # habit translation and join its output.
     precomputed_slots: list
@@ -116,7 +119,13 @@ async def mark_missed(state: PlanningState) -> dict:
     weights, and the synthesis layer gets a blame-free framing to surface.
     Ported from control_policy._run_plan_day_flow — v2 previously never
     marked anything overdue.
+
+    A replan (the morning brief, an accepted rule) runs no deadline scan: it changes
+    no task's status, and a task whose deadline passed stays as it is until the user
+    plans or asks for it.
     """
+    if state.get("replan_only"):
+        return {"missed_deadlines": [], "anti_guilt_message": None}
     from app.services.analytical import missed_deadlines as md
 
     user_model = state.get("user_model")
@@ -187,7 +196,13 @@ async def fetch_constraints(state: PlanningState) -> dict:
     from app.api.v1.endpoints import schedule as schedule_ep
 
     zone = await _user_zone(state)
-    horizon_start = schedule_ep.current_horizon_start(zone).isoformat()
+    start = schedule_ep.current_horizon_start(zone)
+    if state.get("replan_only"):
+        # A replan is for today once the user is up: before DAY_START_HOUR the late-night
+        # rule would start it on yesterday's day. From EVENING_CUTOFF_HOUR on it is still
+        # tomorrow's.
+        start = max(start, schedule_ep._compute_horizon_start(zone=zone))
+    horizon_start = start.isoformat()
     focus_by_hour = await _learned_focus(state.get("user_id", "demo"), zone)
     user_model = state["user_model"]
     if user_model:
@@ -241,6 +256,8 @@ async def translate_habits(state: PlanningState) -> dict:
     """Translate the free-text habits into semantic slots, joined by the precomputed ones.
 
     With no free-text habit there is no model call: the precomputed slots are all.
+    ``habits_translated`` says the free text was read; without it (the model failed, or
+    the step's time ran out) the plan does not account for those habits.
     """
     habits_text = state.get("habits_text", "")
     precomputed = list(state.get("precomputed_slots") or [])
@@ -251,7 +268,11 @@ async def translate_habits(state: PlanningState) -> dict:
         slots = await translate_habits_to_slots(habits_text)
         result = [s.model_dump() for s in slots] if slots else []
         result += precomputed
-        return {"semantic_slots": result, "_tool_detail": {"slots": len(result)}}
+        return {
+            "semantic_slots": result,
+            "habits_translated": True,
+            "_tool_detail": {"slots": len(result)},
+        }
     except Exception as e:
         logger.warning(f"Habit translation failed: {e}")
         return {"semantic_slots": precomputed}
@@ -677,6 +698,8 @@ async def create_draft(state: PlanningState) -> dict:
     schedule = state.get("schedule")
     if not draft_store or not schedule:
         return {"draft_id": None}
+    if state.get("replan_only") and habits_unread(state):
+        return {"draft_id": None}  # never stored: the replanner refuses a plan without them
 
     # draft_schedules.horizon_start is TEXT NOT NULL (20260329000002), so a
     # None here is a round-trip that can only fail. solve_schedule echoes the
@@ -804,6 +827,7 @@ def planning_state_in(state) -> dict:
             else state.get("user_message", "")
         ),
         "habits_text": "",
+        "habits_translated": False,
         "precomputed_slots": [],
         "semantic_slots": [],
         "time_slots": [],
@@ -826,6 +850,30 @@ def planning_state_in(state) -> dict:
         "draft_store": state.get("draft_store"),
         "draft_id": None,
     }
+
+
+# What the reply leads with when a plan was made without reading the user's habits.
+HABITS_UNREAD_NOTE = (
+    "I couldn't read your habits just now, so this draft doesn't account for them yet"
+    " — say the word and I'll redo it."
+)
+
+
+def habits_unread(result: dict) -> bool:
+    """Whether the plan was made without reading the user's free-text habits."""
+    return bool((result.get("habits_text") or "").strip()) and not result.get("habits_translated")
+
+
+def _with_habits_note(result: dict, schedule: Any) -> Optional[str]:
+    """The turn's lead-in for the reply: a schedule made without the user's habits says so.
+
+    Through ``anti_guilt_message``, the way a planning step already hands the reply
+    something to lead with (and the complete frame then suggests a re-plan).
+    """
+    message = result.get("anti_guilt_message")
+    if not schedule or not habits_unread(result):
+        return message
+    return f"{message} {HABITS_UNREAD_NOTE}" if message else HABITS_UNREAD_NOTE
 
 
 def planning_state_out(result: dict, module_name: str) -> dict:
@@ -853,7 +901,7 @@ def planning_state_out(result: dict, module_name: str) -> dict:
         "clarification_request": clarification,
         "error": error,
         "draft_id": draft_id,
-        "anti_guilt_message": result.get("anti_guilt_message"),
+        "anti_guilt_message": _with_habits_note(result, schedule),
         "missed_deadlines": result.get("missed_deadlines"),
     }
 
@@ -895,8 +943,11 @@ planning_module = ModuleDefinition(
         ModuleStep(name="mark_missed", handler=mark_missed),
         ModuleStep(name="fetch_constraints", handler=fetch_constraints,
                    depends_on=["mark_missed"], concurrent_safe=True),
+        # Both PRIMARY steps take the PRIMARY lock first, so their timeouts count their
+        # own work, never the wait for another heavy call (a background brief's).
         ModuleStep(name="translate_habits", handler=translate_habits,
-                   depends_on=["fetch_constraints"], timeout_ms=45_000),
+                   depends_on=["fetch_constraints"], timeout_ms=45_000,
+                   holds_primary=lambda state: bool((state.get("habits_text") or "").strip())),
         ModuleStep(name="expand_slots", handler=expand_slots,
                    depends_on=["translate_habits"], concurrent_safe=True, read_only=True),
         ModuleStep(name="memory_to_constraints", handler=memory_to_constraints,
@@ -907,7 +958,8 @@ planning_module = ModuleDefinition(
         # one turn is an OOM risk on 24 GB).
         ModuleStep(name="decompose_goal", handler=decompose_goal,
                    depends_on=["expand_slots", "memory_to_constraints"],
-                   timeout_ms=60_000),
+                   timeout_ms=60_000,
+                   holds_primary=lambda state: not state.get("replan_only")),
         ModuleStep(name="fuse_tasks", handler=fuse_tasks, depends_on=["decompose_goal"]),
         ModuleStep(name="solve_schedule", handler=solve_schedule,
                    depends_on=["fuse_tasks"], timeout_ms=SOLVE_STEP_TIMEOUT_MS,

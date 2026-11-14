@@ -110,8 +110,7 @@ async def test_anticipation__three_skips_at_nine__rule_suggested_accepted_and_ne
         (proposal,) = listed.json()["suggestions"]
         assert proposal["title"] == "A pattern around 9 AM"
         assert proposal["body"] == (
-            "You've set aside 3 of the last 3 tasks around 9 AM."
-            " Want me to stop putting demanding work there?"
+            "You've set aside 3 of the last 3 tasks around 9 AM. Want me to keep that hour clear?"
         )
         # Learned, not yet a rule: the 09:00 hour is only a minimal-work hour, which
         # light tasks may still use.
@@ -125,7 +124,7 @@ async def test_anticipation__three_skips_at_nine__rule_suggested_accepted_and_ne
 
     assert accepted.status_code == 200
     assert accepted.json()["result"]["message"] == (
-        "Saved. Every plan from now on keeps 9 AM free."
+        "Saved. Every plan from now on keeps 9 AM clear."
     )
     (rule,) = jarvis.rows("behavioral_constraints", user_id="alice")
     assert rule["source"] == "inferred"
@@ -138,3 +137,38 @@ async def test_anticipation__three_skips_at_nine__rule_suggested_accepted_and_ne
     assert len(slots) == len(LIGHT_TOPICS)
     assert not [slot for slot in slots if _touches_nine(slot)], slots
     assert "habit_translation" not in llm.tasks(calls_before)  # the rule's hour was known
+
+
+@pytest.mark.asyncio
+async def test_plan__habits_could_not_be_read__the_reply_says_so_and_offers_a_redo(jarvis, llm):
+    """A turn whose habits could not be read (the model did not answer, or the wait for
+    it ran out) still shows its draft, and says plainly that it does not account for
+    them yet, the way the reply leads with anything the plan needs the user to know."""
+    from app.domain.entities import BehavioralConstraint
+    from app.domain.errors import LLMUnavailableError
+    from app.modules.planning_graph import HABITS_UNREAD_NOTE
+    from app.services.analytical.habit_translator import invalidate_habit_cache
+
+    invalidate_habit_cache()
+    await jarvis.state.container.repos.constraints.add("alice", BehavioralConstraint(
+        id="5d0c5b8e-6c0f-4e0e-9a54-2f7d1c3a9b11", user_id="alice",
+        raw_text="Choir practice with the college band on Tuesdays", constraint_type="habit",
+        recurrence="weekly",
+    ))
+
+    def unreachable(req):
+        raise LLMUnavailableError("The model is not answering.")
+
+    llm.script("habit_translation", unreachable)
+    llm.script(
+        "brain_dump_extraction",
+        lambda req: brain_dump(planning_goal="Revise DSA") if "plan" in req.prompt.lower() else "{}",
+    )
+    llm.script("socratic_chunker", decomposition(["Graphs", "DP", "Trees"]))
+
+    turn = await jarvis.say("Plan my DSA revision")
+
+    assert turn.draft_id is not None  # the draft is still shown...
+    assert turn.payload["suggested_action"] == "replan"  # ...with the offer to redo it
+    (synthesis,) = llm.calls_for("voice_of_jarvis_synthesis")
+    assert HABITS_UNREAD_NOTE in synthesis.prompt  # ...and the reply leads with why

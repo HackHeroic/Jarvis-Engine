@@ -135,7 +135,7 @@ def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None
         drafts=drafts, constraints=repos.constraints, memory=memory, planner=planner
     )
     brief = MorningBriefTrigger(repos.tasks, repos.task_events, planner, energy, patterns, actions)
-    rule = PatternRuleTrigger(patterns, repos.suggestions, actions)
+    rule = PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
     service = AnticipationService(
         {brief.name: brief, rule.name: rule}, actions, ConsentPolicy.default(),
         repos.suggestions, repos.profiles, repos.constraints, clock=clock,
@@ -222,6 +222,60 @@ def _no_blame(text: str) -> None:
         assert word not in text.lower(), text
 
 
+def _starts(draft: DraftSchedule) -> dict[str, datetime]:
+    """Each drafted task's start on the user's clock."""
+    origin = datetime.fromisoformat(draft.horizon_start)
+    return {
+        task_id: (origin + timedelta(minutes=slot["start_min"])).astimezone(IST)
+        for task_id, slot in draft.schedule.items()
+    }
+
+
+class _Habits:
+    """A model that reads habits (structured, no slots) once ``readable``; until then it
+    cannot be reached."""
+
+    def __init__(self) -> None:
+        self.readable = False
+        self.calls: list[str] = []
+
+    def install(self) -> None:
+        from app.domain.entities import LLMLocation
+        from app.domain.errors import LLMUnavailableError
+        from app.domain.ports import LLMProvider
+        from app.infrastructure.llm.chain import FallbackChainProvider
+        from app.infrastructure.llm.factory import set_chain
+        from app.schemas.context import SemanticTimeSlotsResponse
+
+        habits = self
+
+        class _Model(LLMProvider):
+            name = "habits"
+            location = LLMLocation.CLOUD
+
+            def is_available(self) -> bool:
+                return True
+
+            async def complete(self, req):
+                habits.calls.append(req.task)
+                if not habits.readable:
+                    raise LLMUnavailableError("The model is not answering.")
+                return SemanticTimeSlotsResponse(semantic_slots=[])
+
+            async def stream(self, req):
+                yield ("content", "")
+
+        set_chain(FallbackChainProvider([_Model()]))
+
+
+def _choir_habit() -> BehavioralConstraint:
+    # No deterministic pattern matches it: only the model can read it.
+    return BehavioralConstraint(
+        id=str(uuid4()), user_id=U, raw_text="Choir practice with the college band on Tuesdays",
+        constraint_type="habit", recurrence="weekly",
+    )
+
+
 # --- MorningBrief: when ---------------------------------------------------------------
 
 
@@ -256,10 +310,9 @@ async def test_brief__after_wake__pending_suggestion_with_draft_and_ask_reason(w
     assert (suggestion.consent_behavior, suggestion.consent_kind, suggestion.consent_reason) == (
         "ask", ConsentReasonKind.MODE_DECISION, ASKING_FIRST
     )
-    # Pacing spreads a small plan over two days, so today holds one or both of them.
+    # Pacing spreads a small plan over at least two days: one of the two lands today.
     assert re.fullmatch(
-        r"[12] tasks? (is|are) planned for today; the hardest, 'Revise \w+', is at \d\d:\d\d\.",
-        suggestion.body,
+        r"1 task is planned for today; the hardest, 'Revise \w+', is at 08:00\.", suggestion.body
     ), suggestion.body
     assert suggestion.expires_at == end_of_local_day(MONDAY, IST)
 
@@ -387,8 +440,7 @@ async def test_brief__copy__no_blame_phrases_and_peak_claim_only_when_learned(
         "3 tasks are planned for today; the hardest, 'Revise graphs', is at 09:00"
         " — your strongest hour.",
         "1 from yesterday found a new slot.",
-        "I noticed: I keep demanding work out of the 2 PM hour — you've set aside 3 of 3 there"
-        " (seen 3 times).",
+        "I noticed you tend to set work aside around 2 PM (3 of the last 3 times).",
     ]
     assert bob.body == "1 task is planned for today; the hardest, 'Revise intro', is at 09:00."
     for suggestion in (alice, bob):
@@ -415,6 +467,197 @@ async def test_brief__replan_infeasible__read_only_suggestion_no_draft(fake, rep
     )
     assert fake.rows.get("draft_schedules", [])[1:] == []  # only the seeding draft
     _no_blame(suggestion.title)
+
+
+@pytest.mark.asyncio
+async def test_brief__automatic_at_07_01__todays_tasks_land_today_from_8am(world, clock):
+    at = _ist(MONDAY, 7, 1)  # just after the default 07:00 wake, before the day starts
+    clock.freeze(at, schedule_endpoint)
+    await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c", "d")])  # 2 a day
+
+    outcome = await _run_brief(world, at)
+
+    draft = await world.repos.drafts.get(U, outcome.suggestion.action["draft_id"])
+    starts = _starts(draft)
+    today = sorted(start for start in starts.values() if start.date() == MONDAY)
+    assert datetime.fromisoformat(draft.horizon_start) == _ist(MONDAY, 8)  # today, not yesterday
+    assert today == [_ist(MONDAY, 8), _ist(MONDAY, 8, 25)]
+    assert all(start.date() <= TUESDAY for start in starts.values())  # nothing pushed further
+    assert outcome.suggestion.body.startswith("2 tasks are planned for today;")
+
+
+@pytest.mark.asyncio
+async def test_brief__run_at_10_30__nothing_before_10_30(world, clock):
+    at = _ist(MONDAY, 10, 30)
+    clock.freeze(at, schedule_endpoint)
+    await _seed_tasks(world.repos, [_row(name) for name in ("a", "b", "c", "d")])
+
+    outcome = await _run_brief(world, at)
+
+    draft = await world.repos.drafts.get(U, outcome.suggestion.action["draft_id"])
+    starts = _starts(draft)
+    assert min(starts.values()) >= at
+    assert len([start for start in starts.values() if start.date() == MONDAY]) == 2
+
+
+@pytest.mark.asyncio
+async def test_brief__every_task_overdue__drafted_and_left_pending(world, clock):
+    import app.services.analytical.missed_deadlines as missed_deadlines
+
+    clock.freeze(MONDAY_7_05, schedule_endpoint, missed_deadlines)
+    yesterday = SUNDAY.isoformat()
+    await _seed_tasks(world.repos, [
+        _row("graphs", deadline_hint=yesterday), _row("trees", deadline_hint=yesterday),
+    ])
+
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+
+    assert suggestion.title == "Today is ready"
+    assert suggestion.action["kind"] == "apply_plan"
+    for task_id in ("graphs", "trees"):
+        assert (await world.repos.tasks.get(U, task_id)).status is TaskStatus.PENDING
+    assert await world.repos.task_events.list_for_user(
+        U, types={TaskEventType.DEADLINE_MISSED}
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_brief__slot_passed_this_morning__counted_as_earlier_today(pinned_world, pinned):
+    this_morning, yesterday = _ist(MONDAY, 8), _ist(SUNDAY, 10)
+    await _seed_tasks(pinned_world.repos, [
+        _row("early", status="missed", start=this_morning),
+        _row("dp", status="missed", start=yesterday),
+    ])
+    await pinned_world.repos.task_events.append_many(U, [
+        _outcome("early", TaskEventType.MISSED, this_morning, this_morning + timedelta(minutes=55)),
+        _outcome("dp", TaskEventType.MISSED, yesterday, yesterday + timedelta(minutes=55)),
+    ])
+
+    outcome = await _run_brief(pinned_world, _ist(MONDAY, 11))
+
+    lines = outcome.suggestion.body.splitlines()
+    assert sorted(pinned.calls[0]) == ["dp", "early"]
+    assert "1 from yesterday found a new slot." in lines
+    assert "1 from earlier today found a new slot." in lines
+
+
+@pytest.mark.asyncio
+async def test_brief__couldnt_fit_note_dismissed__next_day_still_briefed(fake, repos):
+    planner = _PinnedPlanner(repos, raises=errors.ScheduleInfeasibleError("Too much for 30 days."))
+    world = _world(fake, repos, planner)
+    await _seed_tasks(repos, [_row("graphs")])
+    monday = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await world.service.dismiss(U, monday.id)
+
+    world.clock.now = _ist(TUESDAY, 7, 5)
+    tuesday = await _run_brief(world, world.clock.now)
+
+    assert monday.action["dedupe_key"] == "share_insight:brief:2026-11-16"
+    assert tuesday.status == "created"
+    assert tuesday.suggestion.action["dedupe_key"] == "share_insight:brief:2026-11-17"
+    assert tuesday.suggestion.body == COULDNT_FIT
+
+
+@pytest.mark.asyncio
+async def test_brief__insight_dismissed__not_shared_again_when_its_numbers_change(pinned_world):
+    world = pinned_world
+    await _set_aside_at(world, 14)  # 3 of 3
+    monday = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await world.service.dismiss(U, monday.id)
+    slot = _ist(SUNDAY - timedelta(days=4), 14)  # one more set aside: now 4 of 4
+    await world.repos.task_events.append(U, _outcome("past_14_x", TaskEventType.SKIPPED, slot, slot))
+
+    world.clock.now = _ist(TUESDAY, 7, 5)
+    tuesday = await _run_brief(world, world.clock.now)
+
+    assert monday.title == "Something I noticed"
+    assert monday.action["dedupe_key"] == "share_insight:skip_time_window:14"
+    assert tuesday.status == "denied"
+    assert tuesday.decision.kind is ConsentReasonKind.LEARNED_PREFERENCE
+
+
+@pytest.mark.asyncio
+async def test_brief__habits_could_not_be_read__tick_failed_nothing_settled_next_tick_retries(
+    world, clock
+):
+    from app.services.analytical.habit_translator import invalidate_habit_cache
+
+    invalidate_habit_cache()
+    habits = _Habits()
+    habits.install()
+    clock.freeze(MONDAY_7_05, schedule_endpoint)
+    await world.repos.constraints.add(U, _choir_habit())
+    await _seed_tasks(world.repos, [_row("graphs")])
+
+    first = await world.service.run_due(U, MONDAY_7_05)
+    habits.readable = True
+    clock.freeze(MONDAY_7_05 + timedelta(minutes=1), schedule_endpoint)
+    second = await world.service.run_due(U, MONDAY_7_05 + timedelta(minutes=1))
+
+    assert first[0].status == "failed"  # the morning brief; nothing stored, nothing settled
+    assert second[0].status == "created"
+    assert habits.calls.count("habit_translation") >= 2
+    (brief,) = await world.repos.suggestions.list(U, status=None)
+    assert brief.trigger == "morning_brief"
+
+
+@pytest.mark.asyncio
+async def test_brief__learned_evening_peak__hard_task_in_the_peak_and_due_today_reslot_first(
+    fake, repos, clock, deterministic_solver
+):
+    """The demo: what Jarvis learned moves the math. Evenings go well and mornings get set
+    aside, so the hardest task that is not due today goes to the evening peak, while
+    yesterday's set-aside task, due today, takes the first slot of the day."""
+    import app.core.config as config
+    import app.modules.planning_graph as planning_graph
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.orchestrator.hooks import ActionHooks
+
+    clock.freeze(MONDAY_7_05, schedule_endpoint, planning_graph)
+    runtime.set_container(AppContainer.build(  # planning reads the focus profile through it
+        supabase_client=fake, cfg=config, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    ))
+    world = _world(fake, repos)
+    history = []
+    for day in range(1, 15):  # two weeks of evenings done, mornings set aside
+        date_ = MONDAY - timedelta(days=day)
+        evening = _ist(date_, 19)
+        history.append(_outcome(f"eve_{day}", TaskEventType.COMPLETED, evening,
+                                evening + timedelta(minutes=25)))
+        if day <= 3:
+            for hour in (9, 10, 11, 12):
+                morning = _ist(date_, hour)
+                history.append(_outcome(f"am_{hour}_{day}", TaskEventType.SKIPPED, morning, morning))
+    yesterday_10 = _ist(SUNDAY, 10)
+    history.append(_outcome("dp", TaskEventType.MISSED, yesterday_10,
+                            yesterday_10 + timedelta(minutes=55)))
+    await repos.task_events.append_many(U, history)
+    # Eight tasks, four a day: the hardest has no deadline, so it may lean to the peak;
+    # yesterday's set-aside task is due today, so it may not.
+    await _seed_tasks(repos, [
+        _row("graphs", difficulty_weight=0.9),
+        _row("arrays", difficulty_weight=0.5),
+        _row("notes", difficulty_weight=0.3),
+        *[_row(name, difficulty_weight=0.2) for name in ("cards", "recap")],
+        *[_row(name, difficulty_weight=0.1) for name in ("tidy", "links")],
+        _row("dp", status="missed", start=yesterday_10, difficulty_weight=0.8,
+             deadline_hint=MONDAY.isoformat()),
+    ])
+
+    suggestion = (await _run_brief(world, MONDAY_7_05)).suggestion
+
+    draft = await repos.drafts.get(U, suggestion.action["draft_id"])
+    starts = _starts(draft)
+    assert starts["dp"] == _ist(MONDAY, 8)  # due today: the first slot of the day
+    assert starts["graphs"] == _ist(MONDAY, 19), starts  # the learned peak, not the morning
+    today = [task_id for task_id, start in starts.items() if start.date() == MONDAY]
+    assert suggestion.body.splitlines()[0] == (
+        f"{len(today)} tasks are planned for today; the hardest, 'Revise graphs', is at 19:00"
+        " — your strongest hour."
+    )
+    assert "1 from yesterday found a new slot." in suggestion.body.splitlines()
 
 
 # --- MorningBrief: accepting it ---------------------------------------------------------
@@ -499,8 +742,7 @@ async def test_pattern_rule__qualifying_skip_window__suggestion_with_adopt_rule(
     assert outcome.status == "created"
     assert (suggestion.kind, suggestion.title) == ("pattern_rule", "A pattern around 9 AM")
     assert suggestion.body == (
-        "You've set aside 3 of the last 3 tasks around 9 AM."
-        " Want me to stop putting demanding work there?"
+        "You've set aside 3 of the last 3 tasks around 9 AM. Want me to keep that hour clear?"
     )
     assert suggestion.action == {
         "kind": "adopt_rule",
@@ -558,7 +800,7 @@ async def test_pattern_rule__accept__constraint_with_semantic_slot_memory_confir
 
     (rule,) = await world.repos.constraints.list_active(U)
     assert (rule.raw_text, rule.constraint_type, rule.recurrence, rule.source) == (
-        "No demanding work between 09:00 and 10:00", "habit", "daily", "inferred"
+        "No work between 09:00 and 10:00", "habit", "daily", "inferred"
     )
     assert rule.structured_semantics["pattern_key"] == "skip_time_window:9"
     (slot,) = rule.structured_semantics["semantic_slots"]
@@ -571,7 +813,7 @@ async def test_pattern_rule__accept__constraint_with_semantic_slot_memory_confir
     assert accepted.status is SuggestionStatus.ACCEPTED
     assert result.kind == "adopt_rule"
     assert result.message == (
-        "Saved. I've drafted a plan that keeps 9 AM free — accept it when it suits you."
+        "Saved. I've drafted a plan that keeps 9 AM clear — accept it when it suits you."
     )
     draft = await world.repos.drafts.get(U, result.draft_id)
     assert draft.status is DraftStatus.PENDING
@@ -585,7 +827,7 @@ async def test_pattern_rule__accept__constraint_with_semantic_slot_memory_confir
 
 @pytest.mark.asyncio
 async def test_pattern_rule__over_the_api__details_carry_the_numbers_and_accept_the_new_draft_id(
-    world, clock, monkeypatch
+    world, fake, clock, monkeypatch
 ):
     """What the dashboard reads: the pattern's numbers on the card, and the redraft's id
     in the accept response, so the user can be taken to it."""
@@ -605,6 +847,7 @@ async def test_pattern_rule__over_the_api__details_carry_the_numbers_and_accept_
     await _run_rule(world)
     monkeypatch.setattr(app.state, "container", SimpleNamespace(anticipation=world.service),
                         raising=False)
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(fake), raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
         listed = await api.get("/api/v1/anticipation/suggestions", params={"user_id": U})
@@ -617,14 +860,50 @@ async def test_pattern_rule__over_the_api__details_carry_the_numbers_and_accept_
     assert (details["pattern_key"], details["hour"]) == ("skip_time_window:9", 9)
     assert (details["confidence"], details["occurrences"]) == (0.8, 5)
     assert card["body"] == (
-        "You've set aside 4 of the last 5 tasks around 9 AM."
-        " Want me to stop putting demanding work there?"
+        "You've set aside 4 of the last 5 tasks around 9 AM. Want me to keep that hour clear?"
     )
     assert accepted.status_code == 200
     draft_id = accepted.json()["result"]["draft_id"]
     draft = await world.repos.drafts.get(U, draft_id)
     assert draft.status is DraftStatus.PENDING
     assert {t["task_id"] for t in draft.tasks} == {"graphs", "trees"}
+
+
+@pytest.mark.asyncio
+async def test_pattern_rule__window_covered_by_stated_rule__later_window_proposed(pinned_world):
+    await pinned_world.repos.constraints.add(U, BehavioralConstraint(
+        id=str(uuid4()), user_id=U, raw_text="no work before 11 AM", constraint_type="habit",
+        recurrence="daily", source="said",
+    ))
+    await _set_aside_at(pinned_world, 9)  # already covered by what the user said
+    await _set_aside_at(pinned_world, 14)
+
+    outcome = await _run_rule(pinned_world)
+
+    assert outcome.status == "created"
+    assert outcome.suggestion.action["pattern_key"] == "skip_time_window:14"
+
+
+@pytest.mark.asyncio
+async def test_pattern_rule__accept_while_habits_unreadable__saved_and_says_the_redraft_waits(
+    fake, repos
+):
+    planner = _PinnedPlanner(repos, raises=errors.LLMUnavailableError("The model is not answering."))
+    world = _world(fake, repos, planner)
+    await _set_aside_at(world, 9)
+    suggestion = (await _run_rule(world)).suggestion
+
+    accepted, result = await world.service.accept(U, suggestion.id)
+
+    assert accepted.status is SuggestionStatus.ACCEPTED
+    assert result.draft_id is None
+    assert result.message == (
+        "Saved. Every plan from now on keeps 9 AM clear — I'll draft today's around it"
+        " as soon as I can read your habits again."
+    )
+    (rule,) = await repos.constraints.list_active(U)
+    assert rule.structured_semantics["pattern_key"] == "skip_time_window:9"
+    _no_blame(result.message)
 
 
 # --- the listener -----------------------------------------------------------------------

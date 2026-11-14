@@ -1,7 +1,10 @@
 """The suggestions Jarvis makes on its own: list them, accept or dismiss one, run a trigger.
 
 Routing and request parsing only; ``AnticipationService`` does the work. Errors
-are ``JarvisError``s, answered in the one error envelope.
+are ``JarvisError``s, answered in the one error envelope. Every route first requires
+the database (``require_supabase``): without it the container runs on empty in-memory
+stand-ins, which would answer "no suggestions" when the truth is "can't tell". An
+outage answers 503.
 """
 
 from datetime import datetime
@@ -10,9 +13,10 @@ from typing import Literal
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, get_container
+from app.api.deps import CurrentUser, get_container, require_supabase
 from app.domain.anticipation import ActionResult, ConsentDecision
 from app.domain.entities import ConsentReasonKind, Suggestion, SuggestionStatus
+from app.services.anticipation.service import AnticipationService
 
 router = APIRouter()
 
@@ -99,11 +103,19 @@ class RunTriggerRequest(BaseModel):
     )
 
 
+def _anticipation(request: Request) -> AnticipationService:
+    """The anticipation service, once the database is known to be there (else 503)."""
+    require_supabase(request)
+    return get_container(request).anticipation
+
+
 class RunTriggerResponse(BaseModel):
     status: Literal["created", "already_done", "not_due", "nothing_to_say", "denied"] = Field(
         description="How the run ended."
     )
-    suggestion: SuggestionOut | None = Field(description="The suggestion made, if one was.")
+    suggestion: SuggestionOut | None = Field(
+        description="The suggestion made, or the one already made today (already_done)."
+    )
     consent: ConsentOut | None = Field(description="The consent decision, if consent was asked.")
 
 
@@ -120,7 +132,7 @@ async def list_suggestions(
         default=SuggestionStatus.PENDING, description="Only suggestions in this status."
     ),
 ) -> SuggestionListResponse:
-    found = await get_container(request).anticipation.list_suggestions(user, status=status)
+    found = await _anticipation(request).list_suggestions(user, status=status)
     return SuggestionListResponse(suggestions=[SuggestionOut.of(s) for s in found])
 
 
@@ -137,7 +149,7 @@ async def list_suggestions(
 async def accept_suggestion(
     suggestion_id: str, request: Request, user: CurrentUser
 ) -> AcceptSuggestionResponse:
-    suggestion, result = await get_container(request).anticipation.accept(user, suggestion_id)
+    suggestion, result = await _anticipation(request).accept(user, suggestion_id)
     return AcceptSuggestionResponse(
         suggestion=SuggestionOut.of(suggestion), result=ActionResultOut.of(result)
     )
@@ -152,7 +164,7 @@ async def accept_suggestion(
 async def dismiss_suggestion(
     suggestion_id: str, request: Request, user: CurrentUser
 ) -> SuggestionOut:
-    return SuggestionOut.of(await get_container(request).anticipation.dismiss(user, suggestion_id))
+    return SuggestionOut.of(await _anticipation(request).dismiss(user, suggestion_id))
 
 
 @router.post(
@@ -164,9 +176,7 @@ async def dismiss_suggestion(
 async def run_trigger(
     body: RunTriggerRequest, request: Request, user: CurrentUser
 ) -> RunTriggerResponse:
-    outcome = await get_container(request).anticipation.run_trigger(
-        user, body.trigger, force=True
-    )
+    outcome = await _anticipation(request).run_trigger(user, body.trigger, force=True)
     return RunTriggerResponse(
         status=outcome.status,
         suggestion=SuggestionOut.of(outcome.suggestion) if outcome.suggestion else None,

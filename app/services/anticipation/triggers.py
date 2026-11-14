@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 import app.core.config as config
 from app.core.model_router import attribute_llm_calls
 from app.domain import errors
-from app.domain.anticipation import SuggestionDraft, Trigger, TriggerContext
+from app.domain.anticipation import SuggestionDraft, Trigger, TriggerContext, _clock_hours
 from app.domain.entities import (
     DraftSchedule,
     FocusProfile,
@@ -30,6 +30,7 @@ from app.domain.entities import (
 )
 from app.domain.events import DomainEvent, EventListener, PatternDetected
 from app.domain.ports import (
+    ConstraintRepository,
     DraftPlanner,
     EnergyEstimator,
     SuggestionRepository,
@@ -41,7 +42,11 @@ from app.services.anticipation.actions import (
     ApplyDraftAction,
     ShareInsightAction,
 )
-from app.services.anticipation.service import ActionFactory, AnticipationService
+from app.services.anticipation.service import (
+    ActionFactory,
+    AnticipationService,
+    stated_blocks,
+)
 from app.services.draft_service import _slot_map
 from app.services.memory.patterns import (
     INSIGHT_CONFIDENCE,
@@ -49,6 +54,7 @@ from app.services.memory.patterns import (
     OBSERVER_SHUTDOWN_GRACE_S,
     PatternService,
     PatternView,
+    RepeatedSkipDetector,
     SkipTimeWindowDetector,
     _clock_hour,
 )
@@ -77,7 +83,7 @@ class _Brief:
 
     pending: list[Task]
     reslot: list[Task]
-    insight: dict | None
+    insight: PatternView | None
     focus: FocusProfile
 
 
@@ -118,8 +124,9 @@ class MorningBriefTrigger(Trigger):
         zone = ZoneInfo(ctx.profile.timezone)
         pending = await self._tasks.list_by_status(ctx.user_id, frozenset({TaskStatus.PENDING}))
         reslot = await self._passed_slots(ctx, zone)
-        insights = await self._patterns.insights(ctx.user_id)
-        insight = insights[0] if insights else None
+        insight = next(
+            (v for v in await self._patterns.current(ctx.user_id) if _worth_telling(v)), None
+        )
         if not pending and not reslot and insight is None:
             return None
         focus = await self._energy.estimate(ctx.user_id, zone, now=ctx.now)
@@ -141,18 +148,19 @@ class MorningBriefTrigger(Trigger):
                     kind=self.name,
                     title="About today",
                     body=_lines(COULDNT_FIT, insight_line),
-                    action=self._actions.from_payload(
-                        {"kind": ShareInsightAction.kind, "insight": COULDNT_FIT}
-                    ),
+                    action=self._actions.from_payload({
+                        "kind": ShareInsightAction.kind,
+                        "insight": COULDNT_FIT,
+                        "key": f"brief:{ctx.local_day.isoformat()}",  # today's note only
+                    }),
                     expires_at=expires_at,
                 )
-            reslotted = {t.task_id for t in gathered.reslot} & set(_slot_map(draft.schedule) or {})
             return SuggestionDraft(
                 kind=self.name,
                 title="Today is ready",
                 body=_lines(
                     _planned_line(draft, ctx.local_day, zone, gathered.focus),
-                    f"{len(reslotted)} from yesterday found a new slot." if reslotted else None,
+                    *_reslot_lines(draft, gathered.reslot, ctx.local_day, zone),
                     insight_line,
                 ),
                 action=self._actions.from_payload(
@@ -164,9 +172,11 @@ class MorningBriefTrigger(Trigger):
             kind=self.name,
             title="Something I noticed",
             body=insight_line,
-            action=self._actions.from_payload(
-                {"kind": ShareInsightAction.kind, "insight": gathered.insight["insight"]}
-            ),
+            action=self._actions.from_payload({
+                "kind": ShareInsightAction.kind,
+                "insight": insight_line,
+                "key": gathered.insight.pattern.pattern_key,  # dismissed: never this pattern again
+            }),
             expires_at=expires_at,
         )
 
@@ -195,11 +205,53 @@ def _lines(*lines: str | None) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def _insight_line(insight: dict | None) -> str | None:
-    if insight is None:
+def _worth_telling(view: PatternView) -> bool:
+    """A remembered pattern seen 3+ times at 0.7+ (what PatternService.insights tells)."""
+    return (
+        view.memory_id is not None
+        and view.pattern.pattern_key is not None
+        and view.pattern.confidence >= INSIGHT_CONFIDENCE
+        and view.pattern.occurrences >= MIN_OCCURRENCES
+    )
+
+
+def _insight_line(view: PatternView | None) -> str | None:
+    """The line "I noticed ...": the pattern in its own second-person words, evidence once.
+
+    A repeated skip's words already count the times, so it gets no second count.
+    """
+    if view is None:
         return None
-    words = insight["insight"].rstrip(".")
-    return f"I noticed: {words} (seen {insight['occurrences']} times)."
+    pattern = view.pattern
+    words = pattern.description.rstrip(".")
+    words = words[:1].lower() + words[1:]
+    if pattern.detector == RepeatedSkipDetector.name:
+        return f"I noticed {words}."
+    n = round(pattern.confidence * pattern.occurrences)
+    return f"I noticed {words} ({n} of the last {pattern.occurrences} times)."
+
+
+def _reslot_lines(
+    draft: DraftSchedule, reslot: list[Task], day: date, zone: ZoneInfo
+) -> list[str]:
+    """How many set-aside tasks the draft found a new slot for: those whose slot passed
+    on an earlier day ("from yesterday"), and those whose slot passed today."""
+    placed = set(_slot_map(draft.schedule) or {})
+    earlier_days = today = 0
+    for task in reslot:
+        if task.task_id not in placed:
+            continue
+        passed_on = task.scheduled_start.astimezone(zone).date() if task.scheduled_start else None
+        if passed_on == day:
+            today += 1
+        else:
+            earlier_days += 1
+    lines = []
+    if earlier_days:
+        lines.append(f"{earlier_days} from yesterday found a new slot.")
+    if today:
+        lines.append(f"{today} from earlier today found a new slot.")
+    return lines
 
 
 def _planned_line(
@@ -257,11 +309,16 @@ class PatternRuleTrigger(Trigger):
     name: ClassVar[str] = "pattern_rule"
 
     def __init__(
-        self, patterns: PatternService, suggestions: SuggestionRepository, actions: ActionFactory
+        self,
+        patterns: PatternService,
+        suggestions: SuggestionRepository,
+        actions: ActionFactory,
+        constraints: ConstraintRepository,
     ) -> None:
         self._patterns = patterns
         self._suggestions = suggestions
         self._actions = actions
+        self._constraints = constraints
 
     async def already_done(self, ctx: TriggerContext, suggestions: SuggestionRepository) -> bool:
         """Never: each pattern is proposed once, which ``gather`` decides."""
@@ -274,8 +331,9 @@ class PatternRuleTrigger(Trigger):
         """The first remembered, unconfirmed skip window seen 3+ times at 0.7+ not yet proposed.
 
         A window already proposed (pending, accepted, expired) is never proposed again.
-        One the user dismissed comes only after every fresh one, so the consent chain's
-        repeat-dismissal rule turns it down, saying why, and it never hides a fresh one.
+        One the user dismissed, or one a rule they stated already covers, comes only
+        after every fresh one: the consent chain turns it down, saying why, and it never
+        hides a fresh one.
         """
         windows = [v for v in await self._patterns.current(ctx.user_id) if _qualifies(v)]
         if not windows:
@@ -286,8 +344,16 @@ class PatternRuleTrigger(Trigger):
         dismissed = {_key_of(s.action) for s in made if s.status is SuggestionStatus.DISMISSED}
         proposed = {_key_of(s.action) for s in made if s.status is not SuggestionStatus.DISMISSED}
         fresh = [v for v in windows if _rule_key(v) not in proposed]
-        fresh.sort(key=lambda v: _rule_key(v) in dismissed)  # stable: fresh ones first
-        return fresh[0] if fresh else None
+        if not fresh:
+            return None
+        said = stated_blocks(await self._constraints.list_active(ctx.user_id))
+
+        def covered(view: PatternView) -> bool:
+            return any(view.pattern.hour in _clock_hours(start, end) for start, end, _ in said)
+
+        # Stable: fresh first, then dismissed, then already covered by what the user said.
+        fresh.sort(key=lambda v: (covered(v), _rule_key(v) in dismissed))
+        return fresh[0]
 
     async def build_suggestion(self, ctx: TriggerContext, gathered: PatternView) -> SuggestionDraft:
         pattern = gathered.pattern
@@ -298,7 +364,7 @@ class PatternRuleTrigger(Trigger):
             title=f"A pattern around {h12}",
             body=(
                 f"You've set aside {n} of the last {total} tasks around {h12}."
-                " Want me to stop putting demanding work there?"
+                " Want me to keep that hour clear?"
             ),
             action=self._actions.from_payload({
                 "kind": AdoptRuleAction.kind,
