@@ -9,7 +9,7 @@ import re
 from typing import Any, Callable
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.domain.errors import ConflictError, InvalidStateTransition
+from app.domain.errors import ConflictError, InvalidStateTransition, NotFoundError
 
 from langgraph.graph import END, StateGraph
 
@@ -490,6 +490,7 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     from app.services.draft_actions import (
         accept_draft_and_persist,
         draft_id_of,
+        reject_draft,
         resolve_draft,
     )
 
@@ -567,10 +568,15 @@ async def _apply_draft_action(state: JarvisState) -> dict:
 
     if intent_value == IntentType.REJECT_DRAFT.value:
         # The rejection message is the reason — worth keeping, it is the signal
-        # PEARL learns "don't propose this again" from.
-        await asyncio.to_thread(
-            draft_store.reject_draft, draft_id, user_id, state.get("user_message")
-        )
+        # PEARL learns "don't propose this again" from. A draft already closed
+        # (accepted from the review UI while this thread still says REVIEWING)
+        # is not discarded, and the reply must not say it was.
+        try:
+            await reject_draft(
+                draft_store, user_id, draft_id, state.get("user_message"), _supabase_of(state)
+            )
+        except (InvalidStateTransition, NotFoundError):
+            return await _closed_draft_reply(draft_store, user_id, draft_id, attempted="discard")
         return {
             "response_message": "Draft discarded, sir. Tell me what to aim for instead.",
             "negotiation_state": NegotiationPhase.NONE,
@@ -589,25 +595,31 @@ async def _apply_draft_action(state: JarvisState) -> dict:
     }
 
 
-async def _closed_draft_reply(draft_store: Any, user_id: str, draft_id: str | None) -> dict:
-    """Answer an accept that found the draft closed. Nothing was written this turn.
+async def _closed_draft_reply(
+    draft_store: Any, user_id: str, draft_id: str | None, attempted: str = "apply"
+) -> dict:
+    """Answer an accept (or a reject) that found the draft closed. Nothing changed this turn.
 
     Usually it was accepted already: from the review UI, or by a double-click.
     It may instead have expired or been rejected, and then none of its tasks
     were ever written, so "locked in" would be false. Re-read the draft rather
-    than trust the copy from before the accept: a concurrent accept may have
-    closed it since.
+    than trust the copy from before the action: a concurrent accept may have
+    closed it since. Either way the negotiation ends here.
     """
     current = await asyncio.to_thread(draft_store.get_draft, draft_id, user_id) if draft_id else None
     if current and current.get("status") == "accepted":
         return {
-            "response_message": "That plan is already locked in, sir.",
+            "response_message": (
+                "That plan is already locked in, sir."
+                if attempted == "apply"
+                else "That plan is already locked in, sir, so there was nothing to discard."
+            ),
             "negotiation_state": NegotiationPhase.ACCEPTED,
             "draft_id": draft_id,  # so the next "looks good" finds it again
         }
     return {
         "response_message": (
-            "That draft has closed, sir, so I didn't apply it. "
+            f"That draft has closed, sir, so I didn't {attempted} it. "
             "Tell me what to plan and I'll build a fresh one."
         ),
         "negotiation_state": NegotiationPhase.NONE,

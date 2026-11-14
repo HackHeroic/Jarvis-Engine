@@ -131,6 +131,28 @@ async def accept_draft_and_persist(
         return None
 
 
+async def reject_draft(
+    draft_store: Any, user_id: str, draft_id: str, reason: Optional[str], supabase: Any
+) -> None:
+    """Mark the draft REJECTED, keeping ``reason`` (the signal PEARL learns from).
+
+    Returns only when this call rejected it. Raises ``InvalidStateTransition`` when
+    the draft is no longer open — accepted from the review UI, say — and
+    ``NotFoundError`` when the user has no such draft, so no caller can report a
+    discard that did not happen. Goes through ``DraftService``; with no service to
+    go through (no container, no Supabase client) the store rejects, and its
+    ``False`` (absent or closed) raises the same way.
+    """
+    service = _draft_service(supabase)
+    if service is not None:
+        await service.reject(user_id, draft_id, reason)
+        return
+    if not await asyncio.to_thread(draft_store.reject_draft, draft_id, user_id, reason):
+        raise errors.InvalidStateTransition(
+            "That draft is no longer open.", details={"draft_id": draft_id}
+        )
+
+
 def _draft_service(supabase: Any) -> Optional[DraftService]:
     """The composition root's ``DraftService``, whose bus delivers ``DraftAccepted``.
 
