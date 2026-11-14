@@ -1260,9 +1260,16 @@ async def _run_schedule_modify_flow(
             memories=_get_modify_memories(),
         )
 
-    # Parse horizon_start; without one, today's plan start on the user's clock.
+    # Parse horizon_start; without one, today's plan start on the user's clock (their
+    # profile's zone, which the focus profile below is read on too).
     from app.api.v1.endpoints.schedule import current_horizon_start
+    from app.core.runtime import registered_container
+    from app.services.planning.local_time import stored_user_zone
 
+    container = registered_container()
+    zone = await stored_user_zone(
+        container.repos.profiles if container is not None else None, user_id
+    )
     horizon_start = None
     if horizon_start_str:
         try:
@@ -1270,7 +1277,7 @@ async def _run_schedule_modify_flow(
         except (ValueError, TypeError):
             horizon_start = None
     if horizon_start is None:
-        horizon_start = current_horizon_start()
+        horizon_start = current_horizon_start(zone)
     elif horizon_start.tzinfo is None:
         horizon_start = horizon_start.replace(tzinfo=timezone.utc)  # legacy drafts were UTC
 
@@ -1287,15 +1294,12 @@ async def _run_schedule_modify_flow(
     )
 
     # Apply the modification. The re-solve leans on the learned focus profile.
-    from app.core.runtime import registered_container
     from app.services.energy import solver_focus
-    from app.services.planning.local_time import user_zone
 
-    container = registered_container()
     focus_by_hour = await solver_focus(
         container.energy if container is not None else None,
         user_id,
-        user_zone(),
+        zone,
         now=datetime.now(timezone.utc),
     )
     modified_graph, modified_schedule = apply_modification(

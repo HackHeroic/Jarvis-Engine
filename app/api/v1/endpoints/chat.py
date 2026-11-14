@@ -1146,11 +1146,17 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
         except Exception:
             pass
 
-    # The user's day, never UTC's: minute 0 is DAY_START_HOUR in their zone.
+    # The user's day, never UTC's: minute 0 is DAY_START_HOUR in their zone, read from
+    # their profile (the same zone the focus profile below is read on).
+    from app.api.deps import container_of
     from app.api.v1.endpoints.schedule import current_horizon_start
-    from app.services.planning.local_time import user_zone
+    from app.services.planning.local_time import stored_user_zone
 
-    horizon_start = current_horizon_start(user_zone())
+    container = container_of(http_request)
+    zone = await stored_user_zone(
+        container.repos.profiles if container is not None else None, request.user_id
+    )
+    horizon_start = current_horizon_start(zone)
     if request.horizon_start:
         try:
             parsed = datetime.fromisoformat(request.horizon_start)
@@ -1170,14 +1176,12 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
     eg = request.execution_graph or {"decomposition": request.current_tasks, "goal_metadata": {}}
 
     # The re-solve leans on the user's learned focus profile, as the plan did.
-    from app.core.runtime import registered_container
     from app.services.energy import solver_focus
 
-    container = registered_container()
     focus_by_hour = await solver_focus(
         container.energy if container is not None else None,
         request.user_id,
-        user_zone(),
+        zone,
         now=datetime.now(timezone.utc),
     )
 
