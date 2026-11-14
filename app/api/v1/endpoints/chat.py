@@ -1250,9 +1250,19 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
     }
 
 
-@router.post("/v2/stream")
+@router.post(
+    "/v2/stream",
+    summary="Talk to Jarvis (server-sent events)",
+    description=(
+        "THE entry point. Streams phase / step / thinking / message / tool_use / "
+        "memory_extracted / pattern_detected frames, then one `complete` frame whose data "
+        "is a `ChatCompletePayload` (app/schemas/chat_stream.py), or one `error` frame in "
+        "the standard envelope."
+    ),
+)
 async def chat_stream_v2(request: ChatRequest, http_request: Request):
-    """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream."""
+    """SSE endpoint using LangGraph orchestrator. Same SSE contract as /chat/stream; the
+    ``complete`` frame is validated against ``ChatCompletePayload`` before it is sent."""
     from app.core.model_router import ServedModels, attribute_llm_calls, recording_served_models
     from app.core.observation import pearl_insights
     from app.core.user_model import UserModel
@@ -1269,6 +1279,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     from app.api.deps import container_of
     from app.api.error_handlers import error_envelope, request_id_of
     from app.domain.errors import JarvisError
+    from app.schemas.chat_stream import ChatCompletePayload
     from app.orchestrator.graph import is_trivial_input
     from app.services.memory.context import Recall, note_line, render_context_note
     from app.services.planning.local_time import user_zone
@@ -1894,6 +1905,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             _container = container_of(http_request)
             if _container is not None:
                 _container.conversation_memory.compact_in_background(request.user_id, session_id)
+            # The frame's contract, checked before it is sent (fields exactly as the
+            # frontend reads them): a frame off the contract is a failed turn, not a
+            # silently different payload.
+            complete_payload = ChatCompletePayload.model_validate(complete_payload).model_dump(
+                mode="json"
+            )
             yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
         except JarvisError as exc:
             # Raised on purpose, with a user-facing message (a turn that waited too
