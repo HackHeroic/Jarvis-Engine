@@ -640,7 +640,8 @@ async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
     """Drive chat_stream with every I/O boundary stubbed."""
     from types import SimpleNamespace
 
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+    from app.api.v1.endpoints.chat import chat_stream
+    from app.schemas.chat_stream import ChatStreamRequest
 
     async def _session(*args, **kwargs):
         return session_id
@@ -660,7 +661,7 @@ async def _run_chat_v2(monkeypatch, graph, user_id="u1", session_id="sess-1"):
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
     response = await chat_stream(
-        ChatRequest(user_prompt="hi", user_id=user_id), http_request
+        ChatStreamRequest(user_prompt="hi", user_id=user_id), http_request
     )
     async for _chunk in response.body_iterator:  # drain the SSE stream
         pass

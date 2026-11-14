@@ -280,6 +280,12 @@ MEMORY_PROFILE_TOKENS: int = 200
 MEMORY_RECALL_TOKENS: int = 300
 MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
 
+# The largest chat turn the stream accepts (ChatStreamRequest): a message of at most
+# MAX_CHAT_PROMPT_CHARS characters, and an upload that decodes to at most
+# MAX_CHAT_UPLOAD_BYTES. A bigger request is a 422 before any work starts.
+MAX_CHAT_PROMPT_CHARS: int = 8_000
+MAX_CHAT_UPLOAD_BYTES: int = 10 * 1024 * 1024
+
 # Conversations (ConversationMemoryService). The model sees the newest
 # HISTORY_MAX_MESSAGES messages after the conversation's summary_through (its verbatim
 # window), each cut to HISTORY_MAX_CHARS_PER_MESSAGE characters. Once more than
