@@ -1223,6 +1223,49 @@ async def test_memories__find_by_pattern_key__returns_dismissed_row(repos):
 
 
 @pytest.mark.asyncio
+async def test_memories__find_by_pattern_keys__one_read_any_status_only_the_users(
+    repos, fake_client
+):
+    dismissed = await repos.memories.add(
+        U1, _memory(U1, "Skips 9 AM", status=MemoryStatus.DISMISSED, pattern_key="skip_hour:9")
+    )
+    active = await repos.memories.add(U1, _memory(U1, "Peak 7 PM", pattern_key="peak_hour:19"))
+    await repos.memories.add(U1, _memory(U1, "Likes tea"))  # unkeyed
+    await repos.memories.add(U2, _memory(U2, "Theirs", pattern_key="skip_hour:10"))
+    before = len(fake_client.selects)
+
+    found = await repos.memories.find_by_pattern_keys(
+        U1, ["skip_hour:9", "peak_hour:19", "skip_hour:10", "skip_hour:9"]
+    )
+
+    assert sorted(found, key=lambda m: m.pattern_key) == [active, dismissed]
+    if isinstance(repos.memories, SupabaseMemoryRepository):
+        assert len(fake_client.selects) - before == 1, "one read for every key"
+    assert await repos.memories.find_by_pattern_keys(U1, []) == []
+    assert await repos.memories.find_by_pattern_keys(U2, ["skip_hour:9"]) == []
+
+
+@pytest.mark.asyncio
+async def test_memories__find_by_pattern_keys__many_keys__bounded_reads_all_found(
+    repos, fake_client, monkeypatch
+):
+    from app.infrastructure.persistence import supabase_repos
+
+    monkeypatch.setattr(supabase_repos, "PATTERN_KEYS_PER_READ", 2)
+    stored = [
+        await repos.memories.add(U1, _memory(U1, f"Hour {h}", pattern_key=f"skip_hour:{h}"))
+        for h in range(5)
+    ]
+    before = len(fake_client.selects)
+
+    found = await repos.memories.find_by_pattern_keys(U1, [f"skip_hour:{h}" for h in range(5)])
+
+    assert sorted(m.id for m in found) == sorted(m.id for m in stored)
+    if isinstance(repos.memories, SupabaseMemoryRepository):
+        assert len(fake_client.selects) - before == 3, "at most PATTERN_KEYS_PER_READ per read"
+
+
+@pytest.mark.asyncio
 async def test_memories__duplicate_pattern_key__raises_conflict(repos):
     first = await repos.memories.add(U1, _memory(U1, "Skips 9 AM", pattern_key="skip_hour:9"))
     other = await repos.memories.add(U1, _memory(U1, "Skips 10 AM", pattern_key="skip_hour:10"))

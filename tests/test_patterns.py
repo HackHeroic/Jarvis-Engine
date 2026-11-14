@@ -695,6 +695,49 @@ async def test_drain_pending__time_cap_cancels_after_the_write__moment_kept(bus,
     assert (await memories.get("alice", moment.memory_id)).pattern_key == "skip_time_window:9"
 
 
+class _CountingMemories(InMemoryMemoryRepository):
+    """Counts the reads PEARL makes to find the memories behind its patterns."""
+
+    def __init__(self, store: InMemoryStore) -> None:
+        super().__init__(store)
+        self.single: list[str] = []
+        self.batched: list[list[str]] = []
+
+    async def find_by_pattern_key(self, user_id: str, pattern_key: str):
+        self.single.append(pattern_key)
+        return await super().find_by_pattern_key(user_id, pattern_key)
+
+    async def find_by_pattern_keys(self, user_id: str, pattern_keys: list[str]):
+        self.batched.append(list(pattern_keys))
+        return await super().find_by_pattern_keys(user_id, pattern_keys)
+
+
+@pytest.mark.asyncio
+async def test_observe_and_current__many_patterns__one_memory_read_each(bus, clock):
+    store = InMemoryStore()
+    repos = RepositoryFactory.in_memory(store)
+    memories = _CountingMemories(store)
+    keys = [f"k{i}" for i in range(6)]
+    detector = _Fixed([_fixed(k, seen=NOW - timedelta(hours=1)) for k in keys])
+    service = PatternService(
+        repos.task_events, memories, repos.profiles, bus, detectors=[detector], clock=clock
+    )
+    await repos.memories.add("alice", Memory(  # one of them the user dismissed
+        user_id="alice", memory_type="behavioral_pattern", content="Pattern k0",
+        provenance=MemorySource.INFERRED, pattern_key="k0", status=MemoryStatus.DISMISSED,
+        strength_as_of=NOW, created_at=NOW,
+    ))
+
+    changes = await service.observe("alice")
+    views = await service.current("alice")
+
+    assert sorted(c.pattern.pattern_key for c in changes) == keys[1:]
+    assert sorted(v.pattern.pattern_key for v in views) == keys[1:]
+    assert all(v.memory_id is not None for v in views)
+    assert memories.single == [], "never one read per pattern"
+    assert [sorted(read) for read in memories.batched] == [keys, keys]
+
+
 # --- the observer: in the background, once at a time per user -------------------------
 
 

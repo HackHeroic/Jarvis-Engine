@@ -347,6 +347,15 @@ class PatternView(BaseModel):
     confirmed: bool = Field(description="Whether the user has confirmed the remembered pattern.")
 
 
+class PatternLook(BaseModel):
+    """One look at the outcome history: what it changed, and every pattern it sees."""
+
+    changes: list[PatternChange] = Field(description="What the look remembered, in order.")
+    views: list[PatternView] = Field(
+        description="The patterns seen now with their memories; dismissed and forgotten left out."
+    )
+
+
 async def _to_the_end(
     write: Coroutine[Any, Any, "PatternChange | None"],
 ) -> "PatternChange | None":
@@ -357,6 +366,10 @@ async def _to_the_end(
     # fails is not reported as an unretrieved task exception.
     task.add_done_callback(lambda t: t.cancelled() or t.exception())
     return await asyncio.shield(task)
+
+
+def _id_of(memory: Memory | None) -> str | None:
+    return memory.id if memory is not None else None
 
 
 class PatternService:
@@ -397,16 +410,43 @@ class PatternService:
         only by an observation recorded after it was last renewed. Every change is
         also held for the user's next turn (``drain_pending``).
         """
+        return (await self.look(user_id)).changes
+
+    async def look(
+        self,
+        user_id: str,
+        *,
+        events: list[TaskEvent] | None = None,
+        zone: ZoneInfo | None = None,
+    ) -> PatternLook:
+        """``observe``, also returning every pattern seen now with its memory (``current``).
+
+        One detection and one read of the memories behind the patterns, however many
+        there are. ``events`` (the user's outcome events of the last FOCUS_WINDOW_DAYS)
+        and ``zone`` may be given by a caller that has already read them; otherwise
+        they are read here.
+        """
         now = self._clock()
-        changes = []
-        for pattern in await self._detect(user_id, now):
-            change = await self._remember(user_id, pattern, now)
+        patterns = await self._detect(user_id, now, events=events, zone=zone)
+        held = await self._held(user_id, patterns)
+        changes: list[PatternChange] = []
+        views: list[PatternView] = []
+        for pattern in patterns:
+            existing = held.get(pattern.pattern_key)
+            change = await self._remember(user_id, pattern, now, existing)
             if change is not None:
                 changes.append(change)
                 await self._bus.publish(
                     PatternDetected(occurred_at=now, user_id=user_id, pattern=pattern)
                 )
-        return changes
+            if existing is not None and existing.status in SUPPRESSING_STATUSES:
+                continue
+            views.append(PatternView(
+                pattern=pattern,
+                memory_id=change.memory_id if change is not None else _id_of(existing),
+                confirmed=existing is not None and existing.last_confirmed_at is not None,
+            ))
+        return PatternLook(changes=changes, views=views)
 
     def describe(self, memory: Memory) -> str:
         """How a remembered pattern reads now.
@@ -432,21 +472,37 @@ class PatternService:
         """
         return list(self._pending.pop(user_id, ()))
 
-    async def current(self, user_id: str) -> list[PatternView]:
-        """The patterns detected now, each with its memory; dismissed and forgotten left out."""
+    async def current(
+        self,
+        user_id: str,
+        *,
+        events: list[TaskEvent] | None = None,
+        zone: ZoneInfo | None = None,
+    ) -> list[PatternView]:
+        """The patterns detected now, each with its memory; dismissed and forgotten left out.
+
+        One read of the memories behind them, however many there are. ``events`` and
+        ``zone`` as for ``look``.
+        """
+        patterns = await self._detect(user_id, self._clock(), events=events, zone=zone)
+        held = await self._held(user_id, patterns)
         views = []
-        for pattern in await self._detect(user_id, self._clock()):
-            memory = await self._memories.find_by_pattern_key(user_id, pattern.pattern_key)
+        for pattern in patterns:
+            memory = held.get(pattern.pattern_key)
             if memory is not None and memory.status in SUPPRESSING_STATUSES:
                 continue
             views.append(PatternView(
                 pattern=pattern,
-                memory_id=memory.id if memory is not None else None,
+                memory_id=_id_of(memory),
                 confirmed=memory is not None and memory.last_confirmed_at is not None,
             ))
         return views
 
     async def insights(self, user_id: str) -> list[dict]:
+        """What to tell the user about the patterns detected now (``insights_of``)."""
+        return self.insights_of(await self.current(user_id))
+
+    def insights_of(self, views: list[PatternView]) -> list[dict]:
         """What to tell the user: remembered patterns seen 3+ times at confidence 0.7 or more.
 
         The words are the detector's, from the live pattern's numbers, never the
@@ -460,27 +516,47 @@ class PatternService:
                 "occurrences": view.pattern.occurrences,
                 "memory_id": view.memory_id,
             }
-            for view in await self.current(user_id)
+            for view in views
             if view.memory_id is not None
             and view.pattern.confidence >= INSIGHT_CONFIDENCE
             and view.pattern.occurrences >= MIN_OCCURRENCES
         ]
 
-    async def _detect(self, user_id: str, now: datetime) -> list[Pattern]:
-        """Every detector over the user's outcomes of the last FOCUS_WINDOW_DAYS, their clock."""
-        zone = user_zone(await self._profiles.get_or_create(user_id))
-        events = await self._task_events.list_for_user(
-            user_id,
-            since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
-            types=set(SLOT_OUTCOMES),
-        )
+    async def _detect(
+        self,
+        user_id: str,
+        now: datetime,
+        *,
+        events: list[TaskEvent] | None = None,
+        zone: ZoneInfo | None = None,
+    ) -> list[Pattern]:
+        """Every detector over the user's outcomes of the last FOCUS_WINDOW_DAYS, their clock.
+
+        ``events`` and ``zone`` are read only when not given.
+        """
+        if zone is None:
+            zone = user_zone(await self._profiles.get_or_create(user_id))
+        if events is None:
+            events = await self._task_events.list_for_user(
+                user_id,
+                since=now - timedelta(days=config.FOCUS_WINDOW_DAYS),
+                types=set(SLOT_OUTCOMES),
+            )
         return [p for detector in self._detectors for p in detector.detect(events, zone)]
 
+    async def _held(self, user_id: str, patterns: list[Pattern]) -> dict[str, Memory]:
+        """The memories holding ``patterns``, by pattern key: one read, none for no patterns."""
+        keys = [p.pattern_key for p in patterns if p.pattern_key]
+        if not keys:
+            return {}
+        found = await self._memories.find_by_pattern_keys(user_id, keys)
+        return {m.pattern_key: m for m in found if m.pattern_key}
+
     async def _remember(
-        self, user_id: str, pattern: Pattern, now: datetime
+        self, user_id: str, pattern: Pattern, now: datetime, existing: Memory | None
     ) -> PatternChange | None:
-        """Create or strengthen the pattern's memory; None when nothing changed."""
-        existing = await self._memories.find_by_pattern_key(user_id, pattern.pattern_key)
+        """Create or strengthen the pattern's memory (``existing``, read by the caller);
+        None when nothing changed."""
         if existing is None:
             return await _to_the_end(self._create(user_id, pattern, now))
         if existing.status not in _STRENGTHENABLE:  # dismissed or forgotten: never again
