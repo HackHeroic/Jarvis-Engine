@@ -10,9 +10,6 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import hybrid_route_query
-
 
 class ScheduleModification(BaseModel):
     """Parsed modification request from user chat."""
@@ -80,15 +77,15 @@ async def parse_modification_request(
     system_prompt = MODIFICATION_PARSE_PROMPT.format(task_list=task_summary)
 
     try:
-        result = await hybrid_route_query(
-            user_prompt=user_prompt,
+        from app.core.model_router import route_llm_call
+
+        result = await route_llm_call(
+            task="task_edit_parsing",
+            prompt=user_prompt,
             system_prompt=system_prompt,
             response_schema=ScheduleModification,
-            model_override=_cfg.SLM_ROUTER_MODEL,
         )
-        if isinstance(result, dict):
-            return ScheduleModification.model_validate(result)
-        return ScheduleModification.model_validate_json(result)
+        return ScheduleModification.model_validate(result)
     except Exception as e:
         print(f"[ScheduleModifier] Parse failed: {e}")
         return None

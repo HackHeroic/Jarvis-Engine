@@ -4,8 +4,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import ActionItemProposal
 from pydantic import BaseModel, Field
 
@@ -43,17 +41,15 @@ async def propose_action_item(extracted_text: str) -> ActionItemProposal:
     Returns:
         ActionItemProposal with id, title, summary, suggested_actions.
     """
-    result = await hybrid_route_query(
-        user_prompt=extracted_text,
+    from app.core.model_router import route_llm_call
+
+    result = await route_llm_call(
+        task="action_item_extraction",  # the FAST model suffices for extraction
+        prompt=extracted_text,
         system_prompt=ACTION_ITEM_EXTRACTION_PROMPT,
         response_schema=ActionItemExtraction,
-        model_override=_cfg.SLM_ROUTER_MODEL,  # 4B suffices for extraction
     )
-
-    if isinstance(result, dict):
-        data = ActionItemExtraction.model_validate(result)
-    else:
-        data = ActionItemExtraction.model_validate_json(result)
+    data = ActionItemExtraction.model_validate(result)
 
     return ActionItemProposal(
         id=str(uuid.uuid4()),

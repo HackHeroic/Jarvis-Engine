@@ -1,7 +1,7 @@
 """Task rearranger — parses a reorder request via LLM and swaps scheduled positions.
 
-Uses hybrid_route_query (prefer_local=True) to interpret the user's desired
-new task order, then reassigns scheduled_start values accordingly.
+Asks the FAST model (``route_llm_call``, task ``task_edit_parsing``) for the user's
+desired new task order, then reassigns scheduled_start values accordingly.
 """
 
 from __future__ import annotations
@@ -11,8 +11,6 @@ import json
 import logging
 import re
 from typing import Any
-
-from app.models.brain.litellm_conf import hybrid_route_query
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +105,12 @@ async def handle_rearrange(
     )
 
     try:
-        raw_response = await hybrid_route_query(
-            user_prompt=user_prompt,
+        from app.core.model_router import route_llm_call
+
+        raw_response = await route_llm_call(
+            task="task_edit_parsing",
+            prompt=user_prompt,
             system_prompt=system_prompt,
-            prefer_local=True,
         )
         raw_text = raw_response if isinstance(raw_response, str) else str(raw_response)
         clean = re.sub(r"```json|```", "", raw_text).strip()

@@ -1215,27 +1215,14 @@ def test_render_progress_event__malformed__still_emits_a_phase_frame():
 
 
 @pytest.mark.asyncio
-async def test_voj_stream__conversation_history__reaches_the_model(monkeypatch):
+async def test_voj_stream__conversation_history__reaches_the_model():
     """Streamed synthesis was context-blind: the parameter did not exist, so
     every live SSE turn (which always has a progress_queue) synthesized without
     the conversation, while the non-streaming twin got it."""
-    import app.models.brain.litellm_conf as _llm
     from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
 
-    seen: dict = {}
     history = [{"role": "user", "content": "plan my thursday"}]
-
-    async def fake_hybrid(**kwargs):
-        seen.update(kwargs)
-
-        async def _gen():
-            yield ("content", "Done, sir.")
-        return _gen()
-
-    monkeypatch.setattr(_llm, "hybrid_route_query", fake_hybrid)
-    monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
-    )
+    model = _install_synthesis_model("Done, sir.")
 
     _ = [
         tok
@@ -1243,7 +1230,8 @@ async def test_voj_stream__conversation_history__reaches_the_model(monkeypatch):
             {"schedule_generated": True}, conversation_history=history
         )
     ]
-    assert seen["conversation_history"] == history
+    (request,) = model.calls
+    assert request.conversation_history == history
 
 
 @pytest.mark.asyncio
@@ -1275,34 +1263,83 @@ async def test_synthesis_node__streaming__forwards_conversation_history(monkeypa
     assert seen["history"] == history
 
 
-@pytest.mark.asyncio
-async def test_voj_stream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
-    """Synthesis calls hybrid_route_query directly, so route_llm_call's
-    PreCloudLLM gate never ran — and under GEMINI_PRIMARY every synthesis is a
-    cloud send."""
+def _install_synthesis_model(reply: str):
+    """Make a recording model the whole provider chain; returns it."""
+    from app.domain.entities import LLMLocation
+    from app.domain.ports import LLMProvider
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+
+    class _Recording(LLMProvider):
+        name = "recording"
+        location = LLMLocation.CLOUD
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def is_available(self) -> bool:
+            return True
+
+        async def complete(self, req):
+            self.calls.append(req)
+            return reply
+
+        async def stream(self, req):
+            self.calls.append(req)
+            yield ("content", reply)
+
+    model = _Recording()
+    set_chain(FallbackChainProvider([model]))  # conftest's _fresh_llm_chain resets it
+    return model
+
+
+def _wire_transport(monkeypatch, *, gemini_primary: bool) -> dict:
+    """Build the real provider chain over a recording LiteLLM transport.
+
+    Returns the kwargs of the last transport call: what would have gone on the wire.
+    """
+    import contextvars
+
     import app.core.config as _cfg
     import app.models.brain.litellm_conf as _llm
+    from app.core.model_router import build_chain
+    from app.domain.events import NullEventBus
+    from app.infrastructure.llm.factory import set_chain
     from app.orchestrator.hooks import ActionHooks, register_all_hooks
-    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
 
     seen: dict = {}
 
     async def fake_hybrid(**kwargs):
         seen.update(kwargs)
+        if not kwargs.get("stream"):
+            return "Noted, sir."
 
         async def _gen():
             yield ("content", "Noted, sir.")
         return _gen()
 
     monkeypatch.setattr(_llm, "hybrid_route_query", fake_hybrid)
+    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", gemini_primary)
+    monkeypatch.setattr(_cfg, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(_cfg, "GEMMA_FAST_MODEL", "openai/gemma-fast")
     monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
+        "app.core.model_router.force_cloud_var", contextvars.ContextVar("fc", default=False)
     )
-    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", True)
 
     hooks = ActionHooks()
     register_all_hooks(hooks)
-    monkeypatch.setattr("app.orchestrator.hooks.get_hooks", lambda: hooks)
+    set_chain(build_chain(_cfg, hooks, NullEventBus()))  # conftest's _fresh_llm_chain resets it
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_voj_stream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
+    """Synthesis used to call hybrid_route_query directly, so route_llm_call's
+    PreCloudLLM gate never ran — and under GEMINI_PRIMARY every synthesis is a
+    cloud send. It now goes through the chain, whose cloud providers redact."""
+    from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
+
+    seen = _wire_transport(monkeypatch, gemini_primary=True)
 
     _ = [
         tok
@@ -1312,6 +1349,7 @@ async def test_voj_stream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
         })
     ]
 
+    assert seen["force_cloud"] is True
     wire = seen["user_prompt"] + seen["system_prompt"]
     assert "555-123-4567" not in wire
     assert "madhav@example.com" not in wire
@@ -1322,30 +1360,16 @@ async def test_voj_stream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
 async def test_voj_nonstream__cloud_route__pii_never_reaches_the_wire(monkeypatch):
     """Both twins gate symmetrically — fixing only the streaming one would
     leave the plain /chat path sending the same PII."""
-    import app.core.config as _cfg
-    from app.orchestrator.hooks import ActionHooks, register_all_hooks
     from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response
 
-    seen: dict = {}
-
-    async def fake_hybrid(**kwargs):
-        seen.update(kwargs)
-        return "Noted, sir."
-
-    monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
-    )
-    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", True)
-
-    hooks = ActionHooks()
-    register_all_hooks(hooks)
-    monkeypatch.setattr("app.orchestrator.hooks.get_hooks", lambda: hooks)
+    seen = _wire_transport(monkeypatch, gemini_primary=True)
 
     await synthesize_jarvis_response({
         "habits_saved": "reach me on 555-123-4567",
         "memory_context": "user email is madhav@example.com",
     })
 
+    assert seen["force_cloud"] is True
     wire = seen["user_prompt"] + seen["system_prompt"]
     assert "555-123-4567" not in wire and "madhav@example.com" not in wire
     assert "[PHONE]" in wire and "[EMAIL]" in wire
@@ -1355,26 +1379,9 @@ async def test_voj_nonstream__cloud_route__pii_never_reaches_the_wire(monkeypatc
 async def test_voj_stream__local_route__prompt_is_untouched(monkeypatch):
     """The gate is for cloud sends only — a local Gemma call must not pay for
     it, and must not see redacted text."""
-    import app.core.config as _cfg
     from app.services.analytical.voice_of_jarvis import synthesize_jarvis_response_stream
 
-    seen: dict = {}
-
-    async def fake_hybrid(**kwargs):
-        seen.update(kwargs)
-
-        async def _gen():
-            yield ("content", "Noted, sir.")
-        return _gen()
-
-    monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query", fake_hybrid
-    )
-    monkeypatch.setattr(_cfg, "GEMINI_PRIMARY", False)
-    monkeypatch.setattr(
-        "app.core.model_router.force_cloud_var",
-        __import__("contextvars").ContextVar("fc_local", default=False),
-    )
+    seen = _wire_transport(monkeypatch, gemini_primary=False)
 
     _ = [
         tok
@@ -1382,6 +1389,7 @@ async def test_voj_stream__local_route__prompt_is_untouched(monkeypatch):
             {"habits_saved": "reach me on 555-123-4567"}
         )
     ]
+    assert seen["model_override"] == "openai/gemma-fast"  # the local FAST model
     assert "555-123-4567" in seen["user_prompt"]
 
 

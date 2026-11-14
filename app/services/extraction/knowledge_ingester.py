@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import hybrid_route_query
 from pydantic import BaseModel, Field
 
 
@@ -239,14 +237,14 @@ async def _run_proactive_extraction(
         prompt = text.strip()[:16000]  # Cap token count
         if deadline_detected:
             prompt = f"Detected deadline: {deadline_detected}\n\n{prompt}"
-        result = await hybrid_route_query(
-            user_prompt=prompt,
+        from app.core.model_router import route_llm_call
+
+        result = await route_llm_call(
+            task="action_item_extraction",
+            prompt=prompt,
             system_prompt=PROACTIVE_EXTRACTION_PROMPT,
             response_schema=ProactiveExtractionSchema,
-            model_override=_cfg.SLM_ROUTER_MODEL,
         )
-        if isinstance(result, dict):
-            return ProactiveExtractionSchema.model_validate(result)
-        return ProactiveExtractionSchema.model_validate_json(result)
+        return ProactiveExtractionSchema.model_validate(result)
     except Exception:
         return ProactiveExtractionSchema()

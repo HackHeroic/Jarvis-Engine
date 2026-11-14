@@ -66,3 +66,7 @@ class TaskWorkspace(BaseModel):
         default=None,
         description="MCII card with obstacle/response if available for this task",
     )
+    notices: List[str] = Field(
+        default_factory=list,
+        description="Plain statements of what could not be surfaced, e.g. that web results are unavailable",
+    )
