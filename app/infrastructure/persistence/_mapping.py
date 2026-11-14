@@ -22,6 +22,7 @@ from app.domain.entities import (
     DraftStatus,
     LLMLocation,
     LLMUsageEvent,
+    Memory,
     OPEN_DRAFT_STATUSES,  # noqa: F401  (re-exported to the repositories)
     Task,
     TaskStatus,
@@ -37,6 +38,21 @@ DRAFT_TTL = timedelta(hours=24)
 _LEGACY_TASK_STATUSES = {"pacing_pushed": TaskStatus.SKIPPED}
 
 _PROFILE_FIELDS = frozenset(UserProfile.model_fields) - {"user_id"}
+
+# Memory fields an update may set; the embedding is stored beside the entity.
+_MEMORY_FIELDS = frozenset(Memory.model_fields) - {"id", "user_id"}
+EMBEDDING = "embedding"
+
+# The entity's origin is the legacy user_memories.source column, which the v1 memory
+# path still writes; the new provenance column says whether the user said it.
+_MEMORY_COLUMN_FOR = {"origin": "source"}
+_MEMORY_FIELD_FOR = {column: name for name, column in _MEMORY_COLUMN_FOR.items()}
+
+# The user_memories columns every memory read selects: the entity's, never the
+# embedding (384 floats a row, which no caller reads).
+MEMORY_COLUMNS: tuple[str, ...] = tuple(
+    _MEMORY_COLUMN_FOR.get(name, name) for name in Memory.model_fields
+)
 
 
 def now_utc() -> datetime:
@@ -206,6 +222,49 @@ def apply_profile_update(profile: UserProfile, fields: dict[str, Any]) -> UserPr
         raise errors.ValidationError(
             "Some profile settings are invalid.", details={"fields": bad}
         ) from exc
+
+
+def memory_to_row(memory: Memory, fields: Iterable[str] | None = None) -> dict:
+    """Return ``memory`` as a user_memories row: every field, or only ``fields``."""
+    row = to_row(memory)
+    names = Memory.model_fields if fields is None else fields
+    return {_MEMORY_COLUMN_FOR.get(name, name): row[name] for name in names}
+
+
+def memory_from_row(row: dict) -> Memory:
+    """Build a Memory from a user_memories row (or a match_memories result row)."""
+    return from_row(Memory, {_MEMORY_FIELD_FOR.get(key, key): value for key, value in row.items()})
+
+
+def apply_memory_update(memory: Memory, fields: dict[str, Any]) -> Memory:
+    """Return ``memory`` with ``fields`` applied; an ``embedding`` key is left to the caller.
+
+    Raises ValidationError on an unknown field (``id`` and ``user_id`` included) or a
+    value the memory rejects.
+    """
+    unknown = sorted(set(fields) - _MEMORY_FIELDS - {EMBEDDING})
+    if unknown:
+        raise errors.ValidationError("Those are not memory fields.", details={"fields": unknown})
+    changes = {name: value for name, value in fields.items() if name != EMBEDDING}
+    try:
+        return normalized(Memory.model_validate({**memory.model_dump(), **changes}))
+    except PydanticValidationError as exc:
+        bad = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
+        raise errors.ValidationError(
+            "Some memory fields are invalid.", details={"fields": bad}
+        ) from exc
+
+
+def embedding_values(embedding: list[float] | None) -> list[float] | None:
+    """Return a copy of ``embedding`` as plain floats (None stays None)."""
+    return None if embedding is None else [float(x) for x in embedding]
+
+
+def pattern_key_taken(pattern_key: str | None) -> errors.ConflictError:
+    """Storing the memory would break user_memories' unique (user_id, pattern_key)."""
+    return errors.ConflictError(
+        "Jarvis already remembers this.", details={"pattern_key": pattern_key}
+    )
 
 
 def summarize_usage(events: Iterable[LLMUsageEvent]) -> dict:

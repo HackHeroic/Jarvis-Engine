@@ -1,10 +1,11 @@
 """Domain entities: the things Jarvis reasons about, free of any framework or storage detail."""
 
+import math
 from datetime import datetime, time
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.domain.errors import InvalidStateTransition
 
@@ -51,6 +52,34 @@ class SuggestionStatus(str, Enum):
 class LLMLocation(str, Enum):
     LOCAL = "local"
     CLOUD = "cloud"
+
+
+class MemoryStatus(str, Enum):
+    ACTIVE = "active"
+    DISMISSED = "dismissed"
+    FORGOTTEN = "forgotten"
+    FADED = "faded"
+
+
+class MemorySource(str, Enum):
+    """Where a memory came from: the user's own words, or Jarvis's reading of behaviour."""
+
+    SAID = "said"
+    INFERRED = "inferred"
+
+
+MemoryType = Literal[
+    "fact", "preference", "behavioral_pattern", "temporal_event", "goal", "feedback", "constraint"
+]
+
+# A memory in one of these states never comes back on its own: the same fact said or
+# observed again is recognised by its pattern key and not stored again.
+SUPPRESSING_STATUSES: frozenset[MemoryStatus] = frozenset(
+    {MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN}
+)
+
+# At stability 1 a memory's strength falls by a factor of e every week.
+BASE_HALFLIFE_HOURS = 168
 
 
 # The states a draft is still under review in. The only definition: the persistence
@@ -217,6 +246,86 @@ class BehavioralConstraint(BaseModel):
         default="said",
         description="Whether the user stated it or Jarvis inferred it from behaviour.",
     )
+
+
+class Memory(BaseModel):
+    """Something Jarvis knows about the user, with a lifecycle and a strength that decays."""
+
+    id: str | None = Field(default=None, description="Storage row id; None until persisted.")
+    user_id: str = Field(description="Owner of the memory.")
+    memory_type: MemoryType = Field(description="What kind of thing is remembered.")
+    content: str = Field(
+        max_length=2000,
+        description="The memory in words; empty only once the user has asked Jarvis to forget it.",
+    )
+    status: MemoryStatus = Field(
+        default=MemoryStatus.ACTIVE,
+        description=(
+            "Lifecycle state: active, dismissed (hidden), forgotten (text erased) or faded."
+        ),
+    )
+    provenance: MemorySource = Field(
+        description="Whether the user said it or Jarvis inferred it from what happened."
+    )
+    origin: str = Field(
+        default="conversation",
+        description="The channel it arrived by (e.g. conversation, behavior, ingestion).",
+    )
+    pattern_key: str | None = Field(
+        default=None,
+        description="Stable identity of the fact, unique per user, so a repeat is recognised.",
+    )
+    confidence: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="How sure Jarvis is that it holds, 0 to 1."
+    )
+    strength: float = Field(
+        default=1.0, ge=0.0, le=1.0, description="Strength as of strength_as_of, 0 to 1."
+    )
+    stability: float = Field(
+        default=1.0,
+        ge=0.01,
+        le=20.0,
+        description="How slowly strength decays: 1 loses a factor of e per week, 20 per 20 weeks.",
+    )
+    strength_as_of: datetime = Field(description="The instant `strength` was measured at.")
+    observation_count: int = Field(
+        default=1, ge=1, description="How many times it has been said or observed."
+    )
+    source_session_id: str | None = Field(
+        default=None, description="Chat session it was learned in, if any."
+    )
+    source_message_id: str | None = Field(
+        default=None, description="Chat message it was learned from, if any."
+    )
+    created_at: datetime = Field(description="When it was first stored.")
+    last_confirmed_at: datetime | None = Field(
+        default=None, description="When it was last said, observed or confirmed again."
+    )
+    superseded_by: str | None = Field(
+        default=None, description="Id of the memory that replaced this one, if any."
+    )
+    expires_at: datetime | None = Field(
+        default=None, description="After this instant it no longer applies (temporal events)."
+    )
+    applied_as: str | None = Field(
+        default=None,
+        description="How planning applies it, if it does (e.g. hard_constraint, soft_preference).",
+    )
+
+    @model_validator(mode="after")
+    def _blank_only_when_forgotten(self) -> "Memory":
+        if not self.content.strip() and self.status is not MemoryStatus.FORGOTTEN:
+            raise ValueError("only a forgotten memory may have empty content")
+        return self
+
+    def strength_at(self, now: datetime) -> float:
+        """Strength at ``now``: it falls by a factor of e every ``stability`` weeks.
+
+        An instant before ``strength_as_of`` reads as ``strength_as_of``: strength
+        never grows on its own.
+        """
+        hours = max(0.0, (now - self.strength_as_of).total_seconds() / 3600)
+        return self.strength * math.exp(-hours / (self.stability * BASE_HALFLIFE_HOURS))
 
 
 class Pattern(BaseModel):

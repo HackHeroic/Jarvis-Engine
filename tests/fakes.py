@@ -6,7 +6,10 @@ that the stores actually call: ``table(name).insert(row).execute()``,
 ``.delete().eq(...).execute()``, plus ``.order()`` / ``.limit()``, the
 ``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` / ``.gt()`` filters,
 ``.is_(column, "null")``, and
-``rpc("accept_draft", params).execute()``.
+``rpc("accept_draft" | "match_memories", params).execute()``. It records the
+columns every ``select`` names (``FakeSupabase.selects``) and enforces the one
+unique index a repository maps to an error on a plain write: user_memories'
+``(user_id, pattern_key) where pattern_key is not null``.
 
 It is deliberately a real (if tiny) implementation rather than a MagicMock:
 a MagicMock returns a canned payload regardless of the filters passed, so it
@@ -16,12 +19,18 @@ prevent. Filtering here is real, so user-isolation assertions have teeth.
 """
 
 import copy
+import hashlib
 import json
+import math
+import re
 import threading
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
+
+from app.domain.ports import TextEmbedder
+from app.utils.embedding import cosine_similarity
 
 # Canned LLM output shared by every test that mocks the model boundary.
 # Asserting this sentinel (rather than merely `is not None`) matters because
@@ -64,10 +73,29 @@ def _compare(op: Callable[[Any, Any], bool]) -> Callable[[Any, Any], bool]:
     return check
 
 
+# Unique indexes the fake enforces on table().insert/update, as {table: (name, columns)}.
+# The index only binds rows where every column is non-NULL (a partial index on
+# "where <column> is not null" behaves the same here).
+_UNIQUE_INDEXES = {
+    # 20261115000002_memory_lifecycle_and_vectors.sql
+    "user_memories": ("idx_user_memories_user_pattern_key", ("user_id", "pattern_key")),
+}
+
+
+def _unique_violation(index: str) -> Exception:
+    return Exception(f'duplicate key value violates unique constraint "{index}"')
+
+
 class _Query:
-    def __init__(self, rows: list[dict], table_name: str):
+    def __init__(
+        self,
+        rows: list[dict],
+        table_name: str,
+        selects: list[tuple[str, tuple[str, ...]]] | None = None,
+    ):
         self._rows = rows
         self._table = table_name
+        self._selects = selects if selects is not None else []
         self._op: str | None = None
         self._payload: Any = None
         self._filters: list[tuple[str, Any]] = []
@@ -80,8 +108,10 @@ class _Query:
         self._op, self._payload = "insert", payload
         return self
 
-    def select(self, *_columns: str) -> "_Query":
+    def select(self, *columns: str) -> "_Query":
         self._op = "select"
+        names = tuple(name.strip() for spec in columns for name in spec.split(","))
+        self._selects.append((self._table, names))
         return self
 
     def update(self, payload: dict) -> "_Query":
@@ -135,6 +165,17 @@ class _Query:
         return self
 
     # ── execution ───────────────────────────────────────────
+    def _check_unique(self, candidate: dict, others: list[dict]) -> None:
+        """Raise as Postgres would if ``candidate`` repeats a unique key held in ``others``."""
+        if self._table not in _UNIQUE_INDEXES:
+            return
+        index, columns = _UNIQUE_INDEXES[self._table]
+        key = tuple(candidate.get(column) for column in columns)
+        if None in key:
+            return
+        if any(tuple(row.get(column) for column in columns) == key for row in others):
+            raise _unique_violation(index)
+
     def _matches(self, row: dict) -> bool:
         return all(row.get(col) == val for col, val in self._filters) and all(
             predicate(row) for predicate in self._predicates
@@ -147,6 +188,7 @@ class _Query:
             )
             inserted = []
             for row in incoming:
+                self._check_unique(row, self._rows)
                 # The real table defaults created_at; emulate so .order() works.
                 # Deep copies: a real client serialises the payload, so a caller
                 # mutating its dict afterwards cannot reach the stored row.
@@ -161,6 +203,9 @@ class _Query:
         matched = [r for r in self._rows if self._matches(r)]
 
         if self._op == "update":
+            for row in matched:
+                others = [r for r in self._rows if r is not row]
+                self._check_unique({**row, **self._payload}, others)
             for row in matched:
                 row.update(copy.deepcopy(self._payload))
         elif self._op == "delete":
@@ -195,9 +240,11 @@ class FakeSupabase:
         # Stands in for the row lock (`select ... for update`) the real
         # function takes: repositories run calls on worker threads.
         self._rpc_lock = threading.Lock()
+        # (table, column names) for every select, in call order.
+        self.selects: list[tuple[str, tuple[str, ...]]] = []
 
     def table(self, name: str) -> _Query:
-        return _Query(self.rows.setdefault(name, []), name)
+        return _Query(self.rows.setdefault(name, []), name, self.selects)
 
     def rpc(self, name: str, params: dict) -> _RpcCall:
         # The real client sends params as JSON; round-trip so a value the
@@ -205,7 +252,41 @@ class FakeSupabase:
         params = json.loads(json.dumps(params))
         if name == "accept_draft":
             return _RpcCall(lambda: self._accept_draft(**params))
+        if name == "match_memories":
+            return _RpcCall(lambda: self._match_memories(**params))
         raise NotImplementedError(f"FakeSupabase has no rpc {name!r}")
+
+    def _match_memories(
+        self,
+        p_user_id: str,
+        p_query: list[float],
+        p_statuses: list[str],
+        p_types: list[str] | None,
+        p_limit: int,
+        p_min_similarity: float,
+    ) -> _Result:
+        """Mirror of the match_memories SQL function: cosine over the stored lists.
+
+        Same filters (user, status, type when given, has an embedding, not superseded),
+        most similar first, at most ``p_limit``; every column but ``embedding``, plus
+        ``similarity``.
+        """
+        found = []
+        for row in self.rows.setdefault("user_memories", []):
+            if (
+                row.get("user_id") != p_user_id
+                or row.get("status") not in p_statuses
+                or (p_types is not None and row.get("memory_type") not in p_types)
+                or row.get("embedding") is None
+                or row.get("superseded_by") is not None
+            ):
+                continue
+            similarity = cosine_similarity(row["embedding"], p_query)
+            if similarity >= p_min_similarity:
+                result = {k: copy.deepcopy(v) for k, v in row.items() if k != "embedding"}
+                found.append({**result, "similarity": similarity})
+        found.sort(key=lambda r: r["similarity"], reverse=True)
+        return _Result(found[:p_limit])
 
     def _accept_draft(self, p_draft_id: str, p_user_id: str, p_rows: list[dict]) -> _Result:
         """Mirror of the accept_draft SQL function: one transaction, all or nothing.
@@ -263,6 +344,29 @@ class FakeSupabase:
                 ):
                     other["status"] = "superseded"
             return _Result(len(p_rows))
+
+
+def bag_of_words_embedding(text: str, dims: int = 128) -> list[float]:
+    """Deterministic stand-in for the sentence embedder: hashed word counts."""
+    vector = [0.0] * dims
+    for word in re.findall(r"[a-z0-9]+", text.lower()):
+        vector[int(hashlib.md5(word.encode()).hexdigest(), 16) % dims] += 1.0
+    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+    return [v / norm for v in vector]
+
+
+class BagOfWordsEmbedder(TextEmbedder):
+    """A ``TextEmbedder`` with no model: texts sharing words point the same way.
+
+    Defaults to the production embedder's 384 dimensions, the width of the
+    user_memories.embedding column.
+    """
+
+    def __init__(self, dimensions: int = 384) -> None:
+        self.dimensions = dimensions
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [bag_of_words_embedding(text, self.dimensions) for text in texts]
 
 
 class FakeDBClient:

@@ -10,6 +10,7 @@ from typing import Any
 from app.domain.ports import (
     ConstraintRepository,
     DraftRepository,
+    MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
     TaskEventRepository,
@@ -19,6 +20,7 @@ from app.domain.ports import (
 from app.infrastructure.persistence.in_memory import (
     InMemoryConstraintRepository,
     InMemoryDraftRepository,
+    InMemoryMemoryRepository,
     InMemoryProfileRepository,
     InMemoryStore,
     InMemorySuggestionRepository,
@@ -29,6 +31,7 @@ from app.infrastructure.persistence.in_memory import (
 from app.infrastructure.persistence.supabase_repos import (
     SupabaseConstraintRepository,
     SupabaseDraftRepository,
+    SupabaseMemoryRepository,
     SupabaseProfileRepository,
     SupabaseSuggestionRepository,
     SupabaseTaskEventRepository,
@@ -48,6 +51,7 @@ class Repositories:
     profiles: ProfileRepository
     suggestions: SuggestionRepository
     usage: UsageRepository
+    memories: MemoryRepository
 
 
 class RepositoryFactory:
@@ -64,6 +68,7 @@ class RepositoryFactory:
             profiles=SupabaseProfileRepository(client),
             suggestions=SupabaseSuggestionRepository(client),
             usage=SupabaseUsageRepository(client),
+            memories=SupabaseMemoryRepository(client),
         )
 
     @staticmethod
@@ -78,4 +83,5 @@ class RepositoryFactory:
             profiles=InMemoryProfileRepository(store),
             suggestions=InMemorySuggestionRepository(store),
             usage=InMemoryUsageRepository(store),
+            memories=InMemoryMemoryRepository(store),
         )

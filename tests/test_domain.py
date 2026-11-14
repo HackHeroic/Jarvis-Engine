@@ -1,6 +1,7 @@
 """The framework-free domain layer: entities, the draft state machine, ports and the event bus."""
 
 import logging
+import math
 from datetime import datetime, timezone
 
 import pytest
@@ -16,7 +17,7 @@ from app.domain.events import (
     TaskCompleted,
     TaskSkipped,
 )
-from app.domain.ports import LLMProvider, TaskRepository
+from app.domain.ports import LLMProvider, MemoryRepository, TaskRepository, TextEmbedder
 
 _NOW = datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc)
 
@@ -135,6 +136,10 @@ def test_ports__instantiated_directly__raise_type_error():
         LLMProvider()
     with pytest.raises(TypeError):
         EventListener()
+    with pytest.raises(TypeError):
+        MemoryRepository()
+    with pytest.raises(TypeError):
+        TextEmbedder()
 
 
 # --- Event bus --------------------------------------------------------------
@@ -235,3 +240,54 @@ def test_llm_usage_event__negative_count__rejected(field):
     assert LLMUsageEvent(**fields).input_tokens == 0  # zero is a real count
     with pytest.raises(ValidationError):
         LLMUsageEvent(**{**fields, field: -1})
+
+
+# --- Memory -----------------------------------------------------------------------
+
+
+def _memory(**overrides):
+    from app.domain.entities import Memory, MemorySource
+
+    fields = {
+        "user_id": "u1",
+        "memory_type": "preference",
+        "content": "Prefers deep work before noon",
+        "provenance": MemorySource.SAID,
+        "strength_as_of": _NOW,
+        "created_at": _NOW,
+    }
+    fields.update(overrides)
+    return Memory(**fields)
+
+
+def test_memory__strength_at__decays_by_e_each_stability_week():
+    from datetime import timedelta
+
+    memory = _memory(strength=1.0, stability=1.0)
+    sturdy = _memory(strength=1.0, stability=2.0)
+    week = timedelta(hours=168)
+
+    assert memory.strength_at(_NOW) == pytest.approx(1.0)
+    assert memory.strength_at(_NOW + week) == pytest.approx(math.exp(-1))
+    assert memory.strength_at(_NOW + 2 * week) == pytest.approx(math.exp(-2))
+    assert sturdy.strength_at(_NOW + 2 * week) == pytest.approx(math.exp(-1))
+
+
+def test_memory__confidence_out_of_range__rejected():
+    with pytest.raises(ValidationError):
+        _memory(confidence=1.01)
+    with pytest.raises(ValidationError):
+        _memory(confidence=-0.01)
+    assert _memory(confidence=0.0).confidence == 0.0
+    assert _memory(confidence=1.0).confidence == 1.0
+
+
+def test_memory__blank_content__allowed_only_when_forgotten():
+    from app.domain.entities import MemoryStatus
+
+    assert _memory(content="", status=MemoryStatus.FORGOTTEN).content == ""
+    for status in (MemoryStatus.ACTIVE, MemoryStatus.DISMISSED, MemoryStatus.FADED):
+        with pytest.raises(ValidationError):
+            _memory(content="", status=status)
+    with pytest.raises(ValidationError):
+        _memory(content="x" * 2001)

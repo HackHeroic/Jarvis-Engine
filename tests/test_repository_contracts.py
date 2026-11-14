@@ -20,6 +20,9 @@ from app.domain.entities import (
     DraftStatus,
     LLMLocation,
     LLMUsageEvent,
+    Memory,
+    MemorySource,
+    MemoryStatus,
     Suggestion,
     SuggestionStatus,
     TaskEvent,
@@ -29,6 +32,7 @@ from app.domain.entities import (
 from app.domain.ports import (
     ConstraintRepository,
     DraftRepository,
+    MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
     TaskEventRepository,
@@ -37,6 +41,7 @@ from app.domain.ports import (
 )
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryStore
+from app.infrastructure.persistence.supabase_repos import SupabaseMemoryRepository
 from tests.fakes import FakeSupabase
 
 U1, U2 = "user-1", "user-2"
@@ -180,6 +185,34 @@ def _usage(
     )
 
 
+def _memory(
+    user_id: str,
+    content: str = "Prefers deep work before noon",
+    *,
+    memory_type: str = "preference",
+    status: MemoryStatus = MemoryStatus.ACTIVE,
+    **fields,
+) -> Memory:
+    return Memory(
+        user_id=user_id,
+        memory_type=memory_type,
+        content=content,
+        status=status,
+        provenance=fields.pop("provenance", MemorySource.SAID),
+        strength_as_of=T0,
+        created_at=fields.pop("created_at", T0),
+        **fields,
+    )
+
+
+def _vec(x: float, y: float) -> list[float]:
+    """A 384-dimension embedding pointing (x, y) in its first two dimensions."""
+    return [x, y] + [0.0] * 382
+
+
+ACTIVE = frozenset({MemoryStatus.ACTIVE})
+
+
 # --- Factory -----------------------------------------------------------------
 
 
@@ -192,6 +225,7 @@ def test_factory__both_families__implement_every_port():
         "profiles": ProfileRepository,
         "suggestions": SuggestionRepository,
         "usage": UsageRepository,
+        "memories": MemoryRepository,
     }
     for family in (RepositoryFactory.in_memory(), RepositoryFactory.supabase(FakeSupabase())):
         for name, port in ports.items():
@@ -743,6 +777,207 @@ async def test_usage__summary__counts_local_and_cloud(repos):
     }
 
 
+# --- Memories ----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_memories__add_get__roundtrip_with_provenance_and_session(repos, fake_client):
+    session_id, message_id = str(uuid4()), str(uuid4())
+
+    added = await repos.memories.add(
+        U1,
+        _memory(
+            U1,
+            "Usually skips the 9 AM slot",
+            memory_type="behavioral_pattern",
+            provenance=MemorySource.INFERRED,
+            origin="behavior",
+            pattern_key="skip_hour:9",
+            confidence=0.7,
+            observation_count=3,
+            source_session_id=session_id,
+            source_message_id=message_id,
+            last_confirmed_at=T0 + timedelta(hours=1),
+        ),
+        embedding=_vec(1.0, 0.0),
+    )
+
+    assert added.id is not None
+    got = await repos.memories.get(U1, added.id)
+    assert got == added
+    assert got.provenance is MemorySource.INFERRED and got.origin == "behavior"
+    assert (got.source_session_id, got.source_message_id) == (session_id, message_id)
+    assert got.status is MemoryStatus.ACTIVE and got.pattern_key == "skip_hour:9"
+    assert got.last_confirmed_at == T0 + timedelta(hours=1)
+    assert await repos.memories.get(U2, added.id) is None
+    assert await repos.memories.get(U1, str(uuid4())) is None
+    if isinstance(repos.memories, SupabaseMemoryRepository):
+        # origin lives in the legacy source column; the table has no origin column.
+        (row,) = fake_client.rows["user_memories"]
+        assert row["source"] == "behavior" and "origin" not in row
+        assert row["provenance"] == "inferred"
+
+
+@pytest.mark.asyncio
+async def test_memories__list__active_only_by_default(repos):
+    active = await repos.memories.add(U1, _memory(U1, "Likes tea"))
+    dismissed = await repos.memories.add(
+        U1, _memory(U1, "Hates mornings", status=MemoryStatus.DISMISSED)
+    )
+    forgotten = await repos.memories.add(U1, _memory(U1, "", status=MemoryStatus.FORGOTTEN))
+    await repos.memories.add(U1, _memory(U1, "Ran in 2025", status=MemoryStatus.FADED))
+    await repos.memories.add(U1, _memory(U1, "Likes coffee", superseded_by=active.id))
+    await repos.memories.add(U2, _memory(U2, "Theirs"))
+
+    assert await repos.memories.list(U1) == [active]
+    suppressed = await repos.memories.list(
+        U1, statuses=frozenset({MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN})
+    )
+    assert sorted(m.id for m in suppressed) == sorted([dismissed.id, forgotten.id])
+    assert [m.content for m in await repos.memories.list(U2)] == ["Theirs"]
+
+
+@pytest.mark.asyncio
+async def test_memories__list__types_filter(repos):
+    fact = await repos.memories.add(U1, _memory(U1, "Studies CS", memory_type="fact"))
+    goal = await repos.memories.add(U1, _memory(U1, "Ship the capstone", memory_type="goal"))
+    await repos.memories.add(U1, _memory(U1, "Likes tea", memory_type="preference"))
+
+    found = await repos.memories.list(U1, types=frozenset({"fact", "goal"}))
+
+    assert sorted(m.id for m in found) == sorted([fact.id, goal.id])
+    assert await repos.memories.list(U1, types=frozenset({"constraint"})) == []
+
+
+@pytest.mark.asyncio
+async def test_memories__list__never_returns_embeddings(repos, fake_client):
+    added = await repos.memories.add(U1, _memory(U1, pattern_key="tea"), embedding=_vec(1.0, 0.0))
+
+    read = [
+        *await repos.memories.list(U1),
+        await repos.memories.get(U1, added.id),
+        await repos.memories.find_by_pattern_key(U1, "tea"),
+        *[m.memory for m in await repos.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE)],
+    ]
+
+    assert len(read) == 4
+    assert all("embedding" not in m.model_dump() for m in read)
+    selected = [columns for table, columns in fake_client.selects if table == "user_memories"]
+    if isinstance(repos.memories, SupabaseMemoryRepository):
+        assert len(selected) == 3, "list, get and find_by_pattern_key each select once"
+    assert all("embedding" not in columns and "*" not in columns for columns in selected)
+
+
+@pytest.mark.asyncio
+async def test_memories__find_by_pattern_key__returns_dismissed_row(repos):
+    dismissed = await repos.memories.add(
+        U1, _memory(U1, "Skips 9 AM", status=MemoryStatus.DISMISSED, pattern_key="skip_hour:9")
+    )
+
+    assert await repos.memories.find_by_pattern_key(U1, "skip_hour:9") == dismissed
+    assert await repos.memories.find_by_pattern_key(U1, "skip_hour:10") is None
+    assert await repos.memories.find_by_pattern_key(U2, "skip_hour:9") is None
+
+
+@pytest.mark.asyncio
+async def test_memories__duplicate_pattern_key__raises_conflict(repos):
+    first = await repos.memories.add(U1, _memory(U1, "Skips 9 AM", pattern_key="skip_hour:9"))
+    other = await repos.memories.add(U1, _memory(U1, "Skips 10 AM", pattern_key="skip_hour:10"))
+
+    with pytest.raises(errors.ConflictError):
+        await repos.memories.add(U1, _memory(U1, "Skips 9 AM again", pattern_key="skip_hour:9"))
+    with pytest.raises(errors.ConflictError):
+        await repos.memories.update(U1, other.id, pattern_key="skip_hour:9")
+
+    # Unkeyed memories never clash, and another user may hold the same key.
+    await repos.memories.add(U1, _memory(U1, "Likes tea"))
+    await repos.memories.add(U1, _memory(U1, "Likes jasmine tea"))
+    await repos.memories.add(U2, _memory(U2, "Skips 9 AM", pattern_key="skip_hour:9"))
+    assert await repos.memories.find_by_pattern_key(U1, "skip_hour:9") == first
+    assert (await repos.memories.get(U1, other.id)).pattern_key == "skip_hour:10"
+    assert len(await repos.memories.list(U1)) == 4
+
+
+@pytest.mark.asyncio
+async def test_memories__nearest__most_similar_first_status_and_type_filtered(repos):
+    close = await repos.memories.add(U1, _memory(U1, "Close"), embedding=_vec(1.0, 0.1))
+    closest = await repos.memories.add(U1, _memory(U1, "Closest"), embedding=_vec(1.0, 0.0))
+    far = await repos.memories.add(U1, _memory(U1, "Far"), embedding=_vec(0.0, 1.0))
+    await repos.memories.add(U1, _memory(U1, "No embedding"))
+    dismissed = await repos.memories.add(
+        U1, _memory(U1, "Dismissed", status=MemoryStatus.DISMISSED), embedding=_vec(1.0, 0.0)
+    )
+    goal = await repos.memories.add(
+        U1, _memory(U1, "A goal", memory_type="goal"), embedding=_vec(1.0, 0.05)
+    )
+    await repos.memories.add(
+        U1, _memory(U1, "Superseded", superseded_by=close.id), embedding=_vec(1.0, 0.0)
+    )
+    query = _vec(1.0, 0.0)
+
+    matches = await repos.memories.nearest(U1, query, statuses=ACTIVE)
+    assert [m.memory.id for m in matches] == [closest.id, goal.id, close.id, far.id]
+    assert matches[0].similarity == pytest.approx(1.0)
+    assert matches[-1].similarity == pytest.approx(0.0)
+
+    preferences = await repos.memories.nearest(
+        U1, query, statuses=ACTIVE, types=frozenset({"preference"}), limit=2
+    )
+    assert [m.memory.id for m in preferences] == [closest.id, close.id]
+
+    similar = await repos.memories.nearest(U1, query, statuses=ACTIVE, min_similarity=0.5)
+    assert far.id not in [m.memory.id for m in similar] and len(similar) == 3
+
+    with_dismissed = await repos.memories.nearest(
+        U1, query, statuses=frozenset({MemoryStatus.DISMISSED})
+    )
+    assert [m.memory.id for m in with_dismissed] == [dismissed.id]
+
+
+@pytest.mark.asyncio
+async def test_memories__nearest__user_without_memories__empty_never_another_users(repos):
+    for status in MemoryStatus:
+        content = "" if status is MemoryStatus.FORGOTTEN else "Their fact"
+        await repos.memories.add(U2, _memory(U2, content, status=status), embedding=_vec(1.0, 0.0))
+
+    found = await repos.memories.nearest(
+        U1, _vec(1.0, 0.0), statuses=frozenset(MemoryStatus), limit=50, min_similarity=-1.0
+    )
+
+    assert found == []
+    assert await repos.memories.list(U1, statuses=frozenset(MemoryStatus)) == []
+
+
+@pytest.mark.asyncio
+async def test_memories__update__other_user__raises_not_found(repos):
+    mine = await repos.memories.add(U1, _memory(U1, "Likes tea"), embedding=_vec(0.0, 1.0))
+
+    with pytest.raises(errors.NotFoundError):
+        await repos.memories.update(U2, mine.id, status=MemoryStatus.DISMISSED)
+    with pytest.raises(errors.NotFoundError):
+        await repos.memories.update(U1, str(uuid4()), status=MemoryStatus.DISMISSED)
+    with pytest.raises(errors.NotFoundError):
+        await repos.memories.update(U1, "not-a-uuid", status=MemoryStatus.DISMISSED)
+    assert await repos.memories.get(U1, mine.id) == mine
+
+    forgotten = await repos.memories.update(
+        U1, mine.id, status=MemoryStatus.FORGOTTEN, content="", embedding=_vec(1.0, 0.0)
+    )
+
+    assert forgotten.status is MemoryStatus.FORGOTTEN and forgotten.content == ""
+    assert await repos.memories.get(U1, mine.id) == forgotten
+    (match,) = await repos.memories.nearest(
+        U1, _vec(1.0, 0.0), statuses=frozenset({MemoryStatus.FORGOTTEN})
+    )
+    assert match.similarity == pytest.approx(1.0)
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.update(U1, mine.id, confidence=2.0)
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.update(U1, mine.id, id=str(uuid4()))
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.update(U1, mine.id, favourite_colour="red")
+
+
 # --- Supabase family only: transport failures ---------------------------------
 
 
@@ -767,6 +1002,8 @@ class _UnreachableClient:
         lambda r: r.profiles.get_or_create(U1),
         lambda r: r.suggestions.exists_today(U1, "evening_review", T0.date()),
         lambda r: r.usage.record(_usage(U1, LLMLocation.LOCAL, 1, 1)),
+        lambda r: r.memories.list(U1),
+        lambda r: r.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE),
     ],
 )
 async def test_supabase_repos__transport_error__raises_persistence_error_chained(call):

@@ -22,6 +22,8 @@ from app.domain.entities import (
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
+    Memory,
+    MemoryStatus,
     Suggestion,
     SuggestionStatus,
     Task,
@@ -33,6 +35,8 @@ from app.domain.entities import (
 from app.domain.ports import (
     ConstraintRepository,
     DraftRepository,
+    MemoryMatch,
+    MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
     TaskEventRepository,
@@ -40,17 +44,24 @@ from app.domain.ports import (
     UsageRepository,
 )
 from app.infrastructure.persistence._mapping import (
+    EMBEDDING,
+    MEMORY_COLUMNS,
     OPEN_DRAFT_STATUSES,
     accepted_task_rows,
+    apply_memory_update,
     apply_profile_update,
     day_bounds,
     draft_closed,
+    embedding_values,
     from_row,
     is_uuid,
     iso,
+    memory_from_row,
+    memory_to_row,
     new_draft,
     not_found,
     now_utc,
+    pattern_key_taken,
     prepare_new,
     summarize_usage,
     task_from_row,
@@ -64,6 +75,11 @@ _UNREACHABLE = "Could not reach the database."
 # The name 20261114000001_capstone_lld.sql gives user_tasks' UNIQUE (user_id, task_id).
 _TASK_ID_KEY = "user_tasks_user_id_task_id_key"
 _UNREADABLE = "Stored data is not readable."
+# The name 20261115000002_memory_lifecycle_and_vectors.sql gives the unique
+# (user_id, pattern_key) index on user_memories.
+_PATTERN_KEY_INDEX = "idx_user_memories_user_pattern_key"
+_UNIQUE_VIOLATION = "23505"
+_MEMORY_SELECT = ", ".join(MEMORY_COLUMNS)
 # A lost compare-and-set on a draft's status is retried against the status that won.
 _STATUS_CAS_ATTEMPTS = 3
 
@@ -84,6 +100,13 @@ def _read(model: type[M], row: dict) -> M:
 def _read_task(row: dict) -> Task:
     try:
         return task_from_row(row)
+    except PydanticValidationError as exc:
+        raise errors.PersistenceError(_UNREADABLE) from exc
+
+
+def _read_memory(row: dict) -> Memory:
+    try:
+        return memory_from_row(row)
     except PydanticValidationError as exc:
         raise errors.PersistenceError(_UNREADABLE) from exc
 
@@ -437,6 +460,124 @@ class SupabaseSuggestionRepository(_SupabaseRepository, SuggestionRepository):
             .limit(1)
         )
         return bool(rows)
+
+
+class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
+    """Reads name their columns (never ``embedding``); similarity search is the
+    ``match_memories`` database function, which filters and ranks in one query."""
+
+    table = "user_memories"
+
+    async def _write(self, build: Callable[[Any], Any], pattern_key: str | None) -> list[dict]:
+        """Run a write; a clash on the unique (user_id, pattern_key) index is a ConflictError."""
+        try:
+            return await self._run(build)
+        except errors.PersistenceError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, Exception) and (
+                _PATTERN_KEY_INDEX in _error_text(cause)
+                or getattr(cause, "code", None) == _UNIQUE_VIOLATION
+            ):
+                raise pattern_key_taken(pattern_key) from cause
+            raise
+
+    async def add(
+        self, user_id: str, m: Memory, *, embedding: list[float] | None = None
+    ) -> Memory:
+        stored = prepare_new(user_id, m, "memory")
+        row = memory_to_row(stored)
+        if embedding is not None:
+            row[EMBEDDING] = embedding_values(embedding)
+        rows = await self._write(lambda q: q.insert(row), stored.pattern_key)
+        return _read_memory(rows[0]) if rows else stored
+
+    async def get(self, user_id: str, memory_id: str) -> Memory | None:
+        if not is_uuid(memory_id):  # the id column is a uuid; anything else matches nothing
+            return None
+        rows = await self._run(
+            lambda q: q.select(_MEMORY_SELECT).eq("id", memory_id).eq("user_id", user_id).limit(1)
+        )
+        return _read_memory(rows[0]) if rows else None
+
+    async def list(
+        self,
+        user_id: str,
+        *,
+        statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
+        types: frozenset[str] | None = None,
+    ) -> list[Memory]:
+        def build(q: Any) -> Any:
+            q = (
+                q.select(_MEMORY_SELECT)
+                .eq("user_id", user_id)
+                .in_("status", sorted(MemoryStatus(s).value for s in statuses))
+                .is_("superseded_by", "null")
+            )
+            if types is not None:
+                q = q.in_("memory_type", sorted(types))
+            return q.order("created_at")
+
+        return [_read_memory(r) for r in await self._run(build)]
+
+    async def find_by_pattern_key(self, user_id: str, pattern_key: str) -> Memory | None:
+        rows = await self._run(
+            lambda q: q.select(_MEMORY_SELECT)
+            .eq("user_id", user_id)
+            .eq("pattern_key", pattern_key)
+            .limit(1)
+        )
+        return _read_memory(rows[0]) if rows else None
+
+    async def nearest(
+        self,
+        user_id: str,
+        embedding: list[float],
+        *,
+        statuses: frozenset[MemoryStatus],
+        types: frozenset[str] | None = None,
+        limit: int = 5,
+        min_similarity: float = 0.0,
+    ) -> list[MemoryMatch]:
+        params = {
+            "p_user_id": user_id,
+            "p_query": embedding_values(embedding),
+            "p_statuses": sorted(MemoryStatus(s).value for s in statuses),
+            "p_types": sorted(types) if types is not None else None,
+            "p_limit": limit,
+            "p_min_similarity": min_similarity,
+        }
+        try:
+            result = await asyncio.to_thread(
+                lambda: self._client.rpc("match_memories", params).execute()
+            )
+        except Exception as exc:  # any transport or PostgREST failure
+            raise errors.PersistenceError(_UNREACHABLE) from exc
+        try:
+            return [
+                MemoryMatch(memory=_read_memory(row), similarity=float(row["similarity"]))
+                for row in result.data or []
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise errors.PersistenceError(_UNREADABLE) from exc
+
+    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+        current = await self.get(user_id, memory_id)
+        if current is None:
+            raise not_found("memory", memory_id)
+        updated = apply_memory_update(current, fields)
+        changed = [name for name in fields if name != EMBEDDING]
+        payload = memory_to_row(updated, changed)
+        if EMBEDDING in fields:
+            payload[EMBEDDING] = embedding_values(fields[EMBEDDING])
+        if not payload:
+            return current
+        rows = await self._write(
+            lambda q: q.update(payload).eq("id", memory_id).eq("user_id", user_id),
+            updated.pattern_key,
+        )
+        if not rows:  # deleted since it was read
+            raise not_found("memory", memory_id)
+        return _read_memory(rows[0])
 
 
 class SupabaseUsageRepository(_SupabaseRepository, UsageRepository):

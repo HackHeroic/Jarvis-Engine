@@ -24,6 +24,8 @@ from app.domain.entities import (
     FocusProfile,
     LLMLocation,
     LLMUsageEvent,
+    Memory,
+    MemoryStatus,
     Suggestion,
     SuggestionStatus,
     Task,
@@ -192,6 +194,80 @@ class SuggestionRepository(ABC):
         """Return whether ``trigger`` already produced a suggestion for the user on ``day``."""
 
 
+class MemoryMatch(BaseModel):
+    """A memory found by similarity search, with how close it is to the query."""
+
+    memory: Memory = Field(description="The memory found.")
+    similarity: float = Field(
+        description="Cosine similarity to the query embedding, from -1 to 1 (1 is identical)."
+    )
+
+
+class MemoryRepository(ABC):
+    """Storage for what Jarvis remembers about the user, searchable by meaning.
+
+    Embeddings are written alongside a memory but never read back: no method
+    returns one.
+    """
+
+    @abstractmethod
+    async def add(
+        self, user_id: str, m: Memory, *, embedding: list[float] | None = None
+    ) -> Memory:
+        """Store the memory (and its embedding, if given) and return it with its id.
+
+        Raises ValidationError if the memory belongs to another user or its id is not
+        a UUID, and ConflictError if the user already has a memory with its pattern_key.
+        """
+
+    @abstractmethod
+    async def get(self, user_id: str, memory_id: str) -> Memory | None:
+        """Return the user's memory with this id, whatever its status, or None."""
+
+    @abstractmethod
+    async def list(
+        self,
+        user_id: str,
+        *,
+        statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
+        types: frozenset[str] | None = None,
+    ) -> list[Memory]:
+        """Return the user's memories in ``statuses`` (and ``types``), oldest first.
+
+        A superseded memory is never returned.
+        """
+
+    @abstractmethod
+    async def find_by_pattern_key(self, user_id: str, pattern_key: str) -> Memory | None:
+        """Return the user's memory with this pattern_key, whatever its status, or None."""
+
+    @abstractmethod
+    async def nearest(
+        self,
+        user_id: str,
+        embedding: list[float],
+        *,
+        statuses: frozenset[MemoryStatus],
+        types: frozenset[str] | None = None,
+        limit: int = 5,
+        min_similarity: float = 0.0,
+    ) -> list[MemoryMatch]:
+        """Return up to ``limit`` of the user's memories most similar to ``embedding``.
+
+        Only memories in ``statuses`` (and ``types``) that have an embedding, are not
+        superseded, and score at least ``min_similarity`` count; most similar first.
+        """
+
+    @abstractmethod
+    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+        """Set the given fields and return the memory; ``embedding`` may be one of them.
+
+        Raises NotFoundError if the user has no such memory, ValidationError for an
+        unknown field (``id`` and ``user_id`` included) or a value the memory rejects,
+        and ConflictError if a new pattern_key is already the user's.
+        """
+
+
 class UsageRepository(ABC):
     """Ledger of language-model calls."""
 
@@ -230,6 +306,22 @@ class EnergyEstimator(ABC):
     @abstractmethod
     async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
         """Return the user's focus profile as of ``now``, hours read on ``zone``'s clock."""
+
+
+# --- Embeddings -------------------------------------------------------------
+
+
+class TextEmbedder(ABC):
+    """Turns text into vectors whose cosine similarity tracks meaning (Strategy)."""
+
+    dimensions: int
+
+    @abstractmethod
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Return one ``dimensions``-long vector per text, in order.
+
+        Synchronous CPU work: async callers run it with ``asyncio.to_thread``.
+        """
 
 
 # --- Language models --------------------------------------------------------

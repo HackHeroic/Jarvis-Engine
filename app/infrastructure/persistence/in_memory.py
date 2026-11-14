@@ -22,6 +22,8 @@ from app.domain.entities import (
     DraftSchedule,
     DraftStatus,
     LLMUsageEvent,
+    Memory,
+    MemoryStatus,
     Suggestion,
     SuggestionStatus,
     Task,
@@ -33,6 +35,8 @@ from app.domain.entities import (
 from app.domain.ports import (
     ConstraintRepository,
     DraftRepository,
+    MemoryMatch,
+    MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
     TaskEventRepository,
@@ -41,20 +45,25 @@ from app.domain.ports import (
 )
 from app.infrastructure.persistence._mapping import (
     OPEN_DRAFT_STATUSES,
+    EMBEDDING,
     accepted_task_rows,
+    apply_memory_update,
     apply_profile_update,
     day_bounds,
     draft_closed,
+    embedding_values,
     new_draft,
     normalized,
     not_found,
     now_utc,
+    pattern_key_taken,
     prepare_new,
     summarize_usage,
     task_from_row,
     task_id_clash,
     utc,
 )
+from app.utils.embedding import cosine_similarity
 
 
 @dataclass
@@ -68,6 +77,9 @@ class InMemoryStore:
     profiles: list[UserProfile] = field(default_factory=list)
     suggestions: list[Suggestion] = field(default_factory=list)
     usage: list[LLMUsageEvent] = field(default_factory=list)
+    memories: list[Memory] = field(default_factory=list)
+    # Each memory's embedding, keyed by (user_id, memory id); held apart, as no read returns it.
+    memory_embeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     # Serialises draft status changes, as the row lock does in the database.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -392,6 +404,117 @@ class InMemorySuggestionRepository(SuggestionRepository):
             s.user_id == user_id and s.trigger == trigger and start <= s.created_at < end
             for s in self._store.suggestions
         )
+
+
+class InMemoryMemoryRepository(MemoryRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, memory_id: str) -> int | None:
+        return next(
+            (
+                i
+                for i, m in enumerate(self._store.memories)
+                if m.id == memory_id and m.user_id == user_id
+            ),
+            None,
+        )
+
+    def _key_taken(self, user_id: str, pattern_key: str | None, *, other_than: str | None) -> bool:
+        """The unique (user_id, pattern_key) index, which ignores a NULL key."""
+        return pattern_key is not None and any(
+            m.user_id == user_id and m.pattern_key == pattern_key and m.id != other_than
+            for m in self._store.memories
+        )
+
+    def _set_embedding(self, user_id: str, memory_id: str, embedding: list[float] | None) -> None:
+        key = (user_id, memory_id)
+        if embedding is None:
+            self._store.memory_embeddings.pop(key, None)
+        else:
+            self._store.memory_embeddings[key] = embedding_values(embedding)
+
+    async def add(
+        self, user_id: str, m: Memory, *, embedding: list[float] | None = None
+    ) -> Memory:
+        stored = prepare_new(user_id, m, "memory")
+        if self._key_taken(user_id, stored.pattern_key, other_than=None):
+            raise pattern_key_taken(stored.pattern_key)
+        self._store.memories.append(stored)
+        self._set_embedding(user_id, stored.id, embedding)
+        return stored.model_copy(deep=True)
+
+    async def get(self, user_id: str, memory_id: str) -> Memory | None:
+        i = self._index(user_id, memory_id)
+        return self._store.memories[i].model_copy(deep=True) if i is not None else None
+
+    async def list(
+        self,
+        user_id: str,
+        *,
+        statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
+        types: frozenset[str] | None = None,
+    ) -> list[Memory]:
+        found = [
+            m
+            for m in self._store.memories
+            if m.user_id == user_id
+            and m.status in statuses
+            and (types is None or m.memory_type in types)
+            and m.superseded_by is None
+        ]
+        return [m.model_copy(deep=True) for m in sorted(found, key=lambda m: m.created_at)]
+
+    async def find_by_pattern_key(self, user_id: str, pattern_key: str) -> Memory | None:
+        return next(
+            (
+                m.model_copy(deep=True)
+                for m in self._store.memories
+                if m.user_id == user_id and m.pattern_key == pattern_key
+            ),
+            None,
+        )
+
+    async def nearest(
+        self,
+        user_id: str,
+        embedding: list[float],
+        *,
+        statuses: frozenset[MemoryStatus],
+        types: frozenset[str] | None = None,
+        limit: int = 5,
+        min_similarity: float = 0.0,
+    ) -> list[MemoryMatch]:
+        scored = []
+        for m in self._store.memories:
+            stored = self._store.memory_embeddings.get((user_id, m.id))
+            if (
+                m.user_id != user_id
+                or stored is None
+                or m.status not in statuses
+                or (types is not None and m.memory_type not in types)
+                or m.superseded_by is not None
+            ):
+                continue
+            similarity = cosine_similarity(stored, embedding)
+            if similarity >= min_similarity:
+                scored.append(MemoryMatch(memory=m.model_copy(deep=True), similarity=similarity))
+        scored.sort(key=lambda match: match.similarity, reverse=True)
+        return scored[:limit]
+
+    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+        i = self._index(user_id, memory_id)
+        if i is None:
+            raise not_found("memory", memory_id)
+        updated = apply_memory_update(self._store.memories[i], fields)
+        if "pattern_key" in fields and self._key_taken(
+            user_id, updated.pattern_key, other_than=memory_id
+        ):
+            raise pattern_key_taken(updated.pattern_key)
+        self._store.memories[i] = updated
+        if EMBEDDING in fields:
+            self._set_embedding(user_id, memory_id, fields[EMBEDDING])
+        return updated.model_copy(deep=True)
 
 
 class InMemoryUsageRepository(UsageRepository):
