@@ -318,3 +318,30 @@ def test_accept_schedule__container__id_held_by_a_finished_task__409_and_nothing
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "conflict"
     assert _rows(client) == [finished, _STILL_PENDING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["conflict", "outage"])
+async def test_accept_schedule__container__accept_fails__the_draft_it_made_is_expired(
+    wired, monkeypatch, failure
+):
+    """A failed accept leaves no open draft behind: the newest-pending fallback ("looks
+    good" on a thread with no draft id) must never find and accept it later."""
+    from app.domain import errors
+
+    client, container = wired
+    if failure == "conflict":
+        finished = {**_STILL_PENDING, "task_id": "goal_task_1", "status": "completed"}
+        client.app.state._test_supabase.rows["user_tasks"] = [finished]
+    else:
+        async def down(*_args, **_kwargs):
+            raise errors.PersistenceError("Could not reach the database.")
+
+        monkeypatch.setattr(container.draft_service, "accept", down)
+
+    resp = _post(client)
+
+    assert resp.status_code == (409 if failure == "conflict" else 503)
+    drafts = client.app.state._test_supabase.rows["draft_schedules"]
+    assert [d["status"] for d in drafts] == ["expired"]
+    assert await container.repos.drafts.get_open("test_user") is None
