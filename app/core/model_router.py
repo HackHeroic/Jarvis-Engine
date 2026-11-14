@@ -186,6 +186,8 @@ MODEL_ROUTING: dict[str, ModelRole] = {
     "goal_validation": ModelRole.FAST,
     "task_edit_parsing": ModelRole.FAST,
     "action_item_extraction": ModelRole.FAST,
+    # One call per compaction or idle summary, never per turn, and off the hot path.
+    "session_summary": ModelRole.FAST,
     "web_search": ModelRole.CLOUD,
     "real_time_research": ModelRole.CLOUD,
 }

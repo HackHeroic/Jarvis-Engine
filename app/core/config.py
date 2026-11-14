@@ -280,6 +280,44 @@ MEMORY_PROFILE_TOKENS: int = 200
 MEMORY_RECALL_TOKENS: int = 300
 MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
 
+# Conversations (ConversationMemoryService). The model sees the newest
+# HISTORY_MAX_MESSAGES messages after the conversation's summary, each cut to
+# HISTORY_MAX_CHARS_PER_MESSAGE characters. Once more than COMPACT_AFTER_MESSAGES are
+# unsummarized, one FAST call folds all but the newest COMPACT_KEEP_RECENT into the
+# summary; so between compactions the window only grows (8 to 18 messages), and the
+# prefix it sends changes only when a compaction rewrites it. A conversation idle for
+# SESSION_IDLE_MINUTES gets the rest summarised too, by the session-summary sweep, for
+# "since we last spoke".
+HISTORY_MAX_MESSAGES: int = 24
+HISTORY_MAX_CHARS_PER_MESSAGE: int = 1500
+COMPACT_AFTER_MESSAGES: int = 16
+COMPACT_KEEP_RECENT: int = 8
+SESSION_IDLE_MINUTES: int = 30
+# The most unsummarized messages one summary call reads: a bound on its prompt. More
+# can pile up only while summary calls keep failing, or on a conversation older than
+# summaries; the older ones were already out of the window, and stay out of the summary.
+SUMMARY_MAX_INPUT_MESSAGES: int = 40
+# After a summary call fails (or is refused), that conversation's next try waits this
+# long: the turns stay as they were, and no turn pays for a call that keeps failing.
+SUMMARY_RETRY_MINUTES: int = 15
+# The sweep reads each user's recently active sessions from storage once every
+# SESSION_SUMMARY_RESCAN_HOURS (sessions active in the last SESSION_SUMMARY_LOOKBACK_DAYS),
+# to pick up conversations from before a restart; between those reads it knows from the
+# turns this process served, and a tick with nothing due reads nothing.
+SESSION_SUMMARY_RESCAN_HOURS: int = 24
+SESSION_SUMMARY_LOOKBACK_DAYS: int = 7
+# The context note's token budgets for the conversation summary (<earlier>) and "since
+# we last spoke" (<since>), estimated like the memory budgets. A summary sentence that
+# does not fit is left out, never cut mid-sentence.
+CONVERSATION_SUMMARY_TOKENS: int = 450
+SINCE_LAST_SPOKE_TOKENS: int = 250
+# A summary sentence at least this close (cosine similarity, memory embedder) to a memory
+# the user forgot or dismissed is never shown or fed to the next summary. Lower than
+# MEMORY_SUPPRESS_SIMILARITY on purpose: a sentence carries more words than the fact, and
+# dropping an innocent sentence costs little, while showing a forgotten fact breaks a
+# promise.
+SUMMARY_SUPPRESS_SIMILARITY: float = 0.5
+
 # AWS S3 (document storage)
 AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")

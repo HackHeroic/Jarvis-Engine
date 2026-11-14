@@ -458,6 +458,46 @@ class Suggestion(BaseModel):
     )
 
 
+class ConversationSession(BaseModel):
+    """One conversation with Jarvis, and the summary of its turns that are no longer shown."""
+
+    id: str = Field(description="Session id (a UUID string).")
+    user_id: str = Field(description="Owner of the conversation.")
+    title: str | None = Field(
+        default=None, description="Short title taken from the first message; None until then."
+    )
+    created_at: datetime = Field(description="When the conversation started.")
+    updated_at: datetime = Field(
+        description="Its last activity: when a message was last added. Writing the summary "
+        "is not activity and leaves it as it was."
+    )
+    summary: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="Running summary of every message up to summary_through; None until the "
+        "first one is written.",
+    )
+    summary_through: datetime | None = Field(
+        default=None,
+        description="created_at of the last message the summary covers; the history window "
+        "starts after it.",
+    )
+    summary_updated_at: datetime | None = Field(
+        default=None, description="When the summary was last written."
+    )
+
+
+class ChatMessage(BaseModel):
+    """One message in a conversation, as stored."""
+
+    id: str = Field(description="Message id (a UUID string).")
+    session_id: str = Field(description="Conversation the message belongs to.")
+    user_id: str = Field(description="Owner of the conversation.")
+    role: Literal["user", "assistant", "system"] = Field(description="Who wrote it.")
+    content: str = Field(description="The message text.")
+    created_at: datetime = Field(description="When it was written.")
+
+
 class LLMUsageEvent(BaseModel):
     """One completed language-model call, recorded for cost and privacy accounting."""
 

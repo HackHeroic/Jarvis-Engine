@@ -1220,7 +1220,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     from app.core.runtime import registered_container
     from app.domain.errors import JarvisError
     from app.orchestrator.graph import _is_trivial_input
-    from app.services.memory.context import Recall, render_context_note
+    from app.services.memory.context import Recall, note_line, render_context_note
     from app.services.planning.local_time import user_zone
     from app.services.task_service import utc_now
     from app.services.turn_locks import thread_lock
@@ -1249,6 +1249,8 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
     # The recalled memories, for the frontend MemoryPanel; filled by _read_conversation.
     _existing_memories: list[dict] = []
+    # "Since we last spoke" exactly as the note gave it to the model, when it did.
+    _since_last_spoke: list[str] = []
 
     user_model = UserModel(user_id=request.user_id, db=db_client)
     if memory_store:
@@ -1343,23 +1345,51 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
 
         History first, then save: the window is the PRIOR context. Saved first, the
         message being answered also sat in its own history — the model read it
-        twice and it took one of the ten slots.
+        twice and it took one of the window's slots. The window is
+        ``ConversationMemoryService.build_history``: the messages after the
+        conversation's summary, the summary itself going in the note (``<earlier>``).
+        A conversation with no messages yet, opened after an earlier one, gets "since
+        we last spoke" (``<since>``, no model call), read before this message is saved.
 
         Then the turn's context note (``memory_context``): what ``MemoryService.recall``
         finds for this message within its token budgets (a trivial message gets the
         profile only), the plate and the time on the user's clock. The memory panel
         shows exactly the recalled memories. A read that fails is left out of the note
-        and logged; the turn goes on. Without a composition root there is no note.
+        and logged; the turn goes on. Without a composition root there is no note, and
+        the history is the plain newest-ten window, as it is when the window cannot be
+        read (for one, before the summary columns' migration is applied).
         """
-        initial_state["conversation_history"] = await build_context_messages(
-            session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
-        )
+        container = registered_container()
+        if container is None:
+            initial_state["conversation_history"] = await build_context_messages(
+                session_id, request.user_id, max_messages=10, max_chars_per_message=500,
+                supabase=supabase,
+            )
+            initial_state["user_message_id"] = await save_user_message(
+                session_id, request.user_id, request.user_prompt, supabase
+            )
+            return
+        conversations = container.conversation_memory
+        window = None
+        try:
+            window = await conversations.build_history(request.user_id, session_id)
+            initial_state["conversation_history"] = window.history
+        except Exception as exc:  # the plain newest-ten window, never a failed turn
+            logger.warning(f"Conversation history unavailable this turn ({type(exc).__name__})")
+            initial_state["conversation_history"] = await build_context_messages(
+                session_id, request.user_id, max_messages=10, max_chars_per_message=500,
+                supabase=supabase,
+            )
+        zone = user_zone(await user_model.get_profile())
+        since = None
+        if window is not None and window.message_count == 0 and not window.summarized:
+            try:
+                since = await conversations.since_last_spoke(request.user_id, session_id, zone=zone)
+            except Exception as exc:  # nothing to pick up this turn, never a failed turn
+                logger.warning(f"'Since we last spoke' unavailable ({type(exc).__name__})")
         initial_state["user_message_id"] = await save_user_message(
             session_id, request.user_id, request.user_prompt, supabase
         )
-        container = registered_container()
-        if container is None:
-            return
         now = utc_now()
         recall = Recall(profile=[], relevant=[], tokens=0)
         try:
@@ -1383,10 +1413,18 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             ]
         except Exception as exc:  # no plate this turn, never a failed turn
             logger.warning(f"Pending tasks unavailable for the context note ({type(exc).__name__})")
-        zone = user_zone(await user_model.get_profile())
         initial_state["memory_context"] = (
-            render_context_note(recall, now=now, zone=zone, plate=plate) or ""
+            render_context_note(
+                recall,
+                now=now,
+                zone=zone,
+                since=since,
+                earlier=window.earlier if window is not None else None,
+                plate=plate,
+            )
+            or ""
         )
+        _since_last_spoke[:] = [note_line(since)] if since else []
         _existing_memories[:] = [
             {
                 "memory_id": m.id,
@@ -1726,6 +1764,8 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 # {memory_id, memory_type, content, confidence, provenance}: what the
                 # model was given about the user this turn.
                 "memories": list(_existing_memories) or None,
+                # What the model was told about the last conversation, or null.
+                "since_last_spoke": _since_last_spoke[0] if _since_last_spoke else None,
                 "pearl_insights": _insights,
                 "generation_metrics": {
                     "total_tokens": _token_count,
@@ -1735,6 +1775,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     "model": _stream_model,
                 },
             }
+            # Compaction: a tracked background task the turn never waits for. It starts
+            # once this frame is on its way; created before the yield, so a client that
+            # leaves at the frame cannot skip it.
+            _container = registered_container()
+            if _container is not None:
+                _container.conversation_memory.compact_in_background(request.user_id, session_id)
             yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
         except JarvisError as exc:
             # Raised on purpose, with a user-facing message (a turn that waited too

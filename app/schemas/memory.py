@@ -73,3 +73,26 @@ def valid_memories(value: Any) -> list[ExtractedMemory]:
 class MemoryExtractionResponse(BaseModel):
     """Response schema for the memory extraction LLM call."""
     memories: list[ExtractedMemory] = Field(default_factory=list)
+
+
+class SessionSummary(BaseModel):
+    """The running summary of one conversation, as the FAST model writes it.
+
+    Task ``session_summary``: it replaces the summary so far, so it carries forward what
+    still matters from the old one and adds what the newer messages changed.
+    """
+
+    summary: str = Field(
+        max_length=1200,
+        description=(
+            "What the conversation has covered so far, written to the person in the second "
+            "person ('You asked...', 'We agreed...'; Jarvis is 'I'): what they want, the "
+            "decisions and plans made, the facts they gave that matter here. At most 150 "
+            "words. No blame: work that did not happen was set aside."
+        ),
+    )
+    open_threads: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="Up to five questions or tasks still unresolved, each a short phrase.",
+    )

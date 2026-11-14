@@ -39,6 +39,10 @@ from app.services.anticipation.triggers import (
 )
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
+from app.services.memory.conversation_memory import (
+    ConversationMemoryService,
+    SessionSummarySweep,
+)
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
 from app.services.memory.patterns import PatternObserver, PatternService
 from app.services.task_service import SlotPassedSweep, TaskService
@@ -70,6 +74,7 @@ class AppContainer:
     anticipation: AnticipationService
     anticipation_listener: AnticipationListener
     user_model_service: UserModelService
+    conversation_memory: ConversationMemoryService
 
     @classmethod
     def build(
@@ -139,6 +144,13 @@ class AppContainer:
         )
         anticipation_listener = AnticipationListener(anticipation)
         events.subscribe(PatternDetected, anticipation_listener)
+        # Conversations that remember: the window, its summaries, "since we last spoke".
+        conversation_memory = ConversationMemoryService(
+            repos.conversations,
+            repos.task_events,
+            memory=memory_service,
+            suggestions=repos.suggestions,
+        )
 
         return cls(
             repos=repos,
@@ -147,7 +159,11 @@ class AppContainer:
             draft_service=draft_service,
             usage_ledger=usage_ledger,
             task_service=task_service,
-            sweeps=[SlotPassedSweep(task_service), MemoryDecaySweep(memory_service)],
+            sweeps=[
+                SlotPassedSweep(task_service),
+                MemoryDecaySweep(memory_service),
+                SessionSummarySweep(conversation_memory),
+            ],
             energy=energy,
             embedder=embedder,
             memory_service=memory_service,
@@ -161,10 +177,13 @@ class AppContainer:
             user_model_service=UserModelService(
                 repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
             ),
+            conversation_memory=conversation_memory,
         )
 
     async def shutdown(self) -> None:
-        """Stop the background work the container owns: PEARL runs and the pattern
-        proposals they start get a short grace to finish, then are cancelled."""
+        """Stop the background work the container owns: PEARL runs, the pattern
+        proposals they start and conversation compactions get a short grace to finish,
+        then are cancelled."""
         await self.pattern_observer.shutdown()
         await self.anticipation_listener.shutdown()
+        await self.conversation_memory.shutdown()

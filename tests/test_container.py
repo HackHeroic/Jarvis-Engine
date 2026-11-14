@@ -96,6 +96,10 @@ def test_container__installs_its_chain_for_route_llm_call():
 
 def test_container__memory_service_on_the_given_embedder__decay_sweep_listed_chain_left_alone():
     from app.infrastructure.embedding import MiniLMEmbedder
+    from app.services.memory.conversation_memory import (
+        ConversationMemoryService,
+        SessionSummarySweep,
+    )
     from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
     from tests.fakes import BagOfWordsEmbedder
 
@@ -108,8 +112,12 @@ def test_container__memory_service_on_the_given_embedder__decay_sweep_listed_cha
 
     assert isinstance(container.memory_service, MemoryService)
     assert container.embedder is embedder
-    assert [sweep.name for sweep in container.sweeps] == ["slot_passed", "memory_decay"]
+    assert [sweep.name for sweep in container.sweeps] == [
+        "slot_passed", "memory_decay", "session_summary",
+    ]
     assert isinstance(container.sweeps[1], MemoryDecaySweep)
+    assert isinstance(container.sweeps[2], SessionSummarySweep)
+    assert isinstance(container.conversation_memory, ConversationMemoryService)
     assert current_chain() is installed  # not replaced by container.llm
     assert isinstance(_build().embedder, MiniLMEmbedder)  # the default: the local model
 

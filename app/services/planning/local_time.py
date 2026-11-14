@@ -79,6 +79,12 @@ def logical_day_start(
     return datetime.combine(day, time(hour, 0), tzinfo=zone)
 
 
+def local_date(moment: datetime, zone: ZoneInfo) -> date:
+    """The date ``moment`` falls on, on the user's clock (a calendar date, not the
+    logical day: 01:00 is already the new date)."""
+    return _local(moment, zone).date()
+
+
 def local_today(zone: ZoneInfo | None = None) -> date:
     """Today's date on the user's clock."""
     return datetime.now(zone or user_zone()).date()

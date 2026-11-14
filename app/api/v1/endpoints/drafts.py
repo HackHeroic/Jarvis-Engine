@@ -28,10 +28,12 @@ from app.schemas.draft import (
     DraftModifyRequest,
     DraftRearrangeRequest,
     DraftRejectRequest,
+    DraftScheduleView,
     DraftStateResponse,
     DraftTaskEdit,
 )
 from app.services.draft_store import is_open_draft
+from app.services.planning.task_rows import draft_slots
 from app.services.memory.memory_service import MemoryCandidate
 
 logger = logging.getLogger(__name__)
@@ -83,17 +85,24 @@ async def _refused_edit(store, draft_id: str, user_id: str, not_found: str) -> E
     summary="Get draft state",
 )
 async def get_draft(draft_id: str, user_id: str, http_request: Request):
-    """Retrieve the current state of a draft for user review."""
+    """Retrieve the current state of a draft for user review, with its solved slots' times."""
     _, draft = await _load_draft(http_request, draft_id, user_id)
+    tasks = draft.get("tasks") or []
+    slots = draft_slots(tasks, draft.get("schedule"), draft.get("horizon_start"))
     return DraftStateResponse(
         draft_id=draft["id"],
         user_id=draft["user_id"],
         goal_id=draft.get("goal_id"),
-        tasks=draft.get("tasks") or [],
+        tasks=tasks,
         horizon_start=draft.get("horizon_start"),
         status=draft.get("status", "pending"),
         rejection_reason=draft.get("rejection_reason"),
         created_at=str(draft["created_at"]) if draft.get("created_at") else None,
+        schedule=(
+            DraftScheduleView(horizon_start=draft["horizon_start"], schedule=slots)
+            if slots
+            else None
+        ),
     )
 
 

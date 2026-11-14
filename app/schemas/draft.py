@@ -6,6 +6,34 @@ from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class DraftSlot(BaseModel):
+    """One task's solved slot, in minutes from horizon_start and on the user's clock."""
+
+    task_id: str = Field(description="The task the slot belongs to.")
+    title: Optional[str] = Field(default=None, description="The task's title.")
+    start_min: int = Field(description="Start, in minutes from horizon_start.")
+    end_min: int = Field(description="End, in minutes from horizon_start.")
+    start: datetime = Field(
+        description="Start as an ISO-8601 instant with the offset of the user's zone."
+    )
+    end: datetime = Field(
+        description="End as an ISO-8601 instant with the offset of the user's zone."
+    )
+    duration_minutes: int = Field(description="Length of the slot in minutes.")
+
+
+class DraftScheduleView(BaseModel):
+    """A draft's solved slots, in the shape the chat ``complete`` payload's schedule has
+    (``horizon_start`` and task_id -> {start_min, end_min, title}), plus wall-clock times."""
+
+    horizon_start: str = Field(
+        description="ISO-8601 instant of minute 0 (08:00 on the user's clock), as stored."
+    )
+    schedule: dict[str, DraftSlot] = Field(
+        description="task_id -> its slot, for every task the solver placed."
+    )
+
+
 class DraftStateResponse(BaseModel):
     """A ``draft_schedules`` row as the review UI sees it.
 
@@ -24,6 +52,11 @@ class DraftStateResponse(BaseModel):
     status: str = Field(description="pending, accepted, rejected, modified, expired")
     rejection_reason: Optional[str] = None
     created_at: Optional[str] = None
+    schedule: Optional[DraftScheduleView] = Field(
+        default=None,
+        description="The solved slots with their times on the user's clock; None for a draft "
+        "stored without them.",
+    )
 
 
 class DraftAcceptRequest(BaseModel):
