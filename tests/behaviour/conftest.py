@@ -306,10 +306,7 @@ async def jarvis(tmp_path) -> Jarvis:
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
     from app.orchestrator.hooks import get_hooks
-    from app.services.memory.pearl import pearl_registry, register_default_patterns
-
-    if not pearl_registry.registered_names():  # the lifespan's job in the app
-        register_default_patterns()
+    # Like the lifespan, no legacy PEARL detectors: the composition root is built below.
     supabase = FakeSupabase()
     async with open_checkpointer(str(tmp_path / "checkpoints.sqlite")) as saver:
         app = Jarvis(build_jarvis_graph(checkpointer=saver), supabase)

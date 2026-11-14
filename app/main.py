@@ -74,9 +74,6 @@ async def lifespan(app: FastAPI):
     from app.services.documents.registry import register_default_document_types
     register_default_document_types()
 
-    from app.services.memory.pearl import register_default_patterns
-    register_default_patterns()
-
     from app.modules import register_default_modules
     register_default_modules()
 
@@ -131,6 +128,10 @@ async def lifespan(app: FastAPI):
     container = AppContainer.build(supabase_client=supabase_client, cfg=_cfg, hooks=get_hooks())
     app.state.container = container
     set_container(container)
+    # The lifespan always builds the composition root, and with it PEARL runs on task
+    # outcomes (PatternService): the legacy user_tasks detectors (memory/pearl.py) are
+    # not registered. Their callers (the deprecated v1 routes) use them only without a
+    # composition root (tests, scripts). Retired in the next plan.
     if supabase_client is not None:
         print(" ✅ Repositories: Supabase")
 

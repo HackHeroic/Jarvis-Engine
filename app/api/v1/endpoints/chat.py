@@ -6,7 +6,7 @@ import json as json_mod
 import re
 import time as time_mod
 from collections.abc import AsyncGenerator
-from typing import Optional
+from typing import Any, Optional
 
 import anyio
 from fastapi import APIRouter, Request
@@ -1024,14 +1024,18 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
 
     DEPRECATED (2026-08-08): superseded by POST /api/v1/drafts/{draft_id}/accept.
 
-    Answers 503 unless the tasks are verifiably in ``user_tasks``. This route is
-    the only thing between an accepted plan and the database on the no-draft
-    path, and ``_persist_fused_tasks`` swallows its own exceptions — so its
-    return value (a freshly minted plan_id, or None) plus a read-back of the
-    rows carrying that plan_id is the only honest evidence available. Same duty,
-    same verification helper, as ``accept_draft_and_persist``.
+    With the composition root (always, in the app) the plan is stored as a draft and
+    accepted through ``DraftService`` like every other plan (``_accept_as_a_draft``):
+    one atomic write, its slots recorded, other open drafts superseded, times gone
+    by moved first; a task id a finished task holds is 409.
+
+    Without one (tests, scripts) the legacy write: answers 503 unless the tasks are
+    verifiably in ``user_tasks``. ``_persist_fused_tasks`` swallows its own
+    exceptions, so its return value (a freshly minted plan_id, or None) plus a
+    read-back of the rows carrying that plan_id is the only honest evidence available.
     """
     logger.warning("DEPRECATED endpoint hit — migrate caller to /api/v1/drafts/{draft_id}/accept")
+    from app.api.deps import container_of
     from app.api.v1.endpoints.reasoning import TaskChunk
     from app.services.analytical.control_policy import _persist_fused_tasks
     from app.services.draft_actions import _count_persisted
@@ -1056,6 +1060,9 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
         {**chunk.model_dump(), "goal_id": raw.get("goal_id")}
         for chunk, raw in zip(task_chunks, request.tasks)
     ]
+    container = container_of(http_request)
+    if container is not None:
+        return await _accept_as_a_draft(container, request, chunks, supabase)
     plan_id = _persist_fused_tasks(
         request.user_id, chunks, supabase,
         schedule=request.schedule.get("schedule") if request.schedule else None,
@@ -1078,12 +1085,11 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
         return _persist_failed()
 
     # Fire-and-forget: detect behavioral patterns from task history — only without the
-    # composition root. With it, PEARL runs on task outcomes (PatternService); the
-    # legacy detectors read user_tasks and would bring back a pattern the user dismissed.
-    from app.api.deps import container_of
-
+    # composition root (this path). With it, PEARL runs on task outcomes
+    # (PatternService); the legacy detectors read user_tasks and would bring back a
+    # pattern the user dismissed.
     memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store and container_of(http_request) is None:
+    if memory_store:
         from app.services.memory.pearl import detect_patterns
         _sb = getattr(db_client, "supabase", db_client) if db_client else None
         if _sb:
@@ -1092,6 +1098,46 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
             ))
 
     return {"status": "accepted", "task_count": len(task_chunks)}
+
+
+async def _accept_as_a_draft(
+    container: Any, request: AcceptScheduleRequest, chunks: list[dict], supabase: Any
+) -> Any:
+    """Accept the posted plan the one way plans are accepted: as a draft, through
+    ``DraftService`` (``accept_on_time``). Its slots are recorded as scheduled, the
+    user's other open drafts (a morning brief) are superseded, and a time already gone
+    by is moved first. A task id a finished task holds is 409; an outage, 503
+    ``{"status": "failed"}`` as before; nothing schedulable, the parse-error shape."""
+    from app.domain import errors
+    from app.services.draft_actions import MOVED_ON_ACCEPT, accept_on_time
+
+    schedule = request.schedule.get("schedule") if request.schedule else None
+    try:
+        draft = await container.repos.drafts.create(
+            request.user_id,
+            tasks=chunks,
+            horizon_start=request.horizon_start,
+            goal_id=(request.goal_metadata or {}).get("goal_id"),
+            schedule=schedule,
+        )
+        outcome = await accept_on_time(
+            container.draft_service, request.user_id, draft.id, supabase=supabase
+        )
+    except errors.PersistenceError:
+        logger.error(f"accept-schedule for {request.user_id} did not land — reporting failure")
+        return _persist_failed()
+    except errors.ValidationError:
+        return {
+            "status": "error",
+            "message": "Invalid tasks: some tasks are not in the expected shape.",
+            "task_count": 0,
+        }
+    return {
+        "status": "accepted",
+        "task_count": outcome.written,
+        "draft_id": draft.id,
+        "message": MOVED_ON_ACCEPT if outcome.moved else None,
+    }
 
 
 class ModifyScheduleRequest(BaseModel):

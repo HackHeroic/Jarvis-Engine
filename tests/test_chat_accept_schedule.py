@@ -45,9 +45,13 @@ def client():
 
     original_db = getattr(app.state, "db_client", _UNSET)
     original_memory = getattr(app.state, "memory_store", _UNSET)
+    original_container = getattr(app.state, "container", _UNSET)
 
     supabase = FakeSupabase()
     app.state.db_client = FakeDBClient(supabase)
+    # No composition root: the legacy write path (tests and scripts only; the app's
+    # lifespan always builds one, see the ``wired`` fixture below).
+    app.state.container = None
     # detect_patterns is fire-and-forget on the success path; leaving a real
     # store wired would spawn a background task this test never awaits.
     app.state.memory_store = None
@@ -55,7 +59,10 @@ def client():
 
     yield TestClient(app)
 
-    for name, original in (("db_client", original_db), ("memory_store", original_memory)):
+    for name, original in (
+        ("db_client", original_db), ("memory_store", original_memory),
+        ("container", original_container),
+    ):
         if original is _UNSET:
             delattr(app.state, name)
         else:
@@ -244,3 +251,70 @@ async def test_accept_schedule__composition_root_registered__legacy_pearl_never_
 @pytest.mark.asyncio
 async def test_accept_schedule__no_composition_root__legacy_pearl_still_runs(monkeypatch):
     assert await _accept_directly(monkeypatch, with_container=False) == ["test_user"]
+
+
+# --- with the composition root: the one accept path (DraftService) --------------------
+
+
+@pytest.fixture
+def wired(client):
+    """The app as the lifespan builds it: a composition root over the same database."""
+    import app.core.config as config
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder
+
+    original = getattr(client.app.state, "container", _UNSET)
+    container = AppContainer.build(
+        supabase_client=client.app.state._test_supabase, cfg=config, hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(), install_chain=False,
+    )
+    client.app.state.container = container
+    yield client, container
+    if original is _UNSET:
+        delattr(client.app.state, "container")
+    else:
+        client.app.state.container = original
+
+
+SLOTTED = {
+    "horizon_start": "2099-01-05T08:00:00+05:30",
+    "schedule": {"schedule": {
+        "goal_task_1": {"start_min": 60, "end_min": 85},
+        "goal_task_2": {"start_min": 120, "end_min": 140},
+    }},
+}
+
+
+@pytest.mark.asyncio
+async def test_accept_schedule__container__through_draft_service_slots_recorded_brief_superseded(
+    wired,
+):
+    client, container = wired
+    brief = await container.repos.drafts.create(
+        "test_user", tasks=[{"task_id": "brief_t1", "title": "x"}], horizon_start=None,
+        goal_id=None, schedule=None,
+    )
+
+    resp = _post(client, **SLOTTED)
+
+    assert resp.status_code == 200
+    assert (resp.json()["status"], resp.json()["task_count"]) == ("accepted", 2)
+    assert {r["task_id"] for r in _rows(client)} == {"goal_task_1", "goal_task_2"}
+    scheduled = client.app.state._test_supabase.rows.get("task_events", [])
+    assert sorted(e["task_id"] for e in scheduled if e["event_type"] == "scheduled") == [
+        "goal_task_1", "goal_task_2",
+    ]
+    assert (await container.repos.drafts.get("test_user", brief.id)).status.value == "superseded"
+
+
+def test_accept_schedule__container__id_held_by_a_finished_task__409_and_nothing_deleted(wired):
+    client, _container = wired
+    finished = {**_STILL_PENDING, "task_id": "goal_task_1", "status": "completed"}
+    client.app.state._test_supabase.rows["user_tasks"] = [finished, dict(_STILL_PENDING)]
+
+    resp = _post(client)
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "conflict"
+    assert _rows(client) == [finished, _STILL_PENDING]
