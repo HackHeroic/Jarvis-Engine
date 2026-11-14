@@ -38,6 +38,10 @@ from app.domain.entities import (
 
 # --- Repositories -----------------------------------------------------------
 
+# The most tasks one read by status returns: the newest, so a bound (or PostgREST's
+# 1000-row cap) only ever leaves out the oldest.
+TASK_LIST_LIMIT = 500
+
 
 class TaskRepository(ABC):
     """Storage for the user's committed tasks."""
@@ -45,6 +49,13 @@ class TaskRepository(ABC):
     @abstractmethod
     async def list_pending(self, user_id: str) -> list[Task]:
         """Return the user's tasks whose status is PENDING."""
+
+    @abstractmethod
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        """Return the user's newest TASK_LIST_LIMIT tasks in ``statuses``, newest first.
+
+        A legacy stored status counts as the status it reads as. No statuses, no tasks.
+        """
 
     @abstractmethod
     async def get(self, user_id: str, task_id: str) -> Task | None:
@@ -371,6 +382,22 @@ class Sweep(ABC):
         """Sweep each user as of ``now``; return items changed.
 
         One user's failure is logged, never raised: the other users are still swept.
+        """
+
+
+# --- Planning ---------------------------------------------------------------
+
+
+class DraftPlanner(ABC):
+    """Redrafts the user's plan from the tasks they already have, for them to review."""
+
+    @abstractmethod
+    async def replan(self, user_id: str, *, reslot_task_ids: list[str]) -> DraftSchedule | None:
+        """Draft the user's pending tasks, plus the set-aside ones in ``reslot_task_ids``.
+
+        Returns the stored draft, or None when there is nothing to plan (or nothing
+        could be proposed). Raises ScheduleInfeasibleError when nothing fits even in
+        30 days. Never breaks a goal into new tasks.
         """
 
 

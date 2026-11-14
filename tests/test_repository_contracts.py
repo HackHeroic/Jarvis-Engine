@@ -320,6 +320,37 @@ async def test_tasks__legacy_pacing_pushed__reads_as_skipped_and_matches_expecte
     assert done.status is TaskStatus.COMPLETED
 
 
+@pytest.mark.asyncio
+async def test_tasks__list_by_status__filters_and_isolates(repos):
+    await _seed_tasks(repos, U1, [_row("old_missed", status="missed")])
+    await _seed_tasks(
+        repos,
+        U1,
+        [
+            _row("pending"),
+            _row("done", status="completed"),
+            _row("new_missed", status="missed"),
+            _row("pushed", status="pacing_pushed"),
+        ],
+    )
+    await _seed_tasks(repos, U2, [_row("theirs", status="missed")])
+
+    missed = await repos.tasks.list_by_status(U1, frozenset({TaskStatus.MISSED}))
+    either = await repos.tasks.list_by_status(
+        U1, frozenset({TaskStatus.PENDING, TaskStatus.MISSED})
+    )
+    skipped = await repos.tasks.list_by_status(U1, frozenset({TaskStatus.SKIPPED}))
+
+    assert [t.task_id for t in missed] == ["new_missed", "old_missed"]  # newest first
+    assert {t.task_id for t in either} == {"pending", "new_missed", "old_missed"}
+    assert [t.task_id for t in skipped] == ["pushed"]  # a legacy status reads as its meaning
+    assert all(t.user_id == U1 for t in either)
+    assert await repos.tasks.list_by_status(U1, frozenset()) == []
+    assert [t.task_id for t in await repos.tasks.list_by_status(
+        U2, frozenset({TaskStatus.MISSED})
+    )] == ["theirs"]
+
+
 # --- Task events -------------------------------------------------------------
 
 

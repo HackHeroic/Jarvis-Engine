@@ -8,10 +8,12 @@ error type, timeouts, retries, the PreCloudLLM (PII) gate on every cloud send, a
 usage metering.
 """
 
+import asyncio
 import contextvars
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import aclosing, nullcontext
+from contextlib import aclosing, asynccontextmanager, nullcontext
 from enum import Enum
 from types import ModuleType
 from typing import Any, Optional
@@ -189,6 +191,57 @@ MODEL_ROUTING: dict[str, ModelRole] = {
 }
 
 
+# --- one PRIMARY call at a time ---------------------------------------------------
+# The heavy local model fits in unified memory once: two PRIMARY-role calls at the same
+# time OOM or queue-block LM Studio. A planning turn can make one and, since the
+# anticipation scheduler, so can a background trigger, so every PRIMARY-role call holds
+# this lock for the whole call. FAST and CLOUD calls never touch it. An asyncio.Lock
+# belongs to one event loop; the server runs one, so in practice this is one
+# process-wide lock. A script or test that starts a new loop gets that loop's own lock.
+_primary_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary()
+)
+# The hold the current context is inside, if any, and the holds still in progress. A
+# PRIMARY call made from inside one (in the same task, or in a task started from it,
+# which copies the context) runs under the outer hold instead of waiting for a lock its
+# own caller holds: no deadlock. Once the outer call ends its hold is no longer in
+# progress, so a task it left running waits for the lock like anyone else.
+_primary_hold: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "primary_hold", default=None
+)
+_holds_in_progress: set[object] = set()
+
+
+def _primary_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _primary_locks.get(loop)
+    if lock is None:
+        lock = _primary_locks[loop] = asyncio.Lock()
+    return lock
+
+
+@asynccontextmanager
+async def _one_primary_call(role: ModelRole) -> AsyncIterator[None]:
+    """Hold the PRIMARY lock around a PRIMARY-role call; anything else passes straight through.
+
+    Released however the call ends: an error, a timeout or a cancellation (``async
+    with`` releases on every exit, and a waiter cancelled before it got the lock never
+    holds it).
+    """
+    if role is not ModelRole.PRIMARY or _primary_hold.get() in _holds_in_progress:
+        yield
+        return
+    async with _primary_lock():
+        hold = object()
+        _holds_in_progress.add(hold)
+        token = _primary_hold.set(hold)
+        try:
+            yield
+        finally:
+            _primary_hold.reset(token)
+            _holds_in_progress.discard(hold)
+
+
 async def _replay(
     head: tuple[tuple[str, str], ...], rest: AsyncIterator[tuple[str, str]]
 ) -> AsyncIterator[tuple[str, str]]:
@@ -246,6 +299,11 @@ async def route_llm_call(
     The request carries the user and session ``attribute_llm_calls`` set for this
     context, so the usage ledger knows whom the call was for.
 
+    A PRIMARY-role call waits for any other PRIMARY-role call in flight to finish
+    (one heavy-model call at a time); FAST and CLOUD calls never wait. PRIMARY tasks
+    are structured and never stream: ``stream=True`` on one is a ValueError, since the
+    lock could not cover a stream that outlives the call.
+
     Raises ``RuntimeError`` when every reachable provider failed and no cloud
     provider is configured, and ``LLMUnavailableError`` when cloud ones failed too.
     """
@@ -253,6 +311,8 @@ async def route_llm_call(
         raise ValueError("route_llm_call: stream=True cannot be combined with response_schema")
 
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
+    if stream and role is ModelRole.PRIMARY:
+        raise ValueError(f"route_llm_call: PRIMARY-role task {task!r} cannot stream")
     skip_local = (
         role == ModelRole.CLOUD
         or bool(force_cloud)
@@ -278,7 +338,8 @@ async def route_llm_call(
         with gate:
             if stream:
                 return await _open_stream(chain, req, skip_local)
-            return await chain.complete(req, skip_local=skip_local)
+            async with _one_primary_call(role):
+                return await chain.complete(req, skip_local=skip_local)
     except LLMUnavailableError as exc:
         if not chain.has_available(LLMLocation.CLOUD):
             raise RuntimeError(f"Local LLM failed for {task} and no GEMINI_API_KEY set") from exc

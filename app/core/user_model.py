@@ -95,6 +95,24 @@ class UserModel:
                 self._cache["pending_tasks"] = result.data
             return self._cache["pending_tasks"]
 
+    async def get_missed_tasks(self) -> list[dict]:
+        """The user's set-aside (missed) tasks, newest first, at most TASK_LIST_LIMIT."""
+        from app.domain.ports import TASK_LIST_LIMIT
+
+        async with self._get_lock("missed_tasks"):
+            if "missed_tasks" not in self._cache:
+                result = await asyncio.to_thread(
+                    lambda: self._db.supabase.table("user_tasks")
+                    .select("*")
+                    .eq("user_id", self._user_id)
+                    .eq("status", "missed")
+                    .order("created_at", desc=True)
+                    .limit(TASK_LIST_LIMIT)
+                    .execute()
+                )
+                self._cache["missed_tasks"] = result.data
+            return self._cache["missed_tasks"]
+
     async def get_all_tasks(self) -> list[dict]:
         """All tasks (any status) for progress tracking."""
         async with self._get_lock("all_tasks"):

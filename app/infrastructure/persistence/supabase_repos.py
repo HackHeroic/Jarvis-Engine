@@ -34,6 +34,7 @@ from app.domain.entities import (
     UserProfile,
 )
 from app.domain.ports import (
+    TASK_LIST_LIMIT,
     ConstraintRepository,
     DraftRepository,
     MemoryMatch,
@@ -153,6 +154,20 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
             .eq("user_id", user_id)
             .eq("status", TaskStatus.PENDING.value)
             .order("created_at")
+        )
+        return [_read_task(r) for r in rows]
+
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        values = sorted({v for status in statuses for v in task_status_values(TaskStatus(status))})
+        if not values:
+            return []
+        rows = await self._run(
+            lambda q: q.select("*")
+            .eq("user_id", user_id)
+            .in_("status", values)
+            # Newest first: whatever the bound leaves out is the oldest.
+            .order("created_at", desc=True)
+            .limit(TASK_LIST_LIMIT)
         )
         return [_read_task(r) for r in rows]
 

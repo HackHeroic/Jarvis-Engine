@@ -83,6 +83,9 @@ class _DelegatingTasks(TaskRepository):
     async def list_pending(self, user_id):
         return await self._inner.list_pending(user_id)
 
+    async def list_by_status(self, user_id, statuses):
+        return await self._inner.list_by_status(user_id, statuses)
+
     async def get(self, user_id, task_id):
         return await self._inner.get(user_id, task_id)
 
