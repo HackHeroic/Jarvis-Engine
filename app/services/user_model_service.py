@@ -33,7 +33,7 @@ from app.domain.entities import (
     TaskEventType,
     UserProfile,
 )
-import app.core.config as config
+from app.core.settings import FocusSettings, default_settings
 from app.domain.ports import (
     ConstraintRepository,
     EnergyEstimator,
@@ -177,6 +177,7 @@ class UserModelService:
         task_events: TaskEventRepository,
         *,
         clock: Callable[[], datetime] = utc_now,
+        settings: FocusSettings | None = None,
     ) -> None:
         self._task_events = task_events
         self._profiles = profiles
@@ -186,6 +187,7 @@ class UserModelService:
         self._energy = energy
         self._usage = usage
         self._clock = clock
+        self._settings = settings or default_settings().focus
 
     async def snapshot(self, user_id: str) -> YouView:
         """The You page for ``user_id``: PEARL looks first, then every section is read.
@@ -200,14 +202,14 @@ class UserModelService:
         propagates (PersistenceError): an outage is never an empty page.
         """
         now = self._clock()
-        history_days = max(config.FOCUS_WINDOW_DAYS, STREAK_WINDOW_DAYS)
+        history_days = max(self._settings.window_days, STREAK_WINDOW_DAYS)
         profile, history = await asyncio.gather(
             self._profiles.get_or_create(user_id),
             self._task_events.list_for_user(
                 user_id, since=now - timedelta(days=history_days), types=set(SLOT_OUTCOMES)
             ),
         )
-        focus_since = now - timedelta(days=config.FOCUS_WINDOW_DAYS)
+        focus_since = now - timedelta(days=self._settings.window_days)
         events = [e for e in history if as_aware(e.occurred_at) >= focus_since]
         zone = user_zone(profile)
         since = now - timedelta(days=RECEIPT_WINDOW_DAYS)

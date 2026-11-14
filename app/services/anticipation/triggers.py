@@ -14,7 +14,7 @@ from datetime import date, datetime, time, timedelta
 from typing import ClassVar
 from zoneinfo import ZoneInfo
 
-import app.core.config as config
+from app.core.settings import AnticipationSettings, default_settings
 from app.core.model_router import attribute_llm_calls
 from app.domain import errors
 from app.domain.anticipation import SuggestionDraft, Trigger, TriggerContext, clock_hours
@@ -106,6 +106,7 @@ class MorningBriefTrigger(Trigger):
         actions: ActionFactory,
         *,
         suggestions: SuggestionRepository,
+        settings: AnticipationSettings | None = None,
     ) -> None:
         self._tasks = tasks
         self._task_events = task_events
@@ -114,12 +115,13 @@ class MorningBriefTrigger(Trigger):
         self._patterns = patterns
         self._actions = actions
         self._suggestions = suggestions
+        self._settings = settings or default_settings().anticipation
 
     async def should_fire(self, ctx: TriggerContext) -> bool:
-        """From the user's wake time, for MORNING_BRIEF_WINDOW_HOURS, on their clock."""
+        """From the user's wake time, for ``morning_brief_window_hours``, on their clock."""
         zone = ZoneInfo(ctx.profile.timezone)
         wake = datetime.combine(ctx.local_day, ctx.profile.wake_time, tzinfo=zone)
-        window = timedelta(hours=config.MORNING_BRIEF_WINDOW_HOURS)
+        window = timedelta(hours=self._settings.morning_brief_window_hours)
         return wake <= ctx.now.astimezone(zone) < wake + window
 
     async def gather(self, ctx: TriggerContext) -> _Brief | None:

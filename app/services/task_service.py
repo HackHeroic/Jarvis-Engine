@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar
 
-import app.core.config as config
+from app.core.settings import TaskSettings, default_settings
 from app.domain import errors
 from app.domain.clock import utc_now  # noqa: F401  (re-exported: older imports use it here)
 from app.domain.entities import Task, TaskEvent, TaskEventType, TaskStatus
@@ -98,11 +98,13 @@ class TaskService:
         bus: EventBus,
         *,
         clock: Callable[[], datetime] = utc_now,
+        settings: TaskSettings | None = None,
     ) -> None:
         self._tasks = tasks
         self._events = task_events
         self._bus = bus
         self._clock = clock
+        self._settings = settings or default_settings().tasks
 
     async def complete(
         self,
@@ -168,16 +170,16 @@ class TaskService:
     async def sweep_passed_slots(self, user_id: str, now: datetime) -> list[TaskEvent]:
         """Mark missed each pending task whose slot passed with no outcome; return the events.
 
-        A slot has passed once ``scheduled_end + SLOT_GRACE_MINUTES <= now``, compared as
-        instants (never by date, so a slot just after the user's local midnight is no
-        different). Slots that started up to ``SLOT_SWEEP_LOOKBACK_DAYS`` ago are
-        considered. A completed, skipped or missed event recorded since the slot began
+        A slot has passed once ``scheduled_end`` plus the grace (``slot_grace_minutes``) is
+        not after ``now``, compared as instants (never by date, so a slot just after the
+        user's local midnight is no different). Slots that started up to
+        ``sweep_lookback_days`` ago are considered. A completed, skipped or missed event recorded since the slot began
         leaves the task alone. A task that changes under the sweep is left for the next pass,
         and one re-slotted meanwhile (an accept wrote it again, in a new slot) is never
         marked: the compare-and-set holds the slot the sweep read as well as the status.
         """
-        lookback = timedelta(days=config.SLOT_SWEEP_LOOKBACK_DAYS)
-        grace = timedelta(minutes=config.SLOT_GRACE_MINUTES)
+        lookback = timedelta(days=self._settings.sweep_lookback_days)
+        grace = timedelta(minutes=self._settings.slot_grace_minutes)
         passed = [
             task
             for task in await self._tasks.list_scheduled_between(user_id, now - lookback, now)

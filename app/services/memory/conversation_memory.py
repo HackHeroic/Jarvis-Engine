@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
-import app.core.config as config
+from app.core.settings import ConversationSettings, default_settings
 from app.core.model_router import attribute_llm_calls, route_llm_call
 from app.domain.clock import utc_now
 from app.domain.entities import ChatMessage, ConversationSession
@@ -129,24 +129,25 @@ class HistoryWindow(BaseModel):
     )
 
 
-def _cut(text: str) -> str:
-    """``text`` at most HISTORY_MAX_CHARS_PER_MESSAGE characters; a cut one ends in '…'."""
-    limit = config.HISTORY_MAX_CHARS_PER_MESSAGE
+def _cut(text: str, limit: int) -> str:
+    """``text`` at most ``limit`` characters (``history_max_chars_per_message``); a cut
+    one ends in '…'."""
     return text if len(text) <= limit else text[: limit - 1] + _CUT_MARK
 
 
-def _transcript_line(message: ChatMessage) -> str:
+def _transcript_line(message: ChatMessage, limit: int) -> str:
     label = _ROLE_LABEL.get(message.role, "Note")
-    return f"{label}: {as_data(_cut(' '.join(message.content.split())))}"
+    return f"{label}: {as_data(_cut(' '.join(message.content.split()), limit))}"
 
 
-def _within_chars(messages: list[ChatMessage], budget: int) -> list[ChatMessage]:
-    """The first messages, in order, whose transcript lines fit ``budget`` characters;
-    at least one. Never skips one: a summary must cover a run of messages, no gaps."""
+def _within_chars(messages: list[ChatMessage], budget: int, limit: int) -> list[ChatMessage]:
+    """The first messages, in order, whose transcript lines (each cut to ``limit``) fit
+    ``budget`` characters; at least one. Never skips one: a summary must cover a run of
+    messages, no gaps."""
     taken: list[ChatMessage] = []
     used = 0
     for message in messages:
-        cost = len(_transcript_line(message)) + (1 if taken else 0)
+        cost = len(_transcript_line(message, limit)) + (1 if taken else 0)
         if taken and used + cost > budget:
             break
         taken.append(message)
@@ -154,8 +155,8 @@ def _within_chars(messages: list[ChatMessage], budget: int) -> list[ChatMessage]
     return taken
 
 
-def _summary_prompt(old_summary: str, messages: list[ChatMessage]) -> str:
-    transcript = "\n".join(_transcript_line(m) for m in messages)
+def _summary_prompt(old_summary: str, messages: list[ChatMessage], limit: int) -> str:
+    transcript = "\n".join(_transcript_line(m, limit) for m in messages)
     return (
         f"<summary_so_far>\n{as_data(old_summary) or '(none yet)'}\n</summary_so_far>\n"
         f"<messages>\n{transcript}\n</messages>"
@@ -196,12 +197,14 @@ class ConversationMemoryService:
         clock: Callable[[], datetime] = utc_now,
         memory: MemoryService | None = None,
         suggestions: SuggestionRepository | None = None,
+        settings: ConversationSettings | None = None,
     ) -> None:
         """``memory`` checks summaries against what the user let go of, and counts new
         patterns; ``suggestions`` counts the suggestions waiting. Without them, only the
         blame check, and no such counts."""
         self._conversations = conversations
         self._clock = clock
+        self._settings = settings or default_settings().conversation
         self._filter = SummaryFilter(memory)
         self._since = SinceLastSpoke(
             conversations, task_events, self._filter,
@@ -238,13 +241,16 @@ class ConversationMemoryService:
         """
         session = await self._conversations.get_session(user_id, session_id)
         through = session.summary_through if session is not None else None
-        rows = await self._conversations.messages(
-            user_id, session_id, after=through, limit=config.HISTORY_MAX_MESSAGES + 1
+        window, max_chars = (
+            self._settings.history_max_messages, self._settings.history_max_chars_per_message
         )
-        overflow = len(rows) > config.HISTORY_MAX_MESSAGES
+        rows = await self._conversations.messages(
+            user_id, session_id, after=through, limit=window + 1
+        )
+        overflow = len(rows) > window
         history = [
-            {"role": m.role, "content": _cut(m.content)}
-            for m in rows[-config.HISTORY_MAX_MESSAGES :]
+            {"role": m.role, "content": _cut(m.content, max_chars)}
+            for m in rows[-window:]
             if m.role in _ROLE_LABEL
         ]
         summarized = bool(session is not None and session.summary and through is not None)
@@ -273,7 +279,7 @@ class ConversationMemoryService:
         known = await let_go_ids() if let_go_ids is not None else None
         clean = await self._filter.clean(user_id, session.summary or "", let_go_ids=known)
         body = (
-            fit(clean.sentences, clean.threads, frame, config.CONVERSATION_SUMMARY_TOKENS)
+            fit(clean.sentences, clean.threads, frame, self._settings.summary_tokens)
             if clean is not None
             else ""
         )
@@ -341,9 +347,10 @@ class ConversationMemoryService:
                 default=None,
             )
             newest = await self._conversations.messages(
-                user_id, session_id, after=through, limit=config.COMPACT_AFTER_MESSAGES + 1
+                user_id, session_id, after=through,
+                limit=self._settings.compact_after_messages + 1,
             )
-            keep = config.COMPACT_KEEP_RECENT
+            keep = self._settings.compact_keep_recent
             if idle:
                 if len(newest) < 2:
                     return "nothing"
@@ -355,7 +362,7 @@ class ConversationMemoryService:
                     else through or min(session.created_at, newest[0].created_at - _JUST_BEFORE)
                 )
             else:
-                if len(newest) <= config.COMPACT_AFTER_MESSAGES:
+                if len(newest) <= self._settings.compact_after_messages:
                     return "nothing"
                 stop = newest[-keep].created_at  # the oldest message kept word for word
                 cap = None
@@ -363,12 +370,13 @@ class ConversationMemoryService:
                 user_id,
                 session_id,
                 after=covered_to,
-                limit=config.SUMMARY_PAGE_MESSAGES,
+                limit=self._settings.summary_page_messages,
                 oldest_first=True,
             )
             covered = _within_chars(
                 [m for m in page if stop is None or m.created_at < stop],
-                config.SUMMARY_INPUT_MAX_CHARS,
+                self._settings.summary_input_max_chars,
+                self._settings.history_max_chars_per_message,
             )
             if not covered:
                 if idle or old is None:
@@ -384,7 +392,10 @@ class ConversationMemoryService:
                 result = await self._write_summary(
                     user_id,
                     session_id,
-                    _summary_prompt(summary_text(old.sentences, old.threads), covered),
+                    _summary_prompt(
+                        summary_text(old.sentences, old.threads), covered,
+                        self._settings.history_max_chars_per_message,
+                    ),
                 )
                 text = stored_summary(result)
                 checked = await self._filter.clean(user_id, text)
@@ -401,7 +412,8 @@ class ConversationMemoryService:
                     "Conversation summary not written (%s); its turns are unchanged",
                     type(exc).__name__,
                 )
-                self._retry_at[key] = now + timedelta(minutes=config.SUMMARY_RETRY_MINUTES)
+                retry = timedelta(minutes=self._settings.summary_retry_minutes)
+                self._retry_at[key] = now + retry
                 return "failed"
             self._retry_at.pop(key, None)
             if not written:  # another writer's summary already reaches further
@@ -542,9 +554,9 @@ class ConversationMemoryService:
         """
         scanned = self._scanned.get(user_id)
         if scanned is None or now - scanned >= timedelta(
-            hours=config.SESSION_SUMMARY_RESCAN_HOURS
+            hours=self._settings.summary_rescan_hours
         ):
-            since = now - timedelta(days=config.SESSION_SUMMARY_LOOKBACK_DAYS)
+            since = now - timedelta(days=self._settings.summary_lookback_days)
             for session in await self._conversations.recent_sessions(user_id, since=since):
                 if _idle_summary_due(session):
                     self._note_activity(user_id, session.id, session.updated_at)
@@ -552,7 +564,7 @@ class ConversationMemoryService:
         watched = self._active.get(user_id)
         if not watched:
             return 0
-        idle_before = now - timedelta(minutes=config.SESSION_IDLE_MINUTES)
+        idle_before = now - timedelta(minutes=self._settings.idle_minutes)
         summarized = 0
         for session_id, noticed in sorted(watched.items()):
             if noticed > idle_before:

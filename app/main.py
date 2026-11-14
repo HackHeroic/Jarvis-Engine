@@ -155,13 +155,14 @@ async def lifespan(app: FastAPI):
         container.anticipation,
         container.repos.profiles,
         container.sweeps,
-        tick_s=_cfg.ANTICIPATION_TICK_SECONDS,
+        settings=container.settings.anticipation,
     )
     app.state.anticipation_scheduler = anticipation_scheduler
     if _cfg.ANTICIPATION_ENABLED:
         anticipation_scheduler.start()
         print(
-            f" ✅ Anticipation scheduler started: a tick every {_cfg.ANTICIPATION_TICK_SECONDS}s"
+            " ✅ Anticipation scheduler started: a tick every"
+            f" {container.settings.anticipation.tick_seconds}s"
         )
     else:
         print("    Anticipation scheduler off (JARVIS_ANTICIPATION=false)")
