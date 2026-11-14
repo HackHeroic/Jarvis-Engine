@@ -492,19 +492,55 @@ async def test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds(rep
 
 
 @pytest.mark.asyncio
-async def test_drafts__accept_atomic__concurrent_task_edit__edit_is_not_lost(repos):
-    """An accept marks the draft ACCEPTED; it must not also write back stale tasks."""
+async def test_drafts__accept_atomic__concurrent_task_edit__edit_lands_first_or_is_refused(repos):
+    """An edit racing an accept either lands before it (and the accept does not write
+    stale tasks back over it) or is refused because the draft has closed."""
     draft = await _new_draft(repos)
     edited = [{"task_id": "g1_t9", "title": "Edited while accepting", "duration_minutes": 10}]
 
-    await asyncio.gather(
+    accepted, edit = await asyncio.gather(
         repos.drafts.accept_atomic(U1, draft.id, [_row("x")]),
         repos.drafts.replace_tasks(U1, draft.id, edited),
+        return_exceptions=True,
     )
 
+    assert accepted == 1
     stored = await repos.drafts.get(U1, draft.id)
     assert stored.status is DraftStatus.ACCEPTED
-    assert stored.tasks == edited
+    if isinstance(edit, BaseException):
+        assert isinstance(edit, errors.InvalidStateTransition)
+        assert stored.tasks == draft.tasks
+    else:
+        assert stored.tasks == edited
+
+
+@pytest.mark.asyncio
+async def test_drafts__replace_tasks__accepted_draft__raises_invalid_state_transition(repos):
+    draft = await _new_draft(repos)
+    await repos.drafts.accept_atomic(U1, draft.id, [_row("x")])
+
+    with pytest.raises(errors.InvalidStateTransition):
+        await repos.drafts.replace_tasks(U1, draft.id, [{"task_id": "g1_t9", "title": "Late edit"}])
+
+    assert (await repos.drafts.get(U1, draft.id)).tasks == draft.tasks
+
+
+@pytest.mark.asyncio
+async def test_drafts__accept_atomic__two_open_drafts__the_other_is_superseded(repos):
+    """Parity with the accept_draft SQL function: the accepted plan replaces the others."""
+    first = await _new_draft(repos)
+    second = await _new_draft(repos)
+    other_users = await repos.drafts.create(
+        U2, tasks=[], horizon_start=T0.isoformat(), goal_id="g1", schedule=None
+    )
+
+    await repos.drafts.accept_atomic(U1, first.id, [_row("x")])
+
+    assert (await repos.drafts.get(U1, second.id)).status is DraftStatus.SUPERSEDED
+    assert (await repos.drafts.get(U2, other_users.id)).status is DraftStatus.PENDING
+    with pytest.raises(errors.InvalidStateTransition):
+        await repos.drafts.accept_atomic(U1, second.id, [_row("y")])
+    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["x"]
 
 
 @pytest.mark.asyncio
@@ -813,6 +849,8 @@ async def test_supabase_drafts__accept_atomic__odd_rpc_payload__raises_persisten
         await repos.drafts.accept_atomic(U1, draft.id, [_row("x")])
 
     assert isinstance(info.value.__cause__, TypeError)
+    # The database answered; what it answered is unreadable. Not an outage.
+    assert info.value.message == "Stored data is not readable."
 
 
 @pytest.mark.asyncio

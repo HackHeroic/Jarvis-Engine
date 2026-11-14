@@ -44,6 +44,7 @@ from app.infrastructure.persistence._mapping import (
     accepted_task_rows,
     apply_profile_update,
     day_bounds,
+    draft_closed,
     new_draft,
     normalized,
     not_found,
@@ -216,6 +217,8 @@ class InMemoryDraftRepository(DraftRepository):
             i = self._index(user_id, draft_id)
             if i is None:
                 raise not_found("draft", draft_id)
+            if self._store.drafts[i].status not in OPEN_DRAFT_STATUSES:
+                raise draft_closed(draft_id, self._store.drafts[i].status)
             # model_copy assigns update values by reference: copy, or the caller keeps a handle.
             self._store.drafts[i] = self._store.drafts[i].model_copy(
                 update={"tasks": copy.deepcopy(tasks)}
@@ -278,6 +281,13 @@ class InMemoryDraftRepository(DraftRepository):
             self._store.drafts[i] = self._store.drafts[i].model_copy(
                 update={"status": DraftStatus.ACCEPTED}
             )
+            # As the accept_draft SQL function does: the accepted plan replaces
+            # every other plan the user had open.
+            for j, other in enumerate(self._store.drafts):
+                if other.user_id == user_id and j != i and other.status in OPEN_DRAFT_STATUSES:
+                    self._store.drafts[j] = other.model_copy(
+                        update={"status": DraftStatus.SUPERSEDED}
+                    )
             return len(new_tasks)
 
 

@@ -71,6 +71,15 @@ def not_found(what: str, entity_id: str) -> errors.NotFoundError:
     return errors.NotFoundError(f"That {what} does not exist.", details={f"{what}_id": entity_id})
 
 
+def draft_closed(draft_id: str, status: DraftStatus | str | None) -> errors.InvalidStateTransition:
+    """An edit aimed at a draft that is no longer open (accepted, rejected, superseded...)."""
+    status_value = getattr(status, "value", status)
+    return errors.InvalidStateTransition(
+        "This draft is no longer open, so it cannot be changed.",
+        details={"draft_id": draft_id, "from": status_value},
+    )
+
+
 def task_id_clash(draft_id: str) -> errors.ConflictError:
     """Accepting the draft would break user_tasks' UNIQUE (user_id, task_id).
 
