@@ -23,13 +23,23 @@ slot, because hours with no history keep the prior's high morning scores.
 
 No model is ever called. Times are on the demo user's clock (Asia/Kolkata).
 
-Usage, from the Jarvis-Engine directory:
-    .venv/bin/python scripts/seed_demo_user.py [--user demo] [--days 21] [--reset] [--dry-run]
+Usage, from the Jarvis-Engine directory, on the demo day, with the backend stopped:
+    .venv/bin/python scripts/seed_demo_user.py [--user demo] [--days 21] [--reset]
+        [--dry-run] [--base-url http://localhost:8000] [--allow-running-backend]
 
-It refuses any user but ``demo``. Without ``--reset`` a demo user who already has
-task events is left alone (exit 0). ``--reset`` first deletes the demo user's rows,
-every one scoped by user_id. ``--dry-run`` seeds an in-memory store with no network
-and prints the same report. Credentials come from .env and are never printed.
+It refuses any user but ``demo``, and refuses to run while a backend answers at
+``--base-url`` (its slot sweep runs on the real clock and would set half-seeded
+tasks aside; ``JARVIS_ANTICIPATION=false`` keeps it from starting). Before anything
+is deleted it warms the embedder and probes the schema the seed needs. A demo user
+who is already seeded is left alone (exit 0); a partial seed, or demo rows with no
+seeded history, is never merged into. ``--reset`` deletes the demo user's rows, every
+one scoped by user_id. After seeding, a self-check confirms the history is the seed's
+alone. ``--dry-run`` seeds an in-memory store with no network. Credentials come from
+.env and are never printed.
+
+Exit codes: 0 seeded or already seeded; 1 a partial seed, a failed self-check or a
+reset that left rows; 2 a refused user, an unmigrated database or no embedder
+(nothing deleted); 3 a backend is running.
 """
 
 import argparse
@@ -45,14 +55,23 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import httpx
+
 import app.core.config as config  # loads .env the way the app does
 from app.api.v1.endpoints.reasoning import TaskChunk
 from app.container import AppContainer
-from app.domain.entities import AutonomyMode, MemorySource, TaskEvent
+from app.domain.entities import (
+    AutonomyMode,
+    MemorySource,
+    MemoryStatus,
+    TaskEvent,
+    TaskEventType,
+)
 from app.domain.events import EventBus
 from app.domain.ports import (
     DraftRepository,
@@ -64,15 +83,19 @@ from app.infrastructure.embedding import MiniLMEmbedder
 from app.infrastructure.persistence.factory import Repositories
 from app.orchestrator.hooks import ActionHooks
 from app.services.draft_service import DraftService
+from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.memory_service import MemoryCandidate, MemoryService
 from app.services.memory.patterns import PatternService
 from app.services.planning.local_time import local_today
-from app.services.task_service import TaskService
+from app.services.task_service import SLOT_OUTCOMES, TaskService, as_aware
 
 DEMO_USER_ID = "demo"
 DEMO_TIMEZONE = "Asia/Kolkata"
 DEFAULT_DAYS = 21
+MIN_DAYS = 7  # fewer days than a week give the detectors too little to find
 SEED = 42
+DEFAULT_BASE_URL = "http://localhost:8000"  # where a running backend would answer
+BACKEND_PROBE_TIMEOUT_S = 1.0
 
 ACCEPT_AT = time(7, 30)  # each day's plan is accepted before the day starts
 CRUNCH_AT = time(8, 0)  # Friday morning: the week's OS chunks, one after another
@@ -100,6 +123,27 @@ _RESET_ORDER = (
     "user_memories",
     "user_profiles",
 )
+
+# Only the profile's cascade reaches these; the check after a reset reads them too.
+_CASCADE_ONLY = (
+    "goals",
+    "proactive_suggestions",
+    "behavioral_constraints",
+    "chat_messages",
+    "chat_sessions",
+)
+# The preflight's schema probes: what migrations 20261115000000-0004 add, as
+# (table, columns) the seed's own writes need.
+_SCHEMA_PROBES = (
+    ("task_events", "id,task_id,event_type,occurred_at,scheduled_start,scheduled_end,metadata"),
+    ("user_memories", "status,pattern_key,provenance,strength_as_of"),
+    ("proactive_suggestions", "consent_kind"),
+)
+# Bounds for "any scheduled task" in the already-seeded check.
+_ALL_TIME = (datetime(2000, 1, 1, tzinfo=timezone.utc), datetime(2100, 1, 1, tzinfo=timezone.utc))
+# An outcome stamped between the run's real start and end (give or take this) was
+# written on the real clock, not the seed's.
+_CLOCK_SLACK = timedelta(minutes=1)
 
 # (days before today, memory type, what the user said). Recent enough to stay above
 # the retention floor today, so the You page shows them.
@@ -199,6 +243,14 @@ _OS = _Routine(
     mix=((UNTOUCHED, 100),),
 )
 _ROUTINES = (_DSA, _LECTURES, _LAB, _PROJECT, _FLASHCARDS, _OS)
+
+
+class SeedProblem(Exception):
+    """Why the seed stopped, in words the operator can act on, and the exit code to return."""
+
+    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 class SimClock:
@@ -384,7 +436,11 @@ async def _accept_plan(
 async def _recorded(write: Awaitable[TaskEvent | None], task_id: str) -> None:
     """Await an outcome; one that wrote nothing means the history is not what was planned."""
     if await write is None:
-        raise RuntimeError(f"The seed's outcome for {task_id} was not recorded.")
+        raise SeedProblem(
+            f"The outcome for {task_id} could not be recorded: something else changed the"
+            " demo user's tasks while seeding (a running backend's slot sweep?). Stop it,"
+            " then rerun with --reset."
+        )
 
 
 def _outcomes(
@@ -500,35 +556,181 @@ async def run(
     today: date,
     zone: ZoneInfo,
 ) -> dict | None:
-    """Seed the user unless they already have history; the report, or None when left alone."""
+    """Seed the user, then check the history is what was planned; the report (with the
+    focus profile's ``learned_peak_hour``), or None when the user is already seeded and
+    is left alone.
+
+    Raises SeedProblem (exit 1) for a partial seed found before starting, an outcome
+    that could not be recorded, or a history that fails the self-check afterwards.
+    """
     _require_demo(user_id)
-    existing = await repos.task_events.list_for_user(user_id)
-    if existing:
-        print(f"{user_id} already seeded ({len(existing)} events) — pass --reset to rebuild")
+    if await _already_seeded(repos, user_id):
         return None
+    started = datetime.now(timezone.utc)
     clock = SimClock(datetime.combine(today - timedelta(days=days), time(0, 0), zone))
-    return await seed_history(
+    report = await seed_history(
         build_seed_services(repos, embedder, clock), user_id,
         days=days, today=today, zone=zone, rng=random.Random(SEED),
     )
+    problems = await _self_check(repos, user_id, report, today=today, zone=zone,
+                                 started=started)
+    if problems:
+        raise SeedProblem(
+            "The seeded history is not what was planned:\n"
+            + "".join(f"  - {problem}\n" for problem in problems)
+            + "Something else may have written to the demo user meanwhile (a running backend?)."
+            " Stop it, then rerun with --reset."
+        )
+    profile = await HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()).estimate(
+        user_id, zone, now=datetime.combine(today, time(0, 0), zone)
+    )
+    scores = profile.scores()
+    report["learned_peak_hour"] = max(range(len(scores)), key=lambda h: (scores[h], -h))
+    return report
+
+
+async def _closing_memory_exists(repos: Repositories, user_id: str) -> bool:
+    """Whether PEARL's closing look left a pattern memory, in any state: the seed's last write."""
+    patterns = await repos.memories.list(
+        user_id, statuses=frozenset(MemoryStatus), types=frozenset({"behavioral_pattern"})
+    )
+    return any(m.origin == "behavior" and m.pattern_key for m in patterns)
+
+
+async def _already_seeded(repos: Repositories, user_id: str) -> bool:
+    """True (and says so) when the user holds a whole seed. A partial one, or demo rows
+    with no seeded history, is a SeedProblem: never merged into, never seeded over."""
+    events = await repos.task_events.list_for_user(user_id)
+    if events and await _closing_memory_exists(repos, user_id):
+        print(f"{user_id} already seeded ({len(events)} events) — pass --reset to rebuild")
+        return True
+    tasks = {t.task_id for t in await repos.tasks.list_pending(user_id)}
+    tasks |= {t.task_id for t in await repos.tasks.list_scheduled_between(user_id, *_ALL_TIME)}
+    found = {
+        "task events": len(events),
+        "tasks": len(tasks),
+        "memories": len(await repos.memories.list(user_id, statuses=frozenset(MemoryStatus))),
+        "suggestions": len(await repos.suggestions.list(user_id)),
+    }
+    if any(found.values()):
+        what = ", ".join(f"{name}: {count}" for name, count in found.items() if count)
+        why = "no closing pattern memory" if events else "no seeded history"
+        raise SeedProblem(f"partial seed found — rerun with --reset ({what}; {why}).")
+    return False
+
+
+async def _self_check(
+    repos: Repositories, user_id: str, report: dict, *, today: date, zone: ZoneInfo,
+    started: datetime,
+) -> list[str]:
+    """What is off in the seeded history, in plain words; empty when it is as planned.
+
+    Every event happened before today (on the user's clock), and none at a real time
+    while this run was writing (``started`` until now: what a backend's sweep would
+    stamp); one scheduled event per seeded task; and PEARL's closing look left its
+    pattern memory.
+    """
+    midnight = datetime.combine(today, time(0, 0), zone)
+    while_seeding = (started - _CLOCK_SLACK, datetime.now(timezone.utc) + _CLOCK_SLACK)
+    events = await repos.task_events.list_for_user(user_id)
+    problems = []
+    late = [e for e in events if as_aware(e.occurred_at) >= midnight]
+    if late:
+        problems.append(f"{len(late)} event(s) dated today or later; the seed ends yesterday")
+    scheduled = sum(1 for e in events if e.event_type is TaskEventType.SCHEDULED)
+    if scheduled != report["tasks"]:
+        problems.append(f"{scheduled} scheduled events for {report['tasks']} seeded tasks")
+    on_the_real_clock = [
+        e for e in events
+        if e.event_type in SLOT_OUTCOMES
+        and while_seeding[0] <= as_aware(e.occurred_at) <= while_seeding[1]
+    ]
+    if on_the_real_clock:
+        problems.append(
+            f"{len(on_the_real_clock)} outcome(s) carry the real clock's time, not the seed's"
+        )
+    if not await _closing_memory_exists(repos, user_id):
+        problems.append("PEARL's closing pattern memory (origin 'behavior') is missing")
+    return problems
 
 
 def reset_user(client: Any, user_id: str) -> None:
     """Delete the demo user's rows: usage first, the profile last (its cascade takes the rest).
 
     Every delete is scoped by user_id. Raises ValueError for any other user, before
-    anything is touched, and RuntimeError if rows of the tables this script writes
-    are still there afterwards.
+    anything is touched. Afterwards no row of the user may be left in the tables
+    deleted here or in those only the cascade reaches; a SeedProblem lists any that is.
     """
     _require_demo(user_id)
     for table in _RESET_ORDER:
         client.table(table).delete().eq("user_id", user_id).execute()
     left = {
         table: len(client.table(table).select("user_id").eq("user_id", user_id).execute().data)
-        for table in _RESET_ORDER
+        for table in _RESET_ORDER + _CASCADE_ONLY
     }
     if any(left.values()):
-        raise RuntimeError(f"rows left behind after the reset: {left}")
+        rows = ", ".join(f"{table}: {count}" for table, count in left.items() if count)
+        raise SeedProblem(f"Rows of {user_id!r} were left behind after the reset ({rows}).")
+
+
+def _backend_answers(base_url: str) -> bool:
+    """Whether a backend answers at ``base_url``/health (any HTTP answer, healthy or not)."""
+    try:
+        httpx.get(f"{base_url.rstrip('/')}/health", timeout=BACKEND_PROBE_TIMEOUT_S,
+                  trust_env=False)
+    except httpx.HTTPError:
+        return False
+    return True
+
+
+def _error_text(exc: Exception) -> str:
+    """The text a database error carries: postgrest's APIError keeps it in attributes."""
+    return " ".join([str(exc), *(str(getattr(exc, a, "") or "") for a in ("message", "details"))])
+
+
+async def _preflight(
+    client: Any | None, repos: Repositories, embedder: TextEmbedder, user_id: str
+) -> None:
+    """Everything the seed needs, checked before anything is deleted or written.
+
+    The embedder is warmed (memories are embedded mid-seed). With a database, its
+    schema is probed: the tables and columns migrations 20261115000000-0004 add, and
+    the accept_draft and match_memories functions. Every probe reads only the user's
+    rows. A gap is a SeedProblem (exit 2).
+    """
+    try:
+        (vector,) = await asyncio.to_thread(embedder.embed, ["warm-up"])
+    except Exception as exc:
+        raise SeedProblem(
+            f"The text embedder is not working ({type(exc).__name__}), so memories cannot"
+            " be stored. Nothing was deleted.", exit_code=2,
+        ) from exc
+    if client is None:
+        return
+    missing = []
+    for table, columns in _SCHEMA_PROBES:
+        try:
+            client.table(table).select(columns).eq("user_id", user_id).limit(1).execute()
+        except Exception:
+            missing.append(f"{table} ({columns})")
+    try:  # a draft that cannot exist: the function answers DRAFT_NOT_FOUND, writing nothing
+        client.rpc("accept_draft", {"p_draft_id": str(uuid4()), "p_user_id": user_id,
+                                    "p_rows": []}).execute()
+    except Exception as exc:
+        if "DRAFT_NOT_FOUND" not in _error_text(exc):
+            missing.append("function accept_draft")
+    try:
+        await repos.memories.nearest(
+            user_id, vector, statuses=frozenset({MemoryStatus.ACTIVE}), limit=1
+        )
+    except Exception:
+        missing.append("function match_memories")
+    if missing:
+        raise SeedProblem(
+            f"The database lacks what the seed needs ({'; '.join(missing)}):"
+            " apply the migrations first (supabase/migrations through 20261115000004)."
+            " Nothing was deleted.", exit_code=2,
+        )
 
 
 def _connect() -> Any | None:
@@ -557,14 +759,44 @@ class _OfflineEmbedder(TextEmbedder):
         return vectors
 
 
+def _clock_hour(hour: int) -> str:
+    return f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'} ({hour:02d}:00)"
+
+
 def _format(report: dict) -> str:
     events = ", ".join(f"{kind} {count}" for kind, count in report["events_by_type"].items())
     return "\n".join([
         f"Seeded {DEMO_USER_ID}: {report['days']} days, {report['tasks']} tasks,"
         f" {report['memories']} memories",
         f"  events: {events}",
-        f"  patterns PEARL remembered: {', '.join(report['patterns']) or 'none'}",
     ])
+
+
+def _operator_note(report: dict, today: date) -> str:
+    """What the operator needs before the demo: how fresh it is and what the app will show."""
+    return "\n".join([
+        f"Seeded through yesterday ({today - timedelta(days=1):%a %d %b}).",
+        f"Patterns the detectors found: {', '.join(report['patterns']) or 'none'}.",
+        f"Learned peak hour: {_clock_hour(report['learned_peak_hour'])}.",
+        "Seed on the demo day; rerun with --reset to refresh.",
+    ])
+
+
+async def _seed_demo(args: argparse.Namespace, client: Any | None, embedder: TextEmbedder,
+                     zone: ZoneInfo) -> dict | None:
+    """Preflight, reset when asked, seed and check: the report, or None if already seeded."""
+    container = AppContainer.build(
+        supabase_client=client, cfg=config, hooks=ActionHooks(), embedder=embedder,
+        install_chain=False,
+    )
+    await _preflight(client, container.repos, embedder, args.user)
+    if args.reset and client is not None:
+        reset_user(client, args.user)
+        print(f"Deleted every row of {args.user!r}.")
+    return await run(
+        container.repos, embedder, args.user,
+        days=args.days, today=local_today(zone), zone=zone,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -574,38 +806,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reset", action="store_true", help="delete the demo user's rows first")
     parser.add_argument("--dry-run", action="store_true",
                         help="seed an in-memory store instead (no network)")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                        help="where a running backend would answer (its /health is probed)")
+    parser.add_argument("--allow-running-backend", action="store_true",
+                        help="seed even though a backend answers (its sweep may corrupt the seed)")
     args = parser.parse_args(argv)
 
     if args.user != DEMO_USER_ID:
         print(f"Refusing to touch user {args.user!r}: this script only seeds {DEMO_USER_ID!r}.")
         return 2
-    if not 1 <= args.days <= config.FOCUS_WINDOW_DAYS:
-        print(f"--days must be between 1 and {config.FOCUS_WINDOW_DAYS}.")
+    if not MIN_DAYS <= args.days <= config.FOCUS_WINDOW_DAYS:
+        print(f"--days must be between {MIN_DAYS} and {config.FOCUS_WINDOW_DAYS}.")
         return 2
 
     zone = ZoneInfo(DEMO_TIMEZONE)
-    if args.dry_run:
+    if args.dry_run:  # in memory: nothing a backend does can reach it
         client, embedder = None, _OfflineEmbedder()
     else:
+        if not args.allow_running_backend and _backend_answers(args.base_url):
+            print(
+                f"A Jarvis backend is answering at {args.base_url}. Its slot sweep runs every"
+                " minute on the real clock and would set half-seeded tasks aside. Stop it, or"
+                " restart it with JARVIS_ANTICIPATION=false, then run this again"
+                " (or pass --allow-running-backend)."
+            )
+            return 3
         client = _connect()
         if client is None:
             print("SUPABASE_URL / SUPABASE_SERVICE_KEY are not set in .env; nothing to seed.")
             return 1
         embedder = MiniLMEmbedder()
-        if args.reset:
-            reset_user(client, args.user)
-            print(f"Deleted every row of {args.user!r}.")
 
-    container = AppContainer.build(
-        supabase_client=client, cfg=config, hooks=ActionHooks(), embedder=embedder,
-        install_chain=False,
-    )
-    report = asyncio.run(run(
-        container.repos, container.embedder, args.user,
-        days=args.days, today=local_today(zone), zone=zone,
-    ))
+    try:
+        report = asyncio.run(_seed_demo(args, client, embedder, zone))
+    except SeedProblem as problem:
+        print(problem)
+        return problem.exit_code
     if report is not None:
         print(_format(report))
+        print(_operator_note(report, local_today(zone)))
     return 0
 
 
