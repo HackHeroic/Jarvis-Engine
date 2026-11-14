@@ -349,7 +349,12 @@ class UsageRepository(ABC):
 
     @abstractmethod
     async def summary(self, user_id: str, *, since: datetime | None = None) -> dict:
-        """Return local_calls, cloud_calls, input_tokens, output_tokens, pii_redactions totals."""
+        """Return local_calls, cloud_calls, input_tokens, output_tokens, pii_redactions totals.
+
+        Exact over every matching call, however many: a store that caps one read pages
+        past the cap. ``truncated`` is True only if a store stopped at its own read
+        bound, so the totals may be short; it is never silently short.
+        """
 
 
 # --- Background work --------------------------------------------------------

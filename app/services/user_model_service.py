@@ -2,17 +2,22 @@
 
 ``snapshot`` gathers the You page: the profile, the patterns PEARL sees in the outcome
 history (each with its evidence and the memory that holds it), the rules the user's
-plans respect, the memories in use, the focus profile and the privacy receipt. It runs
-PEARL's idempotent ``observe`` first, so every pattern shown has a memory the user can
-confirm or dismiss. A dismissed or forgotten pattern is never shown again.
+plans respect, the memories in use, the focus profile and the privacy receipt of the
+last RECEIPT_WINDOW_DAYS. It runs PEARL's idempotent ``observe`` first, so every
+pattern shown has a memory the user can confirm or dismiss. A dismissed or forgotten
+pattern is never shown again. A remembered pattern PEARL does not see now (its
+evidence aged out) is listed among the memories: it may still shape plans, so it
+stays visible and can be confirmed or dismissed.
 
-Evidence is reworded for the page: the history records "skipped" and "missed", the
-user reads "set aside" (both count as set aside for PEARL) and "done".
+Evidence reads in the user's terms: "set aside" (skipped and missed both count as set
+aside for PEARL) and "done". PEARL words it so; a line that still starts with a raw
+event type ("missed", "skipped") is reworded here, so none ever reaches the page.
 """
 
+import asyncio
 import functools
 from collections.abc import Callable
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Literal
 from zoneinfo import available_timezones
 
@@ -41,8 +46,10 @@ _EVIDENCE_WORDS = {
     TaskEventType.MISSED.value: "set aside",
     TaskEventType.DEADLINE_MISSED.value: "set aside",
 }
-# Patterns have their own section; their memories are not listed twice.
+# A pattern shown under "patterns" is not listed again among the memories.
 _PATTERN_MEMORY_TYPE = "behavioral_pattern"
+# The privacy receipt covers this many days back from the read; the response says so.
+RECEIPT_WINDOW_DAYS = 30
 
 
 @functools.cache
@@ -97,22 +104,28 @@ class RuleShown(BaseModel):
         description="'said': the user stated it. 'inferred': Jarvis noticed it."
     )
     created_at: datetime | None = Field(
-        default=None, description="When it was stored; null when the store does not say."
+        default=None, description="When it was stored; null for a rule older than the stamp."
     )
 
     @classmethod
     def of(cls, rule: BehavioralConstraint) -> "RuleShown":
-        return cls(id=rule.id, text=rule.raw_text, provenance=rule.source)
+        return cls(
+            id=rule.id, text=rule.raw_text, provenance=rule.source, created_at=rule.created_at
+        )
 
 
 class PrivacyReceipt(BaseModel):
-    """Where the user's language-model calls ran, all time."""
+    """Where the user's language-model calls ran, since ``since``."""
 
+    since: datetime = Field(description="Start of the window the counts cover; it ends now.")
+    truncated: bool = Field(
+        description="True if the store stopped at its read bound: the counts may be short."
+    )
     on_device_calls: int = Field(description="Calls answered on the device.")
     cloud_calls: int = Field(description="Calls sent to a cloud model.")
     pii_redactions: int = Field(description="Personal details redacted before a cloud send.")
-    input_tokens: int = Field(description="Prompt tokens, all calls.")
-    output_tokens: int = Field(description="Reply tokens, all calls.")
+    input_tokens: int = Field(description="Prompt tokens, all calls in the window.")
+    output_tokens: int = Field(description="Reply tokens, all calls in the window.")
 
 
 class YouView(BaseModel):
@@ -123,7 +136,10 @@ class YouView(BaseModel):
     patterns: list[PatternShown] = Field(description="Patterns seen now; dismissed ones never.")
     rules: list[RuleShown] = Field(description="Rules that apply now.")
     memories: list[Memory] = Field(
-        description="Memories in use at as_of, oldest first; pattern memories excluded."
+        description=(
+            "Memories in use at as_of, oldest first; a pattern's memory only when the pattern"
+            " is not among `patterns` (no recent evidence), so all that shapes plans is visible."
+        )
     )
     focus: FocusProfile = Field(description="Focus by local hour, learned or the prior.")
     receipt: PrivacyReceipt = Field(description="Where the user's model calls ran.")
@@ -154,28 +170,34 @@ class UserModelService:
     async def snapshot(self, user_id: str) -> YouView:
         """The You page for ``user_id``: PEARL looks first, then every section is read.
 
-        Any store failure propagates (PersistenceError): an outage is never an empty page.
+        The sections are independent reads, made concurrently. Any store failure
+        propagates (PersistenceError): an outage is never an empty page.
         """
         await self._patterns.observe(user_id)  # idempotent: nothing new, nothing written
         now = self._clock()
         profile = await self._profiles.get_or_create(user_id)
-        patterns = [PatternShown.of(view) for view in await self._patterns.current(user_id)]
-        rules = [RuleShown.of(rule) for rule in await self._constraints.list_active(user_id)]
-        memories = [
-            memory
-            for memory in await self._memory.list_active(user_id, now=now)
-            if memory.memory_type != _PATTERN_MEMORY_TYPE
-        ]
-        focus = await self._energy.estimate(user_id, user_zone(profile), now=now)
-        receipt = PrivacyReceipt(**await self._usage.receipt(user_id))
+        since = now - timedelta(days=RECEIPT_WINDOW_DAYS)
+        views, rules, active, focus, receipt = await asyncio.gather(
+            self._patterns.current(user_id),
+            self._constraints.list_active(user_id),
+            self._memory.list_active(user_id, now=now),
+            self._energy.estimate(user_id, user_zone(profile), now=now),
+            self._usage.receipt(user_id, since=since),
+        )
+        patterns = [PatternShown.of(view) for view in views]
+        shown = {pattern.pattern_key for pattern in patterns}
         return YouView(
             as_of=now,
             profile=profile,
             patterns=patterns,
-            rules=rules,
-            memories=memories,
+            rules=[RuleShown.of(rule) for rule in rules],
+            memories=[
+                memory
+                for memory in active
+                if not (memory.memory_type == _PATTERN_MEMORY_TYPE and memory.pattern_key in shown)
+            ],
             focus=focus,
-            receipt=receipt,
+            receipt=PrivacyReceipt(since=since, **receipt),
         )
 
     async def update_settings(

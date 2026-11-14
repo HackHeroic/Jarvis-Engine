@@ -141,6 +141,7 @@ async def test_container__route_llm_call__usage_recorded_for_the_attributed_user
         "pii_redactions": 0,
         "input_tokens": 42,
         "output_tokens": 7,
+        "truncated": False,
     }
 
 

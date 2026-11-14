@@ -87,7 +87,11 @@ class UsageLedger(EventListener):
             )
 
     async def receipt(self, user_id: str, since: datetime | None = None) -> dict:
-        """The user's calls since ``since`` (all time if None), split on-device / cloud."""
+        """The user's calls since ``since`` (all time if None), split on-device / cloud.
+
+        ``truncated`` is True when the store stopped at its read bound, so the totals
+        may be short; never a short total passed off as the whole.
+        """
         totals = await self._usage.summary(user_id, since=since)
         return {
             "on_device_calls": totals["local_calls"],
@@ -95,6 +99,7 @@ class UsageLedger(EventListener):
             "pii_redactions": totals["pii_redactions"],
             "input_tokens": totals["input_tokens"],
             "output_tokens": totals["output_tokens"],
+            "truncated": totals["truncated"],
         }
 
     async def _record(self, usage: LLMUsageEvent) -> None:

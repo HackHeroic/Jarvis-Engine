@@ -258,6 +258,9 @@ class BehavioralConstraint(BaseModel):
         default="said",
         description="Whether the user stated it or Jarvis inferred it from behaviour.",
     )
+    created_at: datetime | None = Field(
+        default=None, description="When it was stored; set by the store, None until then."
+    )
 
 
 class Memory(BaseModel):

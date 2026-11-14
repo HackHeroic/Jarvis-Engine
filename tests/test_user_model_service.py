@@ -19,6 +19,7 @@ from app.domain.entities import (
     BehavioralConstraint,
     LLMLocation,
     LLMUsageEvent,
+    Memory,
     MemorySource,
     MemoryStatus,
     TaskEvent,
@@ -40,6 +41,8 @@ EVERY_STATUS = frozenset(MemoryStatus)
 MARATHON = "Training for the Mumbai marathon in March"
 SHORT_AFTER_LUNCH = "Prefers short tasks right after lunch"
 ZERO_RECEIPT = {
+    "since": NOW - timedelta(days=30),
+    "truncated": False,
     "on_device_calls": 0,
     "cloud_calls": 0,
     "pii_redactions": 0,
@@ -76,7 +79,9 @@ def _outcome(kind: str, slot: datetime, *, user_id: str = "alice") -> TaskEvent:
     )
 
 
-def _usage(user_id: str, location: LLMLocation, redactions: int = 0) -> LLMUsageEvent:
+def _usage(
+    user_id: str, location: LLMLocation, redactions: int = 0, *, at: datetime = NOW
+) -> LLMUsageEvent:
     return LLMUsageEvent(
         user_id=user_id,
         task="voice_of_jarvis",
@@ -88,7 +93,7 @@ def _usage(user_id: str, location: LLMLocation, redactions: int = 0) -> LLMUsage
         output_tokens=20,
         latency_ms=50,
         pii_redactions=redactions,
-        created_at=NOW,
+        created_at=at,
     )
 
 
@@ -218,21 +223,23 @@ async def test_snapshot__memories__provenance_and_freshness(service, repos, memo
         provenance=MemorySource.INFERRED,
         origin="behavior",
     )).memory
-    await memory.remember(  # patterns show under "patterns", never twice
+    habit = (await memory.remember(  # a pattern PEARL does not see now: listed, as noticed
         "alice",
         MemoryCandidate(memory_type="behavioral_pattern", content="Skips work around 9 AM"),
         provenance=MemorySource.INFERRED,
         origin="behavior",
-    )
+    )).memory
     clock.advance(days=7)  # a week unused: strength falls by a factor of e
 
     view = await service.snapshot("alice")
 
-    assert [m.id for m in view.memories] == [said.id, noticed.id]  # oldest first
-    assert [m.provenance for m in view.memories] == [MemorySource.SAID, MemorySource.INFERRED]
+    assert [m.id for m in view.memories] == [said.id, noticed.id, habit.id]  # oldest first
+    assert [m.provenance for m in view.memories] == [
+        MemorySource.SAID, MemorySource.INFERRED, MemorySource.INFERRED
+    ]
     assert view.as_of == NOW + timedelta(days=7)
     assert [m.strength_at(view.as_of) for m in view.memories] == pytest.approx(
-        [math.exp(-1), math.exp(-1)]
+        [math.exp(-1)] * 3
     )
 
 
@@ -248,6 +255,7 @@ async def test_snapshot__other_users_data__never_included(service, repos, memory
     bob = await service.snapshot("bob")
 
     assert [(r.text, r.provenance) for r in alice.rules] == [("No work after 10 PM", "said")]
+    assert alice.rules[0].created_at is not None  # stamped by the store: "noted N days ago"
     assert (alice.patterns, alice.memories) == ([], [])
     assert alice.focus.observations == 0
     assert alice.receipt.model_dump() == ZERO_RECEIPT
@@ -272,3 +280,42 @@ async def test_update_settings__autonomy_and_wake_time__persisted(service, repos
     moved = await service.update_settings("alice", timezone="Europe/London")
     assert (moved.timezone, moved.wake_time) == ("Europe/London", time(6, 30))
     assert (await repos.profiles.get_or_create("bob")).autonomy_mode is AutonomyMode.ASK_FIRST
+
+
+@pytest.mark.asyncio
+async def test_snapshot__pattern_memory_without_recent_evidence__listed_as_noticed(
+    service, repos, clock
+):
+    """A learned skip window still shapes plans after its evidence ages out of the window:
+    it stays visible (under memories, as noticed) so it can be confirmed or dismissed."""
+    old = NOW - timedelta(days=40)
+    kept = await repos.memories.add("alice", Memory(
+        user_id="alice", memory_type="behavioral_pattern",
+        content="User avoids tasks during hour 9 (3 of 3 set aside)",
+        provenance=MemorySource.INFERRED, origin="behavior", pattern_key="skip_time_window:9",
+        applied_as="soft_preference", observation_count=3, stability=20.0,
+        strength_as_of=old, created_at=old,
+    ))
+    await _seed(repos, *[_outcome("skipped", _slot(d, 9)) for d in (42, 41, 40)])  # too old
+    await _seed(repos, *[_outcome("skipped", _slot(d, 14)) for d in (3, 2, 1)])  # seen now
+
+    view = await service.snapshot("alice")
+
+    assert [p.pattern_key for p in view.patterns] == ["skip_time_window:14"]
+    assert [(m.id, m.provenance) for m in view.memories] == [(kept.id, MemorySource.INFERRED)]
+    assert 0 < kept.strength_at(view.as_of) < 1  # its freshness is shown, not hidden
+
+
+@pytest.mark.asyncio
+async def test_snapshot__receipt__last_30_days_and_says_so(service, repos):
+    await repos.usage.record(_usage("alice", LLMLocation.LOCAL))
+    await repos.usage.record(_usage("alice", LLMLocation.CLOUD, redactions=1,
+                                    at=NOW - timedelta(days=29)))
+    await repos.usage.record(_usage("alice", LLMLocation.CLOUD, redactions=5,
+                                    at=NOW - timedelta(days=31)))  # outside the window
+
+    receipt = (await service.snapshot("alice")).receipt
+
+    assert receipt.since == NOW - timedelta(days=30)
+    assert (receipt.on_device_calls, receipt.cloud_calls, receipt.pii_redactions) == (1, 1, 1)
+    assert receipt.truncated is False

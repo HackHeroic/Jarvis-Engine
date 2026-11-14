@@ -336,6 +336,8 @@ class InMemoryConstraintRepository(ConstraintRepository):
 
     async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
         stored = prepare_new(user_id, c, "constraint")
+        if stored.created_at is None:  # the column default: stamped when stored
+            stored = stored.model_copy(update={"created_at": now_utc()})
         self._store.constraints.append(stored)
         return stored.model_copy(deep=True)
 

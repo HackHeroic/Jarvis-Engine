@@ -109,8 +109,10 @@ async def run_coaching_response(state: dict) -> dict:
         )
 
         db = user_model._db.supabase  # explicit path — avoids wiring bug
+        container = registered_container()
+        task_events = container.repos.task_events if container is not None else None
 
-        mastery = await asyncio.to_thread(get_mastery_summary, user_model.user_id, db)
+        mastery = await get_mastery_summary(user_model.user_id, db, task_events)
         sr = await asyncio.to_thread(_calculate_sr, user_model.user_id, None, db)
         trend = await asyncio.to_thread(compute_quality_trend, user_model.user_id, db)
         streak = await _completion_streak(user_model.user_id)
