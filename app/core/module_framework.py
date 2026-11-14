@@ -9,6 +9,7 @@ See: docs/superpowers/specs/2026-04-13-module-step-framework-design.md
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json as _json
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -30,6 +31,10 @@ class ModuleStep:
     hook_event: str | None = None
     feature_flag: str | None = None
     module_name: str = ""
+    # When this says the step will make PRIMARY model calls (given the state), the step
+    # takes the PRIMARY lock first and its timeout starts once it holds it: waiting for
+    # another heavy call is never counted as the step's own time.
+    holds_primary: Callable[[dict], bool] | None = None
 
 
 @dataclass
@@ -81,6 +86,15 @@ def _emit_tool_use(
 # ---------------------------------------------------------------------------
 
 
+def _primary_turn(step: ModuleStep, state: dict) -> Any:
+    """The PRIMARY lock for a step that will make PRIMARY calls; else nothing to hold."""
+    if step.holds_primary is None or not step.holds_primary(state):
+        return contextlib.nullcontext()
+    from app.core.model_router import hold_primary_model
+
+    return hold_primary_model()
+
+
 def _wrap_step(step: ModuleStep) -> Callable:
     """Wrap a step handler with SSE emission, timeout, feature flags, and hooks."""
 
@@ -120,10 +134,11 @@ def _wrap_step(step: ModuleStep) -> Callable:
         _emit_tool_use(queue, module_name, step.name, "started")
 
         try:
-            result = await asyncio.wait_for(
-                step.handler(state),
-                timeout=step.timeout_ms / 1000,
-            )
+            async with _primary_turn(step, state):
+                result = await asyncio.wait_for(
+                    step.handler(state),
+                    timeout=step.timeout_ms / 1000,
+                )
             detail = result.pop("_tool_detail", None) if isinstance(result, dict) else None
             _emit_tool_use(queue, module_name, step.name, "done", detail)
             return result

@@ -231,3 +231,158 @@ async def test_replan__learned_rule__no_task_in_that_hour(replanner, repos, reco
     assert len(slots) == 6
     assert not [slot for slot in slots.values() if _touches(slot, 9)], slots
     assert recording_llm.calls == []  # the rule's slot was known: nothing to translate
+
+
+# --- habits that could not be read -----------------------------------------------------
+
+
+class _Unreachable:
+    """A model that cannot answer: every call fails as an unreachable provider does."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def install(self) -> None:
+        from app.domain.entities import LLMLocation
+        from app.domain.errors import LLMUnavailableError
+        from app.domain.ports import LLMProvider
+        from app.infrastructure.llm.chain import FallbackChainProvider
+        from app.infrastructure.llm.factory import set_chain
+
+        calls = self.calls
+
+        class _Down(LLMProvider):
+            name = "down"
+            location = LLMLocation.CLOUD
+
+            def is_available(self) -> bool:
+                return True
+
+            async def complete(self, req):
+                calls.append(req.task)
+                raise LLMUnavailableError("The model is not answering.")
+
+            async def stream(self, req):
+                yield ("content", "")
+
+        set_chain(FallbackChainProvider([_Down()]))
+
+
+def _choir_habit() -> BehavioralConstraint:
+    # No deterministic pattern matches it, so only the model can read it.
+    return BehavioralConstraint(
+        id=uuid4().hex, user_id=U, raw_text="Choir practice with the college band on Tuesdays",
+        constraint_type="habit", recurrence="weekly",
+    )
+
+
+@pytest.mark.asyncio
+async def test_replan__habits_could_not_be_read__transient_error_never_a_draft_without_them(
+    replanner, repos, fake
+):
+    from app.domain.errors import LLMUnavailableError
+    from app.services.analytical.habit_translator import invalidate_habit_cache
+
+    invalidate_habit_cache()
+    model = _Unreachable()
+    model.install()
+    await repos.constraints.add(U, _choir_habit())
+    await _seed_tasks(repos, [_row("graphs")])
+
+    with pytest.raises(LLMUnavailableError):
+        await replanner.replan(U, reslot_task_ids=[])
+
+    assert model.calls  # it tried to read them
+    assert [d for d in fake.rows["draft_schedules"] if d["tasks"][0]["task_id"] != "seed"] == []
+
+
+@pytest.mark.asyncio
+async def test_translate_habits_step__waiting_for_the_primary_lock__not_counted_against_its_timeout(
+    monkeypatch,
+):
+    import asyncio
+    import contextvars
+    from dataclasses import replace
+
+    import app.core.config as config
+    import app.services.analytical.habit_translator as habit_translator
+    from app.core.model_router import hold_primary_model
+    from app.core.module_framework import _wrap_step
+    from app.modules.planning_graph import planning_module
+
+    monkeypatch.setattr(config, "GEMINI_PRIMARY", False)
+    monkeypatch.setattr(config, "CLAUDE_PRIMARY", False)
+    monkeypatch.setattr(
+        "app.core.model_router.force_cloud_var", contextvars.ContextVar("fc", default=False)
+    )
+
+    async def quick_translation(text: str) -> list:
+        await asyncio.sleep(0.05)  # well inside the step's timeout, once it has the lock
+        return []
+
+    monkeypatch.setattr(habit_translator, "translate_habits_to_slots", quick_translation)
+    (step,) = [s for s in planning_module.steps if s.name == "translate_habits"]
+    step = replace(step, timeout_ms=200)  # shorter than the wait below
+    released = asyncio.Event()
+
+    async def another_primary_call() -> None:  # e.g. a brief's decomposition-sized hold
+        async with hold_primary_model():
+            await released.wait()
+
+    holder = asyncio.create_task(another_primary_call())
+    await asyncio.sleep(0)
+    running = asyncio.create_task(_wrap_step(step)({"habits_text": "Choir on Tuesdays"}))
+    await asyncio.sleep(0.4)  # twice the step's timeout, all of it spent waiting
+    released.set()
+    result = await asyncio.wait_for(running, 2)
+    await holder
+
+    assert result["habits_translated"] is True
+
+
+def test_planning_state_out__habits_could_not_be_read__the_reply_leads_with_it():
+    from app.modules.planning_graph import HABITS_UNREAD_NOTE, planning_state_out
+
+    schedule = {"schedule": {"t1": {"start_min": 0, "end_min": 25}}}
+    unread = planning_state_out(
+        {"schedule": schedule, "habits_text": "Choir on Tuesdays", "draft_id": "d1"},
+        "planning_module",
+    )
+    read = planning_state_out(
+        {"schedule": schedule, "habits_text": "Choir on Tuesdays", "habits_translated": True},
+        "planning_module",
+    )
+    none = planning_state_out({"schedule": schedule, "habits_text": ""}, "planning_module")
+    both = planning_state_out(
+        {"schedule": schedule, "habits_text": "Choir", "anti_guilt_message": "Two set aside."},
+        "planning_module",
+    )
+
+    assert unread["anti_guilt_message"] == HABITS_UNREAD_NOTE
+    assert read["anti_guilt_message"] is None and none["anti_guilt_message"] is None
+    assert both["anti_guilt_message"] == f"Two set aside. {HABITS_UNREAD_NOTE}"
+    assert "fail" not in HABITS_UNREAD_NOTE.lower()
+
+
+# --- the deadline scan is not the replanner's to run -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_replan__every_task_overdue__drafted_and_left_pending(
+    replanner, repos, recording_llm, clock
+):
+    import app.services.analytical.missed_deadlines as missed_deadlines
+
+    clock.freeze(MONDAY_8AM, schedule_endpoint, missed_deadlines)  # the deadline scan's clock too
+    yesterday = (MONDAY_8AM - timedelta(days=1)).date().isoformat()
+    await _seed_tasks(repos, [
+        _row("graphs", deadline_hint=yesterday), _row("trees", deadline_hint=yesterday),
+    ])
+
+    draft = await replanner.replan(U, reslot_task_ids=[])
+
+    assert {t["task_id"] for t in draft.tasks} == {"graphs", "trees"}
+    for task_id in ("graphs", "trees"):
+        assert (await repos.tasks.get(U, task_id)).status is TaskStatus.PENDING
+    assert await repos.task_events.list_for_user(U, types={TaskEventType.DEADLINE_MISSED}) == []
+    assert recording_llm.calls == []

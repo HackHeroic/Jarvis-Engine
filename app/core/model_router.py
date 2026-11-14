@@ -192,24 +192,41 @@ MODEL_ROUTING: dict[str, ModelRole] = {
 
 
 # --- one PRIMARY call at a time ---------------------------------------------------
-# The heavy local model fits in unified memory once: two PRIMARY-role calls at the same
-# time OOM or queue-block LM Studio. A planning turn can make one and, since the
-# anticipation scheduler, so can a background trigger, so every PRIMARY-role call holds
-# this lock for the whole call. FAST and CLOUD calls never touch it. An asyncio.Lock
-# belongs to one event loop; the server runs one, so in practice this is one
-# process-wide lock. A script or test that starts a new loop gets that loop's own lock.
+# The heavy local model fits in unified memory once: two calls to it at the same time OOM
+# or queue-block LM Studio. A planning turn can make one and, since the anticipation
+# scheduler, so can a background trigger, so every PRIMARY-role call that may run on the
+# local model holds this lock for the whole call. A call that skips the local model
+# (cloud-first, or forced to the cloud) never touches it, nor does a FAST or CLOUD call.
+# An asyncio.Lock belongs to one event loop; the server runs one, so in practice this is
+# one process-wide lock. A script or test that starts a new loop gets that loop's own.
 _primary_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
     weakref.WeakKeyDictionary()
 )
+
+
+class _PrimaryHold:
+    """One holder's turn with the lock, and the PRIMARY calls running inside it."""
+
+    __slots__ = ("calls",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+
 # The hold the current context is inside, if any, and the holds still in progress. A
-# PRIMARY call made from inside one (in the same task, or in a task started from it,
-# which copies the context) runs under the outer hold instead of waiting for a lock its
-# own caller holds: no deadlock. Once the outer call ends its hold is no longer in
-# progress, so a task it left running waits for the lock like anyone else.
-_primary_hold: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+# PRIMARY call made inside a hold (in the same task, or in a task started from it, which
+# copies the context) runs under it instead of waiting for a lock its own caller holds:
+# no deadlock. Once the hold ends it is no longer in progress, so a task it left running
+# waits for the lock like anyone else.
+_primary_hold: contextvars.ContextVar[_PrimaryHold | None] = contextvars.ContextVar(
     "primary_hold", default=None
 )
-_holds_in_progress: set[object] = set()
+_holds_in_progress: set[_PrimaryHold] = set()
+
+_TOGETHER = (
+    "Two PRIMARY-role calls at once inside one hold of the PRIMARY lock: run them one "
+    "after another."
+)
 
 
 def _primary_lock() -> asyncio.Lock:
@@ -220,26 +237,74 @@ def _primary_lock() -> asyncio.Lock:
     return lock
 
 
-@asynccontextmanager
-async def _one_primary_call(role: ModelRole) -> AsyncIterator[None]:
-    """Hold the PRIMARY lock around a PRIMARY-role call; anything else passes straight through.
+def _skips_local(role: "ModelRole", force_cloud: Optional[bool] = None) -> bool:
+    """Whether a call of ``role`` goes straight to the cloud, never to the local model."""
+    return (
+        role == ModelRole.CLOUD
+        or bool(force_cloud)
+        or force_cloud_var.get()
+        or _cfg.GEMINI_PRIMARY
+        or _cfg.CLAUDE_PRIMARY
+    )
 
-    Released however the call ends: an error, a timeout or a cancellation (``async
-    with`` releases on every exit, and a waiter cancelled before it got the lock never
-    holds it).
-    """
-    if role is not ModelRole.PRIMARY or _primary_hold.get() in _holds_in_progress:
-        yield
-        return
+
+@asynccontextmanager
+async def _new_hold() -> AsyncIterator[_PrimaryHold]:
+    """Wait for the lock (released however the block ends: an error, a timeout or a
+    cancellation; a waiter cancelled before it got it never holds it), then hold it."""
     async with _primary_lock():
-        hold = object()
+        hold = _PrimaryHold()
         _holds_in_progress.add(hold)
         token = _primary_hold.set(hold)
         try:
-            yield
+            yield hold
         finally:
             _primary_hold.reset(token)
             _holds_in_progress.discard(hold)
+
+
+@asynccontextmanager
+async def hold_primary_model() -> AsyncIterator[None]:
+    """Hold the PRIMARY lock for a block whose PRIMARY calls should not wait for it.
+
+    For a planning step that makes PRIMARY calls under its own timeout: it takes the
+    lock first, so its timeout counts the work and never the wait for another call. The
+    step's calls then run inside this hold, one after another. Children it spawns must
+    not make PRIMARY calls at the same time: a second call while one is running inside
+    the same hold raises RuntimeError rather than run two heavy calls together. When the
+    local model would be skipped anyway (cloud-first), nothing is held.
+    """
+    if _skips_local(ModelRole.PRIMARY) or _primary_hold.get() in _holds_in_progress:
+        yield
+        return
+    async with _new_hold():
+        yield
+
+
+@asynccontextmanager
+async def _one_primary_call(role: "ModelRole", *, local: bool) -> AsyncIterator[None]:
+    """Hold the PRIMARY lock around a PRIMARY-role call that may run on the local model.
+
+    Inside a hold already in progress (a planning step's, or an outer call's), the call
+    runs under it, provided no other PRIMARY call is running inside it right now. Any
+    other call passes straight through.
+    """
+    if role is not ModelRole.PRIMARY or not local:
+        yield
+        return
+    hold = _primary_hold.get()
+    if hold in _holds_in_progress:
+        if hold.calls:
+            raise RuntimeError(_TOGETHER)
+        hold.calls += 1
+        try:
+            yield
+        finally:
+            hold.calls -= 1
+        return
+    async with _new_hold() as hold:
+        hold.calls += 1
+        yield
 
 
 async def _replay(
@@ -299,10 +364,11 @@ async def route_llm_call(
     The request carries the user and session ``attribute_llm_calls`` set for this
     context, so the usage ledger knows whom the call was for.
 
-    A PRIMARY-role call waits for any other PRIMARY-role call in flight to finish
-    (one heavy-model call at a time); FAST and CLOUD calls never wait. PRIMARY tasks
-    are structured and never stream: ``stream=True`` on one is a ValueError, since the
-    lock could not cover a stream that outlives the call.
+    A PRIMARY-role call that may run on the local model waits for any other one in
+    flight to finish (one heavy local call at a time); FAST and CLOUD calls, and calls
+    that skip the local model, never wait. PRIMARY tasks are structured and never
+    stream: ``stream=True`` on one is a ValueError, since the lock could not cover a
+    stream that outlives the call.
 
     Raises ``RuntimeError`` when every reachable provider failed and no cloud
     provider is configured, and ``LLMUnavailableError`` when cloud ones failed too.
@@ -313,13 +379,7 @@ async def route_llm_call(
     role = MODEL_ROUTING.get(task, ModelRole.FAST)
     if stream and role is ModelRole.PRIMARY:
         raise ValueError(f"route_llm_call: PRIMARY-role task {task!r} cannot stream")
-    skip_local = (
-        role == ModelRole.CLOUD
-        or bool(force_cloud)
-        or force_cloud_var.get()
-        or _cfg.GEMINI_PRIMARY
-        or _cfg.CLAUDE_PRIMARY
-    )
+    skip_local = _skips_local(role, force_cloud)
     req = LLMRequest(
         task=task,
         role=role.value,
@@ -338,7 +398,7 @@ async def route_llm_call(
         with gate:
             if stream:
                 return await _open_stream(chain, req, skip_local)
-            async with _one_primary_call(role):
+            async with _one_primary_call(role, local=not skip_local):
                 return await chain.complete(req, skip_local=skip_local)
     except LLMUnavailableError as exc:
         if not chain.has_available(LLMLocation.CLOUD):

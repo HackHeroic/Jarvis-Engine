@@ -25,9 +25,12 @@ def container(monkeypatch):
     from app.container import AppContainer
     from app.main import app
     from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import FakeDBClient
 
     built = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
     monkeypatch.setattr(app.state, "container", built, raising=False)
+    # The database is there: every route checks before it answers.
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(), raising=False)
     return built
 
 
@@ -167,3 +170,42 @@ async def test_anticipation_api__concurrent_run__one_suggestion(container, log):
     made = {r.json()["suggestion"]["id"] for r in responses if r.json()["suggestion"]}
     assert len(made) == 1  # the second click gets the first one's answer, not a new suggestion
     assert len(await container.repos.suggestions.list(U1, status=None)) == 1
+
+
+def test_anticipation_api__database_unavailable__503_on_every_route(client, monkeypatch):
+    """Without the database the repositories are empty stand-ins: an empty list would
+    say "nothing to suggest" when the truth is "can't tell"."""
+    from types import SimpleNamespace
+
+    from app.main import app
+
+    monkeypatch.setattr(app.state, "db_client", SimpleNamespace(supabase=None), raising=False)
+    params = {"user_id": U1}
+    responses = [
+        client.get("/api/v1/anticipation/suggestions", params=params),
+        client.post("/api/v1/anticipation/suggestions/s1/accept", params=params),
+        client.post("/api/v1/anticipation/suggestions/s1/dismiss", params=params),
+        client.post("/api/v1/anticipation/run", params=params, json={"trigger": "morning_brief"}),
+    ]
+
+    for response in responses:
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "persistence_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_anticipation_api__run_already_done__returns_todays_suggestion(
+    client, container, log
+):
+    container.anticipation.register_trigger(_MorningBrief(action=FakeAction(log)))
+    today = _suggestion().model_copy(update={"created_at": datetime.now(timezone.utc)})
+    stored = await container.repos.suggestions.add(U1, today)
+
+    response = client.post(
+        "/api/v1/anticipation/run", params={"user_id": U1}, json={"trigger": "morning_brief"}
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "already_done"
+    assert (body["suggestion"]["id"], body["suggestion"]["status"]) == (stored.id, "pending")

@@ -275,7 +275,11 @@ class TriggerOutcome(BaseModel):
         "created", "already_done", "not_due", "nothing_to_say", "denied", "failed"
     ] = Field(description="Where the run stopped; 'failed' means the trigger raised.")
     suggestion: Suggestion | None = Field(
-        default=None, description="The suggestion stored, when one was."
+        default=None,
+        description=(
+            "The suggestion stored, when one was; for a manual run that found the day's"
+            " suggestion already made, that one."
+        ),
     )
     decision: ConsentDecision | None = Field(
         default=None, description="The consent decision, when consent was asked."

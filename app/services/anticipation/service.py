@@ -40,7 +40,13 @@ from app.domain.anticipation import (
     TriggerContext,
     TriggerOutcome,
 )
-from app.domain.entities import HOURS_PER_DAY, AutonomyMode, Suggestion, SuggestionStatus
+from app.domain.entities import (
+    HOURS_PER_DAY,
+    AutonomyMode,
+    BehavioralConstraint,
+    Suggestion,
+    SuggestionStatus,
+)
 from app.domain.ports import ConstraintRepository, ProfileRepository, SuggestionRepository
 from app.services.anticipation.user_locks import UserLocks
 from app.services.memory.constraint_bridge import DAY_START_MIN, _parse_time_range
@@ -92,6 +98,22 @@ def _whole_local_hours(start_min: int, end_min: int) -> tuple[int, int] | None:
     if end <= start:
         return None
     return start % HOURS_PER_DAY, end % HOURS_PER_DAY
+
+
+def stated_blocks(constraints: list[BehavioralConstraint]) -> list[tuple[int, int, str]]:
+    """The hours the user said (never inferred) to keep free, on their local clock.
+
+    Each is (start hour, end hour, their words); end <= start wraps past midnight.
+    """
+    blocks = []
+    for constraint in constraints:
+        if constraint.source != "said":
+            continue
+        window = _parse_time_range(constraint.raw_text)
+        hours = _whole_local_hours(*window) if window is not None else None
+        if hours is not None:
+            blocks.append((*hours, constraint.raw_text))
+    return blocks
 
 
 def _aware(now: datetime) -> datetime:
@@ -150,6 +172,9 @@ class AnticipationService:
         of the previous manual run of this trigger for this user, it returns that
         run's outcome instead. An unforced run returns the remembered outcome of a
         trigger that already settled the user's local day.
+
+        A manual run that finds the trigger's suggestion for the day already made
+        returns ``already_done`` together with that suggestion.
         """
         trigger = self._triggers.get(name)
         if trigger is None:
@@ -166,6 +191,9 @@ class AnticipationService:
             ctx = await self._context(user_id, now, force=force)
             outcome = await self._run(trigger, ctx, self._consent_loader(ctx))
             if force:
+                if outcome.status == "already_done" and outcome.suggestion is None:
+                    made = await self._made_today(ctx, name)
+                    outcome = outcome.model_copy(update={"suggestion": made})
                 self._manual[(user_id, name)] = (now, outcome)
             return outcome
 
@@ -285,6 +313,15 @@ class AnticipationService:
             )
         return outcome
 
+    async def _made_today(self, ctx: TriggerContext, name: str) -> Suggestion | None:
+        """The newest suggestion trigger ``name`` made the user on their local day, if any."""
+        zone = ZoneInfo(ctx.profile.timezone)
+        for suggestion in await self._suggestions.list(ctx.user_id, status=None, limit=_LIST_LIMIT):
+            made_on = _aware(suggestion.created_at).astimezone(zone).date()
+            if suggestion.trigger == name and made_on == ctx.local_day:
+                return suggestion
+        return None
+
     def _recent_manual(self, user_id: str, name: str, now: datetime) -> TriggerOutcome | None:
         """The previous manual run's outcome, if it ran within the cooldown before ``now``."""
         recent = self._manual.get((user_id, name))
@@ -358,12 +395,4 @@ class AnticipationService:
 
     async def _stated_blocks(self, user_id: str) -> list[tuple[int, int, str]]:
         """The hours the user said (never inferred) to keep free, on their local clock."""
-        blocks = []
-        for constraint in await self._constraints.list_active(user_id):
-            if constraint.source != "said":
-                continue
-            window = _parse_time_range(constraint.raw_text)
-            hours = _whole_local_hours(*window) if window is not None else None
-            if hours is not None:
-                blocks.append((*hours, constraint.raw_text))
-        return blocks
+        return stated_blocks(await self._constraints.list_active(user_id))

@@ -20,6 +20,7 @@ from app.domain.ports import DraftPlanner, DraftRepository
 from app.services.draft_store import DraftStore
 
 _EXHAUSTED_FALLBACK = "I couldn't fit everything in even with a 30-day window."
+_HABITS_UNREAD = "I couldn't read your habits just now, so the plan waits until I can."
 
 
 class PlanningGraphReplanner(DraftPlanner):
@@ -43,7 +44,9 @@ class PlanningGraphReplanner(DraftPlanner):
         None when there is nothing to plan, before anything else runs (no habit is
         translated for an empty plan), and when no draft could be proposed.
         ScheduleInfeasibleError when nothing fits even in 30 days; PersistenceError
-        when there is no database to plan from.
+        when there is no database to plan from. LLMUnavailableError, a transient error,
+        when the user's free-text habits could not be read (the model failed, or its
+        time ran out): never a draft that ignores them, so a later try can make it.
         """
         db = self._db_provider()
         if getattr(db, "supabase", None) is None:
@@ -51,7 +54,7 @@ class PlanningGraphReplanner(DraftPlanner):
         if not await self._anything_to_plan(UserModel(user_id, db), set(reslot_task_ids)):
             return None
 
-        from app.modules.planning_graph import planning_state_in
+        from app.modules.planning_graph import habits_unread, planning_state_in
 
         user_model = UserModel(user_id, db)  # fresh: planning sets aside overdue tasks first
         user_model.set_memory_store(self._memory_provider())
@@ -69,6 +72,8 @@ class PlanningGraphReplanner(DraftPlanner):
         )
         result = await self._compiled().ainvoke(state)
 
+        if habits_unread(result):
+            raise errors.LLMUnavailableError(_HABITS_UNREAD)
         if result.get("error") == "INFEASIBLE_EXHAUSTED":
             raise errors.ScheduleInfeasibleError(
                 result.get("clarification_request") or _EXHAUSTED_FALLBACK

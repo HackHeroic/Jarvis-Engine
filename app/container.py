@@ -134,7 +134,9 @@ class AppContainer:
                 repos.tasks, repos.task_events, planner, energy, patterns, actions
             )
         )
-        anticipation.register_trigger(PatternRuleTrigger(patterns, repos.suggestions, actions))
+        anticipation.register_trigger(
+            PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
+        )
         anticipation_listener = AnticipationListener(anticipation)
         events.subscribe(PatternDetected, anticipation_listener)
 
