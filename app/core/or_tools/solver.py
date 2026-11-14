@@ -328,11 +328,15 @@ class JarvisScheduler:
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = SOLVER_MAX_TIME_SECONDS
-        idle_stop = _StopWhenIdle(solver, SOLVER_IDLE_STOP_SECONDS)
+        # 0 or None: no idle stop, the search runs to a proof or the cap.
+        idle_stop = (
+            _StopWhenIdle(solver, SOLVER_IDLE_STOP_SECONDS) if SOLVER_IDLE_STOP_SECONDS else None
+        )
         try:
             status = solver.solve(self.model, idle_stop)
         finally:
-            idle_stop.cancel()
+            if idle_stop is not None:
+                idle_stop.cancel()
 
         if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
             schedule = {
