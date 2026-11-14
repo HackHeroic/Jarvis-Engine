@@ -6,8 +6,11 @@ On every non-trivial turn, after the reply and before the stream's ``complete`` 
    extraction call) are remembered through ``MemoryService``: provenance "said", with
    the conversation and the user's message as their source. A fact the user forgot or
    dismissed is suppressed; a cited ``[mN]`` handle supersedes the memory it names.
-   No memory write starts after MEMORY_PERSIST_TIMEOUT_S, and the one in flight is
-   never cut short (a supersede is two writes).
+   Every ``inline_habits`` phrase no extracted memory covers is remembered too (a
+   scheduling rule as a constraint, anything else as a preference): remembering never
+   depends on the model filing a durable fact under both fields. No memory write
+   starts after MEMORY_PERSIST_TIMEOUT_S, and the one in flight is never cut short (a
+   supersede is two writes).
 2. One ``memory_extracted`` frame per memory created, reinforced or superseded.
 3. PEARL looks at the outcome history (``PatternService.observe``) and cognitive state
    updates, together capped at 500 ms: one ``pattern_detected`` frame per learning
@@ -21,6 +24,7 @@ Failures are logged by type and never shown.
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import Coroutine
 from datetime import date, datetime
@@ -33,6 +37,7 @@ from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
 from app.domain.entities import MemorySource
 from app.domain.errors import EmbeddingUnavailableError
+from app.schemas.memory import ExtractedMemory
 from app.services.memory.memory_service import MemoryCandidate, RememberOutcome
 from app.services.memory.patterns import PatternChange
 from app.services.planning.local_time import end_of_local_day, user_zone
@@ -46,6 +51,30 @@ MEMORY_WRITE_TIMEOUT_S = 5.0
 PEARL_INSIGHTS_TIMEOUT_S = 0.5
 # The outcomes the user is told about; a suppressed memory is told nothing.
 _ANNOUNCED = ("created", "reinforced", "superseded")
+# How sure Jarvis is of a habit the user stated in their own words.
+HABIT_MEMORY_CONFIDENCE = 0.8
+# A habit counts as covered by an extracted memory when this share of the shorter one's
+# words is in the other ("Never schedule study before 11 AM" covers the full sentence).
+HABIT_COVERED_OVERLAP = 0.6
+_WORDS = re.compile(r"[a-z0-9]+")
+# Words that say nothing about which fact it is.
+_FILLER = frozenset(
+    "a an and the to of in on at for my me i im i'm is am are be it this that so from now "
+    "any all do does please user users".split()
+)
+# A standing scheduling rule: a word that forbids or reserves time ("only" and "always"
+# are left out: "I only work well after 9 pm" describes a peak, and blocking it would
+# do the opposite of what was said) ...
+_RULE_WORD = re.compile(
+    r"\b(never|avoid|don'?t|do not|no|can'?t|cannot|won'?t|schedule|block|keep)\b", re.I
+)
+# ... anchored to a time of day or week.
+_TIME_ANCHOR = re.compile(
+    r"\b(\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}(:\d{2})|noon|midnight|mornings?|afternoons?|"
+    r"evenings?|nights?|weekends?|weekdays?|mondays?|tuesdays?|wednesdays?|thursdays?|"
+    r"fridays?|saturdays?|sundays?|before \d{1,2}|after \d{1,2}|until \d{1,2})\b",
+    re.I,
+)
 
 
 def _emit_event(state: dict, event_type: str, data: dict) -> None:
@@ -126,8 +155,46 @@ async def _to_completion(write: Coroutine[Any, Any, RememberOutcome]) -> Remembe
     return await asyncio.wait_for(asyncio.shield(task), timeout=MEMORY_WRITE_TIMEOUT_S)
 
 
+def _fact_words(text: str) -> set[str]:
+    return {w for w in _WORDS.findall(text.lower()) if w not in _FILLER}
+
+
+def _covered(habit: str, memories: list[ExtractedMemory]) -> bool:
+    """Whether an extracted memory already says what ``habit`` says (shared words)."""
+    words = _fact_words(habit)
+    for memory in memories:
+        other = _fact_words(memory.content or "")
+        shorter = min(len(words), len(other))
+        if shorter and len(words & other) / shorter >= HABIT_COVERED_OVERLAP:
+            return True
+    return False
+
+
+def habit_memory_type(habit: str) -> str:
+    """``constraint`` for a standing scheduling rule (a rule word anchored to a time),
+    ``preference`` for anything else the user says about how they work."""
+    is_rule = _RULE_WORD.search(habit) and _TIME_ANCHOR.search(habit)
+    return "constraint" if is_rule else "preference"
+
+
+def turn_memories(brain_dump: object) -> list[ExtractedMemory]:
+    """What to remember from the turn's extraction: its ``memories``, then every
+    ``inline_habits`` phrase none of them covers, as a said memory in the user's words."""
+    extracted = list(getattr(brain_dump, "memories", None) or [])
+    habits = [
+        habit.strip() for habit in getattr(brain_dump, "inline_habits", None) or []
+        if isinstance(habit, str) and habit.strip()
+    ]
+    for habit in habits:
+        if not _covered(habit, extracted):
+            extracted.append(ExtractedMemory(
+                type=habit_memory_type(habit), content=habit, confidence=HABIT_MEMORY_CONFIDENCE
+            ))
+    return extracted
+
+
 async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
-    """Remember each of the turn's ``brain_dump.memories``; return what came of each.
+    """Remember the turn's memories (``turn_memories``); return what came of each.
 
     Provenance SAID, sourced to the turn's conversation and user message. A cited handle
     becomes the id of the memory it was shown for; any other citation is ignored. A
@@ -138,7 +205,7 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
     """
     container = registered_container()
     user_id = state.get("user_id")
-    extracted = list(getattr(state.get("brain_dump"), "memories", None) or [])
+    extracted = turn_memories(state.get("brain_dump"))
     if container is None or not user_id or not extracted:
         return []
     handles = state.get("memory_handles") or {}
@@ -188,6 +255,18 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
             continue
         landed.append(outcome)
     return landed
+
+
+def memory_frames(outcomes: list[RememberOutcome]) -> list[dict]:
+    """One ``memory_extracted`` frame per memory the turn learned; a memory two outcomes
+    landed on (one fact said two ways) is told once, as it first landed."""
+    frames, told = [], set()
+    for outcome in outcomes:
+        frame = memory_frame(outcome)
+        if frame is not None and frame["memory_id"] not in told:
+            told.add(frame["memory_id"])
+            frames.append(frame)
+    return frames
 
 
 def memory_frame(outcome: RememberOutcome) -> dict | None:
@@ -320,11 +399,7 @@ async def run_observation_loop(state: dict) -> dict:
 
     _emit_event(state, "phase_start", {"phase": "learning"})
 
-    frames = [
-        frame
-        for frame in (memory_frame(outcome) for outcome in await persist_turn_memories(state))
-        if frame is not None
-    ]
+    frames = memory_frames(await persist_turn_memories(state))
     for frame in frames:
         _emit_event(state, "memory_extracted", frame)
 

@@ -106,9 +106,10 @@ class BrainDumpExtraction(BaseModel):
     memories: List[ExtractedMemory] = Field(
         default_factory=list,
         description=(
-            "Lasting facts, preferences, goals or constraints the USER states about themselves in THIS message. "
-            "Never from the assistant's words, never today-only moods (those are state_updates), "
-            "never a repeat of inline_habits. contradicts: the [mN] handle of a known memory this replaces."
+            "Durable facts, preferences, standing rules or self-descriptions the USER states about themselves "
+            "in THIS message, also when the same sentence is in inline_habits or a planning request. "
+            "Never from the assistant's words, never today-only moods (those are state_updates), never this "
+            "plan's tasks. contradicts: the [mN] handle of a known memory this replaces."
         ),
     )
 

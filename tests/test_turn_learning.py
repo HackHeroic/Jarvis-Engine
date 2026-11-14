@@ -483,3 +483,124 @@ async def test_complete__confirmed_pattern__pearl_insights_listed(jarvis, llm):
         pattern["id"], 1.0, 3
     )
     assert "9 AM" in insight["insight"]
+
+
+# --- a durable fact said as a habit is remembered too -----------------------------------
+#
+# The model may file "never schedule study before 11 AM" or "I'm a night owl" under
+# inline_habits alone. Remembering never depends on how it splits the fields: every habit
+# no extracted memory already covers is remembered as a said memory.
+
+RULE = "From now on never schedule any study before 11 AM, I'm useless in the mornings"
+NIGHT_OWL = "I'm a night owl and do my best work after 9 pm"
+
+
+def _context_of_reply(llm, since: int) -> str:
+    """What the reply was told about the user: its system notes after the history."""
+    (reply_call,) = [c for c in llm.calls[since:] if c.task == "voice_of_jarvis"]
+    return "\n".join(
+        m["content"] for m in reply_call.conversation_history if m["role"] == "system"
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_only_in_inline_habits__remembered_as_a_said_constraint(jarvis, llm):
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))
+
+    turn = await jarvis.say(RULE)
+
+    (row,) = _memories(jarvis)
+    assert (row["memory_type"], row["content"], row["provenance"]) == ("constraint", RULE, "said")
+    assert row["source_session_id"] == turn.conversation_id
+    (frame,) = _frames(turn, "memory_extracted")
+    assert frame == {
+        "memory_id": row["id"], "type": "constraint", "content": RULE, "confidence": 0.8,
+        "provenance": "said", "action": "created",
+    }
+    assert _position(turn, "memory_extracted") < _position(turn, "complete")
+
+
+@pytest.mark.asyncio
+async def test_turn__self_description_only_in_inline_habits__remembered_as_a_preference(
+    jarvis, llm
+):
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[NIGHT_OWL]))
+
+    turn = await jarvis.say(f"Something about me: {NIGHT_OWL}.")
+
+    (row,) = _memories(jarvis)
+    assert (row["memory_type"], row["content"]) == ("preference", NIGHT_OWL)
+    (frame,) = _frames(turn, "memory_extracted")
+    assert (frame["type"], frame["action"]) == ("preference", "created")
+
+
+@pytest.mark.asyncio
+async def test_turn__habit_also_extracted_as_a_memory__one_frame_and_one_row(jarvis, llm):
+    rule = {"type": "constraint", "content": "Never schedule study before 11 AM", "confidence": 0.9}
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE], memories=[rule]))
+
+    turn = await jarvis.say(RULE)
+
+    assert [m["content"] for m in _memories(jarvis)] == [rule["content"]]
+    assert [f["content"] for f in _frames(turn, "memory_extracted")] == [rule["content"]]
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_said_again_as_a_habit__reinforced_not_stored_twice(jarvis, llm):
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))
+    await jarvis.say(RULE)
+
+    again = await jarvis.say(RULE)
+
+    (row,) = _memories(jarvis)
+    (frame,) = _frames(again, "memory_extracted")
+    assert (frame["memory_id"], frame["action"]) == (row["id"], "reinforced")
+
+
+@pytest.mark.asyncio
+async def test_turn__forgotten_rule_said_again_as_a_habit__no_frame_no_row(jarvis, llm):
+    llm.script("brain_dump_extraction", brain_dump(inline_habits=[RULE]))
+    await jarvis.say(RULE)
+    (memory,) = _memories(jarvis)
+    await jarvis.state.container.memory_service.forget("alice", memory["id"])
+
+    turn = await jarvis.say(RULE)
+
+    assert _frames(turn, "memory_extracted") == []
+    (tombstone,) = _memories(jarvis)
+    assert (tombstone["id"], tombstone["status"], tombstone["content"]) == (
+        memory["id"], "forgotten", ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn__rule_from_inline_habits__recalled_in_a_new_conversation(jarvis, llm):
+    llm.script(
+        "brain_dump_extraction",
+        lambda req: brain_dump(inline_habits=[RULE]) if "never schedule" in said(req) else "{}",
+    )
+    first = await jarvis.say(RULE)
+    calls_before = len(llm.calls)
+
+    second = await jarvis.say("What should I focus on this week?")
+
+    assert second.conversation_id != first.conversation_id
+    assert RULE in _context_of_reply(llm, calls_before)
+    assert RULE in [m["content"] for m in second.payload["memories"]]
+
+
+def test_brain_dump_prompt__memories_first__never_exclusive_of_inline_habits():
+    from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT as prompt
+
+    assert isinstance(prompt, str)
+    # Read before the field list a low-effort model skims, with worked examples that fill
+    # inline_habits AND memories from one sentence (a self-description, a standing rule).
+    assert prompt.index("memories") < prompt.index("planning_goal:")
+    both = [
+        line for line in prompt.splitlines()
+        if line.startswith("- '") and "inline_habits: [" in line and "memories: [{" in line
+    ]
+    assert len(both) >= 2
+    # Nothing tells the model a habit cannot also be a memory.
+    for text in (prompt, BrainDumpExtraction.model_fields["memories"].description):
+        assert "repeat of inline_habits" not in text
