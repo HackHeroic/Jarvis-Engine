@@ -37,6 +37,12 @@ def require_supabase(request: Request) -> Any:
     return supabase
 
 
+def container_of(request: Request) -> AppContainer | None:
+    """The composition root on ``app.state``, or None when the lifespan built none
+    (a route that degrades rather than fails without it)."""
+    return getattr(request.app.state, "container", None)
+
+
 def get_container(request: Request) -> AppContainer:
     """The composition root the lifespan built (``app.state.container``)."""
     container = getattr(request.app.state, "container", None)

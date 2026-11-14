@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import app.core.config as config
 from app.domain.entities import UserProfile
+from app.domain.ports import ProfileRepository
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,21 @@ def user_zone(profile: UserProfile | None = None) -> ZoneInfo:
         or _zone_named(config.DEFAULT_TIMEZONE)
         or ZoneInfo("UTC")
     )
+
+
+async def stored_user_zone(profiles: ProfileRepository | None, user_id: str) -> ZoneInfo:
+    """The user's zone from their stored profile (``user_zone``).
+
+    ``DEFAULT_TIMEZONE`` without a profile store (no composition root), or when the
+    profile cannot be read: a plan on the default clock, never a failed request.
+    """
+    if profiles is None:
+        return user_zone()
+    try:
+        return user_zone(await profiles.get_or_create(user_id))
+    except Exception as exc:  # the default clock, never a failed request
+        logger.warning("Profile unread (%s); the default timezone applies", type(exc).__name__)
+        return user_zone()
 
 
 def _local(moment: datetime, zone: ZoneInfo) -> datetime:

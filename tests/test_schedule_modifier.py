@@ -67,13 +67,11 @@ async def test_modify_schedule__learned_profile__handed_to_the_resolve(monkeypat
     import app.core.config as cfg
     from app.api.v1.endpoints.chat import ModifyScheduleRequest, modify_schedule
     from app.container import AppContainer
-    from app.core import runtime
     from app.domain.entities import TaskEvent, TaskEventType
     from app.orchestrator.hooks import ActionHooks
     from app.services.analytical import schedule_modifier
 
     container = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
-    runtime.set_container(container)  # conftest resets the registry afterwards
     now = datetime.now(timezone.utc)
     for day in range(1, 13):
         slot = (now - timedelta(days=day)).astimezone(IST).replace(hour=19, minute=0)
@@ -103,7 +101,9 @@ async def test_modify_schedule__learned_profile__handed_to_the_resolve(monkeypat
     monkeypatch.setattr(
         "app.services.extraction.behavioral_store.get_behavioral_context_for_calendar", no_habits
     )
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(db_client=None)))
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db_client=None, container=container))
+    )
 
     await modify_schedule(
         ModifyScheduleRequest(user_id="alice", user_prompt="shorter flashcards",
@@ -113,3 +113,102 @@ async def test_modify_schedule__learned_profile__handed_to_the_resolve(monkeypat
 
     assert learned.source == "learned"
     assert seen == [learned.scores()]
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+async def _new_yorker_with_an_evening_peak(container) -> None:
+    """A user in New York who gets things done at 19:00 on their own clock."""
+    from app.domain.entities import TaskEvent, TaskEventType
+
+    await container.repos.profiles.update("alice", timezone="America/New_York")
+    now = datetime.now(timezone.utc)
+    for day in range(1, 13):
+        slot = (now - timedelta(days=day)).astimezone(NEW_YORK).replace(hour=19, minute=0)
+        await container.repos.task_events.append("alice", TaskEvent(
+            user_id="alice", task_id=f"past_{day}", event_type=TaskEventType.COMPLETED,
+            occurred_at=slot + timedelta(minutes=25), scheduled_start=slot,
+            scheduled_end=slot + timedelta(minutes=25),
+        ))
+
+
+def _resolve_spy(monkeypatch, schedule_modifier) -> list:
+    async def parse(user_prompt, task_list):
+        return schedule_modifier.ScheduleModification(
+            action="change_duration", target_task_title="Flashcards", new_duration_minutes=20
+        )
+
+    import inspect
+
+    seen: list = []
+    signature = inspect.signature(schedule_modifier.apply_modification)
+
+    def spy(*args, **kwargs):
+        call = signature.bind(*args, **kwargs).arguments
+        seen.append((call.get("focus_by_hour"), call["horizon_start"]))
+        return call["execution_graph"], call["schedule_data"]
+
+    async def no_habits(user_id, supabase):
+        return ""
+
+    monkeypatch.setattr(schedule_modifier, "parse_modification_request", parse)
+    monkeypatch.setattr(schedule_modifier, "apply_modification", spy)
+    monkeypatch.setattr(
+        "app.services.extraction.behavioral_store.get_behavioral_context_for_calendar", no_habits
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_modify_schedule__user_in_new_york__focus_and_day_on_their_clock(monkeypatch):
+    import app.core.config as cfg
+    from app.api.v1.endpoints.chat import ModifyScheduleRequest, modify_schedule
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+    from app.services.analytical import schedule_modifier
+
+    container = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
+    await _new_yorker_with_an_evening_peak(container)
+    theirs = await container.energy.estimate("alice", NEW_YORK, now=datetime.now(timezone.utc))
+    seen = _resolve_spy(monkeypatch, schedule_modifier)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db_client=None, container=container))
+    )
+
+    await modify_schedule(
+        ModifyScheduleRequest(user_id="alice", user_prompt="shorter flashcards",
+                              current_tasks=_draft_graph()["decomposition"]),
+        request,
+    )
+
+    ((focus, horizon_start),) = seen
+    assert focus == theirs.scores() and max(range(24), key=focus.__getitem__) == 19
+    assert horizon_start.utcoffset() == datetime.now(NEW_YORK).utcoffset()
+    assert horizon_start.astimezone(NEW_YORK).hour == cfg.DAY_START_HOUR
+
+
+@pytest.mark.asyncio
+async def test_draft_edit_in_chat__user_in_new_york__focus_on_their_clock(monkeypatch):
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.orchestrator.hooks import ActionHooks
+    from app.services.analytical import schedule_modifier
+    from app.services.analytical.control_policy import _run_schedule_modify_flow
+
+    container = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
+    runtime.set_container(container)  # conftest resets the registry afterwards
+    await _new_yorker_with_an_evening_peak(container)
+    theirs = await container.energy.estimate("alice", NEW_YORK, now=datetime.now(timezone.utc))
+    seen = _resolve_spy(monkeypatch, schedule_modifier)
+
+    await _run_schedule_modify_flow(
+        "shorter flashcards", "alice",
+        {"execution_graph": _draft_graph(), "schedule": {"schedule": {}}},
+        db_client=None,
+    )
+
+    ((focus, horizon_start),) = seen
+    assert focus == theirs.scores()
+    assert horizon_start.astimezone(NEW_YORK).hour == cfg.DAY_START_HOUR
