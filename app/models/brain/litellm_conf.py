@@ -428,6 +428,7 @@ async def gemini_web_search(
             "timeout": _cfg.LLM_TIMEOUT_SECONDS,
         }
         response = await litellm.acompletion(**completion_kwargs)
+        _report_usage(response)  # to the metered search around this call, if any
         content = response.choices[0].message.content
         return content.strip() if content else ""
     except Exception as e:

@@ -788,3 +788,85 @@ async def test_research__user_message_with_an_email__redacted_before_the_search(
     assert out["search_results"]
     assert "madhav@example.com" not in json.dumps(web_search_recorded)
 
+
+
+# --- web search reaches the usage ledger -------------------------------------------------
+
+
+class _UsageOnBus:
+    """A registered container whose bus records every LLMCallCompleted."""
+
+    def __init__(self) -> None:
+        from app.domain.events import EventBus, EventListener, LLMCallCompleted
+
+        recorded = self.recorded = []
+
+        class _Listener(EventListener):
+            async def handle(self, event) -> None:
+                recorded.append(event.usage)
+
+        self.events = EventBus()
+        self.events.subscribe(LLMCallCompleted, _Listener())
+
+
+@pytest.fixture
+def usage_on_bus():
+    from app.core import runtime
+
+    container = _UsageOnBus()
+    runtime.set_container(container)  # conftest resets the registry afterwards
+    return container.recorded
+
+
+@pytest.mark.asyncio
+async def test_web_search__answered__metered_as_a_gemini_web_search_call(
+    web_search_recorded, usage_on_bus, monkeypatch
+):
+    """Search runs outside the provider chain, so MeteredProvider never sees it."""
+    import app.models.brain.litellm_conf as _llm
+    from app.core.model_router import attribute_llm_calls
+    from app.services.analytical.workspace_builder import perform_learning_style_search
+
+    class _Usage:
+        prompt_tokens = 120
+        completion_tokens = 30
+
+    answer = await _llm.litellm.acompletion()  # the fixture's canned response
+    web_search_recorded.clear()
+    type(answer).usage = _Usage()
+
+    end = attribute_llm_calls("alice", "sess-1")
+    try:
+        await perform_learning_style_search("graphs for madhav@example.com", "reader")
+    finally:
+        end()
+
+    (usage,) = usage_on_bus
+    assert (usage.provider, usage.task, usage.role) == ("gemini", "web_search", "cloud")
+    assert usage.location == LLMLocation.CLOUD
+    assert (usage.user_id, usage.session_id) == ("alice", "sess-1")
+    assert (usage.input_tokens, usage.output_tokens) == (120, 30)
+    assert usage.model == _cfg.GEMINI_MODEL
+    assert usage.pii_redactions == 1  # the email in the query
+
+
+@pytest.mark.asyncio
+async def test_web_search__transport_reports_no_tokens__metered_with_zero(
+    web_search_recorded, usage_on_bus
+):
+    from app.services.analytical.workspace_builder import perform_learning_style_search
+
+    await perform_learning_style_search("graphs", "reader")
+
+    (usage,) = usage_on_bus
+    assert (usage.task, usage.input_tokens, usage.output_tokens) == ("web_search", 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_web_search__failed__nothing_metered(web_search_down, usage_on_bus):
+    import app.services.analytical.workspace_builder as wb
+
+    with pytest.raises(wb.WebSearchUnavailableError):
+        await wb.perform_learning_style_search("graphs", "reader")
+
+    assert usage_on_bus == []

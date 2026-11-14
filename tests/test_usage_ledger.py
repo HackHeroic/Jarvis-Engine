@@ -217,12 +217,37 @@ async def test_usage_ledger__storage_unreachable__the_warning_names_the_exceptio
     assert "PersistenceError" in warning.getMessage()
 
 
-def test_lifespan__shutdown__drains_the_usage_ledger_with_a_timeout():
-    """The process waits for in-flight ledger writes on the way out, but not forever."""
-    import inspect
+@pytest.mark.asyncio
+async def test_lifespan__shutdown__waits_for_the_ledger_writes_in_flight(monkeypatch, tmp_path):
+    """The real lifespan, offline: a usage record still being written when the app
+    shuts down lands before the process goes; it is not dropped mid-write."""
+    from fastapi import FastAPI
 
-    from app.main import lifespan
+    import app.core.config as cfg
+    import app.main as main
+    from app.infrastructure.persistence.in_memory import InMemoryUsageRepository
 
-    source = inspect.getsource(lifespan)
-    shutdown = source[source.index("finally:"):]
-    assert "usage_ledger.shutdown(" in shutdown
+    class _NoDatabase:
+        def __init__(self) -> None:
+            raise ValueError("SUPABASE_URL is not set")  # -> the stub client, in-memory repos
+
+    monkeypatch.setattr(main, "DatabaseClient", _NoDatabase)
+    monkeypatch.setattr(cfg, "CHECKPOINT_DB_PATH", str(tmp_path / "checkpoints.sqlite"))
+    monkeypatch.setattr(cfg, "detect_loaded_models", lambda: {"loaded": [], "warning": "offline"})
+    monkeypatch.setattr(cfg, "GEMINI_PRIMARY", cfg.GEMINI_PRIMARY)  # the lifespan sets it
+
+    record = InMemoryUsageRepository.record
+
+    async def slow_record(self, event):
+        await asyncio.sleep(0.05)  # storage is a round-trip away
+        await record(self, event)
+
+    monkeypatch.setattr(InMemoryUsageRepository, "record", slow_record)
+    app = FastAPI()
+
+    async with main.lifespan(app):
+        container = app.state.container
+        await container.events.publish(_completed(_usage(user_id="u1")))
+        assert (await container.repos.usage.summary("u1"))["local_calls"] == 0  # in flight
+
+    assert (await container.repos.usage.summary("u1"))["local_calls"] == 1

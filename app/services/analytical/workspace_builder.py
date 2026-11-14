@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from app.core.model_router import PreCloudLLMRedactor
+from app.core.model_router import PreCloudLLMRedactor, metered_web_search
 from app.domain.errors import LLMUnavailableError
 from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
@@ -47,11 +47,15 @@ async def _search_web(user_prompt: str, system_prompt: str) -> str:
     """
     redactor = PreCloudLLMRedactor(get_hooks())
     try:
-        user_prompt, _ = await redactor.redact(user_prompt)
-        system_prompt, _ = await redactor.redact(system_prompt)
+        user_prompt, redacted_in_prompt = await redactor.redact(user_prompt)
+        system_prompt, redacted_in_system = await redactor.redact(system_prompt)
     except LLMUnavailableError as exc:
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE) from exc
-    raw = await gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt)
+    # Metered into the usage ledger like a chain call: the chain never sees a search.
+    raw = await metered_web_search(
+        lambda: gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt),
+        pii_redactions=redacted_in_prompt + redacted_in_system,
+    )
     if not raw or not raw.strip():
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
     return raw
