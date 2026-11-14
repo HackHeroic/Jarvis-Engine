@@ -33,7 +33,7 @@ _NEGATION = re.compile(r"\b(no|not|never|don'?t|avoid\w*|without)\b", re.IGNOREC
 _BARE_HOURS = re.compile(r"(?<![\d/-])(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})(?![\d/:-])")
 
 
-def _to_horizon(clock_min: int) -> int:
+def to_horizon(clock_min: int) -> int:
     """Wall-clock minutes-from-midnight -> horizon minutes (0 = DAY_START_HOUR).
 
     Every consumer of ``TimeSlot`` — the horizon expander, the biological sleep
@@ -43,7 +43,10 @@ def _to_horizon(clock_min: int) -> int:
     return (clock_min - DAY_START_MIN) % MINUTES_PER_DAY
 
 
-def _parse_time_range(text: str) -> tuple[int, int] | None:
+_to_horizon = to_horizon  # this module's own name for it
+
+
+def parse_time_range(text: str) -> tuple[int, int] | None:
     """Extract a time range from natural language constraint text.
 
     Handles patterns like:
@@ -117,6 +120,9 @@ def _parse_time_range(text: str) -> tuple[int, int] | None:
         return (0, end)
 
     return None
+
+
+_parse_time_range = parse_time_range  # this module's own name for it
 
 
 def _bounded_range(start_clock: int, end_clock: int) -> tuple[int, int] | None:

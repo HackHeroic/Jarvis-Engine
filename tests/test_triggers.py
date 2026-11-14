@@ -137,13 +137,17 @@ def _world(fake: FakeSupabase, repos: Repositories, planner: DraftPlanner | None
     actions = build_action_factory(
         drafts=drafts, constraints=repos.constraints, memory=memory, planner=planner
     )
-    brief = MorningBriefTrigger(repos.tasks, repos.task_events, planner, energy, patterns, actions)
+    brief = MorningBriefTrigger(
+        repos.tasks, repos.task_events, planner, energy, patterns, actions,
+        suggestions=repos.suggestions,
+    )
     rule = PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
     service = AnticipationService(
         {brief.name: brief, rule.name: rule}, actions, ConsentPolicy.default(),
         repos.suggestions, repos.profiles, repos.constraints, clock=clock,
     )
-    return _World(repos, bus, clock, patterns, drafts, service, AnticipationListener(service))
+    listener = AnticipationListener(service, patterns)
+    return _World(repos, bus, clock, patterns, drafts, service, listener)
 
 
 @pytest.fixture
@@ -575,8 +579,26 @@ async def test_brief__insight_dismissed__not_shared_again_when_its_numbers_chang
 
     assert monday.title == "Something I noticed"
     assert monday.action["dedupe_key"] == "share_insight:skip_time_window:14"
-    assert tuesday.status == "denied"
-    assert tuesday.decision.kind is ConsentReasonKind.LEARNED_PREFERENCE
+    # Dismissed, it is no longer something to say: nothing is drafted, nothing asked.
+    assert (tuesday.status, tuesday.suggestion) == ("nothing_to_say", None)
+
+
+@pytest.mark.asyncio
+async def test_brief__insight_dismissed__never_the_noticed_line_of_a_later_brief(pinned_world):
+    """Dismissed once, a pattern is not shared again in any form: not as its own note,
+    and not as the line about it inside a later brief that has a plan to offer."""
+    world = pinned_world
+    await _set_aside_at(world, 14)
+    monday = (await _run_brief(world, MONDAY_7_05)).suggestion
+    await world.service.dismiss(U, monday.id)
+    await _seed_tasks(world.repos, [_row("graphs")])
+
+    world.clock.now = _ist(TUESDAY, 7, 5)
+    tuesday = (await _run_brief(world, world.clock.now)).suggestion
+
+    assert monday.title == "Something I noticed"
+    assert tuesday.title == "Today is ready"
+    assert "2 PM" not in tuesday.body, tuesday.body
 
 
 @pytest.mark.asyncio

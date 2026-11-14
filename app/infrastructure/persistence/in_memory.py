@@ -99,6 +99,10 @@ class InMemoryStore:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+def _value_of(status: TaskStatus | None) -> str | None:
+    return TaskStatus(status).value if status is not None else None
+
+
 class InMemoryTaskRepository(TaskRepository):
     def __init__(self, store: InMemoryStore) -> None:
         self._store = store
@@ -142,17 +146,29 @@ class InMemoryTaskRepository(TaskRepository):
         return [t.model_copy(deep=True) for t in sorted(found, key=lambda t: t.scheduled_start)]
 
     async def update_status(
-        self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
+        self,
+        user_id: str,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        expected: TaskStatus | None = None,
+        expected_start: datetime | None = None,
     ) -> Task:
         indexes = self._indexes(user_id, task_id)
         if not indexes:
             raise not_found("task", task_id)
-        if expected is not None:
-            indexes = [i for i in indexes if self._store.tasks[i].status == expected]
+        if expected is not None or expected_start is not None:
+            start = utc(expected_start) if expected_start is not None else None
+            indexes = [
+                i
+                for i in indexes
+                if (expected is None or self._store.tasks[i].status == expected)
+                and (start is None or self._store.tasks[i].scheduled_start == start)
+            ]
             if not indexes:
                 raise errors.StaleVersionError(
                     "That task changed before this update; reload and try again.",
-                    details={"task_id": task_id, "expected": TaskStatus(expected).value},
+                    details={"task_id": task_id, "expected": _value_of(expected)},
                 )
         for i in indexes:
             self._store.tasks[i] = self._store.tasks[i].model_copy(

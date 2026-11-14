@@ -113,9 +113,18 @@ def _evidence(
     ]
 
 
-def _clock_hour(hour: int) -> str:
+def clock_hour(hour: int) -> str:
     """A 24-hour ``hour`` as the user reads it: 0 is 12 AM, 9 is 9 AM, 19 is 7 PM."""
     return f"{hour % 12 or 12} {'AM' if hour < 12 else 'PM'}"
+
+
+_clock_hour = clock_hour  # this module's own name for it
+
+
+def _lowered(sentence: str) -> str:
+    """A sentence to follow "I noticed": first letter lowered, final full stop dropped."""
+    words = sentence.rstrip(".")
+    return words[:1].lower() + words[1:]
 
 
 def _part_of_day(hour: int) -> str:
@@ -145,6 +154,9 @@ class PatternDetector(ABC):
     name: ClassVar[str]
     # How planning applies a remembered pattern of this kind; None when it does not.
     applied_as: ClassVar[str | None] = None
+    # Whether a pattern of this kind (one with an hour) may be offered as a standing
+    # rule keeping that hour clear. The pattern-rule trigger asks; it names no detector.
+    proposes_rule: ClassVar[bool] = False
 
     @abstractmethod
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
@@ -159,6 +171,12 @@ class PatternDetector(ABC):
         """What Jarvis tells the user about ``pattern``, from its live numbers."""
         return pattern.description
 
+    def noticed(self, pattern: Pattern) -> str:
+        """The morning brief's line "I noticed ...": the pattern's own second-person words,
+        with the evidence once."""
+        n, total = round(pattern.confidence * pattern.occurrences), pattern.occurrences
+        return f"I noticed {_lowered(pattern.description)} ({n} of the last {total} times)."
+
     def text_for_key(self, pattern_key: str) -> str | None:
         """The description of a pattern with this key, when the key holds everything the
         words say; None when they say more (so a stored row keeps its own words)."""
@@ -170,6 +188,7 @@ class SkipTimeWindowDetector(PatternDetector):
 
     name: ClassVar[str] = "skip_time_window"
     applied_as: ClassVar[str | None] = "soft_preference"
+    proposes_rule: ClassVar[bool] = True
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         patterns = []
@@ -301,6 +320,10 @@ class RepeatedSkipDetector(PatternDetector):
     """
 
     name: ClassVar[str] = "repeated_skip"
+
+    def noticed(self, pattern: Pattern) -> str:
+        """Its words already count the times: no second count."""
+        return f"I noticed {_lowered(pattern.description)}."
 
     def detect(self, events: list[TaskEvent], zone: ZoneInfo) -> list[Pattern]:
         by_task: dict[str, list[TaskEvent]] = defaultdict(list)
@@ -541,16 +564,35 @@ class PatternService:
         """
         return [
             {
-                "insight": self._by_name[view.pattern.detector].insight(view.pattern),
+                "insight": self.insight(view.pattern),
                 "confidence": view.pattern.confidence,
                 "occurrences": view.pattern.occurrences,
                 "memory_id": view.memory_id,
             }
             for view in views
-            if view.memory_id is not None
+            if self.worth_telling(view)
+        ]
+
+    def worth_telling(self, view: PatternView) -> bool:
+        """A remembered pattern seen MIN_OCCURRENCES+ times at INSIGHT_CONFIDENCE or more."""
+        return (
+            view.memory_id is not None
             and view.pattern.confidence >= INSIGHT_CONFIDENCE
             and view.pattern.occurrences >= MIN_OCCURRENCES
-        ]
+        )
+
+    def insight(self, pattern: Pattern) -> str:
+        """What Jarvis tells the user about ``pattern``: its detector's words."""
+        return self._by_name[pattern.detector].insight(pattern)
+
+    def noticed(self, pattern: Pattern) -> str:
+        """The morning brief's "I noticed ..." line about ``pattern``: its detector's words."""
+        return self._by_name[pattern.detector].noticed(pattern)
+
+    def proposes_rule(self, pattern: Pattern) -> bool:
+        """Whether ``pattern`` may be offered as a standing rule: its detector says so."""
+        detector = self._by_name.get(pattern.detector)
+        return detector is not None and detector.proposes_rule and pattern.hour is not None
 
     async def _detect(
         self,

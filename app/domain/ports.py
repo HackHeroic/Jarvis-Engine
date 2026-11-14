@@ -76,9 +76,20 @@ class TaskRepository(ABC):
 
     @abstractmethod
     async def update_status(
-        self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
+        self,
+        user_id: str,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        expected: TaskStatus | None = None,
+        expected_start: datetime | None = None,
     ) -> Task:
-        """Set the status if it is ``expected`` (when given); NotFoundError / StaleVersionError."""
+        """Set the status if it is ``expected`` (when given); NotFoundError / StaleVersionError.
+
+        With ``expected_start`` the compare-and-set also holds the slot: the write
+        happens only while the task still starts at that instant (compared as instants,
+        whatever offset it is stored with), so a task re-slotted meanwhile is left alone.
+        """
 
     @abstractmethod
     async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:

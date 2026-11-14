@@ -67,8 +67,37 @@ async def test_trigger_run__already_done__gather_never_called(suggestions):
     outcome = await _run(trigger, suggestions, ctx=_ctx(now=NOW + timedelta(hours=5)))
 
     assert outcome.status == "already_done"
-    assert trigger.calls == {}
+    assert trigger.calls == {"should_fire": 1}  # the free check first, then the read
     assert len(await suggestions.list(U1)) == 1
+
+
+class _CountedReads:
+    """A suggestion repository that counts every call made to it, by method name."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.calls: dict[str, int] = {}
+
+    def __getattr__(self, name: str):
+        method = getattr(self._inner, name)
+
+        async def counted(*args, **kwargs):
+            self.calls[name] = self.calls.get(name, 0) + 1
+            return await method(*args, **kwargs)
+
+        return counted
+
+
+@pytest.mark.asyncio
+async def test_trigger_run__not_due__no_storage_read(suggestions):
+    """A tick outside the trigger's window costs no read: the free timing check runs
+    before the once-a-day check."""
+    counted = _CountedReads(suggestions)
+
+    outcome = await _run(CountingTrigger(due=False), counted)
+
+    assert outcome.status == "not_due"
+    assert counted.calls == {}
 
 
 @pytest.mark.asyncio

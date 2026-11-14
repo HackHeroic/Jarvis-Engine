@@ -201,7 +201,13 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         return [_read_task(r) for r in rows]
 
     async def update_status(
-        self, user_id: str, task_id: str, status: TaskStatus, *, expected: TaskStatus | None = None
+        self,
+        user_id: str,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        expected: TaskStatus | None = None,
+        expected_start: datetime | None = None,
     ) -> Task:
         def build(q: Any) -> Any:
             q = q.update({"status": TaskStatus(status).value}).eq("user_id", user_id).eq(
@@ -209,16 +215,25 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
             )
             if expected is not None:  # compare-and-set: only rows still in ``expected``
                 q = q.in_("status", task_status_values(TaskStatus(expected)))
+            if expected_start is not None:  # ...and still in the slot that was read
+                # Both bounds at one instant: timestamptz compares by instant, whatever
+                # offset the row was written with.
+                at = iso(expected_start)
+                q = q.gte("scheduled_start", at).lte("scheduled_start", at)
             return q
 
         rows = await self._run(build)
         if rows:
             return _read_task(rows[0])
-        if expected is None or await self.get(user_id, task_id) is None:
+        guarded = expected is not None or expected_start is not None
+        if not guarded or await self.get(user_id, task_id) is None:
             raise not_found("task", task_id)
         raise errors.StaleVersionError(
             "That task changed before this update; reload and try again.",
-            details={"task_id": task_id, "expected": TaskStatus(expected).value},
+            details={
+                "task_id": task_id,
+                "expected": TaskStatus(expected).value if expected is not None else None,
+            },
         )
 
     async def reschedule(self, user_id: str, task_id: str, start: datetime, end: datetime) -> Task:

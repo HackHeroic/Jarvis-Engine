@@ -438,6 +438,40 @@ async def test_run_due__one_trigger_raises__the_next_still_runs(repos, log, capl
 
 
 @pytest.mark.asyncio
+async def test_run_due__trigger_keeps_failing__backs_off_1_2_4_capped_at_30_min(repos, log):
+    """A trigger that keeps failing (its habits can't be read while the model is down) is
+    retried after 1, 2, 4, ... minutes, never more than 30 apart, not every tick; a
+    backed-off tick reads nothing. A run that does not fail resets the wait."""
+    trigger = CountingTrigger(action=FakeAction(log), fail_for=frozenset({U1}))
+    profiles = _CountingCalls(repos.profiles)
+    service = AnticipationService(
+        {trigger.name: trigger}, ActionFactory(), ConsentPolicy.default(), repos.suggestions,
+        profiles, repos.constraints, clock=lambda: NOW,
+    )
+
+    ran_at = []
+    for minute in range(70):
+        before = trigger.calls["gather"]
+        (outcome,) = await service.run_due(U1, NOW + timedelta(minutes=minute))
+        if trigger.calls["gather"] > before:
+            ran_at.append(minute)
+            assert outcome.status == "failed"
+        else:
+            assert outcome.status == "not_due"
+
+    assert ran_at == [0, 1, 3, 7, 15, 31, 61]  # 1, 2, 4, 8, 16, then 30 (the cap)
+    assert profiles.calls["get_or_create"] == len(ran_at)  # waiting reads nothing
+
+    trigger.fail_for, trigger.due = frozenset(), False  # the next run ends, not due
+    await service.run_due(U1, NOW + timedelta(minutes=91))
+    trigger.fail_for, trigger.due = frozenset({U1}), True
+    gathered = trigger.calls["gather"]
+    await service.run_due(U1, NOW + timedelta(minutes=92))
+    await service.run_due(U1, NOW + timedelta(minutes=93))
+    assert trigger.calls["gather"] == gathered + 2  # reset: the first wait is 1 minute again
+
+
+@pytest.mark.asyncio
 async def test_auto_apply__racing_accept__409_and_action_runs_once(repos):
     log = ActionLog(hold=asyncio.Event())
     trigger = CountingTrigger(action=FakeLowRiskAction(log))
@@ -457,7 +491,7 @@ async def test_auto_apply__racing_accept__409_and_action_runs_once(repos):
 
 
 @pytest.mark.asyncio
-async def test_run_due__not_due__one_profile_read_and_one_cheap_read_per_trigger(log):
+async def test_run_due__not_due__one_profile_read_and_no_suggestion_read(log):
     repos = RepositoryFactory.in_memory()
     profiles, suggestions = _CountingCalls(repos.profiles), _CountingCalls(repos.suggestions)
     constraints = _CountingCalls(repos.constraints)
@@ -474,7 +508,7 @@ async def test_run_due__not_due__one_profile_read_and_one_cheap_read_per_trigger
 
     assert [o.status for o in outcomes] == ["not_due", "not_due"]
     assert profiles.calls == {"get_or_create": 1}
-    assert suggestions.calls == {"exists_today": 2}
+    assert suggestions.calls == {}  # outside the window: not even the once-a-day read
     assert constraints.calls == {}  # consent is never loaded for a trigger that is not due
 
 
