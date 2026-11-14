@@ -693,6 +693,8 @@ COMPLETE_FIELDS = {  # exactly what the frontend reads today
     "saved_constraints", "conversation_id", "message_id", "clarification_options",
     "memories", "since_last_spoke", "pearl_insights", "generation_metrics",
 }
+# Sent only by a turn that hands over a draft (the version the review card accepts with).
+OPTIONAL_COMPLETE_FIELDS = {"draft_version"}
 
 
 @pytest.mark.asyncio
@@ -705,8 +707,11 @@ async def test_complete__payload__validated_by_its_model_fields_exactly_as_befor
 
     turn = await jarvis.say("Anything I should know about my week?")
 
-    assert set(turn.payload) == set(ChatCompletePayload.model_fields) == COMPLETE_FIELDS
-    assert ChatCompletePayload.model_validate(turn.payload).model_dump(mode="json") == turn.payload
+    assert set(turn.payload) == COMPLETE_FIELDS  # no draft handed over: no draft_version
+    assert set(ChatCompletePayload.model_fields) == COMPLETE_FIELDS | OPTIONAL_COMPLETE_FIELDS
+    assert ChatCompletePayload.model_validate(turn.payload).model_dump(
+        mode="json", exclude_unset=True  # as SseEncoder writes it
+    ) == turn.payload
     assert set(turn.payload["generation_metrics"]) == {
         "total_tokens", "total_time_s", "tok_per_sec", "ttft_ms", "model",
     }

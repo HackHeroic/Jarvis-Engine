@@ -67,6 +67,45 @@ async def test_chat__brain_dump__proposes_a_draft_and_writes_no_tasks(jarvis, ll
 
 
 @pytest.mark.asyncio
+async def test_chat__draft_proposed__complete_names_its_version_and_the_card_can_accept_with_it(
+    jarvis, llm, monkeypatch
+):
+    """The chat review card sends the version it showed: the plan it accepts is the one
+    the user saw, and a plan changed since is refused rather than locked in unseen."""
+    import httpx
+
+    from app.main import app
+
+    turn = await _plan(jarvis, llm)
+
+    container = jarvis.state.container
+    drafted = await container.draft_service.get("alice", turn.draft_id)
+    assert turn.payload["draft_version"] == drafted.version  # what GET /drafts/{id} says
+
+    monkeypatch.setattr(app.state, "container", container, raising=False)
+    monkeypatch.setattr(app.state, "db_client", jarvis.state.db_client, raising=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as api:
+        accepted = await api.post(
+            f"/api/v1/drafts/{turn.draft_id}/accept",
+            json={"user_id": "alice", "expected_version": turn.payload["draft_version"]},
+        )
+
+    assert accepted.status_code == 200
+    assert len(jarvis.rows("user_tasks", user_id="alice")) == len(DSA_TOPICS)
+
+
+@pytest.mark.asyncio
+async def test_chat__turn_that_hands_over_no_draft__no_draft_version_in_complete(jarvis, llm):
+    planned = await _plan(jarvis, llm)
+
+    turn = await jarvis.say("move the mock problems later", session=planned.conversation_id)
+
+    assert turn.draft_id is None
+    assert "draft_version" not in turn.payload
+
+
+@pytest.mark.asyncio
 async def test_chat__looks_good_after_a_draft__locks_it_in_without_a_reply_model_call(jarvis, llm):
     planned = await _plan(jarvis, llm)
     draft_task_ids = [t["task_id"] for t in jarvis.draft(planned.draft_id)["tasks"]]

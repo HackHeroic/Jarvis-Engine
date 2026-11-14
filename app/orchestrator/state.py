@@ -55,6 +55,9 @@ class JarvisState(TypedDict):
     execution_graph: Optional[Any]  # ExecutionGraph — Any to avoid cross-layer import
     schedule: Optional[dict]
     draft_id: Optional[str]
+    # The version of the draft the planning module proposed this turn (sent with draft_id
+    # in the complete frame, so the review card can accept the plan it showed).
+    draft_version: Optional[str]
     draft_response: Optional[dict]
     research_results: Optional[list[dict]]
     ingestion_result: Optional[dict]

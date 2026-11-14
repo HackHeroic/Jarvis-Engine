@@ -72,6 +72,9 @@ class PlanningState(TypedDict):
     # (see _TRANSIENT_KEYS in app/orchestrator/checkpoint.py).
     planning: Any
     draft_id: Optional[str]
+    # The proposed draft's version (DraftSchedule.version, what GET /drafts/{id} reports):
+    # the chat review card accepts with it as expected_version.
+    draft_version: Optional[str]
 
 
 
@@ -761,7 +764,11 @@ async def create_draft(state: PlanningState) -> dict:
     except Exception as e:
         logger.warning(f"Draft creation failed (non-fatal): {e}")
         return {"draft_id": None}
-    return {"draft_id": draft.id, "_tool_detail": {"draft_id": draft.id}}
+    return {
+        "draft_id": draft.id,
+        "draft_version": draft.version,  # of the draft as stored, as accept compares it
+        "_tool_detail": {"draft_id": draft.id},
+    }
 
 
 # The solve step must outlive CP-SAT's own wall-clock cap: when the cap expires the
@@ -871,6 +878,7 @@ def planning_state_in(state) -> dict:
         # one (unit tests, scripts), and then no draft is proposed.
         "planning": getattr(state.get("container"), "planning", None),
         "draft_id": None,
+        "draft_version": None,
     }
 
 
@@ -923,6 +931,7 @@ def planning_state_out(result: dict, module_name: str) -> dict:
         "clarification_request": clarification,
         "error": error,
         "draft_id": draft_id,
+        "draft_version": result.get("draft_version") if draft_id else None,
         "anti_guilt_message": _with_habits_note(result, schedule),
         "missed_deadlines": result.get("missed_deadlines"),
     }
