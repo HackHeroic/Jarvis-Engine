@@ -15,10 +15,11 @@ This repository is the backend. The frontend is [jarvis-frontend](https://github
 | Rules for working in this code | [`.claude/CLAUDE.md`](.claude/CLAUDE.md), [`.claude/rules/`](.claude/rules/) |
 | Older documents | [`docs/INDEX.md`](docs/INDEX.md) |
 
-### The ten capstone documents
+### The capstone documents (a study guide and the ten formal documents)
 
 | # | Document | Evaluation criterion |
 |---|---|---|
+| 00 | [Team study guide](docs/capstone/00-team-study-guide.md) | The design and why each decision was made, for teammates new to the code (read first) |
 | 01 | [Requirements](docs/capstone/01-requirements.md) | Functional and non-functional requirements |
 | 02 | [Architecture](docs/capstone/02-architecture.md) | Layers and how a request moves through them |
 | 03 | [Class diagrams](docs/capstone/03-class-diagrams.md) | Class diagram |
@@ -72,7 +73,7 @@ Then start the frontend (`npm install && npm run dev` in jarvis-frontend) and op
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # offline: never touches the network
+.venv/bin/python -m pytest tests/ -q        # offline: never touches the network (1991 passed, 2 xfailed, 2 deselected at c956a8f)
 .venv/bin/python scripts/live_e2e.py        # 18 live checks against real Supabase and Claude (backend must be running)
 ```
 
@@ -88,4 +89,4 @@ This seeds about three weeks of history for the user `demo`. Start the backend a
 
 ## Not built
 
-Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. `docs/PROJECT_STATUS.md` has the full list.
+Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. Nothing creates habit review trackers, so the Habits page has none to review. An uploaded file is not kept (only its extracted text), so there is no document viewer. Workspace web links need Gemini's web search. `docs/PROJECT_STATUS.md` has the full list.

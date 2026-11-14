@@ -1,7 +1,7 @@
 # Jarvis Engine — Project Status
 
-**Last updated:** 2026-11-14
-**Branch:** `capstone-lld` · **Checked against:** `e76bff9` (end of capstone plan 3, "finish the restructure")
+**Last updated:** 2026-11-15
+**Branch:** `main` (the capstone work is merged) · **Checked against:** `e76bff9` (end of capstone plan 3, "finish the restructure"); the fixes up to `c956a8f` are folded in where they change a claim. `path:line` references are at `e76bff9`.
 **Scope:** what the code does today. Every claim below names the file it was checked in. Where something is a stub or not built, it says so. This is the one current architecture document; the capstone documents (§10) expand each part.
 
 ---
@@ -114,7 +114,7 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 
 | Area | What works | Where |
 |---|---|---|
-| Chat | One SSE endpoint; typed frames; per-conversation lock; checkpointed threads (`user_id:session_id`); request limits; the reply names the model that wrote it | `app/services/chat_turn/`, `app/schemas/chat_stream.py`, `app/orchestrator/checkpoint.py:292` |
+| Chat | One SSE endpoint; typed frames; per-conversation lock; checkpointed threads (`user_id:session_id`); request limits; the reply names the model that wrote it; a resumed conversation reads its draft's real status first, so a plan accepted or discarded from its card ends the review (`_close_review_of_a_closed_draft`); the extraction prompt tells the model that a question about work already planned ("what should I do first today?") is not a planning goal (`app/services/planning/brain_dump_prompt.py`); the reply about a drafted plan is given its real counts and the new work (`_drafted_plan_facts`, `app/services/analytical/voice_of_jarvis.py`) | `app/services/chat_turn/`, `app/schemas/chat_stream.py`, `app/orchestrator/checkpoint.py:292` |
 | Planning | Brain dump → ≤ 25-minute tasks with if-then plans → multi-goal fusion → CP-SAT (hard and soft blocks, dependencies, TMT, adaptive daily cap, night block) → draft; horizon ladder; anti-guilt reply when nothing fits | `app/modules/planning_graph.py`, `app/services/planning/scheduling.py`, `app/core/or_tools/solver.py` |
 | Learned focus | `HistoryEnergyEstimator` learns a 24-hour focus profile from outcomes; a learned profile adds a soft solver term (weight 900 × difficulty, zero for tasks due within 24 h) | `app/services/energy.py:67`, `app/services/planning/scheduling.py:96-111` |
 | Drafts | Propose, read (with `schedule` and a computed `version`), edit, rearrange, reject, discard, accept; accept is atomic and idempotent; a stale `expected_version` is a 409 `stale_version`; a draft whose slots have partly passed is re-solved from now | `app/services/draft_service.py:93`, `app/services/draft_actions.py:61`, `app/api/v1/endpoints/drafts.py` |
@@ -126,8 +126,8 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 | Anticipation | Scheduler, morning brief, pattern → rule proposal, consent chain, suggestions API, manual run with a cooldown | `app/services/anticipation/`, `app/domain/anticipation.py` |
 | You page | Patterns, rules, memories in use, focus profile, privacy receipt (30 days), `streak_days`, settings (autonomy mode, wake time, timezone) | `app/services/user_model_service.py:166`, `app/api/v1/endpoints/you.py` |
 | LLM chain | Local Gemma (auto-detected PRIMARY + FAST) → Claude → Gemini; regex PII redaction before any cloud send; retries with backoff; timeouts; every call metered into `llm_usage_events`; one PRIMARY local call at a time | `app/infrastructure/llm/`, `app/core/model_router.py:204-211` |
-| Documents | Docling → ChromaDB ingestion, user-scoped document search, document → task linking, timetable extraction with approval | `app/services/extraction/`, `app/api/v1/endpoints/documents.py`, `ingestion.py` |
-| Also | Workspace builder (RAG + web links + practice), SM-2 habit trackers, mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
+| Documents | Docling → ChromaDB ingestion, user-scoped document search, document → task linking, timetable extraction with approval. Docling runs on a worker thread, one document at a time, at most 120 s (503 `document_read_timeout`, `read_document` in `app/utils/docling_helper.py`). `POST /ingestion/process` keeps the upload's `file_name`. A short text message that mentions the user's notes is answered from the stored documents; only pasted material of 400+ characters is ingested (`PASTED_MATERIAL_MIN_CHARS`, `app/orchestrator/graph.py`) | `app/services/extraction/`, `app/api/v1/endpoints/documents.py`, `ingestion.py` |
+| Also | Workspace builder (RAG + web links + practice; after a failed web search it waits 5 minutes before searching again, `WEB_SEARCH_COOLDOWN_S`), SM-2 review of existing habit trackers (none are created, §4), mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
 
 ---
 
@@ -140,6 +140,8 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 - **From the restructure (dropped tasks):** the `CognitiveModule` registry with derived routing (routing is still `INTENT_TO_MODULE`), and repositories for chat sessions and messages, documents, pending-calendar rows and task materials.
 - **Auth:** `CurrentUser` reads `user_id` from the query string; it is the seam a JWT would replace (`app/api/deps.py:16`).
 - **Planned analytics:** DKT, RL and SARIMAX are stubs in `app/models/` and need real usage data first.
+- **Creating habit review trackers:** `HabitTrackerRepository` has `get`, `list_for_user` and `record_review`, and `sm2_engine.record_completion` only reviews an existing tracker. Nothing creates one (no route, no service, not the demo seed), so `GET /api/v1/habits/tracker/due` is empty and the Habits page says "No habits due for review" for every user, the demo user included.
+- **Keeping the uploaded file:** only the extracted chunks (ChromaDB) and an `ingested_documents` row (name, topics, chunk count) are kept. The pipeline tries an S3 upload, but `boto3` is not installed, so it fails quietly (non-fatal, `app/services/extraction/orchestrator.py`), and no code reads `s3_key` back. There is no document viewer: the Documents page shows the name, topics, chunk count and linked tasks.
 
 ---
 
@@ -154,6 +156,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 ## 6. Storage
 
 - **Supabase (Postgres)** is the store; `supabase/migrations/` is the source of truth. RLS is on for every table, the backend uses the service-role key, and every repository query filters by `user_id`. Tables, keys, functions and the class → table map: [08 — Database schema](capstone/08-database-schema.md); how to apply: [schema notes](capstone/_schema_notes.md).
+- **The Supabase client** (`app/db/supabase_py.py`) speaks pooled HTTP/1.1. `ConnectRetryTransport` sends a request again, once, only when it provably did no work on the server: a connection that could not be made, or a dropped kept-alive connection on a read (`GET`/`HEAD`). A write that lost its connection, a read timeout or an HTTP error is raised as it came (a 503).
 - **Migrations, in order:** `20260101000000_baseline_legacy_tables`, `20260329000000_chat_sessions`, `20260329000001_phase1_memory_system`, `20260329000002_phase1_missing_tables`, `20260331000000_chat_sessions_pinned`, `20260401000000_user_tasks_missing_columns`, `20260501000001_pearl_scheduled_hour`, `20260501000002_task_workspaces`, `20260808000000_user_tasks_actual_duration`, `20260813000000_user_tasks_status_missed_pacing`, `20260813000001_draft_schedules_schedule`, `20261114000001_capstone_lld`, `20261114000002_user_tasks_original_duration`, `20261115000000_skip_writes_skipped`, `20261115000001_accept_draft_reslots_missed`, `20261115000002_memory_lifecycle_and_vectors`, `20261115000003_session_summaries`, `20261115000004_suggestion_consent_kind`, `20261115000006_session_summary_reach`. There is no `…0005`. Plan 3 added no migration.
 - **SQLite** (`data/checkpoints.sqlite`, override `JARVIS_CHECKPOINT_DB`): LangGraph checkpoints, one thread per `user_id:session_id`; live per-turn objects are scrubbed before a write; a daily sweep keeps the newest 20 per thread (`CHECKPOINT_KEEP_PER_THREAD`, `app/core/config.py:167`).
 - **ChromaDB (cloud):** document chunks only. Memories are in Postgres.
@@ -162,7 +165,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 ## 7. Tests
 
-**1974 passed, 2 xfailed, 2 deselected**, about 76 s, fully offline: `.venv/bin/python -m pytest tests/ -q` at `3208648`. 88 test files.
+**1991 passed, 2 xfailed, 2 deselected**, about 83 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `c956a8f`. 92 test files.
 
 - **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
 - **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.
@@ -179,7 +182,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 2. Run `.venv/bin/python scripts/live_e2e.py` (default `--base-url http://localhost:8000`). It costs ten chat turns, roughly 25–30 model calls.
 3. Pass means the table ends `ALL PASSED` (exit 0; a SKIP is allowed and means the step had nothing to say) and the server log shows no traceback.
 
-Last run: all steps passed at `e76bff9`, with no traceback in the server log (the plan 3 ledger).
+Last run: all 18 steps passed at `c956a8f` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
 
 ---
 
@@ -197,20 +200,24 @@ The full script and the viva questions are in [10 — Demo and contributions](ca
 ## 10. Known limits
 
 1. **Raw-table leftovers.** Eight files still query tables directly, each with its reason in `_RAW_TABLE_CALLS_ALLOWED` (`tests/test_layering.py:451-466`): the workspace builder (its cache and its own `user_tasks` reads), `user_preferences`, `chat_history`, the sessions, documents and ingestion routers, the ingestion orchestrator and the task-material linker.
-2. **Process-local state.** Turn locks, the per-user anticipation lock, the trigger day memo and backoff, and the PRIMARY model lock all live in memory. Correct for the one server process Jarvis runs as; not across processes.
+2. **Process-local state.** Turn locks, the per-user anticipation lock, the trigger day memo and backoff, the PRIMARY model lock, the document-read lock and the web-search cooldown all live in memory. Correct for the one server process Jarvis runs as; not across processes.
 3. **The version check has a window.** It runs in `DraftService` just before `accept_draft`, so an edit landing between the two is not caught (`app/services/draft_service.py:62-72`). Both the dashboard and the chat card send the version they show (the chat card the `complete` frame's `draft_version`, `jarvis-frontend/lib/draftCard.ts:134`).
 4. **TMT ties past ~16 h** and **no default if-then plan** (the two strict xfails, §7).
 5. **A failed decomposition can still produce a plan** from the user's pending tasks: `fuse_tasks` runs after `decompose_goal` with no route on its error (`app/modules/planning_graph.py:989-993`), and a solved plan clears the error (`:710`).
 6. **`validate_goal` rejects goals under 5 characters** ("DSA") and asks for clarification (`app/modules/planning_graph.py:428`).
-7. **Web search is Gemini-only** (`gemini_web_search`, `app/services/analytical/workspace_builder.py:21, 39`). With no Gemini key, research and workspace links come back empty and say so. A search is metered on the composition root's bus, and refused without one (`metered_web_search`, `app/core/model_router.py:106-157`).
+7. **Web search is Gemini-only** (`gemini_web_search`, `app/services/analytical/workspace_builder.py:21, 39`). The workspace's web links, and its practice links when the task has no document chunks, come only from Gemini's grounded search, which fails while the Gemini credits are depleted. The workspace then shows the task, its completion criteria and the notice "Web results are unavailable right now, so no links are shown", and a failed search is not tried again for 5 minutes (`WEB_SEARCH_COOLDOWN_S`, `web_search_cooldown`). With no Gemini key, research links come back empty too. A search is metered on the composition root's bus, and refused without one (`metered_web_search`, `app/core/model_router.py:106-157`).
 8. **The PII gate is regex only** (email and US-format phone, `app/orchestrator/hooks.py`), applied to the prompt, the system prompt and the history before any cloud send.
 9. **Bringing a missed task back records no event** (it is not an outcome; `TaskService.bring_back`, `app/services/task_service.py:154`), and `task_completion_signals` is a table nothing reads or writes.
+10. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 8 allow-listed raw-table leftovers); only its cache read and write run on a worker thread. Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
+11. **Nothing creates habit trackers, and uploaded files are not kept** (§4).
+12. **A chat upload is limited by its step, not the reader.** The knowledge module's `ingest_document` step has its own 60 s limit (`app/modules/knowledge_graph.py`), so in a chat turn a slow parse ends there, before the reader's 120 s limit; the REST ingestion routes answer 503 `document_read_timeout` at 120 s.
 
 ---
 
 ## 11. Documents
 
 **Capstone (`docs/capstone/`):**
+[00 — Team study guide](capstone/00-team-study-guide.md) (the design and its reasons, for teammates; read first) ·
 [01 — Requirements](capstone/01-requirements.md) ·
 [02 — Architecture](capstone/02-architecture.md) ·
 [03 — Class diagrams](capstone/03-class-diagrams.md) ·

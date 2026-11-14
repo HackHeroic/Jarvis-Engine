@@ -1,6 +1,6 @@
 # 08 — Database schema
 
-Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 19 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (branch `capstone-lld`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
+Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 19 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (now part of `main`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -554,12 +554,12 @@ Indexes: `idx_llm_usage_events_user_created (user_id, created_at desc)`. RLS: `o
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** |
 | `user_id` | `text` | NO | — | FK `ingested_documents_user_id_fkey` → `user_profiles` CASCADE |
 | `source_id` | `text` | NO | — | **UK** `ingested_documents_user_id_source_id_key` `(user_id, source_id)`; the key ChromaDB chunks carry |
-| `file_name` | `text` | yes | — | |
+| `file_name` | `text` | yes | — | the upload's own name; since `be76c48` `POST /ingestion/process` passes it through (`IngestionRequest.file_name`, at most 255 characters) |
 | `media_type` | `text` | yes | — | |
 | `document_topics` | `text[]` | yes | `'{}'` | |
 | `chunk_count` | `integer` | yes | `0` | |
 | `created_at` | `timestamptz` | **yes** | `now()` | nullable since 008 |
-| `s3_key` | `text` | yes | — | added by capstone §2; written when the S3 upload succeeds |
+| `s3_key` | `text` | yes | — | added by capstone §2; written when the S3 upload succeeds. With the project's dependencies it does not: `boto3` is neither in `requirements.txt` nor installed in `.venv`, so the upload fails quietly (non-fatal) and the column stays null. No code reads it, so the original file is not kept anywhere Jarvis can show it |
 
 Indexes: the UK; `idx_ingested_documents_user_id (user_id)`. RLS: `owner_all`.
 
@@ -977,7 +977,7 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 **Other known gaps** (from `_schema_notes.md`, "Known gaps", and the plan ledgers):
 - **`goal_id` disagreement.** `build_task_rows` takes a task's `goal_id` from the chunk when present, and only for a chunk without one from the text before the first underscore (`task_rows.py:192`, `_goal_id_of` at line 55). `draft_schedules.goal_id` is the full slug, so older plans could create two goals.
 - **No constraint on `user_memories.content` length.** The entity caps it at 2000 characters (`entities.py:445`); the column has no length CHECK.
-- **No application code creates a habit tracker.** `HabitTrackerRepository` reads and updates rows (`get`, `list_for_user`, `record_review`); none of its methods inserts one.
+- **No application code creates a habit tracker.** `HabitTrackerRepository` reads and updates rows (`get`, `list_for_user`, `record_review`); none of its methods inserts one, and neither the API, the services nor the demo seed write `habit_trackers`. So `GET /api/v1/habits/tracker/due` is empty for every user, the demo user included.
 
 ---
 
@@ -1002,7 +1002,7 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 
 ## 12. How to verify this document
 
-From `Jarvis-Engine/` on branch `capstone-lld`:
+From `Jarvis-Engine/` on branch `main`:
 
 ```bash
 # The migrations: tables created, RLS on every table, every user_id an FK,

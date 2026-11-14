@@ -1,6 +1,6 @@
 # 03 — Class diagrams
 
-This document is the low-level design of the Jarvis backend drawn as UML class diagrams, at branch `capstone-lld`, commit `e76bff9`. There is one overview diagram and fourteen subsystem diagrams: the domain (planning entities, learning entities, events, errors), persistence (the ports and the two repository families), the language-model chain, the chat turn and the orchestrator, anticipation (triggers and consent), and memory and learning. Every class named in a diagram is a real class at the module given in the class index (section 9), and `tests/test_design_conformance.py` parses every diagram in this file and checks it against the code: each class imports, each `<<interface>>` is an `abc.ABC` with abstract methods, each inheritance or realization arrow is a real `issubclass`, each listed method exists with the listed parameter names, each enumeration lists exactly its members, and each whole/part or association arrow names a real attribute. A diagram that lies fails the build.
+This document is the low-level design of the Jarvis backend drawn as UML class diagrams, at commit `e76bff9`, now part of `main`. There is one overview diagram and fourteen subsystem diagrams: the domain (planning entities, learning entities, events, errors), persistence (the ports and the two repository families), the language-model chain, the chat turn and the orchestrator, anticipation (triggers and consent), and memory and learning. Every class named in a diagram is a real class at the module given in the class index (section 9), and `tests/test_design_conformance.py` parses every diagram in this file and checks it against the code: each class imports, each `<<interface>>` is an `abc.ABC` with abstract methods, each inheritance or realization arrow is a real `issubclass`, each listed method exists with the listed parameter names, each enumeration lists exactly its members, and each whole/part or association arrow names a real attribute. A diagram that lies fails the build.
 
 **Owner: ______**
 
@@ -621,6 +621,7 @@ classDiagram
     class InfrastructureError
     class PersistenceError
     class EmbeddingUnavailableError
+    class DocumentReadTimeoutError
     class LLMError
     class LLMTimeoutError
     class LLMUnavailableError
@@ -639,6 +640,7 @@ classDiagram
     ConflictError <|-- DraftOutdatedError
     InfrastructureError <|-- PersistenceError
     InfrastructureError <|-- EmbeddingUnavailableError
+    InfrastructureError <|-- DocumentReadTimeoutError
     InfrastructureError <|-- LLMError
     LLMError <|-- LLMTimeoutError
     LLMError <|-- LLMUnavailableError
@@ -646,7 +648,7 @@ classDiagram
     LLMError <|-- LLMRefusedError
 ```
 
-Every arrow is inheritance: each subclass overrides the class attributes `code` and `http_status` (`app/domain/errors.py:13-106`), and `app/api/error_handlers.py` turns any `JarvisError` into the one error envelope (see `09-error-handling.md`).
+Every arrow is inheritance: each subclass overrides the class attributes `code` and `http_status` (`app/domain/errors.py`; `DocumentReadTimeoutError` was added after `e76bff9`), and `app/api/error_handlers.py` turns any `JarvisError` into the one error envelope (see `09-error-handling.md`).
 
 | Class | `code` | HTTP |
 |---|---|---|
@@ -655,7 +657,7 @@ Every arrow is inheritance: each subclass overrides the class attributes `code` 
 | `NotFoundError` | `not_found` | 404 |
 | `ConflictError` / `InvalidStateTransition` / `StaleVersionError` / `DraftOutdatedError` | `conflict` / `invalid_state_transition` / `stale_version` / `draft_outdated` | 409 |
 | `ScheduleInfeasibleError` | `schedule_infeasible` | 422 |
-| `PersistenceError` / `EmbeddingUnavailableError` | `persistence_unavailable` / `embedding_unavailable` | 503 |
+| `PersistenceError` / `EmbeddingUnavailableError` / `DocumentReadTimeoutError` | `persistence_unavailable` / `embedding_unavailable` / `document_read_timeout` | 503 |
 | `LLMError` / `LLMTimeoutError` / `LLMUnavailableError` / `LLMOutputParseError` / `LLMRefusedError` | `llm_error` / `llm_timeout` / `llm_unavailable` / `llm_output_parse` / `llm_refused` | 503 |
 
 ---
@@ -2134,6 +2136,7 @@ Every class drawn above, and the module it is imported from. The conformance tes
 | `InfrastructureError` | `app.domain.errors` |
 | `PersistenceError` | `app.domain.errors` |
 | `EmbeddingUnavailableError` | `app.domain.errors` |
+| `DocumentReadTimeoutError` | `app.domain.errors` |
 | `LLMError` | `app.domain.errors` |
 | `LLMTimeoutError` | `app.domain.errors` |
 | `LLMUnavailableError` | `app.domain.errors` |
@@ -2306,7 +2309,7 @@ These are the places where the code cannot be drawn faithfully as a class diagra
 
 ## 11. How to verify this document
 
-From `Jarvis-Engine/` on branch `capstone-lld`:
+From `Jarvis-Engine/` on branch `main`:
 
 ```bash
 # The diagrams against the code: classes, interfaces, arrows, methods, enums, attributes

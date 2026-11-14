@@ -1,6 +1,6 @@
 # 04 — OOP and SOLID
 
-This document shows where the four pillars of object-oriented programming (encapsulation, abstraction, inheritance, polymorphism) and the five SOLID principles are applied in the Jarvis backend, at branch `capstone-lld`, commit `e76bff9`. For each one it gives what it means in this code base in one sentence, two or three concrete examples with `file:line` and a short excerpt copied from the code, the test that would fail if the principle were broken, and one honest place where the code falls short and why. The class-level picture is in `03-class-diagrams.md`, and the patterns these principles produce (Strategy, Decorator, Chain of Responsibility, Template Method and others) are in `05-design-patterns.md`. The last section lists the ten largest source files and what would be split next.
+This document shows where the four pillars of object-oriented programming (encapsulation, abstraction, inheritance, polymorphism) and the five SOLID principles are applied in the Jarvis backend, at commit `e76bff9`, now part of `main`. For each one it gives what it means in this code base in one sentence, two or three concrete examples with `file:line` and a short excerpt copied from the code, the test that would fail if the principle were broken, and one honest place where the code falls short and why. The class-level picture is in `03-class-diagrams.md`, and the patterns these principles produce (Strategy, Decorator, Chain of Responsibility, Template Method and others) are in `05-design-patterns.md`. The last section lists the ten largest source files and what would be split next.
 
 **Owner: ______**
 
@@ -232,7 +232,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
 **Here:** each class has one reason to change: the router parses, the turn service runs a turn, the encoder writes frames, each LLM decorator adds one concern.
 
-**Example 1 — the chat router only routes.** The whole endpoint is 61 lines; the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:49-55`:
+**Example 1 — the chat router only routes.** The whole endpoint is 56 lines at `c956a8f` (61 at `e76bff9`, before a hidden alias was removed); the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:49-55`:
 
 ```python
     turn = await ChatTurnService.for_app(http_request.app.state).open_turn(
@@ -458,20 +458,20 @@ class Sweep(ABC):
 
 ## 10. The ten largest source files
 
-Line counts at `e76bff9` (`find app -name '*.py' | xargs wc -l | sort -n | tail`). The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
+Line counts at `c956a8f` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tail`); `planning_graph.py`, `graph.py`, `memory_service.py` and `workspace_builder.py` grew after `e76bff9` (1,008, 810, 627 and 531 lines there). The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
 
 | # | File | Lines | What it holds | What would be split next |
 |---|---|---|---|---|
 | 1 | `app/infrastructure/persistence/supabase_repos.py` | 1,027 | All eleven Supabase repositories and their shared base | One module per repository in a `persistence/supabase/` package, `_SupabaseRepository` in `base.py`; `RepositoryFactory` imports change, nothing else |
-| 2 | `app/modules/planning_graph.py` | 1,008 | Every planning step (validate, constraints, habit translation, slot expansion, decomposition, fusion, solve, draft, infeasible ladder) and the module definition | A `modules/planning/` package: constraint steps, decomposition, solving and the horizon ladder, drafting, and the definition with `planning_state_in/out` (the dropped Plan 3 Task 9) |
+| 2 | `app/modules/planning_graph.py` | 1,015 | Every planning step (validate, constraints, habit translation, slot expansion, decomposition, fusion, solve, draft, infeasible ladder) and the module definition | A `modules/planning/` package: constraint steps, decomposition, solving and the horizon ladder, drafting, and the definition with `planning_state_in/out` (the dropped Plan 3 Task 9) |
 | 3 | `app/infrastructure/persistence/in_memory.py` | 880 | The in-memory store and all eleven in-memory repositories | Mirror the Supabase split, one module per repository |
-| 4 | `app/orchestrator/graph.py` | 810 | `build_jarvis_graph` plus the bodies of the top-level nodes (context, extraction, classification, draft actions, rule storage) | Keep only the wiring; move node bodies to `orchestrator/nodes/` (draft actions, understanding, rules) |
+| 4 | `app/orchestrator/graph.py` | 846 | `build_jarvis_graph` plus the bodies of the top-level nodes (context, extraction, classification, draft actions, rule storage) | Keep only the wiring; move node bodies to `orchestrator/nodes/` (draft actions, understanding, rules) |
 | 5 | `app/domain/ports.py` | 737 | Eleven repository ports plus the LLM, retry, embedding, energy, planner and sweep ports | `ports/repositories.py`, `ports/llm.py`, `ports/learning.py`, re-exported from `ports/__init__.py` so imports stay valid |
 | 6 | `app/services/memory/patterns.py` | 724 | The four detectors, `PatternService`, its view models and `PatternObserver` | `patterns/detectors.py` (the strategies), `patterns/service.py`, `patterns/observer.py` |
 | 7 | `app/domain/entities.py` | 701 | Every entity, enum and transition table | Entities by aggregate (planning, memory, anticipation, conversation, usage) and the transition tables in one `lifecycles.py` |
-| 8 | `app/services/memory/conversation_memory.py` | 632 | The conversation window, compaction, idle summaries and "since we last spoke" | Separate the window builder from the summariser (compaction and idle summaries share the summary-writing code) |
-| 9 | `app/services/memory/memory_service.py` | 627 | Memory lifecycle (remember, confirm, dismiss, forget, edit, fade) and recall | A `MemoryRecall` class for `recall` and `drop_suppressed`; the lifecycle stays in `MemoryService` |
-| 10 | `app/services/analytical/workspace_builder.py` | 531 | The task workspace: retrieval, web search, practice assets, and its cache | `WorkspaceRepository` and `TaskMaterialRepository` ports (which also takes it off the raw-table allow-list), and the web-search helper in its own module |
+| 8 | `app/services/memory/memory_service.py` | 639 | Memory lifecycle (remember, confirm, dismiss, forget, edit, fade) and recall | A `MemoryRecall` class for `recall` and `drop_suppressed`; the lifecycle stays in `MemoryService` |
+| 9 | `app/services/memory/conversation_memory.py` | 632 | The conversation window, compaction, idle summaries and "since we last spoke" | Separate the window builder from the summariser (compaction and idle summaries share the summary-writing code) |
+| 10 | `app/services/analytical/workspace_builder.py` | 561 | The task workspace: retrieval, web search (with its 5-minute cooldown after a failure), practice assets, and its cache | `WorkspaceRepository` and `TaskMaterialRepository` ports (which also takes it off the raw-table allow-list), and the web-search helper in its own module |
 
 ---
 
@@ -483,17 +483,17 @@ Line counts at `e76bff9` (`find app -name '*.py' | xargs wc -l | sort -n | tail`
 | Abstraction | 17 ABC ports in `app/domain/ports.py`, three more in the domain; one model-call function | `UserModel` returns dicts and builds its own energy heuristic |
 | Inheritance | Error hierarchy; decorator base; repository base plus port | A template step overridden only to switch it off |
 | Polymorphism | Provider chain, consent chain, sweeps, event listeners | Two `isinstance` / `getattr` checks around the LLM port |
-| SRP | 61-line router; one frame encoder; one concern per decorator | `ChatTurn.frames`, `planning_graph.py`, `graph.py` |
+| SRP | 56-line router; one frame encoder; one concern per decorator | `ChatTurn.frames`, `planning_graph.py`, `graph.py` |
 | OCP | Detectors, providers, triggers, actions added by registration | Modules still need edits to the routing table and graph |
 | LSP | One contract suite over two repository families | The chain widens `LLMProvider` with `skip_local` |
-| ISP | `PlanningServices`; one-method ports | 43-key turn state carrying the whole container |
+| ISP | `PlanningServices`; one-method ports | 44-key turn state carrying the whole container |
 | DIP | One composition root; `test_layering.py` | 8 raw-table leftovers; three process-wide lookups |
 
 ---
 
 ## 12. How to verify this document
 
-From `Jarvis-Engine/` on branch `capstone-lld`:
+From `Jarvis-Engine/` on branch `main`:
 
 ```bash
 # Every "Would break" test named above
@@ -512,6 +512,6 @@ sed -n '89,95p' app/infrastructure/llm/chain.py
 # The encapsulation shortfall (section 1): assignment is not validated
 .venv/bin/python -c "from app.domain.entities import DraftSchedule; d = DraftSchedule(id='d', user_id='u', status='pending'); d.status = 'accepted?'; print(d.status)"
 
-# The ten largest files (section 10)
-find app -name '*.py' | xargs wc -l | sort -n | tail -11
+# The ten largest files (section 10; tracked files only, so stray local files do not count)
+git ls-files 'app/*.py' | xargs wc -l | sort -n | tail -11
 ```

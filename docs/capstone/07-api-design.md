@@ -1,6 +1,6 @@
 # 07 — API design
 
-Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 48 operations on 42 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `e76bff9` (branch `capstone-lld`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
+Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 48 operations on 42 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `e76bff9` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -153,6 +153,7 @@ The places where this vocabulary is not yet followed are listed in §8.
 | `ChatStreamRequest.file_base64`, `IngestionRequest.file_base64` | ≤ 10 MB decoded (`MAX_CHAT_UPLOAD_BYTES`, `config.py:279`), checked by `within_upload_limit` | `app/schemas/upload.py:16-27` |
 | `ChatStreamRequest.media_type`, `IngestionRequest.media_type` | `"pdf"`, `"image"`, `"png"` or `"jpeg"` (`UploadMediaType`) | `upload.py:13` |
 | `ChatStreamRequest.model_mode` | `"auto"`, `"cloud"`, `"gemini"` or `"4b"` (`ModelMode`) | `chat_stream.py:44, 77-85` |
+| `IngestionRequest.file_name` | ≤ 255 chars (added after `e76bff9`) | `app/api/v1/endpoints/ingestion.py` |
 | `TaskSkipRequest.reason` | ≤ 500 chars | `app/api/v1/endpoints/tasks.py:44-56` |
 | `TaskCompleteRequest.quality` | 0–5 | `tasks.py:27-41` |
 | `TaskCompleteRequest.actual_duration_minutes` | ≥ 1 | `tasks.py:37-41` |
@@ -199,7 +200,7 @@ No route answers 400, 501 or 502 any more: malformed input is 422, and a model t
 | **413** | A body larger than any valid request on `POST /chat/stream` or `POST /ingestion/process` (about 14 MB: the largest file in base64 plus room for the message), refused from its `Content-Length` before it is read, or as soon as a chunked body passes the cap; no route runs (`BodyLimitMiddleware`, `app/api/request_limits.py:21-33, 38-96`) | `payload_too_large` |
 | **422** | Request validation (Pydantic: a malformed body, a message over 8,000 characters, a file over 10 MB, an unknown `model_mode` or `media_type`) and domain validation (bad base64, a missing `media_type`, a draft modify with a component other than `tasks`, an empty draft edit). An infeasible plan on accept or on `/schedule/generate-schedule`. | `validation_error`, `schedule_infeasible` |
 | **500** | A bug or an uncaught exception, answered with a fixed message; also a task workspace that could not be built | `internal_error` |
-| **503** | A dependency is down: database, embedder, language model | `persistence_unavailable`, `embedding_unavailable`, `llm_unavailable`, `llm_timeout`, `llm_error`, `llm_output_parse`, `llm_refused` |
+| **503** | A dependency is down or too slow: database, embedder, document reader, language model | `persistence_unavailable`, `embedding_unavailable`, `document_read_timeout`, `llm_unavailable`, `llm_timeout`, `llm_error`, `llm_output_parse`, `llm_refused` |
 
 Consent is never an error. A step that needs the user's say-so reaches the client as the `consent_request` SSE frame (§6), and a suggestion that needs it is stored PENDING with `consent_behavior: "ask"` (`tests/test_api_contract.py::test_consent__is_data_not_an_exception`).
 
@@ -251,6 +252,7 @@ Every error response has one shape, whatever raised it: a `JarvisError`, request
 | `schedule_infeasible` | 422 | accepting a partly-past draft whose remaining tasks no longer fit when re-solved from now; `/schedule/generate-schedule` when nothing fits |
 | `persistence_unavailable` | 503 | the database cannot be reached, or the app has no client |
 | `embedding_unavailable` | 503 | the text embedder could not run (for example, while editing a memory's words) |
+| `document_read_timeout` | 503 | the document reader (Docling) did not finish an upload within 120 s, on `POST /ingestion/ingest` or `/ingestion/process` (`DocumentReadTimeoutError`, added after `e76bff9`) |
 | `llm_error`, `llm_timeout`, `llm_unavailable`, `llm_output_parse`, `llm_refused` | 503 | the model chain failed; for example, the ingestion classifier is down (`llm_unavailable`), a goal decomposition is unusable (`llm_output_parse`), or the user's habits could not be read for the re-solve on accept |
 | `http_error` | 404 / 405 | Starlette's own answer for a path or method no route declares |
 | `internal_error` | 500 | anything else |
@@ -481,7 +483,7 @@ Every task route first requires the database (`require_supabase`, `tasks.py:116,
 | `POST /tasks/{task_id}/complete` | Record **done**, from `pending`, `missed` or `skipped`. One `completed` event carries the quality and actual duration in its metadata. | `TaskCompleteRequest {user_id, quality: 0–5 = 3, actual_duration_minutes? ≥1}` | `TaskResponse` (`status: "completed"`) | 404 `not_found`; 409 `stale_version`; 503 `persistence_unavailable` |
 | `POST /tasks/{task_id}/skip` | **Set aside** a pending task. One `skipped` event carries the reason. The message suggests today's buffer or tomorrow morning; nothing is re-placed. | `TaskSkipRequest {user_id, reason? ≤500}` | `TaskResponse` (`status: "skipped"`, or the current status with "already done / set aside, so nothing changed") | 404; 409; 503 |
 | `GET /tasks/?user_id=&status=` | The user's tasks, newest first, at most 500; `status` filters to one `TaskStatus` | — | `TaskListResponse {tasks: Task[], count}` | 422 (unknown status); 503 |
-| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[]}` (`app/schemas/workspace.py:53`) | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-60`) |
+| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h. Links, and practice links when the task has no document chunks, come only from Gemini's web search; when it fails, `notices` says "Web results are unavailable right now, so no links are shown", the workspace is not cached, and the search is not tried again for 5 minutes. Its database reads still block the event loop (a raw-table leftover) | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[]}` (`app/schemas/workspace.py:53`) | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-60`) |
 | `DELETE /tasks/{task_id}/workspace?user_id=` | Drop the cached workspace | — | `WorkspaceInvalidated {status: "invalidated"}` (`workspace.py:19`) | — (a failed delete is swallowed) |
 
 **Use case:** UC4 (complete or skip a task). The workspace routes support preparing for a task (no numbered use case).
@@ -543,13 +545,15 @@ Every route first requires the database (`require_supabase`) and goes through th
 | `GET /documents/?user_id=` | Ingested documents, newest first, each with `linked_task_ids` | — | `DocumentListResponse {documents: DocumentOut[]}` (`app/api/v1/endpoints/documents.py:23, 43`; extra row columns pass through) | 503 `persistence_unavailable` |
 | `DELETE /documents/{source_id}?user_id=` | Delete the user's ChromaDB chunks, links and record | — | `DocumentDeleteResponse {status: "deleted", source_id}` | 404 `not_found` "Document not found."; 503 |
 | `GET /documents/{source_id}/chunks?user_id=` | The user's text chunks for a document | — | `DocumentChunksResponse {source_id, chunks: string[], count}` | 503 `persistence_unavailable` |
-| `POST /ingestion/ingest` | Classify text or a file (no user, nothing stored) | `IngestionRequest {payload = "", file_base64? (≤ 10 MB), media_type?}` (`app/api/v1/endpoints/ingestion.py:51`) | `IntentClassification {intent: IntentType, confidence: 0–1, summary}` (`app/schemas/context.py:34`) | 422 `validation_error` (no input, bad base64, missing `media_type`, oversized file); 503 `llm_unavailable` "Could not classify the payload. Try again shortly." |
-| `POST /ingestion/process` | Full extraction pipeline: classify, then route to calendar, knowledge, behavioural or action extraction. Rules, tasks and goals go through the container's repositories, only when there is a database. | `ProcessIngestionRequest {payload, file_base64?, media_type?, user_id?}` (`ingestion.py:155`) | `IngestionPipelineResult {intent, classification_summary, calendar_result?, pending_calendar_id?, knowledge_result?, behavioral_result?, action_proposal?}` (`app/schemas/context.py:234`) | 422 `validation_error`; errors from the pipeline propagate |
+| `POST /ingestion/ingest` | Classify text or a file (no user, nothing stored) | `IngestionRequest {payload = "", file_base64? (≤ 10 MB), media_type?, file_name? (≤ 255)}` (`app/api/v1/endpoints/ingestion.py:51`) | `IntentClassification {intent: IntentType, confidence: 0–1, summary}` (`app/schemas/context.py:34`) | 422 `validation_error` (no input, bad base64, missing `media_type`, oversized file); 503 `document_read_timeout` (the file took more than 120 s to read); 503 `llm_unavailable` "Could not classify the payload. Try again shortly." |
+| `POST /ingestion/process` | Full extraction pipeline: classify, then route to calendar, knowledge, behavioural or action extraction. Rules, tasks and goals go through the container's repositories, only when there is a database. A kept document's row stores `file_name`, so the document list shows the file's own name. | `ProcessIngestionRequest {payload, file_base64?, media_type?, file_name? (≤ 255), user_id?}` (`ingestion.py:155`) | `IngestionPipelineResult {intent, classification_summary, calendar_result?, pending_calendar_id?, knowledge_result?, behavioral_result?, action_proposal?}` (`app/schemas/context.py:234`) | 422 `validation_error`; 503 `document_read_timeout`; other errors from the pipeline propagate |
 | `GET /ingestion/pending-calendar?user_id=` (CU) | Timetable extractions awaiting approval | — | `PendingCalendarListResponse {pending: PendingCalendarOut[]}` (`ingestion.py:71, 87`) | 503 |
 | `POST /ingestion/pending-calendar/{pending_id}/approve?user_id=` (CU) | Approve one; returns the slots for scheduling | — | `PendingCalendarApproved {status: "approved", daily_context: TimeSlot[]}` | 404 `not_found` (also when already processed); 503 |
 | `POST /ingestion/pending-calendar/{pending_id}/reject?user_id=` (CU) | Reject one | — | `PendingCalendarRejected {status: "rejected"}` | 404; 503 |
 
 **Use case:** supports ingestion of documents and timetables (no numbered use case).
+
+**What is kept of an upload.** Its text chunks (in ChromaDB) and one `ingested_documents` row: name, media type, topics, chunk count. The file itself is not kept: the pipeline tries an S3 upload, which fails quietly because `boto3` is not installed, and nothing reads `s3_key` back. So no route returns the original file, and the Documents page shows the name, topics, chunk count and linked tasks, with no viewer. Reading a file runs on a worker thread, one document at a time, for at most 120 s (`read_document`, `app/utils/docling_helper.py`).
 
 ### 5.9 Sessions — conversations
 
@@ -718,7 +722,7 @@ The frontend separates the two ways a stream can end early (`createStreamControl
 
 ## 7. How the frontend consumes the API
 
-The frontend repository is `/Users/madhav/Jarvis-cursor/jarvis-frontend` (branch `capstone-lld`, commit `4f72769`).
+The frontend repository is `/Users/madhav/Jarvis-cursor/jarvis-frontend` (references at commit `4f72769`, now part of its `main`). Later frontend work that changes how the API is used, uncommitted in the frontend's working tree when this was written: a reopened conversation with a pending plan shows its review card again (`storedPlanOf`, `lib/draftCard.ts`, which finds the newest assistant message with a `draft_id` and a schedule; whether that draft is still open is checked with `GET /drafts/{id}`); Discard asks its reason in the page instead of a native prompt; a dashboard quick brain dump starts a clean conversation; and concurrent workspace requests for one task share one call.
 
 | Concern | Where | What it does |
 |---|---|---|
@@ -784,7 +788,7 @@ These are stated plainly so a reviewer does not have to find them.
 
 ## 9. OpenAPI vs code
 
-Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone.
+Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone. Re-checked at `c956a8f` the same way: still 48 operations on 42 paths and 102 component schemas (`file_name` is a new field of an existing request, not a new path).
 
 What agrees:
 - Every operation declares a typed 2xx response model (`tests/test_api_contract.py::test_openapi__every_json_route__declares_a_typed_response_model`, `::test_openapi__schema__every_operation_has_a_typed_2xx_but_the_stream`).
@@ -830,7 +834,7 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 
 ## 12. How to verify this document
 
-From `Jarvis-Engine/` on branch `capstone-lld`, with the backend running on port 8000 for the live steps:
+From `Jarvis-Engine/` on branch `main`, with the backend running on port 8000 for the live steps:
 
 ```bash
 # Routes, parameters and response models: compare against §5 (expect 48 operations).

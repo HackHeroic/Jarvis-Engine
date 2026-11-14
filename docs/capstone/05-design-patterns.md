@@ -1,6 +1,6 @@
 # 05 — Design patterns
 
-This document lists every design pattern that is actually present in the Jarvis backend at branch `capstone-lld`, commit `e76bff9`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen, and it hands every collaborator in: nothing looks the container up from a process-wide registry.
+This document lists every design pattern that is actually present in the Jarvis backend at commit `e76bff9`, now part of `main`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen, and it hands every collaborator in: nothing looks the container up from a process-wide registry.
 
 **Owner: ______**
 
@@ -689,7 +689,7 @@ The restructure closed three earlier gaps: the draft endpoints and the task edit
 
 ## How to verify this document
 
-From `Jarvis-Engine/` on branch `capstone-lld`:
+From `Jarvis-Engine/` on branch `main`:
 
 ```bash
 # Repository: both families pass one contract suite (expect 223 passed)
