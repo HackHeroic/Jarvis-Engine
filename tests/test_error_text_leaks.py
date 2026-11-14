@@ -216,7 +216,8 @@ async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_excep
     import json
     from types import SimpleNamespace
 
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+    from app.api.v1.endpoints.chat import chat_stream
+    from app.schemas.chat_stream import ChatStreamRequest
 
     async def _session(*_a, **_k):
         return "sess-1"
@@ -234,7 +235,7 @@ async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_excep
     state = SimpleNamespace(jarvis_graph=_ExplodingGraph(), db_client=None)
 
     response = await chat_stream(
-        ChatRequest(user_prompt="hi", user_id="u1"),
+        ChatStreamRequest(user_prompt="hi", user_id="u1"),
         SimpleNamespace(app=SimpleNamespace(state=state)),
     )
     raw = ""

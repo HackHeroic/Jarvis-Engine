@@ -91,10 +91,13 @@ class JarvisState(TypedDict):
     progress_queue: Any
 
     # Live Supabase-backed DraftStore from app.state — transient like
-    # user_model, re-supplied per turn by chat.py, never checkpointed.
+    # user_model, re-supplied per turn by ChatTurnService, never checkpointed.
     draft_store: Any
+    # The composition root (AppContainer) the turn was opened with, or None (unit tests,
+    # scripts: a feature that needs it is then off). Transient, set fresh every turn.
+    container: Any
 
-    # Per-turn learning context, set fresh each turn by chat.py: the conversation and
+    # Per-turn learning context, set fresh each turn by ChatTurnService: the conversation and
     # the user's saved message (what this turn's memories cite as their source), and
     # the [mN] handles extract_brain_dump showed the model, mapped to memory ids.
     session_id: Optional[str]

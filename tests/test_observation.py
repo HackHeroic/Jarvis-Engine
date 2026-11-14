@@ -16,7 +16,6 @@ from app.core.observation import (
     persist_turn_memories,
     run_observation_loop,
 )
-from app.core.runtime import set_container
 from app.domain.entities import TaskEvent, TaskEventType, UserProfile
 from app.domain.errors import EmbeddingUnavailableError
 from app.orchestrator.hooks import ActionHooks
@@ -89,20 +88,20 @@ class _DownEmbedder(BagOfWordsEmbedder):
         raise EmbeddingUnavailableError("model weights missing at /srv/models/minilm")
 
 
-def _register(embedder) -> AppContainer:
-    """The composition root over in-memory repositories, registered like the lifespan does."""
-    container = AppContainer.build(
+def _container(embedder) -> AppContainer:
+    """The composition root over in-memory repositories; a turn carries it in its state."""
+    return AppContainer.build(
         supabase_client=None, cfg=config, hooks=ActionHooks(), embedder=embedder,
         install_chain=False,
     )
-    set_container(container)
-    return container
 
 
-def _turn(*memories: dict, **overrides):
-    """A non-trivial turn of alice's whose extraction returned ``memories``, and its queue."""
+def _turn(*memories: dict, container: AppContainer | None = None, **overrides):
+    """A non-trivial turn of alice's whose extraction returned ``memories``, and its queue.
+    ``container`` rides in the turn's state, as ChatTurnService puts it there."""
     queue: asyncio.Queue = asyncio.Queue()
     state = _make_state(**{
+        "container": container,
         "user_id": "alice",
         "session_id": str(uuid.uuid4()),
         "user_message_id": str(uuid.uuid4()),
@@ -129,8 +128,8 @@ MORNINGS = {"type": "preference", "content": "Prefers studying in the mornings",
 
 @pytest.mark.asyncio
 async def test_observation__stated_memory__frame_queued_and_no_task_left_running():
-    _register(_SpyEmbedder())
-    state, queue = _turn(MORNINGS)
+    container = _container(_SpyEmbedder())
+    state, queue = _turn(MORNINGS, container=container)
     before = asyncio.all_tasks()
 
     result = await run_observation_loop(state)
@@ -149,8 +148,8 @@ async def test_observation__learning_phase__end_frame_distinct_from_start():
     """The start and end of the learning step reach the browser as ``phase`` frames with
     ``_event_type`` stripped: identical bodies made the end indistinguishable from the start.
     The end says ``status: done``, as a tool step's last frame does."""
-    _register(_SpyEmbedder())
-    state, queue = _turn(MORNINGS)
+    container = _container(_SpyEmbedder())
+    state, queue = _turn(MORNINGS, container=container)
 
     await run_observation_loop(state)
 
@@ -164,9 +163,9 @@ async def test_observation__learning_phase__end_frame_distinct_from_start():
 @pytest.mark.asyncio
 async def test_observation__embedder_unavailable__turn_goes_on_with_no_memory_frame():
     embedder = _DownEmbedder()
-    _register(embedder)
+    container = _container(embedder)
     marathon = {"type": "goal", "content": "Training for the Mumbai marathon in March"}
-    state, queue = _turn(MORNINGS, marathon)
+    state, queue = _turn(MORNINGS, marathon, container=container)
 
     result = await run_observation_loop(state)
 
@@ -180,9 +179,10 @@ async def test_observation__embedder_unavailable__turn_goes_on_with_no_memory_fr
 @pytest.mark.asyncio
 async def test_persist_turn_memories__blank_or_wordless__never_embedded():
     embedder = _SpyEmbedder()
-    _register(embedder)
+    container = _container(embedder)
     state, _queue = _turn(
-        {"type": "fact", "content": "   "}, {"type": "fact", "content": "... !!"}
+        {"type": "fact", "content": "   "}, {"type": "fact", "content": "... !!"},
+        container=container,
     )
 
     outcomes = await persist_turn_memories(state)
@@ -193,8 +193,10 @@ async def test_persist_turn_memories__blank_or_wordless__never_embedded():
 
 @pytest.mark.asyncio
 async def test_persist_turn_memories__source_ids_not_uuids__stored_without_them():
-    _register(_SpyEmbedder())
-    state, _queue = _turn(MORNINGS, session_id="local-session", user_message_id=None)
+    container = _container(_SpyEmbedder())
+    state, _queue = _turn(
+        MORNINGS, session_id="local-session", user_message_id=None, container=container
+    )
 
     (outcome,) = await persist_turn_memories(state)
 
@@ -204,9 +206,9 @@ async def test_persist_turn_memories__source_ids_not_uuids__stored_without_them(
 
 @pytest.mark.asyncio
 async def test_persist_turn_memories__date_only_expiry__ends_that_day_on_the_users_clock():
-    _register(_SpyEmbedder())
+    container = _container(_SpyEmbedder())
     exam = {"type": "temporal_event", "content": "Calculus exam on 20 March", "expires_at": "2027-03-20"}
-    state, _queue = _turn(exam)
+    state, _queue = _turn(exam, container=container)
 
     (outcome,) = await persist_turn_memories(state)
 
@@ -215,12 +217,12 @@ async def test_persist_turn_memories__date_only_expiry__ends_that_day_on_the_use
 
 @pytest.mark.asyncio
 async def test_persist_turn_memories__expiry__read_from_the_profile_without_creating_one():
-    container = _register(_SpyEmbedder())
+    container = _container(_SpyEmbedder())
     container.repos.profiles.get_or_create = AsyncMock(
         side_effect=AssertionError("reading a timezone must not create a profile")
     )
     exam = {"type": "temporal_event", "content": "Calculus exam on 20 March", "expires_at": "2027-03-20"}
-    state, _queue = _turn(exam)
+    state, _queue = _turn(exam, container=container)
     state["user_model"].get_profile = AsyncMock(
         return_value=UserProfile(user_id="alice", timezone="America/New_York")
     )
@@ -234,9 +236,9 @@ async def test_persist_turn_memories__expiry__read_from_the_profile_without_crea
 
 @pytest.mark.asyncio
 async def test_persist_turn_memories__profile_read_fails__stored_without_an_expiry():
-    _register(_SpyEmbedder())
+    container = _container(_SpyEmbedder())
     exam = {"type": "temporal_event", "content": "Calculus exam on 20 March", "expires_at": "2027-03-20"}
-    state, _queue = _turn(exam)
+    state, _queue = _turn(exam, container=container)
     state["user_model"].get_profile = AsyncMock(side_effect=RuntimeError("profiles unreachable"))
 
     (outcome,) = await persist_turn_memories(state)
@@ -292,7 +294,7 @@ def _slow(monkeypatch, obj: object, name: str, seconds: float) -> None:
 
 @pytest.mark.asyncio
 async def test_observation__slow_store_outlasts_the_cap__held_moments_told_this_turn(monkeypatch):
-    container = _register(_SpyEmbedder())
+    container = _container(_SpyEmbedder())
     await container.repos.task_events.append_many("alice", _a_week_of_outcomes())
     held = await container.patterns.observe("alice")  # PEARL after an outcome, in the background
     monkeypatch.setattr(observation, "PEARL_INLINE_TIMEOUT_S", 0.05)
@@ -304,7 +306,7 @@ async def test_observation__slow_store_outlasts_the_cap__held_moments_told_this_
         (repos.memories, "find_by_pattern_keys"),
     ):
         _slow(monkeypatch, obj, name, 0.04)  # the turn's own look takes longer than the cap
-    state, queue = _turn()
+    state, queue = _turn(container=container)
 
     result = await run_observation_loop(state)
 

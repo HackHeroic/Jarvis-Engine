@@ -175,11 +175,12 @@ def _stub_chat_io(monkeypatch, session_id: str = "sess-1") -> None:
 
 
 async def _open_turn(graph, prompt: str, user_id: str = "u1"):
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+    from app.api.v1.endpoints.chat import chat_stream
+    from app.schemas.chat_stream import ChatStreamRequest
 
     app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
-    return await chat_stream(ChatRequest(user_prompt=prompt, user_id=user_id), http_request)
+    return await chat_stream(ChatStreamRequest(user_prompt=prompt, user_id=user_id), http_request)
 
 
 async def _drain(response) -> None:
@@ -253,11 +254,12 @@ async def _serve_over_asgi(graph, prompt: str, disconnect: asyncio.Event) -> Non
     ASGI spec 2.3 — Starlette then streams inside an anyio task group and cancels the
     stream when ``http.disconnect`` arrives. Handler and response share one task, as
     under Starlette's ``request_response``."""
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+    from app.api.v1.endpoints.chat import chat_stream
+    from app.schemas.chat_stream import ChatStreamRequest
 
     app_state = SimpleNamespace(jarvis_graph=graph, db_client=None)
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
-    response = await chat_stream(ChatRequest(user_prompt=prompt, user_id="u1"), http_request)
+    response = await chat_stream(ChatStreamRequest(user_prompt=prompt, user_id="u1"), http_request)
 
     async def receive():
         await disconnect.wait()
@@ -486,7 +488,8 @@ class _ForceCloudGraph(_AttributionGraph):
 
 @pytest.mark.asyncio
 async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_llm, monkeypatch):
-    from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+    from app.api.v1.endpoints.chat import chat_stream
+    from app.schemas.chat_stream import ChatStreamRequest
     from app.core.model_router import force_cloud_var
 
     _stub_chat_io(monkeypatch)
@@ -495,7 +498,7 @@ async def test_chat_v2__cloud_model_picked__force_cloud_ends_with_the_turn(no_ll
     http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
 
     response = await chat_stream(
-        ChatRequest(user_prompt="hi", user_id="u1", model_mode="cloud"), http_request
+        ChatStreamRequest(user_prompt="hi", user_id="u1", model_mode="cloud"), http_request
     )
     await _drain(response)
     await response.background()

@@ -13,6 +13,8 @@ nested ``checkpoint_ns`` through this same saver:
 * ``draft_store``     — the live ``DraftStore`` wrapping the Supabase client
   (JarvisState and PlanningState). Only ``draft_id`` — a plain string — needs
   to survive the turn; the store itself is re-supplied from ``app.state``.
+* ``container``       — the turn's ``AppContainer`` (composition root), re-supplied
+  by ``ChatTurnService`` every turn.
 * ``file_base64`` / ``file_bytes`` / ``file_name`` — the uploaded document in
   both its encoded and decoded forms, plus its name. Not a serialization
   problem, a privacy one: the upload turn's rows would hold the whole document —
@@ -27,7 +29,7 @@ Without scrubbing, LangGraph's serializer raises
 They are replaced with ``None`` on the way into SQLite — which touches the write
 path only, never the live channel values the running turn reads. ``_load_context``
 rebuilds ``user_model`` from the checkpointed ``user_id``; every other one is
-re-supplied per turn, the file fields from the request (chat.py) and
+re-supplied per turn, the file fields from the request (ChatTurnService) and
 ``db_client`` by ``knowledge_state_in`` from ``user_model._db``.
 
 The key list is a fast path, not the safety net: any *new* live object added to
@@ -61,6 +63,7 @@ _TRANSIENT_KEYS = (
     "progress_queue",
     "db_client",
     "draft_store",
+    "container",
     "file_base64",
     "file_bytes",
     "file_name",

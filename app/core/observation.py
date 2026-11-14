@@ -18,7 +18,8 @@ On every non-trivial turn, after the reply and before the stream's ``complete`` 
    user, this turn's and those PEARL learned in the background since the last turn
    (after a Complete, a Skip or a passed slot).
 
-Without a registered composition root (tests, scripts) nothing is learned: the legacy
+The composition root comes with the turn (``state["container"]``, set by
+``ChatTurnService``). Without one (tests, scripts) nothing is learned: the legacy
 detectors read ``user_tasks`` and would bring back patterns the user dismissed.
 Failures are logged by type and never shown.
 """
@@ -29,19 +30,21 @@ import re
 import uuid
 from collections.abc import Coroutine
 from datetime import date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.runtime import registered_container
 from app.domain.entities import MemorySource
 from app.domain.errors import EmbeddingUnavailableError
 from app.schemas.memory import ExtractedMemory
 from app.services.memory.memory_service import MemoryCandidate, RememberOutcome
 from app.services.memory.patterns import PatternChange, PatternLook
 from app.services.planning.local_time import end_of_local_day, user_zone
+
+if TYPE_CHECKING:
+    from app.container import AppContainer
 
 # No new memory write starts once this much of the turn has gone to remembering.
 MEMORY_PERSIST_TIMEOUT_S = 2.0
@@ -206,7 +209,7 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
     MEMORY_WRITE_TIMEOUT_S, never cancelled). No composition root, nothing to remember,
     or an embedder that is down: an empty or partial list, never an exception.
     """
-    container = registered_container()
+    container = state.get("container")
     user_id = state.get("user_id")
     extracted = turn_memories(state.get("brain_dump"))
     if container is None or not user_id or not extracted:
@@ -330,13 +333,12 @@ def memory_frame(outcome: RememberOutcome) -> dict | None:
     }
 
 
-async def pearl_insights(user_id: str) -> list[dict] | None:
+async def pearl_insights(container: "AppContainer | None", user_id: str) -> list[dict] | None:
     """PEARL's insights for the turn's ``complete`` frame (``PatternService.insights``).
 
     None when there are none, there is no composition root, or they took longer than
     PEARL_INSIGHTS_TIMEOUT_S.
     """
-    container = registered_container()
     if container is None or not user_id:
         return None
     try:
@@ -379,7 +381,7 @@ async def look_for_patterns(state: dict) -> PatternLook | None:
     holds the rest for the next turn. A failed look is logged by its type: None, as
     without a composition root.
     """
-    container = registered_container()
+    container = state.get("container")
     user_id = _user_of(state)
     if container is None or not user_id:
         return None
@@ -403,7 +405,7 @@ def drain_pattern_frames(state: dict) -> list[dict]:
     a Skip or a passed slot) and this turn's own. Never a pattern the user dismissed or
     forgot. No composition root: nothing.
     """
-    container = registered_container()
+    container = state.get("container")
     user_id = _user_of(state)
     if container is None or not user_id:
         return []
@@ -487,7 +489,7 @@ async def run_observation_loop(state: dict) -> dict:
         state, "phase_end",
         {"phase": "learning", "status": "done", **({"timeout": True} if timed_out else {})},
     )
-    container = registered_container()
+    container = state.get("container")
     return {
         "needs_followup": False,
         "memories_extracted_count": len(frames),

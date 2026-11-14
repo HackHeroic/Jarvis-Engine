@@ -259,11 +259,12 @@ class Jarvis:
 
     async def say(self, text: str, *, user: str = "alice", session: str | None = None) -> Turn:
         """Send one message and read the whole SSE reply, then let background work finish."""
-        from app.api.v1.endpoints.chat import ChatRequest, chat_stream
+        from app.api.v1.endpoints.chat import chat_stream
+        from app.schemas.chat_stream import ChatStreamRequest
 
         request = SimpleNamespace(app=SimpleNamespace(state=self.state))
         response = await chat_stream(
-            ChatRequest(user_prompt=text, user_id=user, conversation_id=session), request
+            ChatStreamRequest(user_prompt=text, user_id=user, conversation_id=session), request
         )
         raw = ""
         async for chunk in response.body_iterator:
