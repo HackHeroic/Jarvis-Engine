@@ -35,10 +35,12 @@ class MemoryRecord(BaseModel):
 
 class ExtractedMemory(BaseModel):
     """A memory extracted from a conversation turn by the LLM."""
-    type: MemoryType
+    type: MemoryType = Field(description="What kind of memory it is")
     content: str = Field(description="Concise statement of what was learned")
-    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
-    contradicts: str | None = Field(default=None, description="ID of existing memory this contradicts, or null")
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5, description="How plainly it was said, 0-1")
+    contradicts: str | None = Field(
+        default=None, description='Handle of the known memory this replaces, such as "m3", or null'
+    )
     expires_at: str | None = Field(default=None, description="ISO date if temporal event, or null")
 
 

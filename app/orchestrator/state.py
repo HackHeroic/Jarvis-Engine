@@ -91,6 +91,13 @@ class JarvisState(TypedDict):
     # user_model, re-supplied per turn by chat.py, never checkpointed.
     draft_store: Any
 
+    # Per-turn learning context, set fresh each turn by chat.py: the conversation and
+    # the user's saved message (what this turn's memories cite as their source), and
+    # the [mN] handles extract_brain_dump showed the model, mapped to memory ids.
+    session_id: Optional[str]
+    user_message_id: Optional[str]
+    memory_handles: dict[str, str]
+
     # Per-turn flags
     trivial_input: Optional[bool]            # set when greeting/emotional fast-path fires
     force_cloud_request: Optional[bool]      # set when frontend model picker chose Gemini

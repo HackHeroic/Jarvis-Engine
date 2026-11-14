@@ -6,6 +6,8 @@ from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.memory import ExtractedMemory
+
 
 @dataclass
 class IntentContext:
@@ -100,6 +102,14 @@ class BrainDumpExtraction(BaseModel):
         description="Specific subjects, topics, exams, contests mentioned. "
         "Preserve verbatim with any associated deadlines. "
         "E.g. ['deep learning contest - Friday', 'calculus exam - Monday']",
+    )
+    memories: List[ExtractedMemory] = Field(
+        default_factory=list,
+        description=(
+            "Lasting facts, preferences, goals or constraints the USER states about themselves in THIS message. "
+            "Never from the assistant's words, never today-only moods (those are state_updates), "
+            "never a repeat of inline_habits. contradicts: the [mN] handle of a known memory this replaces."
+        ),
     )
 
 

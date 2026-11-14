@@ -258,11 +258,61 @@ async def _load_context(state: JarvisState) -> dict:
     return {"user_model": user_model}
 
 
-async def _extract_brain_dump(state: JarvisState) -> dict:
-    """Extract planning goal, habits, action items from user message using LLM.
+# The extraction is shown at most this many of the user's memories (the newest), each
+# under a handle it can cite to say a memory in the message replaces it.
+KNOWN_MEMORY_LIMIT = 15
+# Reading them is one query on the reply's critical path: past this, extract without them.
+KNOWN_MEMORIES_TIMEOUT_S = 1.0
 
-    Trivial inputs (greetings, acks) skip the LLM entirely → routes to CHAT.
-    Avoids 26B over-extraction when E4B isn't loaded.
+
+async def _known_memories(user_id: str | None) -> list:
+    """The user's newest active memories, oldest first; none without a composition root.
+
+    A slow or failing read gives none: the turn is extracted without them.
+    """
+    from app.core.runtime import registered_container
+
+    container = registered_container()
+    if container is None or not user_id:
+        return []
+    try:
+        memories = await asyncio.wait_for(
+            container.memory_service.list_active(user_id), timeout=KNOWN_MEMORIES_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Known memories took too long to read; extracting without them")
+        return []
+    except Exception as e:
+        logger.warning(f"Known memories could not be read ({type(e).__name__}); extracting without them")
+        return []
+    return [m for m in memories if m.id and m.content.strip()][-KNOWN_MEMORY_LIMIT:]
+
+
+def _extraction_prompt(user_msg: str, memories: list) -> tuple[str, dict[str, str]]:
+    """The extraction's user prompt, and the handle -> memory id map it shows.
+
+    The known memories are volatile, so they ride in the user prompt (never the
+    byte-stable system prompt): ``[m1] (type) content`` lines, then ``Message:`` and the
+    message. With none known the prompt is the message alone.
+    """
+    if not memories:
+        return user_msg, {}
+    handles: dict[str, str] = {}
+    lines = []
+    for number, memory in enumerate(memories, start=1):
+        handle = f"m{number}"
+        handles[handle] = memory.id
+        lines.append(f"[{handle}] ({memory.memory_type}) {' '.join(memory.content.split())}")
+    return "Known memories:\n" + "\n".join(lines) + "\n\nMessage:\n" + user_msg, handles
+
+
+async def _extract_brain_dump(state: JarvisState) -> dict:
+    """Extract planning goal, habits, action items and memories from the user message.
+
+    One model call: the lasting facts the user states about themselves come back in
+    ``memories`` (the observation loop remembers them), citing the handles of the known
+    memories listed in the prompt. Trivial inputs (greetings, acks) skip the LLM
+    entirely → routes to CHAT. Avoids 26B over-extraction when E4B isn't loaded.
     """
     from app.schemas.context import BrainDumpExtraction
     from app.services.analytical.control_policy import BRAIN_DUMP_EXTRACTION_PROMPT
@@ -280,20 +330,22 @@ async def _extract_brain_dump(state: JarvisState) -> dict:
     if not user_msg.strip():
         return {"brain_dump": None, "trivial_input": False}
 
+    prompt, handles = _extraction_prompt(user_msg, await _known_memories(state.get("user_id")))
     try:
         result = await route_llm_call(
             task="brain_dump_extraction",
-            prompt=user_msg,
+            prompt=prompt,
             system_prompt=BRAIN_DUMP_EXTRACTION_PROMPT,
             response_schema=BrainDumpExtraction,
             conversation_history=state.get("conversation_history"),
         )
         if isinstance(result, BrainDumpExtraction):
-            return {"brain_dump": result, "trivial_input": False}
+            return {"brain_dump": result, "trivial_input": False, "memory_handles": handles}
         if isinstance(result, dict):
             return {
                 "brain_dump": BrainDumpExtraction.model_validate(result),
                 "trivial_input": False,
+                "memory_handles": handles,
             }
         return {"brain_dump": None, "trivial_input": False}
     except Exception as e:

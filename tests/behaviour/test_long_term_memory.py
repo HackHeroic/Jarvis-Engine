@@ -6,12 +6,12 @@ pattern hides it and confirming it raises its confidence. Memories fade with
 time since they were last reinforced (SM-2 style decay) and drop out of context
 below the retention floor. Nobody else's memories are ever in your context.
 
-The memory extraction model is scripted to react only to the exchange in front of
-it (the "User:" line of its prompt), the way a real extractor would; ids it cites
-for contradictions are read off the EXISTING MEMORIES list in that prompt.
+Memories come back from the turn's one extraction call (``brain_dump_extraction``),
+scripted to react only to what the user said in this message, the way a real
+extractor would. Handles it cites for contradictions are read off the known
+memories (``[m1] (type) content``) listed in that prompt.
 """
 
-import json
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -21,7 +21,9 @@ import pytest
 
 import app.services.memory.retriever as retriever_module
 import app.services.memory.store as store_module
+import app.services.task_service as task_service_module
 from app.services.memory.retriever import build_memory_context
+from tests.behaviour.conftest import brain_dump, said
 
 MARATHON = "Training for the Mumbai marathon in March"
 MORNINGS = "Prefers studying in the mornings"
@@ -30,25 +32,25 @@ _T0 = datetime(2026, 11, 16, 9, 0, tzinfo=timezone.utc)
 
 
 def _script_memories(llm, rules: dict) -> None:
-    """When the exchange's user line contains a trigger, extract that rule's memory.
+    """When what the user said contains a trigger, the extraction returns that rule's memory.
 
     A rule's memory is a dict, or a callable taking the extraction prompt (so it
-    can cite the id of an existing memory it contradicts).
+    can cite the handle of a known memory it contradicts).
     """
 
     def reply(req) -> str:
-        user_line = re.search(r"^User: (.*)$", req.prompt, flags=re.MULTILINE).group(1)
+        message = said(req)
         memories = [
             memory(req.prompt) if callable(memory) else memory
-            for trigger, memory in rules.items() if trigger in user_line
+            for trigger, memory in rules.items() if trigger in message
         ]
-        return json.dumps({"memories": memories})
+        return brain_dump(memories=memories)
 
-    llm.script("memory_extraction", reply)
+    llm.script("brain_dump_extraction", reply)
 
 
 def _contradicting_mornings(prompt: str) -> dict:
-    match = re.search(rf"^\[([^\]]+)\] \(preference\) {MORNINGS}$", prompt, flags=re.MULTILINE)
+    match = re.search(rf"^\[(m\d+)\] \(preference\) {MORNINGS}$", prompt, flags=re.MULTILINE)
     return {
         "type": "preference",
         "content": NIGHTS,
@@ -89,7 +91,7 @@ async def _memory_api(jarvis, monkeypatch):
 @pytest.fixture
 def frozen_memory_clock(clock):
     """Memory writes and decay read one controllable clock."""
-    clock.freeze(_T0, store_module, retriever_module)
+    clock.freeze(_T0, store_module, retriever_module, task_service_module)
     return clock
 
 
@@ -273,10 +275,10 @@ async def test_memory__another_users_memories__never_reach_my_context_or_panel(
     await jarvis.say("What should I focus on this week?", user="bob")
 
     assert MARATHON not in _system_prompt_of_reply(llm, calls_before)
-    # Bob's own extraction is not shown Alice's memories as "existing" ones either.
+    # Bob's own extraction is not shown Alice's memories as known ones either.
     for call in llm.calls[calls_before:]:
-        if call.task == "memory_extraction":
-            assert MARATHON not in call.prompt.split("CURRENT EXCHANGE")[0]
+        if call.task == "brain_dump_extraction":
+            assert MARATHON not in call.prompt
     async with _memory_api(jarvis, monkeypatch) as api:
         panel = (await api.get("/api/v1/memories/", params={"user_id": "bob"})).json()
         forget = await api.delete(f"/api/v1/memories/{alices['id']}", params={"user_id": "bob"})

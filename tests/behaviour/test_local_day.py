@@ -9,8 +9,6 @@ UTC-anchored day starts at 13:30 and its "midnight-08:00" sleep block is
 05:30-13:30.
 """
 
-import json
-import re
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -20,7 +18,7 @@ import app.api.v1.endpoints.schedule as schedule_endpoint
 from app.domain.events import NullEventBus
 from app.infrastructure.persistence.supabase_repos import SupabaseDraftRepository
 from app.services.draft_service import DraftService
-from tests.behaviour.conftest import brain_dump, decomposition
+from tests.behaviour.conftest import brain_dump, decomposition, said
 
 IST = ZoneInfo("Asia/Kolkata")
 MONDAY = date(2026, 11, 16)
@@ -84,13 +82,13 @@ async def test_local_day__never_before_11_am__holds_in_local_time_on_every_day(j
     _script_plan(llm, TOPICS)
 
     def extract(req) -> str:
-        user_line = re.search(r"^User: (.*)$", req.prompt, flags=re.MULTILINE).group(1)
-        if "before 11" not in user_line:
-            return '{"memories": []}'
-        rule = {"type": "constraint", "content": "No study before 11 AM", "confidence": 0.9}
-        return json.dumps({"memories": [rule]})
+        message = said(req)
+        if "before 11" in message:  # the rule, remembered from the turn's one extraction call
+            rule = {"type": "constraint", "content": "No study before 11 AM", "confidence": 0.9}
+            return brain_dump(memories=[rule])
+        return brain_dump(planning_goal="Revise DSA") if "plan" in message.lower() else "{}"
 
-    llm.script("memory_extraction", extract)
+    llm.script("brain_dump_extraction", extract)
     await jarvis.say("Please never put study before 11 AM, I'm useless then")
 
     turn = await jarvis.say("Plan my DSA revision")
