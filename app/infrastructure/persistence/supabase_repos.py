@@ -205,22 +205,40 @@ class SupabaseTaskEventRepository(_SupabaseRepository, TaskEventRepository):
         rows = await self._run(lambda q: q.insert(to_row(stored)))
         return _read(TaskEvent, rows[0]) if rows else stored
 
+    async def append_many(self, user_id: str, events: list[TaskEvent]) -> list[TaskEvent]:
+        # Every event is checked before the one insert: all or nothing.
+        stored = [prepare_new(user_id, event, "task event") for event in events]
+        if not stored:
+            return []
+        rows = await self._run(lambda q: q.insert([to_row(event) for event in stored]))
+        # The ids are minted here, so ``stored`` is already what was written; the echoed
+        # rows are preferred only when the response carries all of them.
+        return [_read(TaskEvent, r) for r in rows] if len(rows) == len(stored) else stored
+
     async def list_for_user(
         self,
         user_id: str,
         *,
         since: datetime | None = None,
         types: set[TaskEventType] | None = None,
+        task_ids: set[str] | None = None,
     ) -> list[TaskEvent]:
+        if task_ids is not None and not task_ids:
+            return []
+
         def build(q: Any) -> Any:
             q = q.select("*").eq("user_id", user_id)
             if since is not None:
                 q = q.gte("occurred_at", iso(since))
             if types is not None:
                 q = q.in_("event_type", sorted(TaskEventType(t).value for t in types))
-            return q.order("occurred_at")
+            if task_ids is not None:
+                q = q.in_("task_id", sorted(task_ids))
+            # Newest first: if PostgREST's max_rows cap cuts the answer short, the
+            # rows it leaves out are the oldest. Handed back oldest first, as the port says.
+            return q.order("occurred_at", desc=True)
 
-        return [_read(TaskEvent, r) for r in await self._run(build)]
+        return [_read(TaskEvent, r) for r in reversed(await self._run(build))]
 
 
 class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):

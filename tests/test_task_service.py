@@ -108,8 +108,15 @@ class _FailingEvents(TaskEventRepository):
             raise errors.PersistenceError("Could not reach the database.")
         return await self._inner.append(user_id, event)
 
-    async def list_for_user(self, user_id, *, since=None, types=None):
-        return await self._inner.list_for_user(user_id, since=since, types=types)
+    async def append_many(self, user_id, events):
+        if self.fail:
+            raise errors.PersistenceError("Could not reach the database.")
+        return await self._inner.append_many(user_id, events)
+
+    async def list_for_user(self, user_id, *, since=None, types=None, task_ids=None):
+        return await self._inner.list_for_user(
+            user_id, since=since, types=types, task_ids=task_ids
+        )
 
 
 class _YieldingTasks(_DelegatingTasks):

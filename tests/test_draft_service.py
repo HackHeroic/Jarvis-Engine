@@ -234,6 +234,68 @@ async def test_accept__replan_same_slot__no_new_event(repos):
     ]
 
 
+@pytest.mark.asyncio
+async def test_accept__history_past_the_read_cap__same_slot_still_no_new_event():
+    """Supabase answers at most max_rows rows per read. Newer events about other
+    tasks must not crowd this task's latest slot out of the comparison."""
+    supabase = FakeSupabase()
+    supabase.max_rows = 3
+    repos = RepositoryFactory.supabase(supabase)
+    service = _recording_service(repos)
+    first = await _draft(repos, _tasks("g_t1"), schedule=_slots(g_t1=0))
+    await service.accept(U1, first.id)
+    for n in range(5):  # newer history, all about other tasks
+        await repos.task_events.append(U1, TaskEvent(
+            user_id=U1, task_id=f"other_{n}", event_type=TaskEventType.SCHEDULED,
+            occurred_at=NOW + timedelta(minutes=n + 1), scheduled_start=_at(0),
+        ))
+
+    again = await _draft(repos, _tasks("g_t1"), schedule=_slots(g_t1=0))
+    await service.accept(U1, again.id)
+
+    ours = await repos.task_events.list_for_user(U1, task_ids={"g_t1"})
+    assert [e.event_type for e in ours] == [TaskEventType.SCHEDULED]
+
+
+class _SpyEvents(TaskEventRepository):
+    """Delegates to ``inner`` and records each call's name and keyword arguments."""
+
+    def __init__(self, inner: TaskEventRepository) -> None:
+        self._inner = inner
+        self.calls: list[tuple[str, dict]] = []
+
+    async def append(self, user_id, event):
+        self.calls.append(("append", {}))
+        return await self._inner.append(user_id, event)
+
+    async def append_many(self, user_id, events):
+        self.calls.append(("append_many", {"events": list(events)}))
+        return await self._inner.append_many(user_id, events)
+
+    async def list_for_user(self, user_id, *, since=None, types=None, task_ids=None):
+        self.calls.append(("list_for_user", {"types": types, "task_ids": task_ids}))
+        return await self._inner.list_for_user(
+            user_id, since=since, types=types, task_ids=task_ids
+        )
+
+
+@pytest.mark.asyncio
+async def test_accept__records_slots__one_bounded_read_and_one_bulk_write(repos):
+    spy = _SpyEvents(repos.task_events)
+    service = DraftService(repos.drafts, NullEventBus(), task_events=spy, clock=lambda: NOW)
+    draft = await _draft(repos, _tasks("g_t1", "g_t2", "g_t3"), schedule=_slots(g_t1=0, g_t2=30))
+
+    await service.accept(U1, draft.id)
+
+    assert [name for name, _ in spy.calls] == ["list_for_user", "append_many"]
+    read, write = spy.calls[0][1], spy.calls[1][1]
+    assert read == {
+        "types": {TaskEventType.SCHEDULED, TaskEventType.RESCHEDULED},
+        "task_ids": {"g_t1", "g_t2"},  # the slotted tasks only
+    }
+    assert sorted(e.task_id for e in write["events"]) == ["g_t1", "g_t2"]
+
+
 class _EventStoreDown(TaskEventRepository):
     """A task event store whose ``failing`` call raises as an unreachable database does."""
 
@@ -241,18 +303,23 @@ class _EventStoreDown(TaskEventRepository):
         self._failing = failing
 
     async def append(self, user_id: str, event: TaskEvent) -> TaskEvent:
-        if self._failing == "append":
-            raise errors.PersistenceError("The database could not be reached.")
-        return event
+        raise errors.PersistenceError("The database could not be reached.")
 
-    async def list_for_user(self, user_id, *, since=None, types=None) -> list[TaskEvent]:
+    async def append_many(self, user_id: str, events: list[TaskEvent]) -> list[TaskEvent]:
+        if self._failing == "append_many":
+            raise errors.PersistenceError("The database could not be reached.")
+        return list(events)
+
+    async def list_for_user(
+        self, user_id, *, since=None, types=None, task_ids=None
+    ) -> list[TaskEvent]:
         if self._failing == "list_for_user":
             raise errors.PersistenceError("The database could not be reached.")
         return []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failing", ["append", "list_for_user"])
+@pytest.mark.parametrize("failing", ["append_many", "list_for_user"])
 async def test_accept__event_store_down__accept_still_succeeds_and_logs(repos, caplog, failing):
     service = DraftService(
         repos.drafts, NullEventBus(), task_events=_EventStoreDown(failing), clock=lambda: NOW

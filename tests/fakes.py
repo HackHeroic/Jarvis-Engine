@@ -96,10 +96,12 @@ class _Query:
         rows: list[dict],
         table_name: str,
         selects: list[tuple[str, tuple[str, ...]]] | None = None,
+        max_rows: int | None = None,
     ):
         self._rows = rows
         self._table = table_name
         self._selects = selects if selects is not None else []
+        self._max_rows = max_rows
         self._op: str | None = None
         self._payload: Any = None
         self._filters: list[tuple[str, Any]] = []
@@ -219,6 +221,9 @@ class _Query:
             matched.sort(key=lambda r: r.get(column) or "", reverse=desc)
         if self._limit is not None:
             matched = matched[: self._limit]
+        if self._op == "select" and self._max_rows is not None:
+            # PostgREST's cap: a read silently answers at most max_rows rows.
+            matched = matched[: self._max_rows]
 
         # Return copies so callers mutating results can't corrupt the store.
         return _Result([copy.deepcopy(r) for r in matched])
@@ -244,9 +249,12 @@ class FakeSupabase:
         self._rpc_lock = threading.Lock()
         # (table, column names) for every select, in call order.
         self.selects: list[tuple[str, tuple[str, ...]]] = []
+        # The most rows one read returns, after order and limit, as [api] max_rows
+        # in supabase/config.toml makes PostgREST do; None means no cap.
+        self.max_rows: int | None = 1000
 
     def table(self, name: str) -> _Query:
-        return _Query(self.rows.setdefault(name, []), name, self.selects)
+        return _Query(self.rows.setdefault(name, []), name, self.selects, self.max_rows)
 
     def rpc(self, name: str, params: dict) -> _RpcCall:
         # The real client sends params as JSON; round-trip so a value the
