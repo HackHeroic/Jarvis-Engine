@@ -1,6 +1,6 @@
 # 05 — Design patterns
 
-This document lists every design pattern that is actually present in the Jarvis backend at branch `capstone-lld`, commit `5c6ffd3`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen.
+This document lists every design pattern that is actually present in the Jarvis backend at branch `capstone-lld`, commit `e76bff9`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen, and it hands every collaborator in: nothing looks the container up from a process-wide registry.
 
 **Owner: ______**
 
@@ -10,15 +10,15 @@ This document lists every design pattern that is actually present in the Jarvis 
 
 | # | Pattern | Main location | Status | Pinned by |
 |---|---|---|---|---|
-| 2 | Repository, two families under one contract suite | `app/domain/ports.py:54-511`; `app/infrastructure/persistence/{in_memory,supabase_repos}.py` | Applied; two older endpoints still query Supabase directly (see 2.7) | `tests/test_repository_contracts.py` (89 test functions, 201 runs over both families) |
+| 2 | Repository, two families under one contract suite | `app/domain/ports.py:59-595`; `app/infrastructure/persistence/{in_memory,supabase_repos}.py` | Applied; 8 files still call `.table(...)` for tables with no repository yet, each on a tested allow-list (see 2.7) | `tests/test_repository_contracts.py` (97 test functions, 223 runs) |
 | 3 | Strategy | LLM providers, pattern detectors, embedders, energy estimators, retry policies, autonomy policies | Applied; some strategies have one production implementation (see 3.5) | `tests/test_llm_providers.py`, `tests/test_patterns.py`, `tests/test_recall.py`, `tests/test_consent.py` |
 | 4 | Decorator | `RedactingProvider`, `RetryingProvider`, `MeteredProvider`, `TimeoutProvider` (`app/infrastructure/llm/decorators.py`) | Applied | `tests/test_llm_providers.py` |
 | 5 | Chain of Responsibility | Provider fallback chain (`app/infrastructure/llm/chain.py:35`); consent chain (`app/domain/anticipation.py:218`); hook pipeline (`app/orchestrator/hooks.py:32`) | Applied; the hook pipeline is first-match, not deny-over-ask aggregation (see 5.6) | `tests/test_llm_providers.py::test_chain__*`, `tests/test_consent.py` |
 | 6 | State (transition tables) | Draft, suggestion and memory tables in `app/domain/entities.py`; task moves in `app/services/task_service.py:65-84` | Applied; the task table lives in the service, not the domain (see 6.6) | `tests/test_domain.py`, `tests/test_anticipation_design.py`, `tests/test_task_service.py` |
 | 7 | Observer | `EventBus` (`app/domain/events.py:78`) with `UsageLedger`, `PatternObserver`, `AnticipationListener` | Applied; two published events have no production listener (see 7.6) | `tests/test_domain.py::test_event_bus__*`, `tests/test_container.py` |
 | 8 | Template Method | `Trigger.run` (`app/domain/anticipation.py:353-421`) | Applied | `tests/test_trigger_template.py` (13 tests) |
-| 9 | Factory / composition root | `AppContainer.build` (`app/container.py:99-210`), `RepositoryFactory`, `LLMProviderFactory`, `ActionFactory` | Applied; a few global look-ups of the container remain (see 9.6) | `tests/test_container.py`, `tests/test_layering.py::test_layering__only_container_builds_repositories` |
-| 10 | Facade | `UserModelService.snapshot` (`app/services/user_model_service.py:182-223`) | Applied for the You page; the older `UserModel` facade is still reached through (see 10.6) | `tests/test_user_model_service.py`, `tests/test_you_api.py` |
+| 9 | Factory / composition root | `AppContainer.build` (`app/container.py:103-239`), `Settings.from_config` (`app/core/settings.py:78-118`), `RepositoryFactory`, `LLMProviderFactory`, `ActionFactory` | Applied; the language-model chain is still installed process-wide (see 9.6) | `tests/test_container.py`, `tests/test_injection.py`, `tests/test_layering.py::test_layering__only_container_builds_repositories` |
+| 10 | Facade | `UserModelService.snapshot` (`app/services/user_model_service.py:192-238`); `UserModel` over three ports (`app/core/user_model.py:23-50`); `ChatTurnService` behind the chat router (`app/services/chat_turn/service.py:240-303`) | Applied | `tests/test_user_model_service.py`, `tests/test_you_api.py`, `tests/test_injection.py::test_user_model__over_ports__no_db_attribute`, `tests/test_chat_turn.py::test_chat_router__routing_and_parsing_only` |
 | 11 | Adapter | Provider adapters, Supabase repositories, `MiniLMEmbedder`, `PreCloudLLMRedactor` | Applied | `tests/test_llm_providers.py::test_local__*`, `tests/test_claude_provider.py`, `tests/test_embedding.py` |
 | 12 | Command-like `ProactiveAction` | `app/domain/anticipation.py:58-89`; `app/services/anticipation/actions.py` | Applied (stored, rebuilt, executed once; no undo) | `tests/test_anticipation_service.py`, `tests/test_trigger_template.py` |
 
@@ -48,15 +48,17 @@ The chain tries the three branches top to bottom (local first). Each branch is a
 ## 2. Repository (two families, one contract suite)
 
 ### 2.1 Problem
-Services must store tasks, drafts, events, rules, memories, suggestions, profiles and usage without knowing Supabase exists, and tests must run offline. Before the capstone, endpoints built Supabase queries inline, and some forgot the `user_id` filter (the IDOR found in the audit).
+Services must store tasks, drafts, events, rules, goals, habit trackers, memories, suggestions, profiles, conversations and usage without knowing Supabase exists, and tests must run offline. Before the capstone, endpoints built Supabase queries inline, and some forgot the `user_id` filter (the IDOR found in the audit).
 
 ### 2.2 Pattern
 One abstract repository per aggregate (the port), with every per-user method taking `user_id` first (`app/domain/ports.py:1-5`). Two concrete families implement every port: in-memory (`app/infrastructure/persistence/in_memory.py`) and Supabase (`app/infrastructure/persistence/supabase_repos.py`). The same contract tests run against both, which is how substitutability (Liskov) is shown rather than claimed.
 
 ### 2.3 Where
-- Ports: `TaskRepository` (`ports.py:54-97`), `TaskEventRepository` (`ports.py:100-134`), `DraftRepository` (`ports.py:137-196`), `ConstraintRepository` (`ports.py:199`), `ProfileRepository` (`ports.py:225`), `SuggestionRepository` (`ports.py:241-304`), `MemoryRepository` (`ports.py:316-417`), `ConversationRepository` (`ports.py:420`), `UsageRepository` (`ports.py:497-511`).
-- One family at a time: `Repositories` and `RepositoryFactory` (`app/infrastructure/persistence/factory.py:46-93`).
-- Contract suite fixture, parametrised over both families (`tests/test_repository_contracts.py:70-74`):
+- Ports: `TaskRepository` (`ports.py:59-123`), `TaskEventRepository` (`ports.py:126-160`), `DraftRepository` (`ports.py:163-222`), `ConstraintRepository` (`ports.py:225`), `GoalRepository` (`ports.py:257-275`), `HabitTrackerRepository` (`ports.py:278-306`), `ProfileRepository` (`ports.py:309`), `SuggestionRepository` (`ports.py:325-388`), `MemoryRepository` (`ports.py:400-501`), `ConversationRepository` (`ports.py:504`), `UsageRepository` (`ports.py:581-595`).
+- One family at a time: `Repositories` and `RepositoryFactory` (`app/infrastructure/persistence/factory.py:52-105`).
+- One path per aggregate: drafts go through `DraftService` over `DraftRepository` (`app/services/draft_service.py:93`), task status through `TaskService` (`app/services/task_service.py:87`), and goal reads and deadline updates through `GoalRepository`.
+- The planning sub-graph receives the ports it needs as one record, `PlanningServices` (`app/services/planning/services.py:16-31`), and reads the user through `UserModel`, a read-once facade over `ProfileRepository`, `ConstraintRepository` and `TaskRepository` (`app/core/user_model.py:23-50`). `UserModel.for_planning` builds it from that record, so a chat turn and the replanner read the user the same way (`user_model.py:41-50`).
+- Contract suite fixture, parametrised over both families (`tests/test_repository_contracts.py:77-81`):
 
 ```python
 @pytest.fixture(params=["in_memory", "supabase_fake"])
@@ -67,20 +69,19 @@ def repos(request, memory_store, fake_client) -> Repositories:
 ```
 
 ### 2.4 Adding a variant
-A third family (say, plain Postgres through asyncpg) is a new module with one class per port plus a `RepositoryFactory.postgres(...)` method; add its name to the fixture's `params` and the whole contract suite runs against it. No service changes, because services receive ports from `AppContainer` (`app/container.py:119-123`).
+A third family (say, plain Postgres through asyncpg) is a new module with one class per port plus a `RepositoryFactory.postgres(...)` method; add its name to the fixture's `params` and the whole contract suite runs against it. No service changes, because services receive ports from `AppContainer` (`app/container.py:124-128`).
 
 ### 2.5 Alternative rejected
 - **Active Record (`task.save()`)**: puts storage on the domain entity and makes the entity import the driver, which breaks the dependency rule the layering test enforces (`tests/test_layering.py::test_domain__imports_nothing_from_outer_layers`).
-- **A generic `Repository[T]` with `get/add/update`**: the operations differ per aggregate. Tasks only change status (`ports.py:57-58`: "It writes only a task's status"); drafts need an atomic accept (`ports.py:184-196`); task events are append-only. A generic interface would offer writes the domain must forbid.
+- **A generic `Repository[T]` with `get/add/update`**: the operations differ per aggregate. Tasks only change status (`ports.py:62-64`: "It writes only a task's status (and, bringing a set-aside task back, its passed deadline)"); drafts need an atomic accept (`ports.py:210-222`); task events are append-only. A generic interface would offer writes the domain must forbid.
 - **Local Postgres for tests** (ADR-4): no Docker on the build machine, and supabase-py speaks PostgREST.
 
 ### 2.6 Pinned by
-`tests/test_repository_contracts.py::test_factory__both_families__implement_every_port`; the 89 contract test functions (201 runs) in that file, for example `::test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds` and `::test_repos__entity_for_other_user__raises_validation_and_writes_nothing`; `tests/test_layering.py::test_layering__only_container_builds_repositories`.
+`tests/test_repository_contracts.py::test_factory__both_families__implement_every_port`; the 97 contract test functions (223 runs) in that file, for example `::test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds` and `::test_repos__entity_for_other_user__raises_validation_and_writes_nothing`; `tests/test_layering.py::test_layering__only_container_builds_repositories`.
 
 ### 2.7 Honest notes
 - The Supabase family is tested against `FakeSupabase` (`tests/fakes.py`), a stand-in that mirrors PostgREST and the `accept_draft` SQL function, not against a live database. The live database is exercised by `scripts/live_e2e.py`.
-- Two persistence paths remain: the draft endpoints load a draft through the older `DraftStore` (`app/api/v1/endpoints/drafts.py:55-66`), and `PATCH /tasks/{id}` updates `user_tasks` with direct Supabase calls (`app/api/v1/endpoints/tasks.py:267-295`). Both still filter by `user_id`. The build ledger records moving them behind the ports as Plan 3 work.
-- There is no `GoalRepository`; goals are a column on tasks and drafts.
+- Drafts, tasks, rules, goals and habit trackers each have one persistence path. Raw `.table(...)` calls remain in 8 files, for tables that have no repository yet: chat sessions and messages, ingested documents, task materials, pending calendar updates, the workspace cache (and the workspace builder's task reads, which need columns the `Task` entity does not carry), and the learning-style read. Each file is on `_RAW_TABLE_CALLS_ALLOWED` with its reason (`tests/test_layering.py:438-453`); `tests/test_layering.py::test_layering__no_raw_table_calls_outside_the_allow_list` fails on a new call elsewhere, and `::test_layering__allow_lists__are_exactly_the_documented_leftovers` fails when an entry goes stale. The chat turn still carries a database handle for the session and document rows (`app/services/chat_turn/service.py:243-251`).
 
 ---
 
@@ -96,14 +97,14 @@ Each family is an abstract class; the caller holds the abstraction and the compo
 
 | Strategy port | Implementations | Chosen by |
 |---|---|---|
-| `LLMProvider` (`app/domain/ports.py:625-641`) | `LocalLMStudioProvider` (`app/infrastructure/llm/local.py:16`), `ClaudeProvider` (`app/infrastructure/llm/claude.py:82`), `GeminiProvider` (`app/infrastructure/llm/gemini.py:15`) | `LLMProviderFactory.build` (`app/infrastructure/llm/factory.py:34-56`) and each provider's `is_available()` |
-| `PatternDetector` (`app/services/memory/patterns.py:148-184`) | `SkipTimeWindowDetector` (`:187`), `PeakHourDetector` (`:229`), `DeadlineCrunchDetector` (`:275`), `RepeatedSkipDetector` (`:315`) | `default_pattern_detectors()` (`app/container.py:64-71`) |
-| `TextEmbedder` (`app/domain/ports.py:584-594`) | `MiniLMEmbedder` (`app/infrastructure/embedding.py:10`); test doubles `BagOfWordsEmbedder` (`tests/fakes.py:398`) and `_DownEmbedder` (`tests/test_recall.py:57`) | `AppContainer.build(embedder=...)` (`app/container.py:106, 134`) |
-| `EnergyEstimator` (`app/domain/ports.py:562-578`) | `HeuristicEnergyEstimator` (`app/services/energy.py:31`), `HistoryEnergyEstimator` (`app/services/energy.py:67`) | `app/container.py:144` (the history estimator, with the heuristic as its prior) |
-| `RetryPolicy` (`app/domain/ports.py:644-653`) | `ExponentialBackoff`, `NoRetry` (`app/infrastructure/llm/retry.py:9, 35`) | `_wrap_cloud` (`app/infrastructure/llm/factory.py:27`) |
+| `LLMProvider` (`app/domain/ports.py:709-725`) | `LocalLMStudioProvider` (`app/infrastructure/llm/local.py:16`), `ClaudeProvider` (`app/infrastructure/llm/claude.py:82`), `GeminiProvider` (`app/infrastructure/llm/gemini.py:15`) | `LLMProviderFactory.build` (`app/infrastructure/llm/factory.py:34-56`) and each provider's `is_available()` |
+| `PatternDetector` (`app/services/memory/patterns.py:148-184`) | `SkipTimeWindowDetector` (`:187`), `PeakHourDetector` (`:229`), `DeadlineCrunchDetector` (`:275`), `RepeatedSkipDetector` (`:315`) | `default_pattern_detectors()` (`app/container.py:66-73`) |
+| `TextEmbedder` (`app/domain/ports.py:668-678`) | `MiniLMEmbedder` (`app/infrastructure/embedding.py:10`); test doubles `BagOfWordsEmbedder` (`tests/fakes.py:401`) and `_DownEmbedder` (`tests/test_recall.py:57`) | `AppContainer.build(embedder=...)` (`app/container.py:110, 142`) |
+| `EnergyEstimator` (`app/domain/ports.py:646-662`) | `HeuristicEnergyEstimator` (`app/services/energy.py:31`), `HistoryEnergyEstimator` (`app/services/energy.py:67`) | `app/container.py:152-158` (the history estimator, with the heuristic as its prior) |
+| `RetryPolicy` (`app/domain/ports.py:728-737`) | `ExponentialBackoff`, `NoRetry` (`app/infrastructure/llm/retry.py:9, 35`) | `_wrap_cloud` (`app/infrastructure/llm/factory.py:27`) |
 | `AutonomyPolicy` (`app/domain/anticipation.py:167-172`) | `SuggestOnly`, `AskFirst`, `AutoLowRisk` (`app/domain/anticipation.py:182-196`) | The user's `autonomy_mode`, through `autonomy_policy_for` (`app/domain/anticipation.py:199-208`) |
 
-The provider strategy's interface (`app/domain/ports.py:631-641`):
+The provider strategy's interface (`app/domain/ports.py:715-725`):
 
 ```python
     @abstractmethod
@@ -119,7 +120,7 @@ The provider strategy's interface (`app/domain/ports.py:631-641`):
         """Yield (event_type, token) pairs as they arrive; req.response_schema must be None."""
 ```
 
-The detectors are chosen in exactly one place (`app/container.py:64-71`):
+The detectors are chosen in exactly one place (`app/container.py:66-73`):
 
 ```python
 def default_pattern_detectors() -> list[PatternDetector]:
@@ -132,7 +133,7 @@ def default_pattern_detectors() -> list[PatternDetector]:
     ]
 ```
 
-The embedder port (`app/domain/ports.py:584-594`):
+The embedder port (`app/domain/ports.py:668-678`):
 
 ```python
 class TextEmbedder(ABC):
@@ -150,7 +151,7 @@ class TextEmbedder(ABC):
 
 ### 3.4 Adding a variant
 - **Provider**: a new `LLMProvider` subclass, passed as `extra_cloud` to `LLMProviderFactory.build` (`app/infrastructure/llm/factory.py:38`); it is wrapped for its location and placed between Claude and Gemini. No caller of `route_llm_call` changes. This is how `ClaudeProvider` was added (spec §6.2: "the live OCP demonstration").
-- **Detector**: a new `PatternDetector` subclass that owns its key, words, `applied_as` and `proposes_rule`, plus one line in `default_pattern_detectors()`. If it sets `proposes_rule = True`, the pattern-rule trigger offers it without any edit (`app/services/anticipation/triggers.py:304-305`, `PatternService.proposes_rule`, `patterns.py:586-589`).
+- **Detector**: a new `PatternDetector` subclass that owns its key, words, `applied_as` and `proposes_rule`, plus one line in `default_pattern_detectors()`. If it sets `proposes_rule = True`, the pattern-rule trigger offers it without any edit (`app/services/anticipation/triggers.py:306-307`, `PatternService.proposes_rule`, `patterns.py:589-592`).
 - **Autonomy mode**: a new `AutonomyPolicy` subclass plus an `AutonomyMode` value and one entry in `_POLICIES` (`app/domain/anticipation.py:199-203`).
 
 ### 3.5 Alternative rejected
@@ -234,7 +235,7 @@ A handler list walked in order; each handler either handles the request or passe
         raise LLMUnavailableError(_NOTHING_REACHABLE) from last_error
 ```
 
-**Consent chain** (`app/domain/anticipation.py:115-241`). Links: `RepeatDismissalRule` (deny, "You dismissed this before") → `RiskCheckRule` (allow read-only) → `StatedRuleCoverageRule` (deny when the user already said to keep those hours free, quoting them) → `ModePolicyRule` (always decides, by autonomy mode). The constructor refuses a chain whose last link is not `ModePolicyRule` (`app/domain/anticipation.py:221-225`). Each decision carries a typed reason (`ConsentReasonKind`, `app/domain/entities.py:68-77`). Excerpt (`app/domain/anticipation.py:229-234`):
+**Consent chain** (`app/domain/anticipation.py:115-241`). Links: `RepeatDismissalRule` (deny, "You dismissed this before") → `RiskCheckRule` (allow read-only) → `StatedRuleCoverageRule` (deny when the user already said to keep those hours free, quoting them) → `ModePolicyRule` (always decides, by autonomy mode). The constructor refuses a chain whose last link is not `ModePolicyRule` (`app/domain/anticipation.py:221-225`). Each decision carries a typed reason (`ConsentReasonKind`, `app/domain/entities.py:70-79`). Excerpt (`app/domain/anticipation.py:229-234`):
 
 ```python
     def evaluate(self, action: ProactiveAction, ctx: ConsentContext) -> ConsentDecision:
@@ -273,12 +274,12 @@ Each lifecycle is a transition table (state → allowed next states) with one ch
 
 | Lifecycle | Table | Checker | Storage guard |
 |---|---|---|---|
-| Draft | `DRAFT_TRANSITIONS` (`app/domain/entities.py:172-181`) | `DraftSchedule.transition` (`entities.py:332-345`) | `SupabaseDraftRepository.set_status` CAS on the status read (`app/infrastructure/persistence/supabase_repos.py:363-388`); SQL `accept_draft` status check |
-| Suggestion | `SUGGESTION_TRANSITIONS` (`entities.py:184-199`) | `check_suggestion_move` (`entities.py:213-224`), used by `move_suggestion` (`app/domain/anticipation.py:291-311`) | `set_status(..., expected=frm)` (`supabase_repos.py:554-594`) |
-| Memory | `MEMORY_TRANSITIONS` (`entities.py:113-130`) | `check_memory_move` (`entities.py:139-152`); `memory_moves_to` gives each write's guard (`entities.py:133-136`) | `update(..., only_if_status=...)` (`supabase_repos.py:747-782`) |
-| Task | `_Move` table: `_COMPLETE`, `_SKIP`, `_DEADLINE_MISS`, `_SLOT_MISS` (`app/services/task_service.py:65-84`) | `TaskService._move` (`task_service.py:207-232`) | `update_status(..., expected=..., expected_start=...)` (`supabase_repos.py:209-243`) |
+| Draft | `DRAFT_TRANSITIONS` (`app/domain/entities.py:174-183`) | `DraftSchedule.transition` (`entities.py:370-383`) | `SupabaseDraftRepository.set_status` CAS on the status read (`app/infrastructure/persistence/supabase_repos.py:392-417`); SQL `accept_draft` status check |
+| Suggestion | `SUGGESTION_TRANSITIONS` (`entities.py:186-201`) | `check_suggestion_move` (`entities.py:215-226`), used by `move_suggestion` (`app/domain/anticipation.py:291-311`) | `set_status(..., expected=frm)` (`supabase_repos.py:660-700`) |
+| Memory | `MEMORY_TRANSITIONS` (`entities.py:115-132`) | `check_memory_move` (`entities.py:141-154`); `memory_moves_to` gives each write's guard (`entities.py:135-138`) | `update(..., only_if_status=...)` (`supabase_repos.py:853-888`) |
+| Task | `_Move` table: `_COMPLETE`, `_SKIP`, `_DEADLINE_MISS`, `_SLOT_MISS` (`app/services/task_service.py:65-84`) | `TaskService._move` (`task_service.py:225-250`) | `update_status(..., expected=..., expected_start=...)` (`supabase_repos.py:229-267`) |
 
-Draft table (`app/domain/entities.py:174-181`); PENDING and MODIFIED are the open states, every other state is terminal, so a second accept is an illegal move:
+Draft table (`app/domain/entities.py:176-183`); PENDING and MODIFIED are the open states, every other state is terminal, so a second accept is an illegal move:
 
 ```python
 DRAFT_TRANSITIONS: dict[DraftStatus, frozenset[DraftStatus]] = {
@@ -370,16 +371,17 @@ stateDiagram-v2
     missed --> completed : I actually did that
     skipped --> completed
     missed --> pending : accepted draft re-slots it
+    missed --> pending : brought back, deadline cleared
 ```
 
-The task's move back from missed to pending is not a `_Move`: it happens when an accepted draft replaces the missed row under the same task id, inside the `accept_draft` SQL function (`supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:67-72`).
+The task's move back from missed to pending is not a `_Move`. It happens in two places: when an accepted draft replaces the missed row under the same task id, inside the `accept_draft` SQL function (`supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:67-72`); and when the user asks a planning turn to bring set-aside tasks back, through `TaskService.bring_back` (`app/services/task_service.py:154-168`) and `TaskRepository.bring_back`, one compare-and-set write from MISSED that also clears the passed deadline (`app/domain/ports.py:115-123`, `app/infrastructure/persistence/supabase_repos.py:259-272`). Bringing a task back records no event, because it is not an outcome.
 
 ### 6.4 Adding a variant
 A new state is an enum value plus its row in the table; every checker and every storage guard follows from the table, so no endpoint changes. For example, `memory_moves_to(MemoryStatus.DISMISSED)` is the guard of the dismiss write (`app/services/memory/memory_service.py:56`), computed from the table.
 
 ### 6.5 Alternative rejected
 - **Classic GoF State (one class per state with `accept()`, `reject()` methods)**: the states have no behaviour beyond legality, so eight or so tiny classes would add indirection without adding behaviour, and the storage guard would have to be rebuilt from them.
-- **A `version` column for optimistic concurrency** (the spec's other option, §10(c)): compare-and-set on the status alone is enough, because every legal move changes the status; a version column would need a migration on every table for no extra safety in these flows.
+- **A `version` column for optimistic concurrency** (the spec's other option, §10(c)): compare-and-set on the status alone is enough for these moves, because every legal move changes the status; a version column would need a migration on every table. The one race status cannot see is a draft edited after the user looked at it (an edit leaves the draft open, MODIFIED to MODIFIED). For that, a draft has a version computed from its tasks and schedule, not stored (`DraftSchedule.version`, `app/domain/entities.py:359-368`); an accept that names a stale one is refused with `StaleVersionError` (`app/services/draft_service.py:62-71`).
 
 ### 6.6 Pinned by, and honest notes
 - `tests/test_domain.py::test_draft_transition__accepted_to_accepted__raises_invalid_state_transition`, `::test_memory_transitions__table__the_legal_moves`, `::test_memory_moves_to__the_compare_and_set_guard_for_each_target`, `::test_check_memory_move__not_in_the_table__invalid_state_transition`.
@@ -419,11 +421,11 @@ Who publishes and who listens (subscriptions in `app/container.py`):
 
 | Event | Published by | Listener (subscription) | What the listener does |
 |---|---|---|---|
-| `LLMCallCompleted` | `MeteredProvider._publish` (`app/infrastructure/llm/decorators.py:292`) | `UsageLedger` (`container.py:126-127`) | Writes the usage row in the background, at most 8 writes in flight (`app/services/usage_ledger.py:29, 49-59`) |
-| `TaskCompleted`, `TaskSkipped`, `TaskMissed` | `TaskService._record` (`app/services/task_service.py:274`) | `PatternObserver` (`container.py:140-142`) | Runs PEARL for that user in the background, single-flight (`app/services/memory/patterns.py:694-721`) |
-| `PatternDetected` | `PatternService._look_now` (`patterns.py:486-488`) | `AnticipationListener` (`container.py:171-172`) | Runs `PatternRuleTrigger` for that user when the detector proposes rules (`app/services/anticipation/triggers.py:399-434`) |
-| `DraftAccepted` | `DraftService.accept` (`app/services/draft_service.py:120-127`) | none in production | — |
-| `DeadlineMissed` | `TaskService.mark_deadline_missed` (`task_service.py:140-150`) | none in production | — |
+| `LLMCallCompleted` | `MeteredProvider._publish` (`app/infrastructure/llm/decorators.py:292`) | `UsageLedger` (`container.py:132-133`) | Writes the usage row in the background, at most 8 writes in flight (`app/services/usage_ledger.py:29, 49-59`) |
+| `TaskCompleted`, `TaskSkipped`, `TaskMissed` | `TaskService._record` (`app/services/task_service.py:292`) | `PatternObserver` (`container.py:148-150`) | Runs PEARL for that user in the background, single-flight (`app/services/memory/patterns.py:697-724`) |
+| `PatternDetected` | `PatternService._look_now` (`patterns.py:489-491`) | `AnticipationListener` (`container.py:197-198`) | Runs `PatternRuleTrigger` for that user when the detector proposes rules (`app/services/anticipation/triggers.py:401-436`) |
+| `DraftAccepted` | `DraftService.accept` (`app/services/draft_service.py:217-224`) | none in production | — |
+| `DeadlineMissed` | `TaskService.mark_deadline_missed` (`task_service.py:142-152`) | none in production | — |
 
 So one Complete click fans out: `TaskCompleted` → PEARL looks again → if it finds a new skip window, `PatternDetected` → the rule proposal is drafted. The click returns before any of that runs.
 
@@ -451,7 +453,7 @@ Every proactive trigger must follow the same order — is it due, was it already
 `Trigger.run` is the fixed skeleton; subclasses supply `should_fire`, `gather` and `build_suggestion` (and may override `already_done`).
 
 ### 8.3 Where
-`Trigger` (`app/domain/anticipation.py:342-439`); steps are abstract at `app/domain/anticipation.py:429-439`. Subclasses: `MorningBriefTrigger` (`app/services/anticipation/triggers.py:90`), `PatternRuleTrigger` (`triggers.py:301`). Skeleton excerpt (`app/domain/anticipation.py:375-385`):
+`Trigger` (`app/domain/anticipation.py:342-439`); steps are abstract at `app/domain/anticipation.py:429-439`. Subclasses: `MorningBriefTrigger` (`app/services/anticipation/triggers.py:90`), `PatternRuleTrigger` (`triggers.py:303`). Skeleton excerpt (`app/domain/anticipation.py:375-385`):
 
 ```python
         if not ctx.force and not await self.should_fire(ctx):
@@ -470,7 +472,7 @@ Every proactive trigger must follow the same order — is it due, was it already
 After this, a denied action is not stored; an allowed change is stored already claimed (ACCEPTED) and executed, and handed back to the user as PENDING if it fails or is cancelled (`app/domain/anticipation.py:386-421`).
 
 ### 8.4 Adding a variant
-A new trigger (for example the spec's PreTaskPrep) is a `Trigger` subclass with `name`, `description` and the three steps, registered with `anticipation.register_trigger(...)` in `AppContainer.build` (`app/container.py:162-170`). `GET /anticipation/triggers` lists it and `POST /anticipation/run` accepts it with no API edit (`app/api/v1/endpoints/anticipation.py:195-234`).
+A new trigger (for example the spec's PreTaskPrep) is a `Trigger` subclass with `name`, `description` and the three steps, registered with `anticipation.register_trigger(...)` in `AppContainer.build` (`app/container.py:188-196`). `GET /anticipation/triggers` lists it and `POST /anticipation/run` accepts it with no API edit (`app/api/v1/endpoints/anticipation.py:195-234`).
 
 ### 8.5 Alternative rejected
 - **Strategy objects composed into one generic trigger** (pass `should_fire`, `gather`, ... as functions): equivalent power, but the skeleton's invariants (consent before storage, claim before execution) would no longer be visible in one method of one class.
@@ -487,10 +489,10 @@ A new trigger (for example the spec's PreTaskPrep) is a `Trigger` subclass with 
 Concrete classes (which repository family, which providers in which wrappers, which triggers, which action kinds) depend on the environment. Callers must not choose them, or every service would import infrastructure.
 
 ### 9.2 Pattern
-A composition root builds the object graph once at startup; factories build families and rebuild stored commands.
+A composition root builds the object graph once at startup and passes each collaborator in (a constructor, or the turn's state); factories build families and rebuild stored commands.
 
 ### 9.3 Where
-- **Composition root**: `AppContainer.build` (`app/container.py:99-210`), called once from the FastAPI lifespan (`app/main.py:128`). It chooses the repository family (`container.py:119-123`), creates the bus and subscribes listeners, builds the LLM chain and installs it process-wide (`container.py:129-131`), and wires every service:
+- **Composition root**: `AppContainer.build` (`app/container.py:103-239`), called once from the FastAPI lifespan (`app/main.py:118`), which keeps it on `app.state` only (`app/main.py:119`). It chooses the repository family (`container.py:124-128`), turns the config module into each service's settings once (`Settings.from_config`, `container.py:130`; `app/core/settings.py:78-118`), creates the bus and subscribes listeners, builds the LLM chain and installs it process-wide (`container.py:135-137`), and wires every service:
 
 ```python
         if supabase_client is not None:
@@ -500,7 +502,9 @@ A composition root builds the object graph once at startup; factories build fami
             repos = RepositoryFactory.in_memory()
 ```
 
-- **Abstract Factory**: `RepositoryFactory.supabase` / `.in_memory` build a whole family at once (`app/infrastructure/persistence/factory.py:61-93`), so families cannot be mixed.
+- **How collaborators travel**: a request reaches the container through the app (`container_of`, `app/api/deps.py:40-43`); a chat turn carries it in its LangGraph state under `container` (`app/services/chat_turn/service.py:285-291`), a transient key that is never checkpointed (`app/orchestrator/checkpoint.py:65`); the planning sub-graph copies `PlanningServices` from it into its own state (`app/modules/planning_graph.py:872`), and the replanner holds `PlanningServices` from its constructor (`app/modules/planning_replan.py:37-38`). There is no registry to look the container up from: `app/core/runtime.py` is gone, and a scan of `app/`, `tests/` and `scripts/` for the old lookup names fails the suite if one comes back (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`).
+- **Settings from the root**: eight services built at startup take a frozen settings record (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `app/core/settings.py:13-67`) and do not import the config module (the list is `tests/test_injection.py:386-395`). The container hands each its record; the lifespan hands the scheduler `container.settings.anticipation` (`app/main.py:154-159`). A service built without one (a test, a script) uses `default_settings()` (`settings.py:121-126`).
+- **Abstract Factory**: `RepositoryFactory.supabase` / `.in_memory` build a whole family at once (`app/infrastructure/persistence/factory.py:69-105`), so families cannot be mixed.
 - **Factory**: `LLMProviderFactory.build` (`app/infrastructure/llm/factory.py:30-56`) returns the chain with each provider wrapped for its location; Claude is left out when no credential is configured (`app/infrastructure/llm/factory.py:52-53`).
 - **Factory (rebuild a stored command)**: `ActionFactory` (`app/services/anticipation/service.py:84-102`), filled by `build_action_factory` (`app/services/anticipation/actions.py:290-320`). A suggestion stores its action as a payload; on accept the action is rebuilt from it (`service.py:94-102`):
 
@@ -520,26 +524,27 @@ A composition root builds the object graph once at startup; factories build fami
 A new action kind: a `ProactiveAction` subclass and one `factory.register(kind, builder)` call in `build_action_factory`. A new repository family or provider: see 2.4 and 3.4.
 
 ### 9.5 Alternative rejected
-- **Service locator / global registry looked up from inside services**: hides dependencies and makes tests patch globals. The container passes collaborators in constructors instead.
-- **A DI framework** (dependency-injector, etc.): a 200-line hand-written root is easier to read and explain.
+- **Service locator / global registry looked up from inside services**: hides dependencies and makes tests patch globals. The code had one (`app/core/runtime.py`, `registered_container()`); the restructure deleted it, and the container now passes collaborators in constructors and in the turn's state.
+- **A DI framework** (dependency-injector, etc.): a 250-line hand-written root is easier to read and explain.
 
 ### 9.6 Pinned by, and honest notes
 - `tests/test_container.py::test_container__no_supabase__uses_in_memory_family`, `::test_container__with_fake_supabase__uses_supabase_family`, `::test_container__installs_its_chain_for_route_llm_call`; `tests/test_layering.py::test_layering__only_container_builds_repositories`; `tests/test_anticipation_service.py::test_action_factory__unknown_kind__validation_error`.
-- Two process-wide look-ups remain for code with no request scope: the installed LLM chain (`set_chain`/`current_chain`, `app/infrastructure/llm/factory.py:59-79`) and `registered_container()` (used, for example, at `app/services/draft_actions.py:149` and `app/core/observation.py:209`). The build ledger lists removing the remaining `registered_container()` calls as Plan 3 work.
-- The spec named a `TriggerFactory`; triggers are instead registered directly with the service in the root (`container.py:162-170`).
+- `tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`, `::test_turn__container_only_in_turn_state__rule_memory_and_pattern_reach_the_turn`, `::test_planning_nodes__read_planning_services_from_state__none_means_no_slots_no_focus_no_scan`, `::test_container__services_get_settings_from_the_composition_root`, `::test_container_built_services__import_no_config_module`.
+- Two process-wide objects remain, both on the model side: the installed LLM chain (`set_chain`/`current_chain`, `app/infrastructure/llm/factory.py:59-79`), which `route_llm_call` reads through `get_chain` (`app/core/model_router.py:151-162`), and the hook registry (`get_hooks`, `app/orchestrator/hooks.py:145`), which the lifespan passes into the container (`app/main.py:118`). With no container (a test, a script) `get_chain` builds a default chain gated by those hooks that publishes usage nowhere.
+- The spec named a `TriggerFactory`; triggers are instead registered directly with the service in the root (`container.py:188-196`).
 
 ---
 
 ## 10. Facade (`UserModelService.snapshot`)
 
 ### 10.1 Problem
-The You page needs the profile, the patterns PEARL sees (with evidence and the memory behind each), the rules, the memories in use, the focus profile and the privacy receipt. Six subsystems; the endpoint should make one call.
+The You page needs the profile, the patterns PEARL sees (with evidence and the memory behind each), the rules, the memories in use, the focus profile, the privacy receipt and the completion streak. Several subsystems; the endpoint should make one call. A chat turn has the same shape: a lock, the conversation read, the graph run, the reply, the learning frames and the `complete` frame, behind one route.
 
 ### 10.2 Pattern
-One service method composes the subsystems, reads shared inputs once, and returns one view model (`YouView`, `app/services/user_model_service.py:141-155`).
+One service method composes the subsystems, reads shared inputs once, and returns one view model (`YouView`, `app/services/user_model_service.py:142-163`).
 
 ### 10.3 Where
-`UserModelService.snapshot` (`user_model_service.py:182-223`). The profile and 28 days of outcomes are read once and shared by PEARL's look and the focus estimate; the rest run concurrently (`user_model_service.py:202-208`):
+`UserModelService.snapshot` (`user_model_service.py:192-238`). The profile and the last 60 days of outcomes are read once (`user_model_service.py:204-211`); PEARL's look and the focus estimate share the last 28 days of them and the streak counts all 60; the rest run concurrently (`user_model_service.py:216-222`):
 
 ```python
         look, rules, active, focus, receipt = await asyncio.gather(
@@ -551,7 +556,11 @@ One service method composes the subsystems, reads shared inputs once, and return
         )
 ```
 
-The endpoint is two lines of mapping (`app/api/v1/endpoints/you.py:112-121`).
+The endpoint is one call and a mapping (`app/api/v1/endpoints/you.py:120-130`).
+
+Two more facades:
+- `UserModel` (`app/core/user_model.py:23-50`): the user as a turn or the replanner reads them, over `ProfileRepository`, `ConstraintRepository` and `TaskRepository`, each read once per facade. It holds no database handle.
+- `ChatTurnService` (`app/services/chat_turn/service.py:240-303`): the chat router makes one call and returns the stream (`app/api/v1/endpoints/chat.py:54-61`). The service and `ChatTurn` own the lock, the conversation read, the graph pump, the reply, the `complete` frame and the shielded cleanup (`service.py:123-237`). Every frame is a typed model from one catalogue, `SSE_EVENTS` (`app/schemas/chat_stream.py:302-313`), written by one encoder, `SseEncoder.frame` (`chat_stream.py:328-336`).
 
 ### 10.4 Adding a variant
 A new section is one more collaborator in the constructor and one more entry in the `gather`; the endpoint maps one more field.
@@ -561,7 +570,8 @@ A new section is one more collaborator in the constructor and one more entry in 
 
 ### 10.6 Pinned by, and honest notes
 - `tests/test_user_model_service.py::test_snapshot__history__patterns_with_evidence_and_memory_ids`, `::test_snapshot__other_users_data__never_included`; `tests/test_you_api.py::test_you_api__steady_page_load__each_table_read_once`, `::test_you_api__three_loads_at_once__all_200_same_content_and_one_look`.
-- The older `UserModel` facade (`app/core/user_model.py:15`) is still used by the planning graph, and some modules reach through it to its private `_db` (`app/modules/coach.py:111`, `app/modules/planning_graph.py:132`, `app/modules/knowledge_graph.py:84`, `app/orchestrator/graph.py:458`). The spec's "no more `_db` reach-throughs" is not done.
+- `tests/test_injection.py::test_user_model__over_ports__no_db_attribute`, `::test_user_model__profile_unreadable__none_and_the_default_zone`.
+- `tests/test_chat_turn.py::test_chat_router__routing_and_parsing_only` (the router stays at most 80 lines, no function in it has more than 12 statements, and it imports nothing from `app.orchestrator`, `app.core.observation`, `app.services.memory` or `app.core.user_model`); `tests/test_sse_contract.py::test_chat_turn__every_frame_emitted__parses_into_its_model`; `tests/test_sse_golden.py` (11 recorded turns, compared byte for byte).
 
 ---
 
@@ -580,11 +590,11 @@ A class implements the port and translates calls and errors to and from the libr
 | `LocalLMStudioProvider` (`app/infrastructure/llm/local.py:16-89`) | `LLMProvider` | `litellm_conf.hybrid_route_query` | Role → local model; system notes folded into the prompt for Gemma; errors through `translated_errors` (`app/infrastructure/llm/transport.py:90-99`) |
 | `GeminiProvider` (`app/infrastructure/llm/gemini.py:15-72`) | `LLMProvider` | the same transport with `force_cloud=True` | as above |
 | `ClaudeProvider` (`app/infrastructure/llm/claude.py:82-228`) | `LLMProvider` | Anthropic `AsyncAnthropic` beta messages API | Cached system block, structured outputs, refusal → `LLMRefusedError`, auth failure switches the provider off (`claude.py:189-227`) |
-| `Supabase*Repository` (`app/infrastructure/persistence/supabase_repos.py`) | every repository port | supabase-py (synchronous) | Calls run on a worker thread; any transport failure becomes `PersistenceError` with the driver text chained, never repeated (`supabase_repos.py:155-162`) |
+| `Supabase*Repository` (`app/infrastructure/persistence/supabase_repos.py`) | every repository port | supabase-py (synchronous) | Calls run on a worker thread; any transport failure becomes `PersistenceError` with the driver text chained, never repeated (`supabase_repos.py:166-173`) |
 | `MiniLMEmbedder` (`app/infrastructure/embedding.py:10-32`) | `TextEmbedder` | `embed_texts` (all-MiniLM-L6-v2) | Any model failure or wrong vector length → `EmbeddingUnavailableError` |
 | `PreCloudLLMRedactor` (`app/core/model_router.py:71-94`) | `Redactor` (`app/infrastructure/llm/decorators.py:46-53`) | `ActionHooks.execute("PreCloudLLM", ...)` | DENY or ASK → `LLMUnavailableError`, nothing sent (fails closed) |
 
-The Supabase base adapter (`app/infrastructure/persistence/supabase_repos.py:155-162`):
+The Supabase base adapter (`app/infrastructure/persistence/supabase_repos.py:166-173`):
 
 ```python
     async def _run(self, build: Callable[[Any], Any], *, table: str | None = None) -> list[dict]:
@@ -634,7 +644,7 @@ The action is an object with `describe()`, `to_payload()` and `execute(user_id)`
         """Do it for ``user_id`` and say what happened."""
 ```
 
-Execution is claim-then-execute: the suggestion moves PENDING → ACCEPTED by compare-and-set before `execute` runs, so a double click runs it once; on any failure or cancellation it is released (`app/services/anticipation/service.py:296-351`).
+Execution is claim-then-execute: the suggestion moves PENDING → ACCEPTED by compare-and-set before `execute` runs, so a double click runs it once; on any failure or cancellation it is released (`app/services/anticipation/service.py:298-353`).
 
 ### 12.4 Adding a variant
 A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus one `register` call in `build_action_factory` (`actions.py:290-320`). Consent handles it from its `risk` and `blocked_hours()` without change.
@@ -650,13 +660,13 @@ A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus
 
 ## 13. Patterns named in the spec that are not in the code
 
-| Spec §6.3 entry | Status at `5c6ffd3` |
+| Spec §6.3 entry | Status at `e76bff9` |
 |---|---|
 | Command `Step` with `StepExecutor.run` as a Template Method | Not built. Module steps are still `ModuleStep` handlers wrapped by `app/core/module_framework.py` |
-| `CognitiveModule` registry with derived routing | Not built (no `CognitiveModule` class); routing is `INTENT_TO_MODULE` in the orchestrator |
-| Builder: `MorningBriefBuilder`, `ModuleGraphBuilder` | Not built under those names; the brief's text is assembled by helper functions in `triggers.py:225-298` |
+| `CognitiveModule` registry with derived routing | Not built (no `CognitiveModule` class); routing is `INTENT_TO_MODULE` in the orchestrator. The restructure plan's task for it was dropped |
+| Builder: `MorningBriefBuilder`, `ModuleGraphBuilder` | Not built under those names; the brief's text is assembled by helper functions in `triggers.py:227-300` |
 | Unit of Work | Only in the narrow sense that `accept_draft` is one database transaction; there is no general unit of work |
-| Singleton | Not a class-level singleton: one `AppContainer` is built per process by the lifespan and passed by injection; the LLM chain is held in a module-level variable (9.6) |
+| Singleton | Not a class-level singleton: one `AppContainer` is built per process by the lifespan, kept on `app.state` and passed by injection; the LLM chain is held in a module-level variable (9.6) |
 
 ---
 
@@ -664,14 +674,16 @@ A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus
 
 | Spec | Code |
 |---|---|
-| `ConsentPolicy.evaluate(action)` (§7) | `ConsentPolicy.evaluate(action, ctx)` (`app/domain/anticipation.py:229`): the user's context (autonomy mode, stated blocks, dismissed keys) is passed in, read lazily only when a run reaches consent (`app/services/anticipation/service.py:453-463`) |
-| Triggers call a `PlanningService` (§7 sequence) | Triggers and actions depend on the `DraftPlanner` port (`app/domain/ports.py:534-556`), implemented by `PlanningGraphReplanner` (`app/modules/planning_replan.py:31`) |
-| ChromaDB archive for memories (§5) | pgvector in Postgres behind `MemoryRepository.nearest` (`app/domain/ports.py:381`) |
+| `ConsentPolicy.evaluate(action)` (§7) | `ConsentPolicy.evaluate(action, ctx)` (`app/domain/anticipation.py:229`): the user's context (autonomy mode, stated blocks, dismissed keys) is passed in, read lazily only when a run reaches consent (`app/services/anticipation/service.py:455-465`) |
+| Triggers call a `PlanningService` (§7 sequence) | Triggers and actions depend on the `DraftPlanner` port (`app/domain/ports.py:618-640`), implemented by `PlanningGraphReplanner` (`app/modules/planning_replan.py:34`) |
+| ChromaDB archive for memories (§5) | pgvector in Postgres behind `MemoryRepository.nearest` (`app/domain/ports.py:465`) |
 | Hooks aggregate deny > ask > allow regardless of order (§6.3) | `ActionHooks.execute` is first DENY or ASK wins (`app/orchestrator/hooks.py:41-56`) |
 | `RepositoryFactory`, `LLMProviderFactory`, `TriggerFactory` (§6.3) | The first two exist; triggers are registered in the root; an `ActionFactory` exists that the spec did not name |
-| Draft states `Pending → UnderReview → ...` (§6.3) | `pending` and `modified` are the open states (`app/domain/entities.py:20-26, 160`) |
+| Draft states `Pending → UnderReview → ...` (§6.3) | `pending` and `modified` are the open states (`app/domain/entities.py:22-28, 162`) |
 | `EventListener`s include `TelemetryListener` (§6.2) | Not built; `DraftAccepted` and `DeadlineMissed` have no production listener |
 | Energy term on every plan (§9.2) | Only when the profile is learned (`app/services/energy.py:137-154`) |
+
+The restructure closed three earlier gaps: the draft endpoints and the task edit routes no longer bypass the repositories (2.7), no code looks the container up from a process-wide registry (9.6), and no module reaches through `UserModel` to a database handle (10.6).
 
 ---
 
@@ -680,20 +692,23 @@ A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus
 From `Jarvis-Engine/` on branch `capstone-lld`:
 
 ```bash
-# Repository: both families pass one contract suite (expect 201 passed)
+# Repository: both families pass one contract suite (expect 223 passed)
 .venv/bin/python -m pytest tests/test_repository_contracts.py -q
 
-# Strategy, Decorator, Chain of Responsibility, Adapter (LLM side)
+# Strategy, Decorator, Chain of Responsibility, Adapter (LLM side) (expect 146 passed)
 .venv/bin/python -m pytest tests/test_llm_providers.py tests/test_claude_provider.py tests/test_embedding.py -q
 
-# Strategy (detectors, embedders, energy), Observer, Facade
+# Strategy (detectors, embedders, energy), Observer, Facade (expect 74 passed)
 .venv/bin/python -m pytest tests/test_patterns.py tests/test_recall.py tests/test_energy.py tests/test_user_model_service.py tests/test_you_api.py -q
 
-# State, Observer basics, ports are ABCs
+# Facade: the chat router, the turn service, the frame catalogue and its encoder (expect 39 passed)
+.venv/bin/python -m pytest tests/test_chat_turn.py tests/test_sse_contract.py tests/test_sse_golden.py tests/test_routes.py -q
+
+# State, Observer basics, ports are ABCs (expect 70 passed)
 .venv/bin/python -m pytest tests/test_domain.py tests/test_anticipation_design.py tests/test_task_service.py -q
 
-# Template Method, consent chain, Command, factories, composition root
-.venv/bin/python -m pytest tests/test_trigger_template.py tests/test_consent.py tests/test_anticipation_service.py tests/test_container.py tests/test_layering.py -q
+# Template Method, consent chain, Command, factories, composition root, injection (expect 96 passed)
+.venv/bin/python -m pytest tests/test_trigger_template.py tests/test_consent.py tests/test_anticipation_service.py tests/test_container.py tests/test_layering.py tests/test_injection.py -q
 
 # Excerpts are copied verbatim: compare any of them with the file, e.g.
 sed -n '21,27p' app/infrastructure/llm/factory.py

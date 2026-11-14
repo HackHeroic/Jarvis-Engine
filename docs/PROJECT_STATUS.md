@@ -1,635 +1,226 @@
 # Jarvis Engine — Project Status
 
-**Last Updated:** 2026-11-14
-**Branch:** `capstone-lld`
-**Scope of this document:** what the code actually does today. Every number and
-claim below was checked against the repository at the commit that carries this
-file. Where something is a stub, it says stub.
+**Last updated:** 2026-11-14
+**Branch:** `capstone-lld` · **Checked against:** `e76bff9` (end of capstone plan 3, "finish the restructure")
+**Scope:** what the code does today. Every claim below names the file it was checked in. Where something is a stub or not built, it says so. This is the one current architecture document; the capstone documents (§10) expand each part.
 
 ---
 
-## Current State: v2 Is the Architecture
-
-The **LangGraph orchestrator** (`app/orchestrator/`) is the live request path.
-It replaces `execute_agentic_flow()` in `app/services/analytical/control_policy.py`,
-which now survives only as a library of helpers the v2 graph calls into:
-`BRAIN_DUMP_EXTRACTION_PROMPT` (brain-dump extraction) and `_namespace_chunk`,
-`derive_goal_id`, `mint_run_token` (`decompose_goal`). v2 never calls
-`_persist_fused_tasks`; only the deprecated `/accept-schedule` does.
-
-- **The one entry point:** `POST /api/v1/chat/v2/stream` (SSE).
-- **Deprecated:** `POST /api/v1/chat`, `POST /api/v1/chat/stream`,
-  `POST /api/v1/chat/confirm-schedule` and `POST /api/v1/chat/accept-schedule`
-  carry `deprecated=True` in their FastAPI route metadata and log a warning per
-  call. The frontend calls `/v2/stream` unconditionally — the
-  `NEXT_PUBLIC_USE_V2` flag was retired — but still uses `/accept-schedule` as
-  its no-draft fallback, which is why that route is hardened rather than gone
-  (see the persistence note below).
-- **Conversation state survives the turn:** an async SQLite checkpointer
-  (`data/checkpoints.sqlite`) persists graph state per `(user_id, session_id)`
-  thread, so a draft proposed on one turn is still under review on the next.
-  One turn at a time per thread (`app/services/turn_locks.py`); a turn queued
-  behind another waits at most 120 s, then gets a `conflict` error frame. The
-  stream's cleanup is shielded from cancellation, so on a client disconnect the
-  lock is released only after the cancelled run has finished unwinding.
-- **Replies are honest about who wrote them and what happened.** The `complete`
-  frame's `generation_metrics.model` names the model that wrote the reply (the
-  metering decorator records each answering provider and model per turn;
-  "cloud"/"local" when no model wrote it). Exception text never reaches the
-  client: `tool_use` frames, module errors narrated in the reply, and HTTP
-  bodies carry a `JarvisError`'s message or a fixed text.
-
-**Layers (capstone LLD).** Dependencies point inward:
-
-- `app/domain/` — framework-free core: Pydantic entities (`Task`, `DraftSchedule`
-  and its state machine, `LLMUsageEvent`, …), domain events and the `EventBus`
-  (a subscription to a base class receives its subclasses' events), `abc` ports
-  (repositories, `LLMProvider`), and the `JarvisError` hierarchy. Imports nothing
-  from the outer layers (`tests/test_layering.py`).
-- `app/infrastructure/` — adapters behind the ports. `persistence/`: an InMemory
-  and a Supabase repository family, held to one shared contract suite
-  (`tests/test_repository_contracts.py`). `llm/`: the provider adapters (local,
-  Claude, Gemini), decorators (redaction, retry, timeout, metering), the
-  fallback chain and its factory.
-- `app/container.py` — the composition root (`AppContainer`): repositories,
-  event bus, usage ledger, the LLM chain and `DraftService`, built once in the
-  lifespan. Only it chooses a repository family.
-
-**LLM provider chain.** Every live LLM call goes through `route_llm_call` and
-the chain **Local (LM Studio Gemma) → Claude (`CLAUDE_MODEL`, default Sonnet
-5.5) → Gemini**. Gemini is the last resort, and the only provider for web
-search (Gemini search grounding). Before any cloud send the PII gate redacts the
-prompt, the system prompt and the conversation history; every call, billed
-failures included, is metered into `llm_usage_events`. Roles (`MODEL_ROUTING`):
-PRIMARY (the heavy local model; never two at once) for `socratic_chunker`,
-`habit_translation`, `document_understanding`, `research_summarization`,
-`practice_generation` and `calendar_parsing`; FAST for `intent_classification`,
-`brain_dump_extraction`, `memory_extraction`, `voice_of_jarvis`, the reply
-synthesis, `goal_validation`, `task_edit_parsing` and `action_item_extraction`.
-Web search runs outside the chain (Gemini search grounding only) through one
-helper, `workspace_builder._search_web`, which redacts its query before it leaves
-the machine and meters each answered search into the same ledger (provider
-`gemini`, task `web_search`; zero tokens when the transport reports none). A guard
-test (`tests/test_layering.py`) keeps every other caller out.
-
-**Test suite: 1,113 tests in 65 files; the default run is 1,108 passed and 4 strict xfails in ~18 s.** The one `slow` test (~10 s) is deselected by default. The four xfails pin known gaps: the background replan (#13), TMT past ~16 h (#15), a default if-then plan when the model omits one, and dismissing a learned pattern (#16). The suite runs fully offline: `tests/conftest.py` installs a
-socket guard that fails any non-localhost connect, so no test can reach
-Supabase, Gemini, or ChromaDB.
-
-```bash
-.venv/bin/python -m pytest tests/ -q     # or just: pytest tests/
-.venv/bin/python -m pytest tests/ -q -m slow   # the slow tests, left out by default
-```
-
-Tests marked `slow` (the solver run to its full time cap, ~10 s) are deselected
-by default (`addopts = -m "not slow"` in `pyproject.toml`); `pytest -m slow` runs them.
-
----
-
-## Diagram 1 — Unified v2 Request Flow
+## 1. Architecture on one page
 
 ```mermaid
-flowchart TD
-    FE["jarvis-frontend<br/>lib/api.ts"] -->|POST SSE| V2["/api/v1/chat/v2/stream"]
-    V1["/api/v1/chat<br/>/api/v1/chat/stream<br/>DEPRECATED 2026-08-08"] -.->|superseded by| V2
-
-    V2 --> SESS["Session: get_or_create_session<br/>save_user_message<br/>build_context_messages(10 msgs)"]
-    SESS --> MEM["build_memory_context<br/>(archival memories)"]
-    MEM --> TID["thread_id = user_id:session_id<br/>make_thread_id()"]
-    TID --> CKPT[("ScrubbingSqliteSaver<br/>data/checkpoints.sqlite")]
-
-    CKPT --> PUMP["pump_task: graph.astream()<br/>node events onto progress_queue"]
-    PUMP --> GRAPH
-
-    subgraph GRAPH["LangGraph orchestrator — app/orchestrator/graph.py"]
-        direction TB
-        LC["load_context<br/>rehydrate UserModel from user_id<br/>via app/core/runtime.py registry"]
-        LC -->|negotiation_active| NPC["negotiation_precheck<br/>regex draft verbs, no LLM"]
-        LC -->|normal| EBD["extract_brain_dump<br/>trivial/emotional fast path<br/>else brain_dump_extraction LLM"]
-        EBD --> CI["classify_intent<br/>rule-based, no LLM"]
-
-        NPC -->|draft verb| DA["draft_action"]
-        NPC -->|file upload| KM["knowledge_module"]
-        NPC -->|anything else| PM["planning_module"]
-
-        CI --> PM
-        CI --> SC["store_constraint<br/>persists inline habits, no LLM"]
-        CI --> RA["research_agent"]
-        CI --> KM
-        CI --> CM["conversation_module"]
-        CI --> CO["coach_module"]
-        CI --> DA
-
-        PM --> SYN["synthesize_response<br/>Voice of Jarvis"]
-        RA --> SYN
-        KM --> SYN
-        CO --> SYN
-        SYN --> OL["observation_loop"]
-        CM --> OL
-        DA --> OL
-        SC --> OL
-        OL -->|needs_followup| CI
-        OL -->|done| ENDN(["END"])
+flowchart TB
+    FE["jarvis-frontend (Next.js) · Dashboard · Chat · Schedule · Habits · Documents · Workspace · You"]
+    subgraph API["app/api — routers only (typed request and response models, one error envelope)"]
+        CHAT["POST /api/v1/chat/stream (SSE)"]
+        REST["drafts · tasks · memories · you · anticipation · habits · documents · ingestion · sessions · schedule · reasoning · models"]
     end
-
-    GRAPH -.->|tokens, tool_use, phase| Q(("progress_queue"))
-    Q --> SSE["SSE frames:<br/>phase / step / thinking / message<br/>tool_use / memory_extracted / complete"]
-    SSE --> FE
+    subgraph SVC["app/services — application services"]
+        CTS["ChatTurnService"]
+        DS["DraftService"]
+        TS["TaskService"]
+        MS["MemoryService · ConversationMemoryService · StatedRules"]
+        PS["PatternService (PEARL)"]
+        AS["AnticipationService + AnticipationScheduler"]
+        UMS["UserModelService"]
+        SCH["planning/scheduling.run_schedule"]
+    end
+    subgraph ORCH["app/orchestrator + app/modules — the LangGraph turn"]
+        G["graph: load_context → negotiation_precheck / extract_brain_dump → classify_intent<br/>→ planning · knowledge · research · coach · conversation · draft_action · store_constraint<br/>→ synthesize_response → observation_loop"]
+    end
+    subgraph DOM["app/domain — no framework imports"]
+        ENT["entities · events + EventBus · errors"]
+        PORTS["ports (ABCs): repositories, DraftPlanner, EnergyEstimator,<br/>TextEmbedder, Sweep, LLMProvider, RetryPolicy"]
+        ANT["anticipation: Trigger, ProactiveAction, ConsentPolicy, AutonomyPolicy"]
+    end
+    subgraph INFRA["app/infrastructure"]
+        REPO["Supabase* and InMemory* repositories (one contract suite)"]
+        LLM["LLM chain: Local (LM Studio) → Claude → Gemini,<br/>wrapped in redaction · retry · timeout · metering"]
+        EMB["MiniLMEmbedder (384-d)"]
+    end
+    ROOT(["AppContainer (app/container.py): the composition root"])
+    FE --> API --> SVC
+    CTS --> ORCH
+    SVC --> DOM
+    ORCH --> SVC
+    INFRA -. implements .-> PORTS
+    ROOT -. builds and injects .-> SVC
+    CLOCK(["Clock: AnticipationScheduler, every 60 s"]) --> AS
 ```
 
-Notes that matter and are easy to get wrong:
+**The rules the code keeps** (each pinned by a test):
+- **Layers.** Nothing below `app/api` imports it, the domain imports no outer layer, and no service talks to the Supabase driver (`tests/test_layering.py`). Only the container builds repositories, and every LLM call outside the transport goes through `route_llm_call`. The allow-lists are exact (`test_layering__allow_lists__are_exactly_the_documented_leftovers`): the raw-table list has 8 documented leftovers (§10), `core/model_router.py` is the one file in services, orchestrator, modules, core or api that imports infrastructure, `workspace_builder._search_web` is the one web-search caller, and the rest are empty.
+- **One composition root.** `AppContainer.build` (`app/container.py:104`) picks the repository family (Supabase, or in-memory when Supabase is unreachable), builds the services and hands each its settings record (`Settings.from_config`, `app/core/settings.py:79`). The container lives on `app.state`, rides in a chat turn's state under `container`, and reaches the planning sub-graph as `planning` (`PlanningServices`). There is no global lookup (`tests/test_injection.py`).
+- **One write path to `user_tasks` for plans.** A plan is a draft until accepted; `DraftService.accept` (`app/services/draft_service.py:185`) writes the tasks and closes the draft in one call to the `accept_draft()` SQL function. A second accept is a 409.
+- **One way to call a model.** `route_llm_call` (`app/core/model_router.py:338`) maps a task to a role and runs the provider chain (`test_llm_calls__outside_the_transport__go_through_route_llm_call`).
+- **One frame catalogue.** Every SSE frame is a Pydantic model in `app/schemas/chat_stream.py`, encoded by `SseEncoder` (`:328`); a golden test pins the bytes of 11 recorded turns (`tests/test_sse_golden.py`).
+- **The user's clock.** Minute 0 of a plan is 08:00 in the user's zone (`user_zone`, `app/services/planning/local_time.py:37`); before 08:00 the logical day is yesterday and from 22:00 it is tomorrow (`logical_day_start`, `:77`).
 
-- `load_context` is not a no-op. On a live turn the facade arrives pre-wired; on
-  a **checkpoint-resumed** turn only `user_id` survived serialization, so the
-  node rebuilds `UserModel` from the process-wide client registry
-  (`app/core/runtime.py`), which the FastAPI lifespan populates.
-- The checkpointer **scrubs transients** before writing: `user_model`,
-  `progress_callback`, `progress_queue`, `db_client`, `draft_store`, and
-  `file_base64` / `file_bytes` / `file_name`. The file fields are a privacy
-  scrub, not a serialization one — checkpoint rows are never pruned, so an
-  uploaded document would otherwise sit in an unencrypted local SQLite file
-  forever.
-- Thread ids are **user-scoped** (`user_id:session_id`). A session-only key
-  would let a resumed turn rebuild another user's facade.
-- Streaming is real. The graph runs in a background `pump_task` while the SSE
-  generator drains one shared queue, so tokens leave as they are produced
-  instead of arriving in a single burst at the end. Client disconnect cancels
-  the pump.
+**A chat turn** (`POST /api/v1/chat/stream`):
+1. The router (`app/api/v1/endpoints/chat.py`) validates `ChatStreamRequest` (message ≤ 8,000 characters, upload ≤ 10 MB, `model_mode` and `media_type` from fixed lists; anything else is a 422 envelope) and calls `ChatTurnService.open_turn` (`app/services/chat_turn/service.py:240`).
+2. The turn sets the cloud flag and usage attribution, opens the session, takes the conversation's lock (one turn at a time per `user_id:session_id`; a queued turn waits at most 120 s, `app/services/turn_locks.py:24`), reads the conversation window and the memories in use, and runs the graph (`build_jarvis_graph`, `app/orchestrator/graph.py:734`) on the SQLite checkpointer.
+3. A planning turn ends in a draft: decompose → fuse with pending tasks → CP-SAT (`run_schedule`, `app/services/planning/scheduling.py:174`), widening the horizon 3 → 5 → 7 → 14 → 30 days when nothing fits → `DraftService.propose`. Nothing is written to `user_tasks`.
+4. The observation loop learns inside the turn, before `complete`: stated facts from the turn's one extraction call are remembered, PEARL looks at the outcome history (bounded at 0.5 s), and `memory_extracted` / `pattern_detected` frames go out (`app/core/observation.py:1-23`).
+5. The stream ends with one `complete` frame (`ChatCompletePayload`) or one `error` frame (the envelope). `ClosingStreamingResponse` (`app/api/sse.py:16`) closes the stream under a shielded cancel scope, so a closed tab frees the turn lock at once.
+
+**The first move** (`app/services/anticipation/`): every tick runs the due sweeps (passed slots → `missed`; memory decay; session summaries; checkpoint retention), then each user's triggers. `MorningBriefTrigger` drafts today's plan from the user's wake time; `PatternRuleTrigger` offers an hour the user keeps setting aside as a rule, and also runs as soon as PEARL publishes such a pattern. Each proposal passes `ConsentPolicy` before it is stored; a schedule change always asks.
 
 ---
 
-## Diagram 2 — Planning Module (real compiled shape)
+## 2. Repository layout (what matters)
 
-This is the graph `build_module_graph(planning_module)` actually compiles —
-verified by dumping the compiled edge list, not by reading the declaration.
-Before 2026-08-08 the five steps from `decompose_goal` onward
-(`decompose_goal`, `fuse_tasks`, `solve_schedule`, `handle_infeasible`,
-`create_draft`) were **unreachable and had never executed once**; the research
-agent was severed one node earlier still (`plan_research -> __end__`). The
-barrier-semantics fix in `app/core/module_framework.py` is what made the v2
-planning pipeline run end to end for the first time.
-
-```mermaid
-flowchart TD
-    START([entry]) --> VG["validate_goal<br/>gate — read_only"]
-    VG -->|goal unclear| ENDA(["END → clarification"])
-    VG -->|goal clear| FC["fetch_constraints<br/>behavioral_constraints from Supabase"]
-
-    FC --> TH["translate_habits<br/>PRIMARY model, 45s"]
-    FC --> M2C["memory_to_constraints<br/>PEARL memories → TimeSlots<br/>flag: ENABLE_PEARL"]
-    TH --> ES["expand_slots<br/>semantic → intra-day TimeSlots"]
-
-    ES --> DG
-    M2C --> DG
-    DG["decompose_goal<br/>AND-join barrier: BOTH arms must land<br/>ChromaDB RAG + socratic_chunker, 60s"]
-
-    DG --> FT["fuse_tasks<br/>merge pending user_tasks<br/>other goals kept by prefix rule"]
-    FT --> SS["solve_schedule<br/>delegates to run_schedule() via to_thread<br/>TMT · adaptive cap · hard/soft blocks<br/>biological sleep fallback"]
-
-    SS -->|OPTIMAL| CD["create_draft<br/>insert into draft_schedules incl. goal_id<br/>writes NOTHING to user_tasks"]
-    SS -->|INFEASIBLE| HI["handle_infeasible"]
-    SS -->|no schedule| RU["report_unsolved"] --> ENDD(["END → honest 'try again'"])
-    HI -->|retry| SS
-    HI -->|exhausted| ENDB(["END → anti-guilt message"])
-    CD --> ENDC(["END → negotiation_state = REVIEWING"])
+```
+app/
+├── main.py                    lifespan: Supabase client, checkpointer, model detection,
+│                              AppContainer, the anticipation scheduler
+├── container.py               AppContainer — the composition root
+├── api/                       error_handlers.py (the envelope), sse.py, deps.py (CurrentUser seam)
+│   └── v1/endpoints/          14 routers; chat.py only routes
+├── domain/                    entities, ports, events, anticipation, errors, clock, anti_guilt
+├── infrastructure/            persistence/ (Supabase + InMemory repos, mapping, factory),
+│                              llm/ (local, claude, gemini, decorators, chain, factory),
+│                              embedding.py
+├── services/
+│   ├── chat_turn/             service, context, reply, frames — one chat turn
+│   ├── planning/              scheduling (run_schedule), services (PlanningServices),
+│   │                          goal_ids, brain_dump_prompt, task_rows, local_time
+│   ├── anticipation/          scheduler, service, triggers, actions, user_locks
+│   ├── memory/                memory_service, conversation_memory, patterns (PEARL),
+│   │                          stated_rules, constraint_bridge, context, since_last_spoke
+│   ├── draft_service.py, draft_actions.py, task_service.py, user_model_service.py,
+│   │   energy.py, usage_ledger.py, chat_history.py, turn_locks.py, background.py
+│   ├── analytical/            workspace_builder, sm2_engine, mastery_tracker,
+│   │                          missed_deadlines, habit_translator, horizon_expander, …
+│   ├── extraction/            ingestion orchestrator, calendar, knowledge, linker
+│   └── documents/             document type registry and pipeline
+├── orchestrator/              graph, state, routing, checkpoint, module_wrapper, hooks
+├── modules/                   planning_graph, planning_replan, research_graph,
+│                              knowledge_graph, conversation, coach
+├── core/                      config, settings, model_router, observation, user_model,
+│                              module_framework, or_tools/
+├── schemas/                   chat_stream, errors, draft, schedule, upload, decomposition, …
+└── db/supabase_py.py          the one Supabase client builder (HTTP/1.1)
+supabase/migrations/           19 migration files — the schema's source of truth
+scripts/                       seed_demo_user.py, live_e2e.py
+tests/                         86 test files; behaviour/ drives the real turn over a fake DB
 ```
 
-- **`validate_goal` runs first, ahead of the fan-out.** It used to sit beside
-  the constraint branches and route into `decompose_goal`, which cannot work:
-  LangGraph's AND-join waits on node *completion* and ignores its members'
-  branches, so decomposition fired even on the arm where the goal was too vague.
-  `build_module_graph` now raises at build time if a step mixes a routing
-  dependency with plain ones, and an **orphan check** refuses to compile a
-  module with steps unreachable from the entry point.
-- **`solve_schedule` delegates**, it does not reimplement. TMT deadline
-  weighting, `compute_adaptive_daily_cap`, hard/soft calendar blocks and the
-  biological sleep fallback all live inside `run_schedule`. The call goes
-  through `asyncio.to_thread`: CP-SAT is a synchronous solve, and a bare call
-  freezes the event loop — every queued SSE frame stalls behind it. The solve
-  itself is capped at `SOLVER_MAX_TIME_SECONDS` (10s, `JARVIS_SOLVER_MAX_TIME_SECONDS`
-  overrides); an expired cap returns the best schedule found, or `UNKNOWN`,
-  which takes the INFEASIBLE branch. The step's own timeout
-  (`SOLVE_STEP_TIMEOUT_MS`) always outlasts the cap; a solve that still ends
-  without a schedule routes to `report_unsolved`, which says so plainly
-  ("couldn't work out a schedule… try again") instead of narrating a plan.
-- **Plans run on the user's clock.** Minute 0 is 08:00 in the user's zone —
-  `UserProfile.timezone` (read once per turn through the `UserModel` facade),
-  else `DEFAULT_TIMEZONE` (env `JARVIS_DEFAULT_TIMEZONE`, default
-  `Asia/Kolkata`) — on their logical day: before 08:00 it is still yesterday's
-  (the late-night rule). `horizon_start` is an offset-aware ISO timestamp, so the
-  frontend's `horizon_start + minutes` is the right instant in any browser, and
-  everything the solver sees stays in minutes from it: habit slots, the
-  constraint bridge and the midnight–08:00 night block are local by
-  construction. `fetch_constraints` fixes the horizon once per turn; habit
-  expansion and every solve attempt use it. Missed-deadline dates end at local
-  midnight, and PEARL reads skip hours on the same clock (`app/services/planning/local_time.py`).
-  Zones with DST have 23/25-hour days that "minute 1440 = 08:00 tomorrow"
-  ignores; India has none.
-- **Nothing is scheduled in the past.** For a plan made after 08:00
-  `run_schedule` hard-blocks the minutes already gone (rounded up to the next
-  5). An explicit `plan_start` (`/generate-schedule`) is left as given.
-- **One goal, one namespace.** `decompose_goal` derives a `goal_id` via
-  `derive_goal_id` (the model's `goal_metadata.goal_id` → a slug of the
-  objective/planning goal → `plan_{uuid8}`) and prefixes every chunk and every
-  dependency ref as `{goal_id}_{run}_{task_id}` (`run` is a fresh token per
-  decomposition, so a re-plan never reuses the id of a task already finished).
-  Every chunk also carries its `goal_id`, and `fuse_tasks` decides membership by
-  it (the prefix only for legacy rows) — pending rows from *other* goals are carried into the plan,
-  rows from *this* goal are replaced by the fresh decomposition. Matching on
-  task_id equality was F5: the decomposer's ids are positional, so a new plan
-  shadowed an unrelated older one and `_persist_fused_tasks`'s
-  delete-then-replace erased it on accept. `create_draft` stores the same
-  `goal_id` on the `draft_schedules` row.
-- **Retry ladder:** `HORIZON_RETRY_SEQUENCE = [4320, 7200, 10080, 20160, 43200]`
-  minutes — 3d → 5d → 7d → 14d → 30d. Exhaustion returns an anti-guilt
-  clarification ("a scope problem, not a you problem"), never a 500. Habit slots
-  and the bridge's standing rules are expanded out to 30 days and filtered per
-  attempt, so they (and the sleep habit) hold on every day of every retry.
-- **Overdue tasks are set aside, and can come back.** `mark_missed` marks
-  pending tasks past their deadline `missed` and says so without blame; a
-  planning turn that asks for them ("add the missed tasks" — deterministic, no
-  model call) flips them back to `pending` through `TaskRepository.update_status`
-  before fusion, and the new draft carries them.
-- **Nothing is committed here.** `create_draft` proposes; `user_tasks` is
-  written only on accept.
-- **Feature flags** are env vars with the `JARVIS_` prefix and default to *on*:
-  `memory_to_constraints` is gated on `ENABLE_PEARL`, i.e. `JARVIS_ENABLE_PEARL`,
-  disabled only by setting it to `0`. A skipped step emits a `tool_use` SSE event
-  with `status: "skipped"` and returns `{}`, so the AND-join still fires.
+Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`), `intent_registry.py`, `task_editor.py`, `task_rearranger.py`, `task_retrieval.py`, `memory/pearl.py`, `memory/extractor.py`, `memory/retriever.py`, `memory/store.py` (`MemoryStore`), `draft_store.py` (`DraftStore`) and `core/runtime.py`.
 
 ---
 
-## Diagram 3 — Draft Negotiation State Machine
+## 3. What is built
 
-```mermaid
-stateDiagram-v2
-    [*] --> NONE
-
-    NONE --> REVIEWING: create_draft returned a draft_id
-    NONE --> NONE: draft creation failed - key omitted, phase untouched
-
-    REVIEWING --> ACCEPTED: ACCEPT_DRAFT - persist verified, n tasks landed
-    REVIEWING --> NONE: ACCEPT_DRAFT - draft held nothing schedulable (count == 0)
-    REVIEWING --> NONE: REJECT_DRAFT - reason stored for PEARL
-    REVIEWING --> NONE: draft_store is None - "the draft system is offline"
-    REVIEWING --> NONE: resolve_draft found no draft
-    REVIEWING --> EDITING: EDIT_TASK / REARRANGE
-    REVIEWING --> REVIEWING: persist unverified or store raised - phase NOT reset, accept retries
-
-    EDITING --> ACCEPTED: ACCEPT_DRAFT
-    EDITING --> NONE: REJECT_DRAFT / no draft / store is None
-    EDITING --> EDITING: further edits
-    EDITING --> EDITING: persist unverified or store raised
-
-    ACCEPTED --> [*]
-    NONE --> [*]
-
-    note right of REVIEWING
-      EDITING takes the identical branches - both phases
-      route through the same draft_action node.
-
-      While REVIEWING or EDITING, check_negotiation_shortcut
-      diverts the turn to negotiation_precheck — a one-word
-      "accept" never pays for an LLM call. Unrecognised
-      replies fall through as PLAN_DAY (re-plan).
-    end note
-```
-
-Only **two** of the eight exits keep the phase, and they keep it by *omitting*
-the `negotiation_state` key rather than writing it — LangGraph merges node output
-by key, so an omitted key leaves the channel untouched:
-
-| Branch in `_apply_draft_action` | Returns | Phase after |
+| Area | What works | Where |
 |---|---|---|
-| `draft_store is None` | message + `NONE` | NONE |
-| `resolve_draft` → no draft | message + `NONE` | NONE |
-| ACCEPT, `count > 0` | message + `ACCEPTED` | ACCEPTED |
-| ACCEPT, `count == 0` (nothing schedulable) | message + `NONE` | NONE |
-| ACCEPT, `count is None` (write did not land) | **message only** | unchanged — retry |
-| `handle_draft_action` outer `except` (store raised) | **message only** | unchanged — retry |
-| REJECT_DRAFT | message + `NONE` | NONE |
-| EDIT_TASK / REARRANGE | message + `EDITING` + `draft_id` | EDITING |
-
-The split is deliberate: a *retryable* failure (the write did not commit, or
-Supabase threw) must leave the draft exactly where it was so "accept" tries
-again, while an *unretryable* one (no store, no draft, empty draft) must clear
-the phase — otherwise `check_negotiation_shortcut` locks the thread into
-re-planning forever.
-
-`NegotiationPhase` also declares `PROPOSED`, and `_NEGOTIATION_ACTIVE` treats it
-as a live phase, but nothing in `app/` ever writes it — drafts go straight to
-`REVIEWING`. It is dead but harmless.
-
-The two properties that make this safe:
-
-1. **Full-coverage acceptance matcher.** `_is_acceptance` requires that *every*
-   word of the normalized message be consumed by acceptance phrases — presence
-   is not enough. "looks good, lock it in" accepts; "looks good but move the
-   calculus block later" does not. Negations (`don't`, `not yet`, `hold off`)
-   and any `?` disqualify outright. This matters because ACCEPT_DRAFT is the
-   only v2 intent that writes to `user_tasks`, and the accept replaces every
-   pending row.
-2. **Atomic accept.** `accept_draft_and_persist` calls `DraftService.accept`,
-   whose one repository call (`accept_draft()` in SQL) replaces the user's
-   pending tasks with the draft's, marks the draft `accepted` and the user's
-   other open drafts `superseded`, in one transaction — all or nothing. A second
-   accept finds the draft closed and writes nothing ("already locked in").
-   Returns `n > 0` (written), `0` (nothing schedulable), or `None` (write did
-   not land — draft stays open, user can retry).
-
-Both the conversational path (`handle_draft_action` in the orchestrator) and the
-REST path (`POST /api/v1/drafts/{id}/accept`) import the same
-`app/services/draft_actions.py`, so they cannot drift.
-
-The deprecated no-draft fallback the frontend still calls,
-`POST /api/v1/chat/accept-schedule`, now reuses the same `_count_persisted`
-read-back: it captures the `plan_id` from `_persist_fused_tasks` and answers
-`503 {"status": "failed"}` unless rows carrying it come back. It used to reply
-`{"status": "accepted"}` unconditionally — including with no Supabase client at
-all.
+| Chat | One SSE endpoint; typed frames; per-conversation lock; checkpointed threads (`user_id:session_id`); request limits; the reply names the model that wrote it | `app/services/chat_turn/`, `app/schemas/chat_stream.py`, `app/orchestrator/checkpoint.py:292` |
+| Planning | Brain dump → ≤ 25-minute tasks with if-then plans → multi-goal fusion → CP-SAT (hard and soft blocks, dependencies, TMT, adaptive daily cap, night block) → draft; horizon ladder; anti-guilt reply when nothing fits | `app/modules/planning_graph.py`, `app/services/planning/scheduling.py`, `app/core/or_tools/solver.py` |
+| Learned focus | `HistoryEnergyEstimator` learns a 24-hour focus profile from outcomes; a learned profile adds a soft solver term (weight 900 × difficulty, zero for tasks due within 24 h) | `app/services/energy.py:67`, `app/services/planning/scheduling.py:96-111` |
+| Drafts | Propose, read (with `schedule` and a computed `version`), edit, rearrange, reject, discard, accept; accept is atomic and idempotent; a stale `expected_version` is a 409 `stale_version`; a draft whose slots have partly passed is re-solved from now | `app/services/draft_service.py:93`, `app/services/draft_actions.py:61`, `app/api/v1/endpoints/drafts.py` |
+| Task outcomes | Complete and Skip write one task event each; the slot sweep marks passed slots `missed`; passed deadlines are `deadline_missed`; a missed task can be brought back | `app/services/task_service.py:87` |
+| Rules | A stated rule and the memory of stating it are linked; letting go of one lets go of both; plans read only rules that apply now | `app/services/memory/stated_rules.py:62`, `app/core/user_model.py:77` |
+| Memory | Remember, recall (pgvector `match_memories`), confirm, dismiss, forget (sticks), decay; provenance said / inferred | `app/services/memory/memory_service.py:179` |
+| Conversations | Recent window, background compaction into a summary, "since we last spoke" | `app/services/memory/conversation_memory.py:184` |
+| PEARL | Four detectors over the outcome history (skip window, peak hour, deadline crunch, repeated skip); runs after every outcome, one run per user at a time | `app/services/memory/patterns.py:399`, `app/container.py:66` |
+| Anticipation | Scheduler, morning brief, pattern → rule proposal, consent chain, suggestions API, manual run with a cooldown | `app/services/anticipation/`, `app/domain/anticipation.py` |
+| You page | Patterns, rules, memories in use, focus profile, privacy receipt (30 days), `streak_days`, settings (autonomy mode, wake time, timezone) | `app/services/user_model_service.py:166`, `app/api/v1/endpoints/you.py` |
+| LLM chain | Local Gemma (auto-detected PRIMARY + FAST) → Claude → Gemini; regex PII redaction before any cloud send; retries with backoff; timeouts; every call metered into `llm_usage_events`; one PRIMARY local call at a time | `app/infrastructure/llm/`, `app/core/model_router.py:195-202` |
+| Documents | Docling → ChromaDB ingestion, user-scoped document search, document → task linking, timetable extraction with approval | `app/services/extraction/`, `app/api/v1/endpoints/documents.py`, `ingestion.py` |
+| Also | Workspace builder (RAG + web links + practice), SM-2 habit trackers, mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
 
 ---
 
-## Component Inventory
+## 4. What is not built
 
-### Implemented and wired into the live path
-
-| Component | Location | What it does |
-|---|---|---|
-| LangGraph orchestrator | `app/orchestrator/graph.py` | 12-node graph; entry `load_context`, negotiation shortcut, rule-based intent classification, module fan-out, synthesis, observation loop |
-| State-aware routing | `app/orchestrator/routing.py` | `INTENT_TO_MODULE`, draft-action diversion, negotiation shortcut, follow-up loop |
-| SQLite checkpointer | `app/orchestrator/checkpoint.py` | `ScrubbingSqliteSaver` over `AsyncSqliteSaver`; transient scrubbing on `aput`/`aput_writes` plus a serde-failure fallback that nulls-and-logs |
-| Serializable state | `app/orchestrator/state.py` | `user_id` in state; `user_model` marked non-serializable and rehydrated |
-| Runtime client registry | `app/core/runtime.py` | Process-wide `db` / `memory_store` singletons for code with no request scope |
-| ModuleStep framework | `app/core/module_framework.py` | Declarative steps → compiled LangGraph; AND-join barriers, `routes_to` branches, timeouts, feature flags, SSE `tool_use` events, orphan check |
-| Module registry | `app/modules/__init__.py` | `planning_module`, `research_agent`, `knowledge_module` registered at lifespan startup |
-| Planning module | `app/modules/planning_graph.py` | Diagram 2 above — end to end, with drafts, TMT, full horizon ladder |
-| Draft actions | `app/services/draft_actions.py` | Shared resolve/coerce logic for the graph node and the REST API; accept and reject both go through `DraftService` (via the container, or the shim's no-container fallback), so a closed draft is never "accepted" or "discarded" twice |
-| Drafts REST API | `app/api/v1/endpoints/drafts.py` | GET / accept / reject / modify / delete / PATCH task / rearrange / chat — all on the live Supabase-backed `DraftStore` |
-| Real token streaming | `app/api/v1/endpoints/chat.py` | Background pump task + shared queue; `token` → `event: message`, `thinking_token` → `event: thinking` |
-| Model router | `app/core/model_router.py` | Task → role (PRIMARY/FAST/CLOUD), then the provider chain Local → Claude → Gemini; cloud-first on `force_cloud`, the per-request ContextVar, `GEMINI_PRIMARY` or `CLAUDE_PRIMARY`. Web search stays on Gemini (`gemini_web_search`) |
-| Model auto-detection | `app/core/config.py` | Probes LM Studio `/v1/models`; heavy markers `27b/26b/22b/14b/12b`, fast markers `e4b/e2b/-4b/1b/3b`; Gemma preferred, qwen accepted; env pins outrank detection |
-| Memory system | `app/services/memory/` | 3-tier memory, SM-2 decay, extractor, retriever, PEARL detectors |
-| Memory → constraint bridge | `app/services/memory/constraint_bridge.py` | `memories_to_constraints` turns stored preferences into solver `TimeSlot`s — this is the moat |
-| Observation loop | `app/core/observation.py` | Post-turn: background memory extraction, inline PEARL + cognitive state under a hard 500 ms cap; skipped on trivial input |
-| Coach module | `app/modules/coach.py` | Bandura 4-sources mastery coaching via `route_llm_call` |
-| Conversation module | `app/modules/conversation.py` | CHAT replies streamed through `route_llm_call` — same PII gate as everything else |
-| OR-Tools scheduler | `app/core/or_tools/`, `app/api/v1/endpoints/schedule.py` | CP-SAT; `run_schedule` is the single reusable entry |
-| Store resilience | `app/db/`, `app/services/` | An explicitly-passed `None` client is honoured as "degraded", so chat degrades instead of 500-ing when the DB is down |
-
-### Stub-quality internals (nodes exist, bodies are thin)
-
-| Component | Reality |
-|---|---|
-| `app/modules/research_graph.py` | `execute_search` is real (`perform_learning_style_search`). `plan_research` returns constants, `evaluate_results` is a pure decision point, **`summarize` has no LLM** — it returns `f"Found {n} results for your query."` — and `link_to_tasks` returns `[]`. `research_state_out` propagates only `search_results` and `error`; the summary is dropped on the floor. |
-| `app/modules/knowledge_graph.py` | `ingest_document` is real (`process_ingestion` → Docling → ChromaDB). `classify_content` is a two-keyword check; `extract_calendar` returns a hardcoded `{"status": "pending_approval"}`; `link_to_tasks`, `propose_actions`, `file_operations` all return empties. |
-| `app/orchestrator/hooks.py` | 7 handlers registered, **2 events have call sites**: `PreCloudLLM` (in `model_router.route_llm_call` and `voice_of_jarvis`) and `PreModuleExecution` (in `module_wrapper`). `PreScheduleModify`, `PostModuleExecution`, `PreMemoryWrite`, `CostThreshold`, `ProactiveSuggestion` are never invoked by app code. The PII filter itself is regex-only (email + US-format phone). |
-| `app/core/psychology/woop.py` | Declarations only; WOOP fields are produced by the decomposition prompt, not by this module. |
-
-### Deferred (design preserved, no implementation)
-
-| Component | Why |
-|---|---|
-| DKT (LSTM knowledge tracing) | Data-starved — needs 100+ completion events per user |
-| RL (DQN task ordering) | Needs DKT mastery scores as state input |
-| SARIMAX energy forecasting | Needs 4+ weeks of continuous usage for seasonal decomposition |
-| L1 Evaluation (Ragas/DeepEval) | Needs a stable core loop before feedback signals mean anything |
-| Signals API | Consumers (DKT/RL) do not exist yet |
-| Hooks tier system | Its own design — see Spec 3 |
-
-Full specifications preserved in [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md).
+- **Triggers:** PreTaskPrep and DeadlineRisk. Only the morning brief and the pattern rule exist (`app/container.py:188-197`). The brief preps no workspace.
+- **Ask-back:** no `clarify_gate` and no `clarify_request` frame.
+- **Research cognition:** `summarize` returns "Found N results…" with no model call, and `link_to_tasks` returns nothing (`app/modules/research_graph.py:68-74`). The knowledge module's `extract_calendar`, `link_to_tasks`, `propose_actions` and `file_operations` are thin.
+- **Hooks:** 7 handlers are registered, but only `PreCloudLLM` and `PreModuleExecution` have call sites, and aggregation is first DENY or ASK (`app/orchestrator/hooks.py:39-55, 132-138`).
+- **From the restructure (dropped tasks):** the `CognitiveModule` registry with derived routing (routing is still `INTENT_TO_MODULE`), and repositories for chat sessions and messages, documents, pending-calendar rows and task materials.
+- **Auth:** `CurrentUser` reads `user_id` from the query string; it is the seam a JWT would replace (`app/api/deps.py:16`).
+- **Planned analytics:** DKT, RL and SARIMAX are stubs in `app/models/` and need real usage data first.
 
 ---
 
-## Storage Map
+## 5. API surface
 
-### Supabase (relational)
+48 operations on 42 paths in the OpenAPI schema. Every JSON route declares a typed response model; the chat stream documents its `complete` frame. Every operation documents the error envelope (`ErrorResponse`, `app/schemas/errors.py`) for 422, 4XX and 5XX. The routes, models, status codes and the SSE frame catalogue are in [07 — API design](capstone/07-api-design.md); the error hierarchy is in [09 — Error handling](capstone/09-error-handling.md).
 
-**`supabase/migrations/` is the schema.** Applied in filename order, it builds the
-whole database on a fresh project (verified 2026-11-14 against a local
-PostgreSQL 18, twice in a row: every file is idempotent).
-
-- `20260101000000_baseline_legacy_tables.sql` ports the hand-run
-  `app/db/migrations/001`–`004` and `006`–`008`, plus the `014` columns, into the
-  CLI set. It sorts first because later CLI files `ALTER user_tasks`.
-- `20261114000001_capstone_lld.sql` does the capstone work:
-  - adds the user root `user_profiles` and the domain tables `goals`,
-    `task_events`, `proactive_suggestions` and `llm_usage_events`;
-  - gives every user table a cascading FK to `user_profiles`, plus the CHECKs the
-    entities enforce;
-  - drops six dead tables;
-  - enables RLS everywhere;
-  - adds `accept_draft()`, the one-transaction draft accept.
-  - Its first application **wipes all user tables** (owner decision: test data).
-- `app/db/migrations/` (`001`–`014`) is historical only.
-
-Keys, relationships, triggers, the table → entity map and the reasoning are in
-[`docs/capstone/_schema_notes.md`](capstone/_schema_notes.md). **Before applying,
-the backend must use the project's secret key.** RLS is on, and a publishable
-(anon) key sees no rows.
-
-| Table | Used by | Entity |
-|---|---|---|
-| `user_profiles` | profile repository; created on demand by the `ensure_user_profile` trigger | `UserProfile` |
-| `goals` | created by the `ensure_goal` trigger when a `goal_id` first appears | `Goal` |
-| `user_tasks` | `accept_draft()` (the write path), task lifecycle | `Task` |
-| `task_events` | task event repository | `TaskEvent` |
-| `draft_schedules` | `DraftStore`, draft repository, draft REST API | `DraftSchedule` |
-| `behavioral_constraints` | constraint repository, habit storage | `BehavioralConstraint` |
-| `proactive_suggestions` | suggestion repository | `Suggestion` |
-| `llm_usage_events` | usage repository | `LLMUsageEvent` |
-| `user_memories` | 3-tier memory, SM-2 decay, PEARL | — |
-| `chat_sessions`, `chat_messages` | session + history service | — |
-| `habit_trackers` | SM-2 spaced repetition | — |
-| `task_materials` | document ↔ task RAG bridge | — |
-| `ingested_documents` | ingestion provenance (incl. `s3_key`) | — |
-| `pending_calendar_updates` | timetable approval flow | — |
-| `user_plan_updates` | goal-level deadlines | — |
-| `user_preferences` | learning style for workspace | — |
-| `task_workspaces` | proactive workspace cache | — |
-| `task_completion_signals` | completion telemetry | — |
-
-Dropped as dead (no call site in `app/`): `pending_action_items`,
-`extracted_problems`, `task_completion_criteria`, `user_calendar_anchors`,
-`conversation_sessions` and `conversation_messages`. The startup probe
-(`DatabaseClient.check_connection`) reads `user_tasks`.
-
-### Local SQLite
-
-`data/checkpoints.sqlite` (override with `JARVIS_CHECKPOINT_DB`). LangGraph
-checkpoint rows, one thread per `(user_id, session_id)`. Gitignored via `data/`.
-
-### ChromaDB
-
-`CloudClient` when `CHROMA_API_KEY` + `CHROMA_TENANT` are set, otherwise a local
-in-process client; one per process, built on first use. Collection
-`jarvis_knowledge`, cosine space. The search, `query_knowledge`
-(`app/utils/chroma_client.py`), always filters by `user_id` — there is no
-unfiltered fallback; a user with no matching chunks gets nothing, and a call
-without a user id raises — and keeps only matches within
-`RAG_MAX_COSINE_DISTANCE` (0.6, i.e. cosine similarity ≥ 0.4; env
-`JARVIS_RAG_MAX_COSINE_DISTANCE`). It is read on every chat turn (the
-conversation module), by `decompose_goal`, and as the workspace's fallback when
-a task has no linked materials, always through `asyncio.to_thread` (the call
-blocks). The documents API reads and deletes chunks by `source_id` **and**
-`user_id`. (Before 2026-11-14 an empty filtered result fell back to an
-unfiltered query, which put other users' chunks into the prompt.)
+Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/stream` handler, `/chat/confirm-schedule`, `/chat/accept-schedule`, `/chat/modify-schedule`), `POST /drafts/{id}/chat` (501), `PATCH` and `DELETE /tasks/{id}`, `DELETE /tasks/` and `DELETE /ingestion/behavioral-constraint/{id}`.
 
 ---
 
-## Known Issues
+## 6. Storage
 
-1. **Research module has no cognition.** `summarize` returns a string literal
-   with a result count and no LLM call at all; `link_to_tasks` returns `[]`; the
-   summary never reaches orchestrator state. The knowledge module's
-   `extract_calendar`, `link_to_tasks` and `propose_actions` are equally thin.
-   Node cognition is deferred to **Spec 3**.
-
-2. **Hooks are consent theater.** 5 of 7 registered hook events have no call
-   site anywhere in `app/`, and there is no tier system — no way to say "this
-   action needs consent, that one does not". Shipping a half-wired safety layer
-   was judged worse than shipping none, so wiring-or-cutting is **Spec 3**
-   (design decision D8 in the 2026-08-08 spec).
-
-3. **DKT / RL / SARIMAX are data-starved**, not merely unimplemented. Building
-   them against synthetic data would teach them the wrong things.
-
-4. **FIXED 2026-08-13** — `compute_adaptive_daily_cap` broke single-task plans
-   (cap floored at the longest task and rounded to whole task-atoms; the former
-   strict xfail now passes). Original description: It forces
-   `target_days >= 2`, so one 25-minute task gets a 13 min/day cap — below the
-   task's own duration — and CP-SAT can place it nowhere. Every rung of the
-   horizon ladder lowers the cap further, so the user is told "I couldn't fit
-   everything in even with a 30-day window" for a single 25-minute task. Pinned
-   by `tests/test_planning_graph.py::test_solve_schedule__real_solver__single_small_task__is_feasible`
-   as `xfail(strict=True)` — the moment it is fixed, that test fails loudly and
-   must be un-marked. Fix belongs in `app/utils/pacing.py` (floor the cap at the
-   longest task).
-
-5. **Checkpoint DB grows without bound.** `data/checkpoints.sqlite` has no
-   pruning, retention window, or vacuum. Every turn of every thread accumulates.
-   The file-field scrubbing keeps uploads out of it, but the row count only ever
-   goes up.
-
-6. **FIXED 2026-11-14** — the PII gate now covers `prompt`, `system_prompt` and
-   `conversation_history` on every cloud provider in the chain
-   (`RedactingProvider`). Still a regex gate (email + US phone), not a real
-   privacy gateway. Original description: `system_prompt` and
-   `conversation_history` reached the cloud unfiltered.
-
-7. **`validate_goal` rejects terse real goals.** The gate is
-   `len(goal.strip()) < 5`, so "DSA" or "gym" is treated as too vague and
-   returns a clarification instead of planning.
-
-8. **FIXED** — `draft_schedules` had no `schedule` column. CLI migration
-   `20260813000001` added it. Draft acceptance (`DraftService` →
-   `build_task_rows` → `accept_draft()`) now turns the solver's slot map into
-   wall-clock `scheduled_start`/`scheduled_end`. Original description: the
-   solver's output map was not persisted with the draft, so accepted tasks
-   landed in `user_tasks` without wall-clock times.
-
-9. **FIXED 2026-11-14** — the two migration sets had diverged. The CLI set now
-   carries the legacy tables (`20260101000000_baseline_legacy_tables.sql`) and
-   builds the full schema on a fresh project. `user_state` is no longer probed.
-   Original description: `supabase/migrations/` mirrored only `009`–`012` plus
-   four later additions, so a `supabase db push` into a clean project produced
-   an incomplete schema.
-
-10. ~~**`analytical.py` and `telemetry.py` are dead files.**~~ **FIXED
-    2026-11-14:** deleted (they held a docstring each and were never mounted),
-    with the `/lmstudio` raw-httpx proxy and the no-op `DraftStore` component shims.
-
-11. **A failed decomposition still produces a schedule.** `fuse_tasks`
-    `depends_on=["decompose_goal"]` with no routing on the error, so when
-    `decompose_goal` returns `{"error": ..., "task_chunks": []}` the graph walks
-    on: `fuse_tasks` merges the user's *pending* rows (nothing was namespaced,
-    so none are replaced), `solve_schedule` schedules those and returns
-    `"error": None`, which overwrites the decomposition failure. The user is
-    shown a plausible plan made entirely of stale tasks and is never told the
-    goal they typed was never decomposed. This is the same class of bug as the
-    two fixed on 2026-08-08 — `/chat/accept-schedule` answering `"accepted"`
-    without writing (now verifies the `plan_id` landed and answers 503
-    otherwise, and is marked deprecated), and `/drafts/{id}/chat` answering
-    `"modified"` with no modifier wired (now 501) — an untruthful success, not a
-    crash, which is why no test caught it. Fix is a routing edge on
-    `decompose_goal`; follow-up task, deliberately not folded into the
-    final-review wave.
-
-12. **FIXED 2026-11-14** — draft acceptance was not atomic (write, re-read, then
-    flip the status, in separate calls). It is now one transaction:
-    `accept_draft()` in `supabase/migrations/20261114000001_capstone_lld.sql`,
-    mirrored by the InMemory repository and the test fake.
-
-13. **The background replan is off.** `trigger_replan` (meant to re-plan after a
-    task is completed, skipped, edited or deleted) crashes before it writes
-    anything (`ExecutionGraph(goal_metadata=None)`), pinned by a strict xfail in
-    `tests/test_background_replan.py`. The task endpoints do not schedule it and
-    report `replan_triggered: false`.
-
-14. **Web search is Gemini-only.** It needs Gemini's search grounding; with no
-    Gemini key (or no credits) research and workspace links come back empty,
-    and say so. Claude web search is not wired.
-
-15. **TMT only separates tasks due today.** `run_schedule` gives the solver
-    `max(1, int(motivation*100))`, which is 1 for any deadline more than ~16 h
-    away, so tasks due in 2 and in 5 days tie and the decomposer's order decides.
-    Pinned by a strict xfail in `tests/behaviour/test_psychology.py`.
-
-16. **Dismissing a learned pattern does not stick.** Dismiss lowers the memory's
-    confidence 0.9 → 0.6, which still meets the bridge's 0.6 gate, and PEARL
-    re-detects and reinforces the same pattern next turn. Pinned by a strict
-    xfail in `tests/behaviour/test_learning.py`.
-
-17. **PEARL's duration- and deadline-edit detectors have no data.** They read
-    `user_tasks.original_duration_minutes` / `original_deadline_hint`, and
-    nothing writes those columns, so neither detector can fire.
+- **Supabase (Postgres)** is the store; `supabase/migrations/` is the source of truth. RLS is on for every table, the backend uses the service-role key, and every repository query filters by `user_id`. Tables, keys, functions and the class → table map: [08 — Database schema](capstone/08-database-schema.md); how to apply: [schema notes](capstone/_schema_notes.md).
+- **Migrations, in order:** `20260101000000_baseline_legacy_tables`, `20260329000000_chat_sessions`, `20260329000001_phase1_memory_system`, `20260329000002_phase1_missing_tables`, `20260331000000_chat_sessions_pinned`, `20260401000000_user_tasks_missing_columns`, `20260501000001_pearl_scheduled_hour`, `20260501000002_task_workspaces`, `20260808000000_user_tasks_actual_duration`, `20260813000000_user_tasks_status_missed_pacing`, `20260813000001_draft_schedules_schedule`, `20261114000001_capstone_lld`, `20261114000002_user_tasks_original_duration`, `20261115000000_skip_writes_skipped`, `20261115000001_accept_draft_reslots_missed`, `20261115000002_memory_lifecycle_and_vectors`, `20261115000003_session_summaries`, `20261115000004_suggestion_consent_kind`, `20261115000006_session_summary_reach`. There is no `…0005`. Plan 3 added no migration.
+- **SQLite** (`data/checkpoints.sqlite`, override `JARVIS_CHECKPOINT_DB`): LangGraph checkpoints, one thread per `user_id:session_id`; live per-turn objects are scrubbed before a write; a daily sweep keeps the newest 20 per thread (`CHECKPOINT_KEEP_PER_THREAD`, `app/core/config.py:170`).
+- **ChromaDB (cloud):** document chunks only. Memories are in Postgres.
 
 ---
 
-## Test Coverage
+## 7. Tests
 
-**1,113 collected · 1,108 passed · 4 strict xfails · 1 slow (deselected by default) · 65 files · ~18 s · fully offline.**
+**1833 passed, 2 xfailed, 2 deselected**, about 76 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `e76bff9`. 86 test files.
 
-Verification: `.venv/bin/python -m pytest tests/ -q` (the bare `pytest tests/`
-form works too — `[tool.pytest.ini_options]` puts the repo root on `sys.path`).
-
-`tests/conftest.py` monkeypatches `socket.socket.connect` / `connect_ex` to
-raise on any non-localhost address for the duration of the session, so a test
-that tries to reach Supabase, Gemini or ChromaDB fails instead of silently
-making a paid call.
-
-Areas covered, by file:
-
-| File | Covers |
-|---|---|
-| `test_orchestrator.py`, `test_routing_helpers.py` | Graph wiring, intent → module routing, negotiation shortcut, draft-verb matching |
-| `test_checkpointer.py` | Transient scrubbing (incl. the uploaded-file keys), serde-failure fallback, user-scoped thread ids |
-| `test_module_framework.py`, `test_module_registration.py`, `test_modules.py` | ModuleStep compilation, AND-join barriers, routing/plain dependency conflict, orphan check |
-| `test_planning_graph.py` | Every planning node, the horizon ladder, `run_schedule` delegation, draft creation |
-| `test_draft_flow.py`, `test_draft_endpoints.py`, `test_draft_integration.py`, `test_draft_store.py` | Accept matcher coverage, plan_id-verified persistence, REST endpoints on the real store, `/drafts/{id}/chat` → 501 |
-| `test_chat_accept_schedule.py` | The no-draft fallback: persists-and-verifies vs. 503 on a swallowed write, no client, or a plan_id with no rows behind it |
-| `test_model_router.py`, `test_model_detection.py` | Role routing, `GEMINI_PRIMARY` behaviour incl. unstructured calls, 12B/14B + qwen detection, env pins |
-| `test_memory_*.py` (6 files), `test_pearl*.py` (2) | 3-tier memory, SM-2 decay, retrieval, extraction, constraint bridge, wiring, PEARL patterns |
-| `test_document_*.py` (3 files) | Document type registry, classification, ingestion end-to-end |
-| `test_scheduler.py`, `test_chunker.py` | Real CP-SAT constraints; chunk parsing |
-| `test_store_resilience.py` | Explicit-`None` client sentinel — degrade, don't 500 |
-| `behaviour/` (6 suites) | The real `/chat/v2/stream` handler, orchestrator, CP-SAT and draft service over a fake database and a scripted LLM: chat turns, short- and long-term memory, learning, psychology, the user's local day |
-| `test_local_time.py` | The user's zone (profile, default, misconfiguration), the logical day, local deadline dates, PEARL's local hour, offset-aware accepted instants |
-| `test_chroma_search.py` | Document search: user-scoped only, no unfiltered fallback, relevance cut-off, one client, off the event loop; the documents API's chunk reads and deletes are owner-scoped |
-| `test_error_text_leaks.py`, `test_turn_locks.py` | No exception text on the wire; one turn per conversation, the lock released after a real (Starlette) disconnect unwinds |
-| `test_dependencies.py` | `requirements.txt` and `pyproject.toml` describe the same install |
-| `test_domain.py`, `test_layering.py`, `test_repository_contracts.py`, `test_container.py` | Entities and the draft state machine, the event bus, import rules between layers, both repository families against one contract, the composition root |
-| `test_llm_providers.py`, `test_claude_provider.py`, `test_llm_call_sites.py`, `test_usage_ledger.py` | The provider chain and its decorators, Claude on the real SDK over a mock transport, every LLM call site through the chain, usage metering |
-| `test_errors.py`, `test_error_text_leaks.py`, `test_data_isolation.py`, `test_turn_locks.py` | One error envelope, no exception text on the wire, per-user scoping, one turn at a time per conversation |
-| `test_observation.py`, `test_hooks.py`, `test_user_model.py`, `test_clarification.py`, `test_task_lifecycle.py`, `test_chat_history.py`, `test_chat_sessions_integration.py`, `test_core_pipeline.py`, `test_integration.py`, `test_intent_routing.py`, `test_registry.py` | Observation loop, hook pipeline semantics, user model facade, clarification paths, task lifecycle, session/history persistence, registries |
+- **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
+- **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.
+- **The suite never touches the network:** `tests/conftest.py` makes any non-localhost connect fail.
+- **Guards worth knowing:** `test_layering.py` (imports, raw tables, LLM and web-search call sites), `test_injection.py` (no global lookups; settings from the root), `test_api_contract.py` (typed responses, the envelope, request bounds), `test_sse_golden.py` and `test_sse_contract.py` (the wire), `test_repository_contracts.py` (both repository families), `test_routes.py` (the route table), `tests/behaviour/` (the real turn over a fake database and a scripted model).
 
 ---
 
-## Where to Read Next
+## 8. The live check
 
-- **v2 design:** `docs/superpowers/specs/2026-04-12-jarvis-architecture-v2-design.md`
-- **ModuleStep framework:** `docs/superpowers/specs/2026-04-13-module-step-framework-design.md`
-- **Tonight's stabilization work:** `docs/superpowers/specs/2026-08-08-one-brain-stabilization-unification-design.md`
-  and its plan in `docs/superpowers/plans/`
-- **v1 pipeline (deprecated, historical):** `POLICY_ENGINE_ARCHITECTURE.md`
-- **Deferred analytics specs:** `FUTURE_ARCHITECTURE.md`
+`scripts/live_e2e.py` drives the running backend the way the frontend does, against real Supabase and the real model chain, as a throwaway `e2e-…` user, and deletes that user's rows at the end. It reports 18 steps: plan, accept, double accept (409), "looks good" afterwards, teach a rule, re-plan around it, the rule in a new session, forget (the linked rule goes too), the usage receipt, a memory frame before `complete`, forget sticks, "since we last spoke", a cached prompt, the You page, the morning brief on demand, accepting it (and a second accept is 409), Complete and Skip events, cleanup.
+
+1. Start the backend from this directory: `.venv/bin/uvicorn app.main:app --port 8000` (LM Studio on `:1234` is optional; without it every call goes to the cloud).
+2. Run `.venv/bin/python scripts/live_e2e.py` (default `--base-url http://localhost:8000`). It costs ten chat turns, roughly 25–30 model calls.
+3. Pass means the table ends `ALL PASSED` (exit 0; a SKIP is allowed and means the step had nothing to say) and the server log shows no traceback.
+
+Last run: all steps passed at `e76bff9`, with no traceback in the server log (the plan 3 ledger).
+
+---
+
+## 9. Running the demo
+
+1. **Supabase** must be unpaused and migrated (see the schema notes). `SUPABASE_SERVICE_KEY` must be the service-role key.
+2. **Seed the demo user** with the backend stopped: `.venv/bin/python scripts/seed_demo_user.py --reset`. It writes about three weeks of history for `demo` through the live services under a simulated clock; no model is called. It refuses to run while a backend answers on `:8000`, and refuses any user but `demo`.
+3. **Start the backend** (`.venv/bin/uvicorn app.main:app --port 8000`) and the frontend (`npm run dev` in `../jarvis-frontend`, port 3000).
+4. **Show it:** the dashboard's streak and patterns, the morning brief (it is due from the demo user's wake time for 6 hours, or run it with `POST /api/v1/anticipation/run`), accept it, a brain dump in chat, teach a rule and watch the plan move, the You page.
+
+The full script and the viva questions are in [10 — Demo and contributions](capstone/10-demo-and-contributions.md).
+
+---
+
+## 10. Known limits
+
+1. **Raw-table leftovers.** Eight files still query tables directly, each with its reason in `_RAW_TABLE_CALLS_ALLOWED` (`tests/test_layering.py:438-453`): the workspace builder (its cache and its own `user_tasks` reads), `user_preferences`, `chat_history`, the sessions, documents and ingestion routers, the ingestion orchestrator and the task-material linker.
+2. **Process-local state.** Turn locks, the per-user anticipation lock, the trigger day memo and backoff, and the PRIMARY model lock all live in memory. Correct for the one server process Jarvis runs as; not across processes.
+3. **The version check has a window.** It runs in `DraftService` just before `accept_draft`, so an edit landing between the two is not caught (`app/services/draft_service.py:62-72`). The chat card accepts without a version, because the `complete` payload carries none (`jarvis-frontend/lib/hooks/useJarvisChat.ts:443`); the dashboard sends one.
+4. **TMT ties past ~16 h** and **no default if-then plan** (the two strict xfails, §7).
+5. **A failed decomposition can still produce a plan** from the user's pending tasks: `fuse_tasks` runs after `decompose_goal` with no route on its error (`app/modules/planning_graph.py:982-986`), and a solved plan clears the error (`:709`).
+6. **`validate_goal` rejects goals under 5 characters** ("DSA") and asks for clarification (`app/modules/planning_graph.py:427`).
+7. **Web search is Gemini-only** (`gemini_web_search`, `app/services/analytical/workspace_builder.py:21, 39`). With no Gemini key, research and workspace links come back empty and say so.
+8. **The PII gate is regex only** (email and US-format phone, `app/orchestrator/hooks.py`), applied to the prompt, the system prompt and the history before any cloud send.
+9. **`GET /api/v1/sessions/` answers `[]` without a database**; the other session routes answer 503 (`app/api/v1/endpoints/sessions.py:106-114`).
+10. **Bringing a missed task back records no event** (it is not an outcome; `TaskService.bring_back`, `app/services/task_service.py:154`), and `task_completion_signals` is a table nothing reads or writes.
+
+---
+
+## 11. Documents
+
+**Capstone (`docs/capstone/`):**
+[01 — Requirements](capstone/01-requirements.md) ·
+[02 — Architecture](capstone/02-architecture.md) ·
+[03 — Class diagrams](capstone/03-class-diagrams.md) ·
+[04 — OOP and SOLID](capstone/04-oop-and-solid.md) ·
+[05 — Design patterns](capstone/05-design-patterns.md) ·
+[06 — Sequence and activity diagrams](capstone/06-sequence-and-activity.md) ·
+[07 — API design](capstone/07-api-design.md) ·
+[08 — Database schema](capstone/08-database-schema.md) ·
+[09 — Error handling](capstone/09-error-handling.md) ·
+[10 — Demo and contributions](capstone/10-demo-and-contributions.md) ·
+[Schema notes](capstone/_schema_notes.md)
+
+**Design and plans:** the capstone spec, amended to match the code: [`superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md`](superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md); its three plans in `superpowers/plans/` (`2026-11-14-capstone-plan-1-safety-and-spine.md`, `…-plan-2-vision-core.md`, `…-plan-3-finish-the-restructure.md`). Older specs and plans are listed in [INDEX.md](INDEX.md); `POLICY_ENGINE_ARCHITECTURE.md` describes the deleted v1 pipeline and is history only. Deferred analytics: [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md).

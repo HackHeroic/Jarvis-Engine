@@ -1,6 +1,6 @@
 # Jarvis Engine — Document Index
 
-**Last updated:** 2026-08-08
+**Last updated:** 2026-11-14
 
 Quick reference to all important documents. Start here.
 
@@ -11,10 +11,34 @@ Quick reference to all important documents. Start here.
 | Document | What It Is | When To Read |
 |----------|-----------|-------------|
 | [PITCH_ARCHITECTURE.md](PITCH_ARCHITECTURE.md) | 10 Mermaid diagrams for pitch + moat comparison | VC pitch, demos, explaining the system |
-| [POLICY_ENGINE_ARCHITECTURE.md](POLICY_ENGINE_ARCHITECTURE.md) | **v1 pipeline — deprecated 2026-08-08.** Kept for historical reference | Understanding how the pre-orchestrator system worked |
-| [PROJECT_STATUS.md](PROJECT_STATUS.md) | **Start here.** Honest status: the live v2 architecture, current Mermaid diagrams, verified test counts, known issues, storage map | Before pitching, planning, or touching code |
+| [POLICY_ENGINE_ARCHITECTURE.md](POLICY_ENGINE_ARCHITECTURE.md) | **v1 pipeline — deleted 2026-11-14** (capstone plan 3). Kept for historical reference only | Understanding how the pre-orchestrator system worked |
+| [PROJECT_STATUS.md](PROJECT_STATUS.md) | **Start here.** The one current architecture document: architecture on one page, what is built and not, test counts, the live check, migrations, how to run the demo, known limits | Before pitching, planning, or touching code |
+| [capstone/](capstone/) | The capstone LLD documents (01–10 and the schema notes), listed below | Capstone evaluation, viva |
 | [FUTURE_ARCHITECTURE.md](FUTURE_ARCHITECTURE.md) | Preserved Phase 2 specs (DKT, RL, SARIMAX, L8, L1) | When ready to build advanced features |
 | [NST-Startup-Foundry-2026-Application.md](NST-Startup-Foundry-2026-Application.md) | Startup foundry application | Reference |
+
+## Capstone LLD (November 2026)
+
+| Document | What It Covers |
+|----------|---------------|
+| [01 — Requirements](capstone/01-requirements.md) | Actors, use cases, functional and non-functional requirements |
+| [02 — Architecture](capstone/02-architecture.md) | Layers, components, deployment, the dependency rule |
+| [03 — Class diagrams](capstone/03-class-diagrams.md) | Overview and per-subsystem class diagrams |
+| [04 — OOP and SOLID](capstone/04-oop-and-solid.md) | The OOP pillars and SOLID principles with file:line evidence |
+| [05 — Design patterns](capstone/05-design-patterns.md) | Each pattern: problem, where, alternative rejected |
+| [06 — Sequence and activity diagrams](capstone/06-sequence-and-activity.md) | The core flows as diagrams |
+| [07 — API design](capstone/07-api-design.md) | Endpoint catalogue, error envelope, SSE frame catalogue |
+| [08 — Database schema](capstone/08-database-schema.md) | ER diagram, tables, keys, class → table map, migrations |
+| [09 — Error handling](capstone/09-error-handling.md) | Error hierarchy, failure scenarios, concurrency |
+| [10 — Demo and contributions](capstone/10-demo-and-contributions.md) | Demo script, viva questions, contribution map |
+| [Schema notes](capstone/_schema_notes.md) | How to apply the migrations; keys and constraints |
+
+| Spec / plan | What It Covers | Status |
+|------|---------------|--------|
+| [Capstone LLD + Anticipation Engine](superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md) | Layered architecture, domain entities and ports, design patterns, the anticipation engine, error handling, schema | Phases 1, 2a, 3a, 2b built; amended 2026-11-14 to match the code |
+| [Plan 1: Safety and spine](superpowers/plans/2026-11-14-capstone-plan-1-safety-and-spine.md) | Phases 1 and 2a | Done |
+| [Plan 2: Vision core](superpowers/plans/2026-11-14-capstone-plan-2-vision-core.md) | Phase 3a | Done |
+| [Plan 3: Finish the restructure](superpowers/plans/2026-11-14-capstone-plan-3-finish-the-restructure.md) | Phase 2b: v1 retired, thin chat router, one persistence path, injection, typed API | Done (Tasks 6 and 9 dropped) |
 
 ## Design Specs
 
@@ -103,12 +127,12 @@ All specs live in `superpowers/specs/`. Newest first.
 | [Phase 1D: Behavioral Intelligence](superpowers/plans/2026-03-29-architecture-reset-phase-1d-behavioral-intelligence.md) | PEARL pattern detection, behavioral insights | Done |
 | [Phase 1E: Stabilize & Document](superpowers/plans/2026-03-29-architecture-reset-phase-1e-stabilize-document.md) | FUTURE_ARCHITECTURE.md, PROJECT_STATUS.md rewrite, INDEX.md | Done |
 
-### Phase 7: v2 Orchestrator (April 12 — August 8, Current)
+### Phase 7: v2 Orchestrator (April 12 — August 8)
 
 | Plan | What It Built | Status |
 |------|--------------|--------|
 | [Architecture v2](superpowers/plans/2026-04-12-jarvis-architecture-v2.md) | LangGraph orchestrator, JarvisState, module sub-graphs, hooks, observation loop | Done |
-| [v2 Production Wiring](superpowers/plans/2026-04-12-v2-production-wiring.md) | `/chat/v2/stream`, SSE contract, module registry at lifespan startup | Done |
+| [v2 Production Wiring](superpowers/plans/2026-04-12-v2-production-wiring.md) | The streaming chat endpoint (today `/api/v1/chat/stream`), SSE contract, module registry at lifespan startup | Done |
 | [ModuleStep Framework](superpowers/plans/2026-04-13-module-step-framework.md) | Declarative steps → compiled sub-graphs, replacing `build_*_graph()` | Done |
 | [Intelligent Phase Progress](superpowers/plans/2026-04-13-intelligent-phase-progress.md) | `tool_use` / phase SSE events, spinner verbs | Partial |
 | [Psychology Framework Completion](superpowers/plans/2026-04-13-psychology-framework-completion.md) | WOOP/MCII, Bandura coaching, anti-guilt language | Partial |
