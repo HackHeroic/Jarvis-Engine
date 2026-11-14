@@ -251,7 +251,7 @@ The entities also gained `Goal`'s companion `GoalDeadlineUpdate`, `HabitTracker`
 - **ISP:** small role ports (`TaskReader` vs `TaskWriter` where they diverge). Module nodes receive their projected state (`state_in`/`state_out`), not all 35 JarvisState keys.
 - **DIP:** services and modules depend on ports, and `AppContainer` injects concretes. No `create_client` outside infrastructure; today there are 9 sites.
 
-**(amended 2026-11-14 after implementation)** Built: the `chat.py` split (`app/api/v1/endpoints/chat.py` routes only; the turn is `app/services/chat_turn/`; frames are encoded by `SseEncoder` in `app/schemas/chat_stream.py:328`), the dissolution of `control_policy.py` (§8.5), the LSP contract suite, the `Trigger` and `LLMProvider` extension points, and one `create_client` site (`app/db/supabase_py.py:27`). Not built: `UserModelPromptRenderer`, the `CognitiveModule` registration (§6.2), and `TaskReader`/`TaskWriter` role ports.
+**(amended 2026-11-14 after implementation)** Built: the `chat.py` split (`app/api/v1/endpoints/chat.py` routes only; the turn is `app/services/chat_turn/`; frames are encoded by `SseEncoder` in `app/schemas/chat_stream.py:334`), the dissolution of `control_policy.py` (§8.5), the LSP contract suite, the `Trigger` and `LLMProvider` extension points, and one `create_client` site (`app/db/supabase_py.py:94`). Not built: `UserModelPromptRenderer`, the `CognitiveModule` registration (§6.2), and `TaskReader`/`TaskWriter` role ports.
 
 ## 7. Anticipation Engine: Jarvis makes the first move
 
@@ -261,9 +261,9 @@ This is my call, because Madhav hadn't answered the "weekday morning" question w
 
 **(amended 2026-11-14 after implementation)** How the clock actually runs:
 - **Each tick runs the sweeps first, then the triggers** (`app/services/anticipation/scheduler.py:49-97`). A sweep runs when its interval has passed: `SlotPassedSweep` every minute, `SessionSummarySweep` every 5 minutes, `MemoryDecaySweep` and `CheckpointRetentionSweep` every 24 hours. One sweep's, trigger's or user's failure is logged and never stops the rest.
-- **A trigger that settled the user's local day is not run again that day.** Made, already made, denied or nothing to say: the outcome is remembered in this process (`app/services/anticipation/service.py:7-14`). A failing trigger waits 1, 2, 4 … minutes before its next try, never more than 30 (`:20-24`, `:271-283`).
-- **A manual run (`POST /api/v1/anticipation/run`) bypasses that day memo** and always re-evaluates; the stored suggestion still keeps it to one per local day. A second manual run of the same trigger within `ANTICIPATION_MANUAL_COOLDOWN_SECONDS` (10, `app/core/config.py:197`) returns the first run's outcome, so repeated clicks cannot each spend a model call (`app/services/anticipation/service.py:195-229`).
-- **The brief is due in the window [wake time, wake time + 6 h)** on the user's clock (`MORNING_BRIEF_WINDOW_HOURS`, `app/core/config.py:199`; `MorningBriefTrigger.should_fire`, `app/services/anticipation/triggers.py:120-125`).
+- **A trigger that settled the user's local day is not run again that day.** Made, already made, denied or nothing to say: the outcome is remembered in this process (`app/services/anticipation/service.py:7-14`). A failing trigger waits 1, 2, 4 … minutes before its next try, never more than 30 (`:20-24`, `:273-285`).
+- **A manual run (`POST /api/v1/anticipation/run`) bypasses that day memo** and always re-evaluates; the stored suggestion still keeps it to one per local day. A second manual run of the same trigger within `ANTICIPATION_MANUAL_COOLDOWN_SECONDS` (10, `app/core/config.py:194`) returns the first run's outcome, so repeated clicks cannot each spend a model call (`app/services/anticipation/service.py:197-231`).
+- **The brief is due in the window [wake time, wake time + 6 h)** on the user's clock (`MORNING_BRIEF_WINDOW_HOURS`, `app/core/config.py:196`; `MorningBriefTrigger.should_fire`, `app/services/anticipation/triggers.py:120-125`).
 - **Only MorningBrief and PatternRule are built** (`app/container.py:188-197`). PreTaskPrep and DeadlineRisk are not built.
 
 | Trigger | Fires | What it has ready | Default consent |
@@ -297,7 +297,7 @@ sequenceDiagram
     FE->>PL: accept → ApplyDraftAction → DraftService.accept (atomic)
 ```
 
-**(amended 2026-11-14 after implementation)** Reading the diagram against the code (`Trigger.run`, `app/domain/anticipation.py:342-421`): the trigger reads tasks and outcome events through its repositories, not through the `UserModel` facade, and plans through the `DraftPlanner` port. A denied action is not stored; the run returns the decision with status `denied`. An allowed action that changes something runs at once and is stored as `auto_applied`; an allowed read-only one is stored as `pending` (it is information). Accept goes through `AnticipationService.accept` (`app/services/anticipation/service.py:298`), which claims the suggestion with a compare-and-set before its action runs and rebuilds the action from its payload with `ActionFactory`. `ApplyDraftAction` refreshes a stale brief at accept: if a slot has begun or a task was finished or skipped since the draft was made, the open tasks are drafted again from now and that plan is accepted instead; nothing left means the stale draft is expired (`app/services/anticipation/actions.py:62-100`).
+**(amended 2026-11-14 after implementation)** Reading the diagram against the code (`Trigger.run`, `app/domain/anticipation.py:342-421`): the trigger reads tasks and outcome events through its repositories, not through the `UserModel` facade, and plans through the `DraftPlanner` port. A denied action is not stored; the run returns the decision with status `denied`. An allowed action that changes something runs at once and is stored as `auto_applied`; an allowed read-only one is stored as `pending` (it is information). Accept goes through `AnticipationService.accept` (`app/services/anticipation/service.py:300`), which claims the suggestion with a compare-and-set before its action runs and rebuilds the action from its payload with `ActionFactory`. `ApplyDraftAction` refreshes a stale brief at accept: if a slot has begun or a task was finished or skipped since the draft was made, the open tasks are drafted again from now and that plan is accepted instead; nothing left means the stale draft is expired (`app/services/anticipation/actions.py:62-100`).
 
 **Consent model** (idea adopted from Claude Code's permission design, written fresh):
 - Every proactive action passes through `ConsentPolicy.evaluate(action) → ConsentDecision(allow | ask | deny, reason)`.
@@ -322,7 +322,7 @@ The page shows "What Jarvis knows about you". Each item shows its evidence and s
 **(amended 2026-11-14 after implementation)**
 - The receipt counts calls **sent to the cloud** (any cloud provider: Claude or Gemini), not "sent to Gemini" (`PrivacyReceipt.cloud_calls`, `app/services/user_model_service.py:136`). It covers the last 30 days, and the response says where the window opens (`RECEIPT_WINDOW_DAYS`, `:60`; `since`, `:215`).
 - The settings are autonomy mode, wake time **and timezone** (an IANA name; an unknown zone is a 422 and nothing changes) through `PATCH /api/v1/you/settings` (`app/api/v1/endpoints/you.py:133-151`).
-- `GET /api/v1/you` also returns `streak_days`, the coach's completion streak on the user's days; a streak is not broken until the local day ends (`compute_streak_from_events`, `app/services/analytical/mastery_tracker.py:241`).
+- `GET /api/v1/you` also returns `streak_days`, the coach's completion streak on the user's days; a streak is not broken until the local day ends (`compute_streak_from_events`, `app/services/analytical/mastery_tracker.py:230`).
 
 ### 8.2 Make learning moments arrive
 
@@ -348,7 +348,7 @@ Solver-conflict explanation (AddAssumptions) is P2.
 
 Replace the stub with a real search-and-summarise path through `LLMProvider`, so it passes through `RedactingProvider` and the usage ledger. Use Claude's server-side web search tool when the cloud tier is Claude, and Gemini grounding otherwise. Today it bypasses both.
 
-**(amended 2026-11-14 after implementation)** Not built. `execute_search` runs the shared web-search helper, which is PII-gated and metered on the turn's event bus; `summarize` makes no model call (it returns "Found N results…") and `link_to_tasks` returns nothing (`app/modules/research_graph.py:28-74`).
+**(amended 2026-11-14 after implementation)** Not built. `execute_search` runs the shared web-search helper, which is PII-gated and metered on the turn's event bus; `summarize` makes no model call (it returns "Found N results…") and `link_to_tasks` returns nothing (`app/modules/research_graph.py:29-75`).
 
 ### 8.5 Retire v1
 
@@ -359,7 +359,7 @@ Delete the deprecated routes and `execute_agentic_flow`; move the live helpers (
 - **Modules:** `services/analytical/control_policy.py` (with `execute_agentic_flow`), `services/intent_registry.py`, `services/analytical/task_editor.py`, `task_rearranger.py`, `task_retrieval.py`, `services/memory/pearl.py`, `extractor.py`, `retriever.py`, `store.py` (`MemoryStore`), `services/draft_store.py` (`DraftStore`) and `core/runtime.py`.
 - **Moved, not deleted:** `derive_goal_id`, `mint_run_token` and `namespace_chunk` to `app/services/planning/goal_ids.py`; the brain-dump extraction prompt to `app/services/planning/brain_dump_prompt.py`; `run_schedule` to `app/services/planning/scheduling.py`.
 
-`/api/v1/chat/stream` (`app/api/v1/endpoints/chat.py`) only routes: it opens a turn with `ChatTurnService` (`app/services/chat_turn/service.py`) and returns its frames, each a typed model encoded by `SseEncoder` (`app/schemas/chat_stream.py`). The frontend posts only to it (`jarvis-frontend/lib/api.ts:23`).
+`/api/v1/chat/stream` (`app/api/v1/endpoints/chat.py`) only routes: it opens a turn with `ChatTurnService` (`app/services/chat_turn/service.py`) and returns its frames, each a typed model encoded by `SseEncoder` (`app/schemas/chat_stream.py`). The frontend posts only to it (`jarvis-frontend/lib/api.ts:25`).
 
 ## 9. Demo data: seeded history, real computation
 
@@ -404,10 +404,10 @@ The new semantics:
 - The morning brief's draft re-solves the whole pending set, using the existing multi-goal fusion semantics. There is no new "accept only today" path.
 
 **(amended 2026-11-14 after implementation)**
-- **The term applies only with a learned profile.** A profile is "learned" from `MIN_FOCUS_OBSERVATIONS` (10) outcomes in the last `FOCUS_WINDOW_DAYS` (28); a "prior" profile never steers the solver (`app/services/energy.py:119, 154`; `app/core/config.py:201-216`).
-- **Weight:** `ENERGY_OBJECTIVE_WEIGHT` = 900 × difficulty, scaled to the makespan weight (`app/core/config.py:207-213`).
+- **The term applies only with a learned profile.** A profile is "learned" from `MIN_FOCUS_OBSERVATIONS` (10) outcomes in the last `FOCUS_WINDOW_DAYS` (28); a "prior" profile never steers the solver (`app/services/energy.py:119, 154`; `app/core/config.py:198-213`).
+- **Weight:** `ENERGY_OBJECTIVE_WEIGHT` = 900 × difficulty, scaled to the makespan weight (`app/core/config.py:204-210`).
 - **Zero for a task due within 24 hours** (or overdue), so the term never competes with urgency (`ENERGY_MIN_DELAY_HOURS`, `_energy_weight`, `app/services/planning/scheduling.py:96-111`).
-- **The solver stops when idle:** inside the 10 s cap (`SOLVER_MAX_TIME_SECONDS`), the search stops once no better schedule has turned up for `SOLVER_IDLE_STOP_SECONDS` (1.0 s, env `JARVIS_SOLVER_IDLE_STOP_SECONDS`) after the first one (`app/core/config.py:226-237`; `app/core/or_tools/solver.py:28-44, 330-333`).
+- **The solver stops when idle:** inside the 10 s cap (`SOLVER_MAX_TIME_SECONDS`), the search stops once no better schedule has turned up for `SOLVER_IDLE_STOP_SECONDS` (1.0 s, env `JARVIS_SOLVER_IDLE_STOP_SECONDS`) after the first one (`app/core/config.py:223-234`; `app/core/or_tools/solver.py:28-44, 330-333`).
 - `run_schedule` lives in `app/services/planning/scheduling.py`; the `POST /api/v1/schedule/generate-schedule` endpoint only calls it.
 
 ## 10. Error handling, validation, concurrency (feeds `09-error-handling.md`)
@@ -453,6 +453,7 @@ JarvisError
 JarvisError                          internal_error, 500
 ├── DomainError
 │   ├── ValidationError              validation_error, 422
+│   │   └── PayloadTooLargeError       payload_too_large, 413 (a body larger than any valid request)
 │   ├── NotFoundError                not_found, 404
 │   ├── ConflictError                conflict, 409
 │   │   ├── InvalidStateTransition     invalid_state_transition
@@ -473,13 +474,13 @@ JarvisError                          internal_error, 500
 - **`EmbeddingUnavailableError`:** the embedder could not run. In a turn, the observation loop catches it and the turn goes on with no memory frame (`app/core/observation.py`).
 - **The envelope** is `ErrorResponse` / `ErrorBody` in `app/schemas/errors.py`, produced by the handlers in `app/api/error_handlers.py` and documented in OpenAPI as the 422, 4XX and 5XX of every operation. Inside the stream, the `error` frame is the same `ErrorResponse`, encoded by `SseEncoder`.
 - **Stale version:** `GET /api/v1/drafts/{id}` returns a computed `version`; `POST /api/v1/drafts/{id}/accept` with an `expected_version` that no longer matches is a 409 `stale_version` whose `details.draft` is the latest draft, and nothing is written (`check_version`, `app/services/draft_service.py:59-72`). The check runs in the service just before `accept_draft`, not inside the SQL function, so an edit landing between the two is not caught.
-- **Request limits:** a chat message over 8,000 characters (`MAX_CHAT_PROMPT_CHARS`) or a file that decodes to more than 10 MB (`MAX_CHAT_UPLOAD_BYTES`) is a 422 envelope before any work starts (`app/core/config.py:282-285`; `app/schemas/upload.py`). `model_mode` and `media_type` are `Literal`s, so `"27b"` is a 422. Draft edits bound `duration_minutes` to 1–25 and `start_min` to ≥ 0.
+- **Request limits:** a chat message over 8,000 characters (`MAX_CHAT_PROMPT_CHARS`) or a file that decodes to more than 10 MB (`MAX_CHAT_UPLOAD_BYTES`) is a 422 envelope before any work starts (`app/core/config.py:276-279`; `app/schemas/upload.py`); a body larger than any valid request (about 14 MB) is refused 413 `payload_too_large` before it is read (`app/api/request_limits.py`). `model_mode` and `media_type` are `Literal`s, so `"27b"` is a 422. Draft edits bound `duration_minutes` to 1–25 and `start_min` to ≥ 0.
 - **Infeasible:** `run_schedule` raises `ScheduleInfeasibleError` (422 `schedule_infeasible`); the planning node catches it and walks the horizon ladder, so a chat turn answers with guidance, never an error.
-- **The PRIMARY lock covers local calls only.** Every PRIMARY-role call that may run on the local model holds one process-wide lock for the whole call; a call that goes straight to the cloud, and every FAST or CLOUD call, never touches it (`app/core/model_router.py:195-202`).
+- **The PRIMARY lock covers local calls only.** Every PRIMARY-role call that may run on the local model holds one process-wide lock for the whole call; a call that goes straight to the cloud, and every FAST or CLOUD call, never touches it (`app/core/model_router.py:204-211`).
 - **Once a day holds in-process.** A trigger's once-a-day check and its insert run under a per-user lock that lives in memory (`app/services/anticipation/user_locks.py:1-5`); the day memo is in memory too. That is right for the single server process Jarvis runs as, and would not hold across processes.
 - **PEARL runs single-flight per user:** one `observe` per user at a time, and outcomes that arrive meanwhile ask for one more run after it (`PerUserSingleFlight`, `app/services/background.py:18`; `PatternObserver`, `app/services/memory/patterns.py:697-708`).
-- **The Supabase client speaks HTTP/1.1** (`httpx.Client(http2=False)`, `app/db/supabase_py.py:15-27`), so concurrent queries do not share one HTTP/2 connection whose failure would read as an outage.
-- **One list still answers `[]` without a database:** `GET /api/v1/sessions/` (`app/api/v1/endpoints/sessions.py:106-114`); the other session routes answer 503.
+- **The Supabase client speaks HTTP/1.1** (`httpx.HTTPTransport(http1=True, http2=False)` with bounded keep-alive, `app/db/supabase_py.py:69-94`), so concurrent queries do not share one HTTP/2 connection whose failure would read as an outage. A connection that cannot be made is retried once after a short random pause; a request that may have reached the server is never retried (`ConnectRetryTransport`, `:31-66`).
+- **No list answers `[]` without a database:** the session reads answer 503 too (`require_supabase`, `app/api/v1/endpoints/sessions.py:107-114`; `app/services/chat_history.py:254-255, 341-342`).
 
 ## 11. Database (feeds `08-database-schema.md`)
 
@@ -518,7 +519,7 @@ One migration source: `supabase/migrations/`. Numbered N001–N014 are ported in
 - **`proactive_suggestions.consent_kind`** stores which consent rule decided (`20261115000004_suggestion_consent_kind.sql:11-12`).
 - **`pacing_pushed` is dropped:** existing rows became `skipped` and the status CHECK is the four `TaskStatus` values (`20261115000000_skip_writes_skipped.sql:11-15`).
 - **The migrations after the capstone one** are `20261115000000_skip_writes_skipped`, `…0001_accept_draft_reslots_missed`, `…0002_memory_lifecycle_and_vectors`, `…0003_session_summaries`, `…0004_suggestion_consent_kind` and `…0006_session_summary_reach`. There is no `20261115000005`. The restructure (§12, 2b) added no migration.
-- **Not moved behind ports (the restructure's Task 6 was dropped):** the session routes and `chat_history` still query `chat_sessions` / `chat_messages` directly (`ConversationRepository` serves conversation memory: the window, its summaries and "since we last spoke"), and documents, pending-calendar rows and task materials have no repository. Eight files query tables directly, each listed with its reason in `_RAW_TABLE_CALLS_ALLOWED` (`tests/test_layering.py:438-453`): those, the workspace cache with its own `user_tasks` reads, and `user_preferences`.
+- **Not moved behind ports (the restructure's Task 6 was dropped):** the session routes and `chat_history` still query `chat_sessions` / `chat_messages` directly (`ConversationRepository` serves conversation memory: the window, its summaries and "since we last spoke"), and documents, pending-calendar rows and task materials have no repository. Eight files query tables directly, each listed with its reason in `_RAW_TABLE_CALLS_ALLOWED` (`tests/test_layering.py:451-466`): those, the workspace cache with its own `user_tasks` reads, and `user_preferences`.
 
 ## 12. Phases, in order, each ending demoable
 

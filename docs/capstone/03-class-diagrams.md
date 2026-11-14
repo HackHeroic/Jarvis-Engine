@@ -168,13 +168,13 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `AppContainer *--` every field (`repos`, `events`, `llm`, the services, `consent`, `actions`, `settings`) | Composition | `build` creates each one, the container is the only object that holds the set, and they live exactly as long as the container (the lifespan builds one at startup and shuts it down at exit) | `app/container.py:124-239`, `app/main.py:118`, `app/main.py:178` |
-| `AppContainer *-- "3..*" Sweep : sweeps` | Composition | `build` creates three sweeps; the lifespan appends a fourth (`CheckpointRetentionSweep`) to the same list | `app/container.py:215-219`, `app/main.py:147` |
+| `AppContainer *--` every field (`repos`, `events`, `llm`, the services, `consent`, `actions`, `settings`) | Composition | `build` creates each one, the container is the only object that holds the set, and they live exactly as long as the container (the lifespan builds one at startup and shuts it down at exit) | `app/container.py:124-239`, `app/main.py:119`, `app/main.py:179` |
+| `AppContainer *-- "3..*" Sweep : sweeps` | Composition | `build` creates three sweeps; the lifespan appends a fourth (`CheckpointRetentionSweep`) to the same list | `app/container.py:215-219`, `app/main.py:148` |
 | `AppContainer *-- TextEmbedder`, `*-- EnergyEstimator`, `*-- DraftPlanner` | Composition, to the port | The container holds the port type, so its fields depend on abstractions; the realization arrows show which concrete class `build` chose | `app/container.py:86-94`, `142`, `152`, `177` |
 | `MemoryService o-- TextEmbedder`, `PlanningServices o--` its services, `AnticipationService o-- ConsentPolicy` / `ActionFactory` | Aggregation | Injected through the constructor and shared: the same `MemoryService` is held by `PlanningServices`, `ConversationMemoryService`, `UserModelService`, `StatedRules` and two actions | `app/container.py:143`, `168-176`, `184-187` |
 | `EventBus o-- "*" EventListener` | Aggregation | The bus keeps references to listeners it did not create; a listener (the usage ledger) is also a container field | `app/domain/events.py:85-90`, `app/container.py:133` |
 | `FallbackChainProvider *-- "1..*" LLMProvider` | Composition | The factory builds each wrapped provider for this chain only; the chain keeps them in a private tuple | `app/infrastructure/llm/factory.py:51-56`, `chain.py:44-45` |
-| `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | The lifespan hands it the container's service and sweep list; the container outlives the scheduler's loop | `app/main.py:154-159`, `scheduler.py:38-41` |
+| `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | The lifespan hands it the container's service and sweep list; the container outlives the scheduler's loop | `app/main.py:155-160`, `scheduler.py:38-41` |
 | `ChatTurnService o-- "0..1" AppContainer` | Aggregation | One service object per request (`for_app`), all sharing the one container; `None` when the lifespan built none | `app/services/chat_turn/service.py:243-258` |
 | `ChatTurn --> ChatTurnService` | Association | A back-reference the turn uses to reach the graph and container | `app/services/chat_turn/service.py:59` |
 | `... ..> ... : creates` | Dependency | The factory method returns the object and keeps no reference | `persistence/factory.py:72-104`, `llm/factory.py:33-56` |
@@ -646,7 +646,7 @@ classDiagram
     LLMError <|-- LLMRefusedError
 ```
 
-Every arrow is inheritance: each subclass overrides the class attributes `code` and `http_status` (`app/domain/errors.py:13-99`), and `app/api/error_handlers.py` turns any `JarvisError` into the one error envelope (see `09-error-handling.md`).
+Every arrow is inheritance: each subclass overrides the class attributes `code` and `http_status` (`app/domain/errors.py:13-106`), and `app/api/error_handlers.py` turns any `JarvisError` into the one error envelope (see `09-error-handling.md`).
 
 | Class | `code` | HTTP |
 |---|---|---|
@@ -979,7 +979,7 @@ classDiagram
 
 ## 5. Language models
 
-Every model call goes through `route_llm_call` (`app/core/model_router.py:338`), which builds an `LLMRequest` and hands it to the process-wide `FallbackChainProvider`. The chain is Strategy (interchangeable providers), Chain of Responsibility (try each until one answers), and Decorator (one concern per wrapper). `LLMProviderFactory.build` assembles it: cloud providers are wrapped `Redacting → Retrying → Metered → Timeout → adapter`; the local provider `Metered → Timeout → adapter` (`app/infrastructure/llm/factory.py:33-56`).
+Every model call goes through `route_llm_call` (`app/core/model_router.py:347`), which builds an `LLMRequest` and hands it to the process-wide `FallbackChainProvider`. The chain is Strategy (interchangeable providers), Chain of Responsibility (try each until one answers), and Decorator (one concern per wrapper). `LLMProviderFactory.build` assembles it: cloud providers are wrapped `Redacting → Retrying → Metered → Timeout → adapter`; the local provider `Metered → Timeout → adapter` (`app/infrastructure/llm/factory.py:33-56`).
 
 ```mermaid
 classDiagram
@@ -1163,7 +1163,7 @@ classDiagram
 | `Redactor` (protocol) | — | `PreCloudLLMRedactor` satisfies it structurally; because a `typing.Protocol` is not subclassed, no realization arrow can be drawn honestly | `decorators.py:46-53`, `model_router.py:71` |
 | `MeteredProvider ..> ServedModels`, `..> TokenTally` | Dependency | Reached through context variables for the duration of one call, never stored | `decorators.py:242-248`, `284-287` |
 
-Routing in one table (`app/core/model_router.py:165-190`, `241-249`, `338-406`):
+Routing in one table (`app/core/model_router.py:174-199`, `241-249`, `338-406`):
 
 | Step | What happens |
 |---|---|
@@ -1178,7 +1178,7 @@ Routing in one table (`app/core/model_router.py:165-190`, `241-249`, `338-406`):
 
 ### 6.1 The chat turn
 
-`POST /api/v1/chat/stream` (`app/api/v1/endpoints/chat.py:24-60`) only parses the request and opens a turn. `ChatTurnService.open_turn` sets the turn's context (cloud flag, usage attribution, session) in the handler's context; `ChatTurn.frames` runs the LangGraph graph under a per-conversation lock and writes every frame through `SseEncoder`.
+`POST /api/v1/chat/stream` (`app/api/v1/endpoints/chat.py:22-55`) only parses the request and opens a turn. `ChatTurnService.open_turn` sets the turn's context (cloud flag, usage attribution, session) in the handler's context; `ChatTurn.frames` runs the LangGraph graph under a per-conversation lock and writes every frame through `SseEncoder`.
 
 ```mermaid
 classDiagram
@@ -1212,6 +1212,7 @@ classDiagram
         +str intent
         +str message
         +str | None draft_id
+        +str | None draft_version
         +str | None conversation_id
         +str | None message_id
         +str | None since_last_spoke
@@ -1292,19 +1293,19 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `ChatTurnService "*" o-- CompiledStateGraph : graph` | Aggregation | The graph is compiled once in the lifespan and shared by every request's service object | `app/main.py:81`, `service.py:248`, `254-257` |
+| `ChatTurnService "*" o-- CompiledStateGraph : graph` | Aggregation | The graph is compiled once in the lifespan and shared by every request's service object | `app/main.py:82`, `service.py:248`, `254-257` |
 | `ChatTurnService "*" o-- "0..1" AppContainer` | Aggregation | Shared container, possibly absent | `service.py:249-251` |
 | `ChatTurn *-- ServedModels : _served` | Composition | Made in `open_turn` for this turn only; the reply is credited to the model it records | `service.py:291-303` |
 | `ChatTurn --> ChatStreamRequest`, `--> ChatTurnService` | Association | References kept for the turn's life, not owned | `service.py:59-60` |
 | `ChatTurn ..> JarvisState` | Dependency | `_state` is a plain `dict` built by `initial_state` in the shape of the `JarvisState` TypedDict | `service.py:61`, `app/services/chat_turn/context.py:31` |
-| `ChatTurn ..> _TurnLock` | Dependency | `thread_lock(thread_id)` takes the conversation's lock from a module-level registry for the turn | `service.py:135`, `app/services/turn_locks.py:37-75` |
+| `ChatTurn ..> _TurnLock` | Dependency | `thread_lock(thread_id)` takes the conversation's lock from a module-level registry for the turn | `service.py:135`, `app/services/turn_locks.py:37-70` |
 | `JarvisState --> UserModel`, `--> AppContainer` | Association | Transient keys, set fresh each turn and scrubbed before checkpointing | `app/orchestrator/state.py:43`, `93`, `app/orchestrator/checkpoint.py:60-90` |
 
-`JarvisState` has 43 keys (`app/orchestrator/state.py:31-115`); the diagram shows the ones the turn reads most.
+`JarvisState` has 44 keys (`app/orchestrator/state.py:31-118`); the diagram shows the ones the turn reads most.
 
 ### 6.2 The orchestrator, modules and checkpoints
 
-`build_jarvis_graph` (`app/orchestrator/graph.py:734-810`) is a function, so it is not a class here; it compiles a `StateGraph(JarvisState)` into the `CompiledStateGraph` above. Three cognitive modules are `ModuleDefinition` objects (`planning_module`, `research_agent`, `knowledge_module`; `app/modules/__init__.py:12-21`), each compiled to a sub-graph by `ModuleRegistry`; coach and conversation are plain node functions (`graph.py:749-750`).
+`build_jarvis_graph` (`app/orchestrator/graph.py:762-838`) is a function, so it is not a class here; it compiles a `StateGraph(JarvisState)` into the `CompiledStateGraph` above. Three cognitive modules are `ModuleDefinition` objects (`planning_module`, `research_agent`, `knowledge_module`; `app/modules/__init__.py:12-20`), each compiled to a sub-graph by `ModuleRegistry`; coach and conversation are plain node functions (`graph.py:777-778`).
 
 ```mermaid
 classDiagram
@@ -1435,9 +1436,9 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `ModuleRegistry o-- "*" ModuleDefinition` | Aggregation | Definitions are module-level objects created in their own modules and registered; they exist without the registry | `app/core/module_framework.py:330-354`, `app/modules/planning_graph.py:944` |
-| `ModuleDefinition *-- ModuleStep`, `*-- ConditionalEdge` | Composition | Steps are written inline in the definition and belong to it; `register` even stamps `module_name` onto each | `module_framework.py:50-58`, `337-341`, `planning_graph.py:962-999` |
-| `CompiledStateGraph o-- ScrubbingSqliteSaver : checkpointer` | Aggregation | The saver is opened by the lifespan and passed in when the graph is compiled; the lifespan closes it | `app/main.py:77-81`, `181` |
+| `ModuleRegistry o-- "*" ModuleDefinition` | Aggregation | Definitions are module-level objects created in their own modules and registered; they exist without the registry | `app/core/module_framework.py:330-354`, `app/modules/planning_graph.py:951` |
+| `ModuleDefinition *-- ModuleStep`, `*-- ConditionalEdge` | Composition | Steps are written inline in the definition and belong to it; `register` even stamps `module_name` onto each | `module_framework.py:50-58`, `337-341`, `planning_graph.py:969-1006` |
+| `CompiledStateGraph o-- ScrubbingSqliteSaver : checkpointer` | Aggregation | The saver is opened by the lifespan and passed in when the graph is compiled; the lifespan closes it | `app/main.py:78-82`, `181` |
 | `AsyncSqliteSaver <\|-- ScrubbingSqliteSaver` | Inheritance | Overrides `aput` / `aput_writes` to drop transient per-turn objects before they are serialised | `app/orchestrator/checkpoint.py:92-163` |
 | `UserModel o--` three ports | Aggregation | The facade reads through ports the container built, and caches each read for one turn | `app/core/user_model.py:26-50` |
 | `PlanningServices o--` seven collaborators | Aggregation | A frozen record of exactly what the planning sub-graph needs (Interface Segregation), sharing the container's objects | `app/services/planning/services.py:16-31` |
@@ -1629,14 +1630,14 @@ classDiagram
 | `Trigger ..>` context, draft, outcome, `ConsentPolicy`, `SuggestionRepository` | Dependency | All arrive as parameters of `run` or are returned by it; a trigger stores none of them | `anticipation.py:353-421` |
 | `SuggestionDraft *-- ProactiveAction : action` | Composition | `build_suggestion` creates the action for this draft; it is serialised into the stored suggestion (`to_payload`) and rebuilt on accept | `anticipation.py:259-270`, `398` |
 | Triggers `o--` ports, `PatternService`, `ActionFactory` | Aggregation | Constructor-injected, shared with the service and container | `triggers.py:99-118`, `315-325` |
-| `AnticipationService *-- "*" Trigger : _triggers` | Composition | The container creates each trigger only to register it; the service is its only holder | `app/container.py:188-196`, `service.py:187-189` |
-| `AnticipationService *-- UserLocks : _locks` | Composition | Created in its constructor; serialises one user's trigger runs | `service.py:178` |
-| `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | Handed in by the lifespan; the container owns them | `app/main.py:154-159` |
+| `AnticipationService *-- "*" Trigger : _triggers` | Composition | The container creates each trigger only to register it; the service is its only holder | `app/container.py:188-196`, `service.py:189-191` |
+| `AnticipationService *-- UserLocks : _locks` | Composition | Created in its constructor; serialises one user's trigger runs | `service.py:180` |
+| `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | Handed in by the lifespan; the container owns them | `app/main.py:155-160` |
 | `AnticipationListener *-- PerUserSingleFlight : _flight` | Composition | Created in its constructor; one background run per user | `triggers.py:412-415` |
-| `Sweep <\|.. four sweeps` | Realization | Each owns the data it maintains: tasks, memories, conversation summaries, the checkpoint file | `task_service.py:310`, `memory_service.py:597`, `conversation_memory.py:602`, `checkpoint.py:271` |
-| Sweeps `o--` their service | Aggregation | The sweep calls the subsystem's service, which the container owns | `task_service.py:316-317`, `memory_service.py:603-604`, `conversation_memory.py:608-609`, `checkpoint.py:281-285` |
+| `Sweep <\|.. four sweeps` | Realization | Each owns the data it maintains: tasks, memories, conversation summaries, the checkpoint file | `task_service.py:310`, `memory_service.py:609`, `conversation_memory.py:602`, `checkpoint.py:271` |
+| Sweeps `o--` their service | Aggregation | The sweep calls the subsystem's service, which the container owns | `task_service.py:316-317`, `memory_service.py:615-616`, `conversation_memory.py:608-609`, `checkpoint.py:281-285` |
 
-Sweep intervals: `slot_passed` 1 minute, `session_summary` 5 minutes, `memory_decay` 24 hours, `checkpoint_retention` 24 hours. The scheduler ticks every `ANTICIPATION_TICK_SECONDS` = 60 (`app/core/config.py:193`).
+Sweep intervals: `slot_passed` 1 minute, `session_summary` 5 minutes, `memory_decay` 24 hours, `checkpoint_retention` 24 hours. The scheduler ticks every `ANTICIPATION_TICK_SECONDS` = 60 (`app/core/config.py:190`).
 
 ### 7.2 The consent chain and proactive actions
 
@@ -1927,7 +1928,7 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `MemoryService o-- MemoryRepository`, `o-- TextEmbedder` | Aggregation | Injected; the embedder is also a container field, warmed up at startup | `memory_service.py:182-195`, `app/main.py:125-128` |
+| `MemoryService o-- MemoryRepository`, `o-- TextEmbedder` | Aggregation | Injected; the embedder is also a container field, warmed up at startup | `memory_service.py:182-195`, `app/main.py:126-129` |
 | `TextEmbedder <\|.. MiniLMEmbedder` | Realization (Adapter) | Wraps the local all-MiniLM-L6-v2 model behind the port; 384 dimensions, the width of `user_memories.embedding` | `app/infrastructure/embedding.py:10-32` |
 | `MemoryService ..>` candidate, outcome, snapshot, recall | Dependency | Parameter and return types, never stored | `memory_service.py:197-207`, `359-381` |
 | `ConversationMemoryService *-- SummaryFilter`, `*-- SinceLastSpoke`, `*-- UserLocks` | Composition | All three are created in its constructor and live with it | `app/services/memory/conversation_memory.py:208-214` |
@@ -2293,10 +2294,10 @@ These are the places where the code cannot be drawn faithfully as a class diagra
 
 | What | Why it is not drawn, or drawn differently |
 |---|---|
-| `route_llm_call`, `build_jarvis_graph`, `thread_lock`, `accept_draft_and_persist`, `run_observation_loop`, `run_schedule` and the graph's node functions | Functions, not classes. `02-architecture.md` places them in the runtime view. |
+| `route_llm_call`, `build_jarvis_graph`, `thread_lock`, `accept_draft_on_time`, `run_observation_loop`, `run_schedule` and the graph's node functions | Functions, not classes. `02-architecture.md` places them in the runtime view. |
 | The three cognitive modules (`planning_module`, `research_agent`, `knowledge_module`) | They are `ModuleDefinition` instances, not classes (section 6.2). |
 | `PreCloudLLMRedactor` realizing `Redactor` | `Redactor` is a `typing.Protocol`; the match is structural, so a realization arrow would not be a true `issubclass`. |
-| Process-wide singletons: the hook pipeline (`get_hooks()`, `app/orchestrator/hooks.py:142-150`), the installed LLM chain (`set_chain` / `get_chain`, `app/infrastructure/llm/factory.py:59-79`, `app/core/model_router.py:151-162`), the module registry (`app/modules/__init__.py:9`), the turn-lock registry (`app/services/turn_locks.py:37`) | Module-level state, not fields of any object, so no arrow can show them. `02-architecture.md` lists them as process-local state. |
+| Process-wide singletons: the hook pipeline (`get_hooks()`, `app/orchestrator/hooks.py:142-150`), the installed LLM chain (`set_chain` / `get_chain`, `app/infrastructure/llm/factory.py:59-79`, `app/core/model_router.py:160-171`), the module registry (`app/modules/__init__.py:9`), the turn-lock registry (`app/services/turn_locks.py:37`) | Module-level state, not fields of any object, so no arrow can show them. `02-architecture.md` lists them as process-local state. |
 | `Settings`' five nested records (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `app/core/settings.py:13-68`) | Plain frozen dataclasses of configuration values, built once by `Settings.from_config`; drawing them adds nothing to the design. All 22 `AppContainer` fields are drawn in the overview. |
 | Private helpers (`_Move`, `_Backoff`, `_Settled`, `_Brief`, `_Entry`, `_PrimaryHold`), API request/response models, frame models (`PhaseFrame`, `StepFrame`, ...), and the analytical services (`workspace_builder`, `voice_of_jarvis`, the OR-Tools `JarvisScheduler`) | Out of scope for the LLD diagrams; `07-api-design.md` covers the API models and the frame catalogue. |
 | Types | `Literal[...]` is drawn as `str`; generics with a comma (`dict[str, X]`, `tuple[int, int]`) are drawn without parameters, because Mermaid cannot render them. |
