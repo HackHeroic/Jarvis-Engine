@@ -448,6 +448,18 @@ class MemoryService:
         )
         return Recall(profile=profile, relevant=relevant, tokens=profile_tokens + relevant_tokens)
 
+    async def drop_let_go(self, user_id: str, texts: list[str]) -> list[str]:
+        """``texts``, in order, less each one ``remember`` would suppress: one at least
+        ``suppress_similarity`` close to a memory the user forgot or dismissed.
+
+        For something the user says that is stored outside the memories — a stated rule —
+        so forgetting holds for it too. Raises EmbeddingUnavailableError as
+        ``drop_suppressed`` does.
+        """
+        return await self.drop_suppressed(
+            user_id, texts, min_similarity=self._settings.suppress_similarity
+        )
+
     async def drop_suppressed(
         self,
         user_id: str,

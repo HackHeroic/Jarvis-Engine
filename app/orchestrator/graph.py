@@ -14,6 +14,7 @@ from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.domain.errors import (
     ConflictError,
     DraftOutdatedError,
+    EmbeddingUnavailableError,
     InvalidStateTransition,
     LLMUnavailableError,
     NotFoundError,
@@ -465,14 +466,37 @@ async def _store_rule(state: JarvisState, habit: str) -> dict:
     )
 
 
+async def _not_let_go(state: JarvisState, habits: list[str]) -> list[str] | None:
+    """``habits`` less each one the user let go of: said again in words close to a memory
+    they forgot or dismissed (``MemoryService.drop_let_go``, the test ``remember`` uses).
+
+    Forgetting the memory of a rule deleted the rule; saying it again must not bring it
+    back. None when that cannot be checked (the embedder is down while the user has let
+    something go): then no rule is stored rather than one they may have forgotten.
+    Without a composition root nothing is stored anyway (``_store_rule``).
+    """
+    container = state.get("container")
+    user_id = state.get("user_id")
+    if container is None or not user_id:
+        return habits
+    try:
+        return await container.memory_service.drop_let_go(user_id, habits)
+    except EmbeddingUnavailableError:
+        logger.warning(
+            "store_constraint: the rules could not be checked against what the user let go "
+            "of (embedder unavailable), so none is stored"
+        )
+        return None
+
+
 async def store_constraint(state: JarvisState) -> dict:
     """Persist the turn's inline habits as behavioral constraints.
 
-    BEHAVIORAL_CONSTRAINT is classified from ``brain_dump.inline_habits`` —
-    the extraction already carries the verbatim habit phrases. v1 stored them
-    via behavioral_store; v2 routed them into the planning module, which
-    treated the habit as a goal and stored nothing. This node is the v2 home.
-    Deterministic confirmation, no LLM call.
+    BEHAVIORAL_CONSTRAINT is classified from ``brain_dump.inline_habits`` — the
+    extraction already carries the verbatim habit phrases, and this node stores each as
+    a rule. A habit the user let go of (its memory forgotten or dismissed) is not stored
+    again, and nothing is said about it: like the suppressed memory, it is simply not
+    kept. Deterministic confirmation, no LLM call.
     """
     bd = state.get("brain_dump")
     habits = list(getattr(bd, "inline_habits", None) or [])
@@ -484,6 +508,10 @@ async def store_constraint(state: JarvisState) -> dict:
                 "rule. Could you phrase it as one habit — e.g. 'no study before 11am'?"
             ),
         }
+    kept = await _not_let_go(state, habits)
+    if kept is not None and not kept:  # every one was let go of: nothing to keep
+        return {"saved_constraints": [], "response_message": "Understood, sir."}
+    habits = kept or []
 
     saved: list[str] = []
     # Each stored rule's id, by its words: the observation loop links the rule to the
