@@ -5,6 +5,37 @@ Integration tests for task state transitions.
 import pytest
 from unittest.mock import MagicMock
 
+from tests.fakes import FakeDBClient, FakeSupabase
+
+
+def _task_row(
+    task_id: str, *, user_id: str = "u1", title: str = "Study CNNs", minutes: int = 25
+) -> dict:
+    """A pending user_tasks row with the columns the table requires."""
+    return {
+        "user_id": user_id, "task_id": task_id, "title": title, "status": "pending",
+        "duration_minutes": minutes, "difficulty_weight": 0.5,
+    }
+
+
+def _client_over(fake: FakeSupabase, monkeypatch):
+    """A TestClient whose app stores everything in ``fake``, as the lifespan wires it."""
+    from fastapi.testclient import TestClient
+
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.main import app
+    from app.orchestrator.hooks import ActionHooks
+
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(fake), raising=False)
+    monkeypatch.setattr(
+        app.state,
+        "container",
+        AppContainer.build(supabase_client=fake, cfg=cfg, hooks=ActionHooks()),
+        raising=False,
+    )
+    return TestClient(app)
+
 
 @pytest.fixture
 def mock_supabase():
@@ -66,58 +97,50 @@ class TestTaskComplete:
         result = query.execute()
         assert result.data["status"] == "completed"
 
-    def test_task_skip__marks_skipped(self, mock_supabase):
-        mock_supabase.table.return_value.execute.return_value.data = {
-            "task_id": "t1", "status": "skipped",
-        }
+    def test_task_skip__marks_skipped(self, monkeypatch):
+        """Skip writes ``skipped`` (never ``pacing_pushed``) and one outcome event."""
+        fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+        client = _client_over(fake, monkeypatch)
 
-        query = (
-            mock_supabase.table("user_tasks")
-            .update({"status": "skipped"})
-            .eq("task_id", "t1")
-            .eq("user_id", "user-a")
-        )
-        result = query.execute()
-        assert result.data["status"] == "skipped"
+        resp = client.post("/api/v1/tasks/t1/skip", json={"user_id": "u1"})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "skipped"
+        assert "buffer" in resp.json()["message"]
+        assert fake.rows["user_tasks"][0]["status"] == "skipped"
+        assert "reschedule_count" not in fake.rows["user_tasks"][0]
+        (event,) = fake.rows["task_events"]
+        assert (event["user_id"], event["task_id"], event["event_type"]) == ("u1", "t1", "skipped")
 
 
-# --- actual_duration_minutes reaches the user_tasks UPDATE ------------------
-# F2 (live run 2026-08-08): the field is declared on TaskCompleteRequest and
-# written into the UPDATE payload, but no migration created the column, so
-# PostgREST 500'd with PGRST204 on every request that supplied it. The column
-# now exists (supabase/migrations/20260808000000_user_tasks_actual_duration.sql);
-# this pins the write path that depends on it, so the two can't drift apart
-# again without a test failing.
+# --- actual_duration_minutes reaches storage --------------------------------
+# F2 (live run 2026-08-08): the field is declared on TaskCompleteRequest but once
+# reached a column no migration created, so every request that supplied it 500'd.
+# Completion now goes through TaskService, and the duration is recorded on the
+# completed task event, the outcome history the learning layer reads.
 
 
 class TestCompletionDurationWrite:
-    def test_update_task_status__extra_fields__merged_into_update_payload(self, mock_supabase):
-        from app.api.v1.endpoints.tasks import _update_task_status_sync
+    def test_complete_endpoint__actual_duration__recorded_on_the_completed_event(
+        self, monkeypatch
+    ):
+        fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+        client = _client_over(fake, monkeypatch)
 
-        table = mock_supabase.table.return_value
-        table.execute.return_value.data = [{"task_id": "t1", "user_id": "demo"}]
-
-        _update_task_status_sync(
-            mock_supabase, "t1", "demo", "completed", {"actual_duration_minutes": 18},
+        resp = client.post(
+            "/api/v1/tasks/t1/complete",
+            json={"user_id": "u1", "quality": 4, "actual_duration_minutes": 18},
         )
 
-        table.update.assert_called_once_with(
-            {"status": "completed", "actual_duration_minutes": 18}
-        )
-
-    def test_update_task_status__no_extra_fields__status_only(self, mock_supabase):
-        """The optional field must never be written as an explicit NULL."""
-        from app.api.v1.endpoints.tasks import _update_task_status_sync
-
-        table = mock_supabase.table.return_value
-        table.execute.return_value.data = [{"task_id": "t1", "user_id": "demo"}]
-
-        _update_task_status_sync(mock_supabase, "t1", "demo", "completed", None)
-
-        table.update.assert_called_once_with({"status": "completed"})
+        assert resp.status_code == 200, resp.text
+        assert fake.rows["user_tasks"][0]["status"] == "completed"
+        (event,) = fake.rows["task_events"]
+        assert event["event_type"] == "completed"
+        assert event["metadata"]["actual_duration_minutes"] == 18
+        assert event["metadata"]["quality"] == 4
 
     def test_task_complete_request__accepts_actual_duration_minutes(self):
-        """The schema advertises the field; the column now backs it."""
+        """The schema advertises the field; the completed event records it."""
         from app.api.v1.endpoints.tasks import TaskCompleteRequest
 
         body = TaskCompleteRequest(user_id="demo", quality=4, actual_duration_minutes=18)
@@ -233,8 +256,7 @@ def test_patch_task__unknown_status__422():
         app.state.db_client = original
 
 
-@pytest.mark.parametrize("status", ["missed", "pacing_pushed"])
-def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status):
+def test_patch_task__missed__accepted_and_written():
     from fastapi.testclient import TestClient
     from app.main import app
     from tests.fakes import FakeSupabase
@@ -249,12 +271,38 @@ def test_patch_task__missed_or_pacing_pushed__accepted_and_written(status):
     original = getattr(app.state, "db_client", None)
     app.state.db_client = _DB()
     try:
-        resp = TestClient(app).patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": status})
+        resp = TestClient(app).patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "missed"})
         assert resp.status_code == 200
-        assert resp.json()["status"] == status
-        assert fake.rows["user_tasks"][0]["status"] == status
+        assert resp.json()["status"] == "missed"
+        assert fake.rows["user_tasks"][0]["status"] == "missed"
     finally:
         app.state.db_client = original
+
+
+def test_patch_task__pacing_pushed__422(monkeypatch):
+    """pacing_pushed is retired: skipped tasks are ``skipped``, and the CHECK drops it."""
+    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+    client = _client_over(fake, monkeypatch)
+
+    resp = client.patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "pacing_pushed"})
+
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+    assert fake.rows["user_tasks"][0]["status"] == "pending"
+
+
+def test_complete_endpoint__unknown_task__404_envelope(monkeypatch):
+    fake = FakeSupabase({"user_tasks": [_task_row("t1", user_id="someone_else")]})
+    client = _client_over(fake, monkeypatch)
+
+    resp = client.post("/api/v1/tasks/t1/complete", json={"user_id": "u1", "quality": 4})
+
+    assert resp.status_code == 404
+    error = resp.json()["error"]
+    assert set(error) == {"code", "message", "details", "request_id"}
+    assert error["code"] == "not_found"
+    assert fake.rows.get("task_events", []) == []
+    assert fake.rows["user_tasks"][0]["status"] == "pending"
 
 
 # The background replan (control_policy.trigger_replan) has never run to completion
@@ -276,10 +324,7 @@ _REPLAN_CLAIMS = ("schedule updated", "schedule adjusted", "slotted", "moves to"
 def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
     method, path, body, monkeypatch
 ):
-    from fastapi.testclient import TestClient
-
     from app.main import app
-    from tests.fakes import FakeDBClient, FakeSupabase
 
     replans: list[tuple] = []
 
@@ -288,15 +333,12 @@ def test_task_endpoints__any_change__schedule_no_replan_and_claim_none(
 
     monkeypatch.setattr("app.services.analytical.control_policy.trigger_replan", recording_replan)
     fake = FakeSupabase({"user_tasks": [
-        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending",
-         "duration_minutes": 25},
-        {"user_id": "u1", "task_id": "t2", "title": "Write the essay", "status": "pending",
-         "duration_minutes": 90},
+        _task_row("t1", title="Study CNNs", minutes=25),
+        _task_row("t2", title="Write the essay", minutes=90),
     ]})
-    monkeypatch.setattr(app.state, "db_client", FakeDBClient(fake), raising=False)
     monkeypatch.setattr(app.state, "memory_store", None, raising=False)
 
-    client = TestClient(app)
+    client = _client_over(fake, monkeypatch)
     response = client.request(method.upper(), path, json=body)
 
     assert response.status_code == 200, response.text

@@ -8,8 +8,9 @@ constraints, so the next plan moves out of that window on every day it covers.
 Dismissing a pattern hands the hour back.
 
 The skip observations are ``user_tasks`` rows with status ``skipped``: what PEARL
-counts today. (The Skip button writes ``pacing_pushed``, not ``skipped``; wiring it
-into PEARL is the next plan's work, so these tests seed the status PEARL reads.)
+counts today. (The Skip button now writes ``skipped`` plus a ``task_events`` row;
+moving PEARL onto those events is later work, so these tests seed the status PEARL
+reads.)
 """
 
 import json

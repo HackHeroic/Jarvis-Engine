@@ -86,8 +86,15 @@ async def _api(monkeypatch, jarvis=None):
     from app.main import app
 
     if jarvis is not None:
+        import app.core.config as cfg
+        from app.container import AppContainer
+        from app.orchestrator.hooks import ActionHooks
+
         monkeypatch.setattr(app.state, "db_client", jarvis.state.db_client, raising=False)
         monkeypatch.setattr(app.state, "memory_store", jarvis.memory_store, raising=False)
+        # The composition root the lifespan builds, over the same database.
+        container = AppContainer.build(supabase_client=jarvis.db, cfg=cfg, hooks=ActionHooks())
+        monkeypatch.setattr(app.state, "container", container, raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
@@ -532,13 +539,11 @@ async def test_anti_guilt__solver_api_infeasible__422_says_scope_without_blame(m
 
 
 @pytest.mark.asyncio
-async def test_anti_guilt__skipping_tasks__every_reply_and_note_is_blame_free(
-    jarvis, embeddings, monkeypatch
-):
+async def test_anti_guilt__skipping_tasks__every_reply_is_blame_free(jarvis, monkeypatch):
     for task_id, minutes in (("short", 25), ("long", 90)):
         jarvis.db.table("user_tasks").insert({
             "user_id": "alice", "task_id": task_id, "title": f"Revise {task_id} notes",
-            "status": "pending", "duration_minutes": minutes,
+            "status": "pending", "duration_minutes": minutes, "difficulty_weight": 0.5,
         }).execute()
 
     replies = []
@@ -547,10 +552,20 @@ async def test_anti_guilt__skipping_tasks__every_reply_and_note_is_blame_free(
             response = await api.post(f"/api/v1/tasks/{task_id}/skip", json={"user_id": "alice"})
             assert response.status_code == 200
             replies.append(response.json()["message"])
+        jarvis.db.table("user_tasks").insert({
+            "user_id": "alice", "task_id": "done", "title": "Revise done notes",
+            "status": "completed", "duration_minutes": 25, "difficulty_weight": 0.5,
+        }).execute()
+        response = await api.post("/api/v1/tasks/done/skip", json={"user_id": "alice"})
+        assert response.json()["status"] == "completed"
+        replies.append(response.json()["message"])
 
     assert "tomorrow morning" in replies[0] and "buffer" in replies[1]  # both variants seen
-    (struggle_note,) = [m["content"] for m in jarvis.rows("user_memories", user_id="alice")]
-    for text in [*replies, struggle_note]:
+    # Repeat skips record nothing: one outcome event per task.
+    assert sorted(e["task_id"] for e in jarvis.rows("task_events", user_id="alice")) == [
+        "long", "short"
+    ]
+    for text in replies:
         assert blame_phrases_in(text) == [], text
 
 

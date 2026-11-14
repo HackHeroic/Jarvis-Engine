@@ -42,6 +42,12 @@ class TaskMissed(DomainEvent):
     task_id: str = Field(description="Task that was missed.")
 
 
+class DeadlineMissed(DomainEvent):
+    """A pending task's deadline passed, so it was set aside."""
+
+    task_id: str = Field(description="Task whose deadline passed.")
+
+
 class DraftAccepted(DomainEvent):
     """The user accepted a draft schedule and its tasks were persisted."""
 

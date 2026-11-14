@@ -31,14 +31,21 @@ class _RecordingSupabase(FakeSupabase):
 
 @pytest.fixture
 def app_with_db():
+    import app.core.config as cfg
+    from app.container import AppContainer
     from app.main import app
+    from app.orchestrator.hooks import ActionHooks
 
-    originals = {name: getattr(app.state, name, _UNSET) for name in ("db_client", "memory_store")}
-    supabase = FakeSupabase(
-        {"user_tasks": [{"id": "row-1", "task_id": "t1", "user_id": "alice", "status": "pending"}]}
-    )
+    originals = {
+        name: getattr(app.state, name, _UNSET) for name in ("db_client", "memory_store", "container")
+    }
+    supabase = FakeSupabase({"user_tasks": [{
+        "id": "row-1", "task_id": "t1", "user_id": "alice", "status": "pending",
+        "title": "Revise notes", "duration_minutes": 25, "difficulty_weight": 0.5,
+    }]})
     app.state.db_client = FakeDBClient(supabase)
     app.state.memory_store = None
+    app.state.container = AppContainer.build(supabase_client=supabase, cfg=cfg, hooks=ActionHooks())
     yield app, supabase
     for name, original in originals.items():
         if original is _UNSET:

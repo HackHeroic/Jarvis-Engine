@@ -5,6 +5,7 @@ import operator
 from typing import Annotated, Any, Optional, TypedDict
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.core.runtime import registered_container
 from app.domain.errors import public_message
 
 # Shared with the orchestrator's draft_action node and the /drafts REST API —
@@ -123,9 +124,13 @@ async def mark_missed(state: PlanningState) -> dict:
             "restored_task_ids": [r["task_id"] for r in restored],
             "_tool_detail": {"restored": len(restored)},
         }
+    # With the composition root registered, each task is set aside through
+    # TaskService, which records a deadline_missed event alongside the status.
+    container = registered_container()
+    via_service = {"task_service": container.task_service} if container is not None else {}
     try:
         overdue = await md.detect_and_mark_missed(
-            state.get("user_id", "demo"), supabase, zone=await _user_zone(state)
+            state.get("user_id", "demo"), supabase, zone=await _user_zone(state), **via_service
         )
     except Exception as e:
         logger.warning(f"Missed-deadline scan failed (non-fatal): {e}")
