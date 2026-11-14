@@ -220,3 +220,61 @@ async def test_bridge__dismissed_pattern__hands_the_hour_back(jarvis, llm, monke
 
     assert dismissed.status_code == 200
     assert any(_touches(slot, 9, 10) for slot in _wall_clock(after))
+
+
+# --- the focus profile: learned hours lean the plan, stated rules still win ---------
+
+
+async def _register_container_with_evening_completions(jarvis, llm, count: int) -> None:
+    """The composition root over the same database, its history holding ``count``
+    completed 19:00 slots on the days before Monday."""
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.domain.entities import TaskEvent, TaskEventType
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+    from app.orchestrator.hooks import ActionHooks
+
+    container = AppContainer.build(supabase_client=jarvis.db, cfg=cfg, hooks=ActionHooks())
+    runtime.set_container(container)  # conftest resets the registry afterwards
+    set_chain(FallbackChainProvider([llm]))  # build installed the real chain; the script answers
+    for day in range(1, count + 1):
+        slot = (MONDAY_8AM - timedelta(days=day)).replace(hour=19)
+        await container.repos.task_events.append("alice", TaskEvent(
+            user_id="alice", task_id=f"evening_{day}", event_type=TaskEventType.COMPLETED,
+            occurred_at=slot + timedelta(minutes=25), scheduled_start=slot,
+            scheduled_end=slot + timedelta(minutes=25),
+        ))
+
+
+@pytest.mark.asyncio
+async def test_energy__learned_evening_profile__teaching_a_rule_still_moves_the_schedule(
+    jarvis, llm, clock, monkeypatch
+):
+    import app.modules.planning_graph as planning_graph
+    from app.services.energy import HeuristicEnergyEstimator
+
+    clock.freeze(MONDAY_8AM, schedule_endpoint, planning_graph)
+    await _register_container_with_evening_completions(jarvis, llm, 12)
+    focus_seen: list = []
+    real_run_schedule = schedule_endpoint.run_schedule
+
+    def spy(*args, **kwargs):
+        focus_seen.append(kwargs.get("focus_by_hour"))
+        return real_run_schedule(*args, **kwargs)
+
+    monkeypatch.setattr(schedule_endpoint, "run_schedule", spy)
+    _script_plan(llm)
+    _script_rule(llm)
+
+    await jarvis.say("Please never put study before 11 AM, I'm useless then")
+    after = await jarvis.say("Plan my DSA revision")
+
+    # The learned evening profile reached the solver on this turn...
+    assert focus_seen and focus_seen[-1] is not None
+    assert focus_seen[-1][19] > HeuristicEnergyEstimator().score(19)
+    # ...and the rule the user stated still holds on every day of the plan.
+    slots = _wall_clock(after)
+    assert len({begin.date() for begin, _ in slots}) > 1
+    assert [begin for begin, _ in slots if begin.astimezone(IST).hour < 11] == [], slots

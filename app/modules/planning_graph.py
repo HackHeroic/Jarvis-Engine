@@ -2,7 +2,10 @@
 
 import asyncio
 import operator
+from datetime import datetime, timezone
 from typing import Annotated, Any, Optional, TypedDict
+
+import app.core.config as config
 from app.core.config import MAX_HORIZON_MINUTES, SOLVER_MAX_TIME_SECONDS
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
@@ -47,6 +50,10 @@ class PlanningState(TypedDict):
     # The decomposer's intrinsic-load estimate for this goal (CLT): >= 0.8 cuts the
     # daily cap by a fifth inside run_schedule. None when no decomposition ran.
     intrinsic_load: Optional[float]
+    # The user's learned focus profile (24 scores, index == local hour), read once per
+    # turn by fetch_constraints. None unless the profile is learned and the energy term
+    # is on: the solver then plans on TMT alone.
+    focus_by_hour: Optional[list]
     schedule: Optional[dict]
     horizon_start: Optional[str]
     horizon_minutes: int
@@ -144,16 +151,37 @@ async def mark_missed(state: PlanningState) -> dict:
     }
 
 
+async def _learned_focus(user_id: str, zone: Any) -> Optional[list]:
+    """The user's focus by local hour when it is learned and the energy term is on, else None.
+
+    A profile that is still the prior never steers the solver. Without a registered
+    composition root (tests, scripts) there is no history to read. A failed read
+    means a plan on TMT alone, never a failed plan.
+    """
+    container = registered_container()
+    if container is None or not config.ENERGY_OBJECTIVE_ENABLED:
+        return None
+    try:
+        profile = await container.energy.estimate(user_id, zone, now=datetime.now(timezone.utc))
+    except Exception as e:
+        logger.warning(f"Focus profile read failed (planning on TMT alone): {e!r}")
+        return None
+    return profile.scores() if profile.source == "learned" else None
+
+
 async def fetch_constraints(state: PlanningState) -> dict:
-    """Load the user's stored habits, and fix where this turn's plan starts.
+    """Load the user's stored habits and focus profile, and fix where this turn's plan starts.
 
     The horizon is fixed here, once, before the branches fan out: habit expansion
     (which weekday is day 0) and every solve attempt must agree on minute 0. It is
     08:00 in the user's zone on their logical day, as an offset-aware ISO string.
+    The focus profile is read here once too; every solve attempt reuses it.
     """
     from app.api.v1.endpoints import schedule as schedule_ep
 
-    horizon_start = schedule_ep.current_horizon_start(await _user_zone(state)).isoformat()
+    zone = await _user_zone(state)
+    horizon_start = schedule_ep.current_horizon_start(zone).isoformat()
+    focus_by_hour = await _learned_focus(state.get("user_id", "demo"), zone)
     user_model = state["user_model"]
     if user_model:
         constraints = await user_model.get_behavioral_constraints()
@@ -164,9 +192,15 @@ async def fetch_constraints(state: PlanningState) -> dict:
             "constraints": constraints,
             "habits_text": habits_text,
             "horizon_start": horizon_start,
+            "focus_by_hour": focus_by_hour,
             "_tool_detail": {"rows": len(constraints)},
         }
-    return {"constraints": [], "habits_text": "", "horizon_start": horizon_start}
+    return {
+        "constraints": [],
+        "habits_text": "",
+        "horizon_start": horizon_start,
+        "focus_by_hour": focus_by_hour,
+    }
 
 
 async def translate_habits(state: PlanningState) -> dict:
@@ -485,6 +519,7 @@ async def solve_schedule(state: PlanningState) -> dict:
             horizon_start=_horizon_start_of(state),
             zone=await _user_zone(state),
             block_past=True,
+            focus_by_hour=state.get("focus_by_hour"),
         )
     except HTTPException as exc:
         if exc.status_code == 422:
@@ -655,6 +690,7 @@ def planning_state_in(state) -> dict:
         "pending_tasks": [],
         "goal_id": None,
         "intrinsic_load": None,
+        "focus_by_hour": None,
         "schedule": None,
         "horizon_start": None,
         "horizon_minutes": 2880,

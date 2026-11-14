@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,6 +21,7 @@ from app.domain.entities import (
     BehavioralConstraint,
     DraftSchedule,
     DraftStatus,
+    FocusProfile,
     LLMLocation,
     LLMUsageEvent,
     Suggestion,
@@ -217,6 +219,17 @@ class Sweep(ABC):
 
         One user's failure is logged, never raised: the other users are still swept.
         """
+
+
+# --- Learning ---------------------------------------------------------------
+
+
+class EnergyEstimator(ABC):
+    """Estimates how well the user focuses at each hour of their day (Strategy)."""
+
+    @abstractmethod
+    async def estimate(self, user_id: str, zone: ZoneInfo, *, now: datetime) -> FocusProfile:
+        """Return the user's focus profile as of ``now``, hours read on ``zone``'s clock."""
 
 
 # --- Language models --------------------------------------------------------

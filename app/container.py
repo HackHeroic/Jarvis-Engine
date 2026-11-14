@@ -15,12 +15,13 @@ from typing import Any
 
 from app.core.model_router import build_chain
 from app.domain.events import EventBus, LLMCallCompleted
-from app.domain.ports import Sweep
+from app.domain.ports import EnergyEstimator, Sweep
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.orchestrator.hooks import ActionHooks
 from app.services.draft_service import DraftService
+from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 
@@ -38,6 +39,7 @@ class AppContainer:
     usage_ledger: UsageLedger
     task_service: TaskService
     sweeps: list[Sweep]
+    energy: EnergyEstimator
 
     @classmethod
     def build(
@@ -73,4 +75,5 @@ class AppContainer:
             usage_ledger=usage_ledger,
             task_service=task_service,
             sweeps=[SlotPassedSweep(task_service)],
+            energy=HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
         )
