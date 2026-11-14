@@ -209,7 +209,8 @@ class MemoryRepository(ABC):
     """Storage for what Jarvis remembers about the user, searchable by meaning.
 
     Embeddings are written alongside a memory but never read back: no method
-    returns one.
+    returns one. An embedding (and the query of ``nearest``) must be 384 finite
+    numbers, not all zero, or the call raises ValidationError.
     """
 
     @abstractmethod
@@ -218,8 +219,10 @@ class MemoryRepository(ABC):
     ) -> Memory:
         """Store the memory (and its embedding, if given) and return it with its id.
 
-        Raises ValidationError if the memory belongs to another user or its id is not
-        a UUID, and ConflictError if the user already has a memory with its pattern_key.
+        Raises ValidationError if the memory belongs to another user, or its id or a
+        reference (source_session_id, source_message_id, superseded_by) is not a UUID;
+        ConflictError if its id is already in use, or the user already has a memory
+        with its pattern_key.
         """
 
     @abstractmethod
@@ -258,6 +261,7 @@ class MemoryRepository(ABC):
 
         Only memories in ``statuses`` (and ``types``) that have an embedding, are not
         superseded, and score at least ``min_similarity`` count; most similar first.
+        A negative ``limit`` raises ValidationError.
         """
 
     @abstractmethod
@@ -265,8 +269,9 @@ class MemoryRepository(ABC):
         """Set the given fields and return the memory; ``embedding`` may be one of them.
 
         Raises NotFoundError if the user has no such memory, ValidationError for an
-        unknown field (``id`` and ``user_id`` included) or a value the memory rejects,
-        and ConflictError if a new pattern_key is already the user's.
+        unknown field (``id`` and ``user_id`` included), a value the memory rejects or
+        a reference that is not a UUID, and ConflictError if a new pattern_key is
+        already the user's.
         """
 
 

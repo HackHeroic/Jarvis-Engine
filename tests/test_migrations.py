@@ -338,7 +338,7 @@ def test_migrations__pearl_task_fetch__selects_only_existing_user_tasks_columns(
 # --- Memory lifecycle and vectors (20261115000002) ----------------------------------
 
 _MATCH_MEMORIES_SIGNATURE = (
-    r"public\.match_memories\(text, extensions\.vector\(384\), text\[\], text\[\], int, "
+    r"public\.match_memories\(text, vector\(384\), text\[\], text\[\], int, "
     r"double precision\)"
 )
 
@@ -374,18 +374,31 @@ def test_migrations__memory_migration__enables_vector_and_defines_match_memories
     sql = _sql(MEMORY_VECTORS)
     params, returned, attributes, _body = _match_memories().groups()
 
-    assert re.search(r"create extension if not exists vector with schema extensions;", sql)
-    # embedding becomes vector(384); an array of any other length becomes NULL.
+    created = re.search(r"create extension if not exists vector with schema extensions;", sql)
+    # The type is unqualified, so the file works wherever pgvector lives (extensions,
+    # or public on a database that installed it there before).
+    search_path = re.search(r"set local search_path = public, extensions;", sql)
+    first_use = re.search(r"vector\(384\)", sql)
+    assert created and search_path and first_use
+    assert created.start() < search_path.start() < first_use.start()
+    assert "extensions.vector" not in sql
+    # embedding becomes vector(384); only a flat, 384-long array of finite numbers
+    # with no NULL survives the cast, everything else becomes NULL.
     assert re.search(
-        r"alter column embedding type extensions\.vector\(384\)\s+using case\s+"
-        r"when array_length\(embedding, 1\) = 384\s+then embedding::extensions\.vector\(384\)",
+        r"alter column embedding type vector\(384\)\s+using case\s+"
+        r"when array_ndims\(embedding\) is distinct from 1 then null\s+"
+        r"when array_length\(embedding, 1\) <> 384 then null\s+"
+        r"when array_position\(embedding, null\) is not null then null\s+"
+        r"when embedding && array\['nan', 'infinity', '-infinity'\]::float8\[\] then null\s+"
+        r"else embedding::vector\(384\)\s+end",
         sql,
     )
     assert [p.split()[0] for p in params.split(",")] == [
         "p_user_id", "p_query", "p_statuses", "p_types", "p_limit", "p_min_similarity",
     ]
-    assert re.search(r"p_query extensions\.vector\(384\)", params)
+    assert re.search(r"p_query vector\(384\)", params)
     assert re.search(r"language sql\s+stable", attributes)
+    # Pinned on the function: <=> resolves wherever pgvector lives.
     assert re.search(r"set search_path = public, extensions", attributes)
     # Every memory column but the embedding, plus the similarity.
     returned_columns = [c.split()[0] for c in (part.strip() for part in returned.split(","))]
@@ -441,16 +454,10 @@ def test_migrations__memory_migration__idempotent_statements():
         "last_confirmed_at", "strength_as_of",
     ):
         assert re.search(rf"add column if not exists {column}\b", sql), column
-    assert re.search(
-        r"add column if not exists source_session_id uuid\s+references public\.chat_sessions\s*"
-        r"\(id\) on delete set null",
-        sql,
-    )
-    assert re.search(
-        r"add column if not exists source_message_id uuid\s+references public\.chat_messages\s*"
-        r"\(id\) on delete set null",
-        sql,
-    )
+    # Soft references: a memory from a chat that was never saved is still stored.
+    assert re.search(r"add column if not exists source_session_id uuid,", sql)
+    assert re.search(r"add column if not exists source_message_id uuid,", sql)
+    assert "references" not in sql
     # A re-run touches no row it already fixed (each update also bumps updated_at).
     assert re.search(
         rf"update {_TABLE}user_memories\s+set provenance = 'inferred'\s+"
@@ -471,3 +478,17 @@ def test_migrations__memory_migration__idempotent_statements():
         "user_memories_stability_range",
     ):
         assert re.search(rf"drop constraint if exists {name};", sql), name
+
+
+def test_migrations__memory_migration__legacy_nullable_columns_filled_then_not_null():
+    sql = _sql(MEMORY_VECTORS)
+
+    for column in (
+        "confidence", "strength", "stability", "observation_count", "source", "created_at",
+    ):
+        filled = re.search(
+            rf"update {_TABLE}user_memories set {column} = [^;]+ where {column} is null;", sql
+        )
+        required = re.search(rf"alter column {column} set not null", sql)
+        assert filled and required, column
+        assert filled.start() < required.start(), f"{column}: fill the NULLs first"

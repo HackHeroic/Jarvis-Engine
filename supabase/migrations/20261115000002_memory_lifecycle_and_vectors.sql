@@ -19,6 +19,12 @@
 
 create extension if not exists vector with schema extensions;
 
+-- The vector type is named unqualified below, so the file works wherever pgvector
+-- lives: in extensions (installed just now), or in public on a database that
+-- installed it there before (then the statement above does nothing). SET LOCAL
+-- lasts until the end of this migration's transaction.
+set local search_path = public, extensions;
+
 -- ============================================================================
 -- 2. Lifecycle columns
 -- ============================================================================
@@ -27,10 +33,10 @@ alter table public.user_memories
     add column if not exists status text not null default 'active',
     add column if not exists provenance text not null default 'said',
     add column if not exists pattern_key text,
-    add column if not exists source_session_id uuid
-        references public.chat_sessions (id) on delete set null,
-    add column if not exists source_message_id uuid
-        references public.chat_messages (id) on delete set null,
+    -- Soft references, no foreign key: a memory learned in a conversation that was
+    -- never saved is still stored (and a key would not check the user anyway).
+    add column if not exists source_session_id uuid,
+    add column if not exists source_message_id uuid,
     add column if not exists last_confirmed_at timestamptz,
     add column if not exists strength_as_of timestamptz not null default now();
 
@@ -55,10 +61,29 @@ update public.user_memories set provenance = 'inferred'
  where source = 'behavior' and provenance <> 'inferred';
 
 -- ============================================================================
--- 4. Range CHECKs the entity enforces
+-- 4. Legacy columns: no NULLs, and inside the entity's ranges
 -- ============================================================================
--- Rows the legacy path wrote are brought inside the ranges first, so the CHECKs can
--- be added over them; a row already inside is never touched.
+-- These columns were nullable since 010; the entity always has a value for them.
+-- NULLs take the column default (created_at: the row's updated_at, else now), then
+-- the columns become NOT NULL. A row that already has a value is never touched.
+
+update public.user_memories set confidence = 0.5 where confidence is null;
+update public.user_memories set strength = 1.0 where strength is null;
+update public.user_memories set stability = 1.0 where stability is null;
+update public.user_memories set observation_count = 1 where observation_count is null;
+update public.user_memories set source = 'conversation' where source is null;
+update public.user_memories set created_at = coalesce(updated_at, now()) where created_at is null;
+
+alter table public.user_memories
+    alter column confidence set not null,
+    alter column strength set not null,
+    alter column stability set not null,
+    alter column observation_count set not null,
+    alter column source set not null,
+    alter column created_at set not null;
+
+-- Rows the legacy path wrote are brought inside the ranges, so the CHECKs can be
+-- added over them.
 
 update public.user_memories set observation_count = 1 where observation_count < 1;
 update public.user_memories set stability = least(greatest(stability, 0.01), 20)
@@ -75,10 +100,12 @@ alter table public.user_memories add constraint user_memories_stability_range
 -- ============================================================================
 -- 5. embedding becomes vector(384)
 -- ============================================================================
--- all-MiniLM-L6-v2 vectors are 384 long. An array of any other length cannot be
--- compared with them, so it becomes NULL (the memory is kept; it is just not found
--- by similarity until it is embedded again). Runs only while the column is still an
--- array: on a vector, array_length() does not exist.
+-- all-MiniLM-L6-v2 vectors are 384 long. Only a flat array of exactly 384 numbers,
+-- none of them NULL, NaN or infinite, becomes a vector; anything else (which pgvector
+-- would refuse, failing the whole migration) becomes NULL. The memory is kept; it is
+-- just not found by similarity until it is embedded again. CASE tests the conditions
+-- in order (array_position fails on a multi-dimensional array). Runs only while the
+-- column is still an array: on a vector, array_length() does not exist.
 
 do $$ begin
     if exists (select 1 from information_schema.columns
@@ -87,10 +114,13 @@ do $$ begin
                   and column_name = 'embedding'
                   and data_type = 'ARRAY') then
         alter table public.user_memories
-            alter column embedding type extensions.vector(384)
+            alter column embedding type vector(384)
             using case
-                when array_length(embedding, 1) = 384
-                then embedding::extensions.vector(384)
+                when array_ndims(embedding) is distinct from 1 then null
+                when array_length(embedding, 1) <> 384 then null
+                when array_position(embedding, null) is not null then null
+                when embedding && array['NaN', 'Infinity', '-Infinity']::float8[] then null
+                else embedding::vector(384)
             end;
     end if;
 end $$;
@@ -121,7 +151,7 @@ create index if not exists idx_user_memories_user_status
 
 create or replace function public.match_memories(
     p_user_id text,
-    p_query extensions.vector(384),
+    p_query vector(384),
     p_statuses text[],
     p_types text[],
     p_limit int,
@@ -175,7 +205,7 @@ as $$
      limit p_limit;
 $$;
 
-comment on function public.match_memories(text, extensions.vector(384), text[], text[], int, double precision) is
+comment on function public.match_memories(text, vector(384), text[], text[], int, double precision) is
     'The user''s memories in p_statuses (and p_types, NULL = any) most similar to p_query: '
     'embedded, not superseded, similarity >= p_min_similarity, most similar first, at most '
     'p_limit; every column but embedding, plus similarity (1 - cosine distance).';
@@ -186,5 +216,5 @@ comment on function public.match_memories(text, extensions.vector(384), text[], 
 -- Only the backend (service_role) and signed-in users may call it. Functions are
 -- executable by PUBLIC by default, and Supabase also grants anon explicitly.
 
-revoke execute on function public.match_memories(text, extensions.vector(384), text[], text[], int, double precision) from public, anon;
-grant execute on function public.match_memories(text, extensions.vector(384), text[], text[], int, double precision) to service_role, authenticated;
+revoke execute on function public.match_memories(text, vector(384), text[], text[], int, double precision) from public, anon;
+grant execute on function public.match_memories(text, vector(384), text[], text[], int, double precision) to service_role, authenticated;

@@ -49,6 +49,7 @@ from app.infrastructure.persistence._mapping import (
     accepted_task_rows,
     apply_memory_update,
     apply_profile_update,
+    check_limit,
     day_bounds,
     draft_closed,
     embedding_values,
@@ -56,8 +57,10 @@ from app.infrastructure.persistence._mapping import (
     normalized,
     not_found,
     now_utc,
+    memory_id_taken,
     pattern_key_taken,
     prepare_new,
+    prepare_new_memory,
     summarize_usage,
     task_from_row,
     task_id_clash,
@@ -436,21 +439,27 @@ class InMemoryMemoryRepository(MemoryRepository):
             for m in self._store.memories
         )
 
-    def _set_embedding(self, user_id: str, memory_id: str, embedding: list[float] | None) -> None:
+    def _set_embedding(self, user_id: str, memory_id: str, values: list[float] | None) -> None:
+        """Store already-checked ``embedding_values`` (None removes the embedding)."""
         key = (user_id, memory_id)
-        if embedding is None:
+        if values is None:
             self._store.memory_embeddings.pop(key, None)
         else:
-            self._store.memory_embeddings[key] = embedding_values(embedding)
+            self._store.memory_embeddings[key] = values
 
     async def add(
         self, user_id: str, m: Memory, *, embedding: list[float] | None = None
     ) -> Memory:
-        stored = prepare_new(user_id, m, "memory")
+        stored = prepare_new_memory(user_id, m)
+        values = embedding_values(embedding)
+        # The primary key spans every user, and Postgres checks it before the
+        # pattern-key index.
+        if any(existing.id == stored.id for existing in self._store.memories):
+            raise memory_id_taken(stored.id)
         if self._key_taken(user_id, stored.pattern_key, other_than=None):
             raise pattern_key_taken(stored.pattern_key)
         self._store.memories.append(stored)
-        self._set_embedding(user_id, stored.id, embedding)
+        self._set_embedding(user_id, stored.id, values)
         return stored.model_copy(deep=True)
 
     async def get(self, user_id: str, memory_id: str) -> Memory | None:
@@ -494,6 +503,8 @@ class InMemoryMemoryRepository(MemoryRepository):
         limit: int = 5,
         min_similarity: float = 0.0,
     ) -> list[MemoryMatch]:
+        query = embedding_values(embedding)
+        check_limit(limit)
         scored = []
         for m in self._store.memories:
             stored = self._store.memory_embeddings.get((user_id, m.id))
@@ -505,7 +516,7 @@ class InMemoryMemoryRepository(MemoryRepository):
                 or m.superseded_by is not None
             ):
                 continue
-            similarity = cosine_similarity(stored, embedding)
+            similarity = cosine_similarity(stored, query)
             if similarity >= min_similarity:
                 scored.append(MemoryMatch(memory=m.model_copy(deep=True), similarity=similarity))
         scored.sort(key=lambda match: match.similarity, reverse=True)
@@ -516,13 +527,14 @@ class InMemoryMemoryRepository(MemoryRepository):
         if i is None:
             raise not_found("memory", memory_id)
         updated = apply_memory_update(self._store.memories[i], fields)
+        values = embedding_values(fields.get(EMBEDDING))
         if "pattern_key" in fields and self._key_taken(
             user_id, updated.pattern_key, other_than=memory_id
         ):
             raise pattern_key_taken(updated.pattern_key)
         self._store.memories[i] = updated
         if EMBEDDING in fields:
-            self._set_embedding(user_id, memory_id, fields[EMBEDDING])
+            self._set_embedding(user_id, memory_id, values)
         return updated.model_copy(deep=True)
 
 

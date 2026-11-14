@@ -7,6 +7,7 @@ read as UTC, as Postgres reads it.
 """
 
 import copy
+import math
 from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, TypeVar
@@ -42,6 +43,11 @@ _PROFILE_FIELDS = frozenset(UserProfile.model_fields) - {"user_id"}
 # Memory fields an update may set; the embedding is stored beside the entity.
 _MEMORY_FIELDS = frozenset(Memory.model_fields) - {"id", "user_id"}
 EMBEDDING = "embedding"
+# The width of user_memories.embedding, vector(384): all-MiniLM-L6-v2's output.
+MEMORY_EMBEDDING_DIMENSIONS = 384
+# Memory fields held in uuid columns. They are soft references (no foreign key), but
+# Postgres still rejects a value that is not a UUID, so both families check the form.
+_MEMORY_UUID_FIELDS = ("source_session_id", "source_message_id", "superseded_by")
 
 # The entity's origin is the legacy user_memories.source column, which the v1 memory
 # path still writes; the new provenance column says whether the user said it.
@@ -232,38 +238,97 @@ def memory_to_row(memory: Memory, fields: Iterable[str] | None = None) -> dict:
 
 
 def memory_from_row(row: dict) -> Memory:
-    """Build a Memory from a user_memories row (or a match_memories result row)."""
-    return from_row(Memory, {_MEMORY_FIELD_FOR.get(key, key): value for key, value in row.items()})
+    """Build a Memory from a user_memories row (or a match_memories result row).
+
+    A legacy row may hold NULL where the entity has a default (confidence, strength,
+    stability, observation_count, source): the default applies. A missing created_at
+    reads as updated_at, then strength_as_of; a missing strength_as_of as created_at.
+    """
+    data = {_MEMORY_FIELD_FOR.get(key, key): value for key, value in row.items()}
+    created_at = data.get("created_at") or data.get("updated_at") or data.get("strength_as_of")
+    data["created_at"] = created_at or now_utc()
+    data["strength_as_of"] = data.get("strength_as_of") or data["created_at"]
+    return from_row(Memory, data)
+
+
+def _check_memory_references(memory: Memory) -> Memory:
+    for name in _MEMORY_UUID_FIELDS:
+        value = getattr(memory, name)
+        if value is not None and not is_uuid(value):
+            raise errors.ValidationError(
+                f"A memory's {name} must be a UUID.", details={name: value}
+            )
+    return memory
+
+
+def prepare_new_memory(user_id: str, memory: Memory) -> Memory:
+    """``prepare_new`` for a memory, which also checks its uuid references' form."""
+    return _check_memory_references(prepare_new(user_id, memory, "memory"))
 
 
 def apply_memory_update(memory: Memory, fields: dict[str, Any]) -> Memory:
     """Return ``memory`` with ``fields`` applied; an ``embedding`` key is left to the caller.
 
-    Raises ValidationError on an unknown field (``id`` and ``user_id`` included) or a
-    value the memory rejects.
+    Raises ValidationError on an unknown field (``id`` and ``user_id`` included), a
+    value the memory rejects, or a reference that is not a UUID.
     """
     unknown = sorted(set(fields) - _MEMORY_FIELDS - {EMBEDDING})
     if unknown:
         raise errors.ValidationError("Those are not memory fields.", details={"fields": unknown})
     changes = {name: value for name, value in fields.items() if name != EMBEDDING}
     try:
-        return normalized(Memory.model_validate({**memory.model_dump(), **changes}))
+        updated = normalized(Memory.model_validate({**memory.model_dump(), **changes}))
     except PydanticValidationError as exc:
         bad = sorted({str(error["loc"][0]) for error in exc.errors() if error["loc"]})
         raise errors.ValidationError(
             "Some memory fields are invalid.", details={"fields": bad}
         ) from exc
+    return _check_memory_references(updated)
 
 
 def embedding_values(embedding: list[float] | None) -> list[float] | None:
-    """Return a copy of ``embedding`` as plain floats (None stays None)."""
-    return None if embedding is None else [float(x) for x in embedding]
+    """Return a checked copy of ``embedding`` as plain floats (None stays None).
+
+    Raises ValidationError unless it holds exactly MEMORY_EMBEDDING_DIMENSIONS finite
+    numbers with a non-zero norm: the column rejects any other length, and a zero
+    vector has no direction (pgvector's cosine distance to it is NaN).
+    """
+    if embedding is None:
+        return None
+    try:
+        values = [float(x) for x in embedding]
+    except (TypeError, ValueError) as exc:
+        raise errors.ValidationError("An embedding must be a list of numbers.") from exc
+    if (
+        len(values) != MEMORY_EMBEDDING_DIMENSIONS
+        or not all(math.isfinite(v) for v in values)
+        or math.fsum(v * v for v in values) == 0.0
+    ):
+        raise errors.ValidationError(
+            f"An embedding must be {MEMORY_EMBEDDING_DIMENSIONS} finite numbers, not all zero.",
+            details={"length": len(values)},
+        )
+    return values
+
+
+def check_limit(limit: int) -> int:
+    """Return ``limit``; raise ValidationError if it is negative."""
+    if limit < 0:
+        raise errors.ValidationError("A limit cannot be negative.", details={"limit": limit})
+    return limit
 
 
 def pattern_key_taken(pattern_key: str | None) -> errors.ConflictError:
     """Storing the memory would break user_memories' unique (user_id, pattern_key)."""
     return errors.ConflictError(
         "Jarvis already remembers this.", details={"pattern_key": pattern_key}
+    )
+
+
+def memory_id_taken(memory_id: str | None) -> errors.ConflictError:
+    """Storing the memory would break user_memories' primary key: the id is in use."""
+    return errors.ConflictError(
+        "A memory with this id already exists.", details={"memory_id": memory_id}
     )
 
 

@@ -121,8 +121,6 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `chat_messages` | `session_id` | `chat_sessions (id)` | CASCADE (pre-existing) |
 | `habit_trackers` | `constraint_id` | `behavioral_constraints (id)` | SET NULL (pre-existing) |
 | `user_memories` | `superseded_by` | `user_memories (id)` | NO ACTION (pre-existing; deleting a user still cascades cleanly, checked locally) |
-| `user_memories` | `source_session_id` | `chat_sessions (id)` | SET NULL: deleting a conversation keeps what was learned in it (`20261115000002`) |
-| `user_memories` | `source_message_id` | `chat_messages (id)` | SET NULL (`20261115000002`) |
 
 **Why `goal_id` links use SET NULL.** `goal_id` is optional on all three tables, so deleting a goal clears the link and keeps the tasks, drafts and deadlines. A goal FK that includes `user_id` also means a row can never point at another user's goal.
 
@@ -135,6 +133,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `user_tasks.dependencies` | task_ids, as a JSON array | A JSON array cannot carry an FK. |
 | `draft_schedules.tasks` / `schedule` | proposed chunks and slots | Stored as JSON. |
 | `user_memories.source_id` | a message or a task | Polymorphic. |
+| `user_memories.source_session_id`, `source_message_id` | `chat_sessions (id)`, `chat_messages (id)` | A memory learned in a conversation that was never saved must still be stored, and a key on the id alone would not check that the session is the same user's. Both families check only that the value is a UUID (`20261115000002`). |
 | `habit_trackers.habit_id` | a habit | Free text. |
 | `llm_usage_events.session_id` | a chat session | Sessions can be ephemeral when persisting them fails. |
 
@@ -167,6 +166,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `user_memories` | `user_memories_confidence_range`, `user_memories_strength_range` | both between 0 and 1 |
 | `user_memories` | `user_memories_status_check`, `user_memories_provenance_check` | `MemoryStatus` values; `said / inferred` (`20261115000002`) |
 | `user_memories` | `user_memories_observation_count_check`, `user_memories_stability_range` | `observation_count >= 1`; `0.01 ≤ stability ≤ 20` (`20261115000002`) |
+| `user_memories` | NOT NULL | `confidence`, `strength`, `stability`, `observation_count`, `source`, `created_at`: legacy NULLs take the column default first (`20261115000002`) |
 | `habit_trackers` | `habit_trackers_ef_floor` | `ef >= 1.3` (the SM-2 floor `sm2_engine` clamps to) |
 
 `tests/test_migrations.py` pins the four status/type CHECKs to the domain enums, so the database and the entities cannot drift apart.
@@ -209,7 +209,7 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 **Apply note.** Apply it live only together with Task 7. Until then the legacy extractor (`MemoryStore.find_similar_memory`) still reads `embedding` as a float array, and after this migration PostgREST returns a vector as a string.
 
 **What it does.**
-1. `create extension if not exists vector with schema extensions`.
+1. `create extension if not exists vector with schema extensions`, then `set local search_path = public, extensions`. Every later statement names the type unqualified (`vector(384)`), so the file works wherever pgvector lives: in `extensions`, or in `public` on a database that installed it there before (where the `create extension` does nothing). `SET LOCAL` needs the transaction the CLI and the SQL editor run each file in.
 2. Adds the lifecycle columns, each guarded by `add column if not exists`:
 
    | Column | Type | Entity field |
@@ -217,14 +217,14 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
    | `status` | `text not null default 'active'`, CHECK `MemoryStatus` | `status` |
    | `provenance` | `text not null default 'said'`, CHECK `said / inferred` | `provenance` |
    | `pattern_key` | `text` | `pattern_key` |
-   | `source_session_id` | `uuid` → `chat_sessions (id)` on delete set null | `source_session_id` |
-   | `source_message_id` | `uuid` → `chat_messages (id)` on delete set null | `source_message_id` |
+   | `source_session_id` | `uuid`, no foreign key (a soft reference) | `source_session_id` |
+   | `source_message_id` | `uuid`, no foreign key (a soft reference) | `source_message_id` |
    | `last_confirmed_at` | `timestamptz` | `last_confirmed_at` |
    | `strength_as_of` | `timestamptz not null default now()` | `strength_as_of` |
 
 3. Backfills `provenance = 'inferred'` where `source = 'behavior'` (PEARL's rows). A re-run touches no row.
-4. Brings legacy rows inside the entity's ranges (`observation_count` to at least 1, `stability` clamped to [0.01, 20]), then adds the two range CHECKs.
-5. Turns `embedding` from `float[]` into `extensions.vector(384)`. An array that is not 384 long becomes NULL. The type change runs only while the column is still an array.
+4. Makes the legacy nullable columns `NOT NULL`: `confidence` (0.5), `strength` (1.0), `stability` (1.0), `observation_count` (1), `source` (`conversation`) and `created_at` (the row's `updated_at`, else now). The NULLs take those values first. It then brings legacy rows inside the entity's ranges (`observation_count` to at least 1, `stability` clamped to [0.01, 20]) and adds the two range CHECKs.
+5. Turns `embedding` from `float[]` into `vector(384)`. Only a one-dimensional array of exactly 384 numbers, none of them NULL, NaN or infinite, is cast. Everything else becomes NULL, because pgvector would refuse it and fail the migration. The checks are ordered `WHEN`s of one `CASE`, since `array_position` fails on a multi-dimensional array. The type change runs only while the column is still an array.
 6. Adds a unique partial index `idx_user_memories_user_pattern_key (user_id, pattern_key) where pattern_key is not null`, and `idx_user_memories_user_status (user_id, status)`. There is no ANN index: a user holds tens to hundreds of memories, scanned exactly behind the `user_id` filter.
 7. Adds `match_memories(p_user_id, p_query, p_statuses, p_types, p_limit, p_min_similarity)`, below.
 8. Revokes `execute` on it from `public` and `anon`, and grants it to `service_role` and `authenticated`.
@@ -233,6 +233,13 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 - The entity's `origin` (conversation, behavior, …) is the legacy `source` column, which the v1 path still writes. The new `provenance` column says whether the user said it.
 - The legacy `source_id`, `last_accessed`, `last_reinforced` and `updated_at` columns have no entity field.
 - Every read names its columns (`_mapping.MEMORY_COLUMNS`) and never selects `embedding`, which is 384 floats a row. Inserts and updates still get the written row back, embedding included: postgrest-py cannot narrow a write's returned columns.
+- A row the v1 path wrote with NULL in a column the entity has a default for reads with that default; a missing `created_at` reads as `updated_at`, then `strength_as_of` (`_mapping.memory_from_row`).
+
+**What both repository families check before writing.** The checks live in `_mapping`, so the families cannot disagree:
+- An embedding, and the query of `nearest`, must be exactly 384 finite numbers with a non-zero norm, or the call raises `ValidationError`. The column rejects any other length, and pgvector's cosine distance to a zero vector is NaN, which Postgres sorts above every number, so such a query would return every row.
+- `source_session_id`, `source_message_id` and `superseded_by` must be UUIDs (`ValidationError`).
+- `nearest`'s `limit` must not be negative (`ValidationError`).
+- An id already in use, by any user, raises `ConflictError` with `{"memory_id": …}`, as `user_memories_pkey` does. A `pattern_key` the user already holds raises `ConflictError` with `{"pattern_key": …}`, as `idx_user_memories_user_pattern_key` does. Any other database error stays `PersistenceError`.
 
 **`match_memories`.** It is `language sql stable`, with `set search_path = public, extensions` so the `<=>` operator resolves.
 - It keeps the user's rows whose status is in `p_statuses`, whose type is in `p_types` (NULL means any type), and that have an embedding and are not superseded.
@@ -242,11 +249,13 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 
 **Checked against PostgreSQL 18 + pgvector (local, throwaway database).**
 - Built on top of the rest of the set, over legacy rows: a 384-long array became a vector; a 2-long one became NULL; the `behavior` row read `inferred`; `stability` 25 became 20 and `observation_count` 0 became 1.
+- Arrays holding NaN, -Infinity or a NULL element, a 2-dimensional array and an empty one all became NULL without failing the migration. A row with every legacy column NULL got the defaults, and all six columns are now `NOT NULL`.
+- The same results, and the same function, with pgvector installed beforehand in `public` instead of `extensions`.
 - A second application touched no row (`updated_at` unchanged). Applying the whole set again also succeeds.
 - Ranking, the type filter, `p_limit`, `p_min_similarity` and the status filter behave as above. A user with no memories gets no rows, whatever the statuses.
 - A duplicate `(user_id, pattern_key)` fails on `idx_user_memories_user_pattern_key`, and the same key for another user is accepted. `anon` gets `permission denied for function match_memories`.
 
-**Fake vs SQL.** `FakeSupabase` mirrors `match_memories` with cosine similarity over the stored lists and the same filters. It also enforces the unique `(user_id, pattern_key)` index on `insert` and `update`, raising the database's message. Unlike the SQL, it accepts an embedding of any length; the database rejects one that is not 384 long (`expected 384 dimensions`).
+**Fake vs SQL.** `FakeSupabase` mirrors `match_memories` with cosine similarity over the stored lists and the same filters. It also enforces `user_memories_pkey` and the unique `(user_id, pattern_key)` index on `insert` and `update`, in that order, raising the database's messages. The repositories validate embeddings before either store sees them.
 
 ## Triggers
 
