@@ -380,3 +380,45 @@ async def test_chat__local_model_answers__reply_names_the_local_model(jarvis, ll
     turn = await jarvis.say("What do you think about learning Rust this year?")
 
     assert turn.payload["generation_metrics"]["model"] == "openai/google/gemma-4-e2b"
+
+
+@pytest.mark.asyncio
+async def test_chat__plan_accepted_from_its_card__next_message_is_a_conversation_not_a_replan(
+    jarvis, llm
+):
+    """Accept on the card goes over REST and never passes through the conversation, whose
+    checkpoint still says the draft is under review. A question asked next must be
+    answered, not read as "plan again"."""
+    planned = await _plan(jarvis, llm)
+    review_ui = DraftService(SupabaseDraftRepository(jarvis.db), NullEventBus())
+    await review_ui.accept("alice", planned.draft_id)
+    tasks_after_accept = len(jarvis.rows("user_tasks", user_id="alice"))
+    drafts_after_accept = len(jarvis.rows("draft_schedules"))
+    llm.script("brain_dump_extraction", "{}")  # a question: nothing to plan
+    calls_before = len(llm.calls)
+
+    turn = await jarvis.say("thanks, what do you know about how I work?",
+                            session=planned.conversation_id)
+
+    assert turn.intent != "PLAN_DAY"
+    assert turn.draft_id is None
+    assert "socratic_chunker" not in llm.tasks(since=calls_before)  # nothing was re-planned
+    assert len(jarvis.rows("draft_schedules")) == drafts_after_accept
+    assert len(jarvis.rows("user_tasks", user_id="alice")) == tasks_after_accept
+
+
+@pytest.mark.asyncio
+async def test_chat__plan_discarded_from_its_card__next_message_is_a_conversation_not_a_replan(
+    jarvis, llm
+):
+    planned = await _plan(jarvis, llm)
+    review_ui = DraftService(SupabaseDraftRepository(jarvis.db), NullEventBus())
+    await review_ui.discard("alice", planned.draft_id)
+    llm.script("brain_dump_extraction", "{}")
+    calls_before = len(llm.calls)
+
+    turn = await jarvis.say("never mind, thanks", session=planned.conversation_id)
+
+    assert turn.intent != "PLAN_DAY"
+    assert "socratic_chunker" not in llm.tasks(since=calls_before)
+    assert jarvis.rows("user_tasks", user_id="alice") == []

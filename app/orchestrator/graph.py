@@ -389,12 +389,12 @@ async def _classify_intent(state: JarvisState) -> dict:
     # says it is already locked in — writing nothing. Only with the accepted
     # draft's id in hand: without one, draft_action would fall back to the
     # user's newest pending draft, which may belong to another conversation.
-    if (
-        state.get("negotiation_state") == NegotiationPhase.ACCEPTED
-        and state.get("draft_id")
-        and _match_draft_intent(state.get("user_message") or "") == IntentType.ACCEPT_DRAFT
-    ):
-        return {"intent": IntentType.ACCEPT_DRAFT}
+    # "Scrap it" after the accept goes the same way: draft_action answers that the plan
+    # is already locked in, instead of a chat reply that would sound like agreement.
+    if state.get("negotiation_state") == NegotiationPhase.ACCEPTED and state.get("draft_id"):
+        verdict = _match_draft_intent(state.get("user_message") or "")
+        if verdict in (IntentType.ACCEPT_DRAFT, IntentType.REJECT_DRAFT):
+            return {"intent": verdict}
 
     bd = state.get("brain_dump")
     if not bd:

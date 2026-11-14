@@ -8,6 +8,7 @@ task_material_linker links a new document to this task.
 
 import asyncio
 import json
+import time
 import re
 from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,31 @@ class WebSearchUnavailableError(LLMUnavailableError):
     code = "web_search_unavailable"
 
 
+# After the web search fails (no key, no quota, the provider is down) it is not tried
+# again for this long: every workspace would otherwise wait on a call that is known to
+# fail. Process-local, like the other single-process guards.
+WEB_SEARCH_COOLDOWN_S = 300.0
+
+
+class _WebSearchCooldown:
+    """Remembers that the web search just failed, for ``WEB_SEARCH_COOLDOWN_S``."""
+
+    def __init__(self) -> None:
+        self._down_until = 0.0
+
+    def is_down(self) -> bool:
+        return time.monotonic() < self._down_until
+
+    def mark_down(self) -> None:
+        self._down_until = time.monotonic() + WEB_SEARCH_COOLDOWN_S
+
+    def reset(self) -> None:
+        self._down_until = 0.0
+
+
+web_search_cooldown = _WebSearchCooldown()
+
+
 async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) -> str:
     """Run the grounded web search, raising ``WebSearchUnavailableError`` when it fails.
 
@@ -48,6 +74,8 @@ async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) ->
     gate that denies the send, or wants to ask, means no search is made. An answered
     search is metered onto ``bus``, the composition root's (``metered_web_search``).
     """
+    if web_search_cooldown.is_down():
+        raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
     redactor = PreCloudLLMRedactor(get_hooks())
     try:
         user_prompt, redacted_in_prompt = await redactor.redact(user_prompt)
@@ -61,6 +89,7 @@ async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) ->
         pii_redactions=redacted_in_prompt + redacted_in_system,
     )
     if not raw or not raw.strip():
+        web_search_cooldown.mark_down()
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
     return raw
 

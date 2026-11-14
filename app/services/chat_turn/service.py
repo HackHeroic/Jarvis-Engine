@@ -21,7 +21,8 @@ from app.core.model_router import (
 )
 from app.core.observation import pearl_insights
 from app.core.user_model import UserModel
-from app.domain.errors import JarvisError
+from app.domain.entities import DraftStatus
+from app.domain.errors import JarvisError, NotFoundError
 from app.orchestrator.checkpoint import make_thread_id
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
 from app.schemas.chat_stream import (
@@ -93,6 +94,41 @@ class ChatTurn:
             resumed = False
         if not resumed:
             self._state["conversation_phase"] = ConversationPhase.GREETING
+            self._state["negotiation_state"] = NegotiationPhase.NONE
+            self._state["draft_id"] = None
+        else:
+            await self._close_review_of_a_closed_draft(existing.values)
+
+    async def _close_review_of_a_closed_draft(self, checkpointed: dict) -> None:
+        """A draft accepted or discarded from its card (REST) never passed through this
+        conversation, so its checkpoint still says the draft is under review, and the
+        negotiation shortcut would read the next message, even "thanks" or a question,
+        as a request to plan again. The draft's own status is the truth: when it is no
+        longer open, the review is over for this turn (accepted stays "accepted", so a
+        second "looks good" is still answered as already locked in).
+        """
+        phase = checkpointed.get("negotiation_state", NegotiationPhase.NONE)
+        draft_id = checkpointed.get("draft_id")
+        container = self._service.container
+        if phase in (NegotiationPhase.NONE, NegotiationPhase.ACCEPTED) or not draft_id:
+            return
+        if container is None:
+            return
+        try:
+            draft = await container.draft_service.get(self._request.user_id, draft_id)
+        except NotFoundError:
+            self._state["negotiation_state"] = NegotiationPhase.NONE
+            self._state["draft_id"] = None
+            return
+        except JarvisError as exc:
+            # The store is unreachable: leave the conversation as it was checkpointed.
+            logger.warning("Draft status not read for a resumed turn (%s)", type(exc).__name__)
+            return
+        if draft.status in (DraftStatus.PENDING, DraftStatus.MODIFIED):
+            return
+        if draft.status == DraftStatus.ACCEPTED:
+            self._state["negotiation_state"] = NegotiationPhase.ACCEPTED
+        else:
             self._state["negotiation_state"] = NegotiationPhase.NONE
             self._state["draft_id"] = None
 

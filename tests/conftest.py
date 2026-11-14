@@ -328,3 +328,13 @@ class Clock:
 @pytest.fixture
 def clock(monkeypatch) -> Clock:
     return Clock(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _web_search_cooldown_cleared():
+    """One test's failed web search never switches the search off for the next test."""
+    from app.services.analytical.workspace_builder import web_search_cooldown
+
+    web_search_cooldown.reset()
+    yield
+    web_search_cooldown.reset()

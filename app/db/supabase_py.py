@@ -29,14 +29,19 @@ CONNECT_RETRY_PAUSE_S = (0.1, 0.4)
 
 
 class ConnectRetryTransport(httpx.BaseTransport):
-    """Sends a request again, once, when its connection could not be established.
+    """Sends a request again, once, when it provably did no work on the server.
 
-    Only ``ConnectError`` (TCP or TLS handshake failed: the ``[SSL…]`` errors of a
-    network blip) and ``ConnectTimeout``: the request was never sent, so a retry cannot
-    apply a write twice. A read timeout, a dropped connection or an HTTP error may follow
-    a request the server received, and is raised as it came. One retry after a short
-    jittered pause; a second failure is raised (the caller's PersistenceError, 503).
+    ``ConnectError`` (TCP or TLS handshake failed: the ``[SSL…]`` errors of a network
+    blip) and ``ConnectTimeout``: the request was never sent, so a retry cannot apply a
+    write twice. Also a dropped connection (``RemoteProtocolError``: the server closed a
+    kept-alive connection this side was about to reuse) when the request is a read
+    (``GET``/``HEAD``): sending a read twice changes nothing. A dropped connection on a
+    write, a read timeout or an HTTP error may follow a request the server received and
+    applied, and is raised as it came. One retry after a short jittered pause; a second
+    failure is raised (the caller's PersistenceError, 503).
     """
+
+    _READ_METHODS = frozenset({"GET", "HEAD"})
 
     def __init__(
         self,
@@ -53,7 +58,12 @@ class ConnectRetryTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         try:
             return self.inner.handle_request(request)
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError) as exc:
+            if (
+                isinstance(exc, httpx.RemoteProtocolError)
+                and request.method.upper() not in self._READ_METHODS
+            ):
+                raise
             pause = random.uniform(*self._pause_s)
             logger.warning(
                 "Database connection could not be made (%s); retrying once in %.2f s",

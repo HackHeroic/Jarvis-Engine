@@ -132,6 +132,19 @@ def test_connect_retry__request_may_have_been_sent__never_retried(outcome):
     assert network.calls == 1 and slept == []
 
 
+def test_connect_retry__kept_alive_connection_dropped_on_a_read__retried_once():
+    """The server closed an idle kept-alive connection as this side reused it. A read
+    sent twice changes nothing, so it is retried instead of surfacing as a 503."""
+    network, slept = _Network(
+        httpx.RemoteProtocolError("Server disconnected without sending a response."), 200
+    ), []
+
+    response = _retrying(network, slept).get("https://example.supabase.co/rest/v1/user_tasks")
+
+    assert response.status_code == 200
+    assert network.calls == 2 and len(slept) == 1
+
+
 def test_build_supabase_client__one_failed_connect__the_query_still_answers(monkeypatch):
     import app.db.supabase_py as supabase_py
 
