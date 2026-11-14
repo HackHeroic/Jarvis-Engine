@@ -256,7 +256,8 @@ def test_migrations__accept_draft_v2__deletes_reslotted_missed_rows():
     assert without_delete(v2) == without_delete(v1)
     sql = _sql(ACCEPT_DRAFT_RESLOTS)
     signature = r"function public\.accept_draft\(uuid, text, jsonb\)"
-    assert re.search(rf"comment on {signature} is", sql)
+    comment = re.search(rf"comment on {signature} is(.*?')\s*;", sql, re.S)
+    assert comment and "missed" in comment.group(1), "the comment must name re-slotted missed rows"
     assert re.search(rf"revoke execute on {signature} from public, anon;", sql)
     assert re.search(rf"grant execute on {signature} to service_role, authenticated;", sql)
 

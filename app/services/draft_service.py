@@ -89,9 +89,10 @@ class DraftService:
     ) -> None:
         """Store a SCHEDULED or RESCHEDULED event for each written row that has a slot.
 
-        Best effort: the accept has already committed, so nothing here may fail it or
-        undo it. A failure is logged as one warning per accept, and the next accept
-        compares against whatever history was stored.
+        One read of those tasks' slot history (narrowed to their ids, so a read cap
+        cannot drop a task's latest slot), then one bulk write. Best effort: the accept
+        has already committed, so nothing here may fail it or undo it. A failure is one
+        warning, and the next accept compares against whatever history was stored.
         """
         if self._task_events is None:
             return
@@ -99,31 +100,23 @@ class DraftService:
         if not slotted:
             return
         try:
-            history = await self._task_events.list_for_user(user_id, types=set(_SLOT_EVENTS))
-        except Exception as exc:  # the accept stands whatever the event store does
-            logger.warning(
-                "Draft %s accepted; its task event history could not be read (%s), "
-                "so no slot was recorded",
-                draft_id, type(exc).__name__,
+            history = await self._task_events.list_for_user(
+                user_id,
+                types=set(_SLOT_EVENTS),
+                task_ids={row["task_id"] for row in slotted},
             )
-            return
-        latest = {event.task_id: event for event in history}  # oldest first: the last wins
-
-        failures: dict[str, int] = {}
-        for row in slotted:
-            try:
+            latest = {event.task_id: event for event in history}  # oldest first: last wins
+            events = []
+            for row in slotted:
                 event = _slot_event(user_id, row, latest.get(row["task_id"]), now)
                 if event is not None:
-                    await self._task_events.append(user_id, event)
-            except Exception as exc:  # the accept stands whatever the event store does
-                kind = type(exc).__name__
-                failures[kind] = failures.get(kind, 0) + 1
-        if failures:
+                    events.append(event)
+            if events:
+                await self._task_events.append_many(user_id, events)
+        except Exception as exc:  # the accept stands whatever the event store does
             logger.warning(
-                "Draft %s accepted; %d task event(s) could not be stored (%s)",
-                draft_id,
-                sum(failures.values()),
-                ", ".join(f"{kind} x{count}" for kind, count in sorted(failures.items())),
+                "Draft %s accepted; its task events could not be recorded (%s)",
+                draft_id, type(exc).__name__,
             )
 
 

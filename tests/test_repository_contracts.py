@@ -365,6 +365,73 @@ async def test_task_events__other_user__invisible(repos):
     assert await repos.task_events.list_for_user(U2) == []
 
 
+@pytest.mark.asyncio
+async def test_task_events__list__filters_task_ids(repos):
+    for task_id, offset in [("a", 0), ("b", 1), ("a", 2), ("c", 3)]:
+        at = T0 + timedelta(hours=offset)
+        await repos.task_events.append(U1, _event(U1, TaskEventType.SCHEDULED, at, task_id))
+    await repos.task_events.append(U2, _event(U2, TaskEventType.SCHEDULED, T0, "a"))
+
+    events = await repos.task_events.list_for_user(U1, task_ids={"a", "c"})
+
+    assert [(e.task_id, e.occurred_at) for e in events] == [
+        ("a", T0),
+        ("a", T0 + timedelta(hours=2)),
+        ("c", T0 + timedelta(hours=3)),
+    ]
+    assert await repos.task_events.list_for_user(U1, task_ids=set()) == []
+
+
+@pytest.mark.asyncio
+async def test_task_events__list__read_cap__drops_oldest_never_newest(repos, fake_client):
+    """PostgREST answers at most max_rows rows per read (supabase/config.toml).
+
+    Whatever a family leaves out of one read, it is the oldest events: the newest
+    always come back, still oldest first. The cap only binds the Supabase family.
+    """
+    fake_client.max_rows = 3
+    times = [T0 + timedelta(minutes=m) for m in range(5)]
+    for m, at in enumerate(times):
+        await repos.task_events.append(U1, _event(U1, TaskEventType.SCHEDULED, at, f"t{m}"))
+
+    returned = [e.occurred_at for e in await repos.task_events.list_for_user(U1)]
+
+    assert len(returned) >= 3
+    assert returned == times[-len(returned):]
+
+
+@pytest.mark.asyncio
+async def test_task_events__append_many__stores_all_with_ids(repos):
+    events = [
+        _event(U1, TaskEventType.SCHEDULED, T0, "a"),
+        _event(U1, TaskEventType.RESCHEDULED, T0 + timedelta(minutes=1), "b"),
+    ]
+
+    stored = await repos.task_events.append_many(U1, events)
+
+    assert [(e.task_id, e.event_type) for e in stored] == [
+        ("a", TaskEventType.SCHEDULED),
+        ("b", TaskEventType.RESCHEDULED),
+    ]
+    assert all(e.id for e in stored) and len({e.id for e in stored}) == 2
+    assert await repos.task_events.list_for_user(U1) == stored
+    assert await repos.task_events.append_many(U1, []) == []
+
+
+@pytest.mark.asyncio
+async def test_task_events__append_many__one_bad_event__raises_validation_and_writes_nothing(repos):
+    events = [
+        _event(U1, TaskEventType.SCHEDULED, T0, "a"),
+        _event(U2, TaskEventType.SCHEDULED, T0, "b"),  # another user's
+    ]
+
+    with pytest.raises(errors.ValidationError):
+        await repos.task_events.append_many(U1, events)
+
+    assert await repos.task_events.list_for_user(U1) == []
+    assert await repos.task_events.list_for_user(U2) == []
+
+
 # --- Ownership ---------------------------------------------------------------
 
 
@@ -685,6 +752,36 @@ async def test_drafts__accept_atomic__reslots_missed_row_with_same_task_id(repos
     window = (T0 - timedelta(days=1), T0 + timedelta(days=2))
     assert [t.task_id for t in await repos.tasks.list_scheduled_between(U1, *window)] == ["m"]
     assert (await repos.tasks.get(U2, "m")).status is TaskStatus.MISSED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taken", ["done", "s"], ids=["completed_id", "skipped_id"])
+async def test_drafts__accept_atomic__reslot_with_taken_id__raises_conflict_and_writes_nothing(
+    repos, taken
+):
+    """The re-slot delete is part of the one transaction: a clash elsewhere in the
+    plan undoes it, so the missed row is still there, still missed, slot unchanged."""
+    await _seed_tasks(
+        repos,
+        U1,
+        [
+            _row("m", status="missed", start=T0),
+            _row("done", status="completed"),
+            _row("s", status="skipped"),
+            _row("open"),
+        ],
+    )
+    draft = await _new_draft(repos)
+
+    with pytest.raises(errors.ConflictError):
+        await repos.drafts.accept_atomic(
+            U1, draft.id, [_row("m", start=T0 + timedelta(days=1)), _row(taken)]
+        )
+
+    kept = await repos.tasks.get(U1, "m")
+    assert (kept.status, kept.scheduled_start) == (TaskStatus.MISSED, T0)
+    assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["open"]
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.PENDING
 
 
 @pytest.mark.asyncio

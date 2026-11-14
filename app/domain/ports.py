@@ -74,14 +74,33 @@ class TaskEventRepository(ABC):
         """Store the event and return it as persisted (with its id)."""
 
     @abstractmethod
+    async def append_many(self, user_id: str, events: list[TaskEvent]) -> list[TaskEvent]:
+        """Store all ``events`` in one write, or none of them; return them as persisted.
+
+        Raises ValidationError, before anything is written, if any event is not the
+        user's. An empty list writes nothing and returns [].
+        """
+
+    @abstractmethod
     async def list_for_user(
         self,
         user_id: str,
         *,
         since: datetime | None = None,
         types: set[TaskEventType] | None = None,
+        task_ids: set[str] | None = None,
     ) -> list[TaskEvent]:
-        """Return the user's events oldest first, optionally filtered by ``since`` and ``types``."""
+        """Return the user's events oldest first, filtered by ``since``, ``types`` and ``task_ids``.
+
+        Each filter applies only when given; an empty ``task_ids`` matches nothing.
+
+        A store may cap how many rows one read returns: Supabase's PostgREST answers
+        at most ``max_rows`` (1000, ``supabase/config.toml``) and says nothing. The
+        read is therefore made newest first and handed back oldest first, so whatever
+        a cap leaves out is the OLDEST matching events, never the newest. A caller
+        that needs every matching event should narrow the read (``task_ids``,
+        ``since``) to stay under the cap.
+        """
 
 
 class DraftRepository(ABC):

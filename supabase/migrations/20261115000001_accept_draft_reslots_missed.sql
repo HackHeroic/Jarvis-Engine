@@ -8,7 +8,8 @@
 -- and completed and skipped rows still hold their ids.
 --
 -- The function is 20261114000001_capstone_lld.sql's, unchanged except for the
--- delete statement; the comment, revoke and grant are repeated. The same delete
+-- delete statement; the comment (updated to name the re-slot), revoke and grant
+-- are repeated. The same delete
 -- rule is mirrored by FakeSupabase._accept_draft (tests/fakes.py) and
 -- InMemoryDraftRepository.accept_atomic. Idempotent: create or replace.
 
@@ -105,9 +106,10 @@ begin
 end $$;
 
 comment on function public.accept_draft(uuid, text, jsonb) is
-    'Accept an open draft and replace the user''s pending tasks with p_rows, atomically; '
-    'the user''s other open drafts become superseded. Raises DRAFT_NOT_FOUND or '
-    'DRAFT_NOT_OPEN; returns the number of tasks inserted.';
+    'Accept an open draft and replace the user''s pending tasks, plus their missed tasks '
+    'whose task_id p_rows re-slots, with p_rows, atomically; the user''s other open drafts '
+    'become superseded. Raises DRAFT_NOT_FOUND or DRAFT_NOT_OPEN; returns the number of '
+    'tasks inserted.';
 
 -- Only the backend (service_role) and signed-in users may call it. Functions are
 -- executable by PUBLIC by default, and Supabase also grants anon explicitly.

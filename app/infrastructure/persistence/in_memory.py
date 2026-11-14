@@ -164,12 +164,19 @@ class InMemoryTaskEventRepository(TaskEventRepository):
         self._store.task_events.append(stored)
         return stored.model_copy(deep=True)
 
+    async def append_many(self, user_id: str, events: list[TaskEvent]) -> list[TaskEvent]:
+        # Every event is checked before any is stored: all or nothing.
+        stored = [prepare_new(user_id, event, "task event") for event in events]
+        self._store.task_events.extend(stored)
+        return [event.model_copy(deep=True) for event in stored]
+
     async def list_for_user(
         self,
         user_id: str,
         *,
         since: datetime | None = None,
         types: set[TaskEventType] | None = None,
+        task_ids: set[str] | None = None,
     ) -> list[TaskEvent]:
         since = utc(since) if since is not None else None
         found = [
@@ -178,6 +185,7 @@ class InMemoryTaskEventRepository(TaskEventRepository):
             if e.user_id == user_id
             and (since is None or e.occurred_at >= since)
             and (types is None or e.event_type in types)
+            and (task_ids is None or e.task_id in task_ids)
         ]
         return [e.model_copy(deep=True) for e in sorted(found, key=lambda e: e.occurred_at)]
 
