@@ -36,7 +36,9 @@ what the serde rejects, nulls that value, and logs the key name.
 
 Checkpoints are written every step of every turn and nothing reads past the newest,
 so a daily ``CheckpointRetentionSweep`` keeps the newest ``CHECKPOINT_KEEP_PER_THREAD``
-per thread and deletes the rest (``prune_checkpoints``).
+per thread, with the sub-graph checkpoints of the turns kept, and deletes the rest
+(``prune_checkpoints``). Deleted rows are zeroed (``secure_delete``) and the
+write-ahead log truncated, so what was pruned cannot be read back from the file.
 """
 
 import logging
@@ -171,43 +173,94 @@ async def open_checkpointer(db_path: str) -> AsyncIterator[ScrubbingSqliteSaver]
         await conn.close()
 
 
-# Every checkpoint past the newest ``keep`` of its (thread, namespace). Checkpoint ids
-# are time-ordered (uuid6), so the newest sort last.
+# Checkpoints a prune deletes, by key:
+# * past the newest ``keep`` of their (thread, namespace);
+# * a sub-graph's (namespace other than ''), older than the thread's oldest kept root
+#   checkpoint. Every module run writes under its own namespace (``planning_module:<task>``)
+#   and seldom reaches ``keep`` rows, so the first rule alone would keep them forever.
+# Checkpoint ids are time-ordered (uuid6), so ordering by id orders by time.
 _STALE_CHECKPOINTS = """
-    SELECT thread_id, checkpoint_ns, checkpoint_id FROM (
+    WITH ranked AS (
         SELECT thread_id, checkpoint_ns, checkpoint_id,
                ROW_NUMBER() OVER (
                    PARTITION BY thread_id, checkpoint_ns ORDER BY checkpoint_id DESC
                ) AS newest_first
         FROM checkpoints
-    ) WHERE newest_first > ?
+    ),
+    oldest_kept_root AS (
+        SELECT thread_id, MIN(checkpoint_id) AS checkpoint_id
+        FROM ranked
+        WHERE checkpoint_ns = '' AND newest_first <= :keep
+        GROUP BY thread_id
+    )
+    SELECT ranked.thread_id, ranked.checkpoint_ns, ranked.checkpoint_id
+    FROM ranked LEFT JOIN oldest_kept_root USING (thread_id)
+    WHERE ranked.newest_first > :keep
+       OR (ranked.checkpoint_ns != ''
+           AND ranked.checkpoint_id < oldest_kept_root.checkpoint_id)
 """
+# Rows deleted per hold of the saver's lock: a turn's checkpoint write waits at most one
+# batch behind a prune.
+_PRUNE_BATCH = 500
+_KEY = "thread_id = ? AND checkpoint_ns = ? AND checkpoint_id = ?"
 
 
 async def prune_checkpoints(saver: AsyncSqliteSaver, keep_per_thread: int) -> int:
-    """Keep the newest ``keep_per_thread`` checkpoints of each (thread, namespace).
+    """Delete every checkpoint a resumed conversation can no longer need; return the count.
 
-    Every older checkpoint is deleted with its ``writes`` rows, in one transaction,
-    under the saver's lock. A thread resumes from its newest checkpoint, which stays
-    whole. Returns how many checkpoints were deleted. ``keep_per_thread`` below 1
-    raises ValueError: it would delete the state a conversation resumes from.
+    Kept: the newest ``keep_per_thread`` of each (thread, namespace), and any sub-graph
+    checkpoint at least as new as its thread's oldest kept root checkpoint. Each deleted
+    checkpoint's ``writes`` rows go with it. A thread resumes from its newest root
+    checkpoint, which stays whole.
+
+    The stale keys are listed once, then deleted ``_PRUNE_BATCH`` at a time, each batch
+    in its own transaction under the saver's lock, released in between. The connection
+    runs with ``secure_delete`` on, so deleted rows are overwritten with zeros rather
+    than left readable in free pages, and the write-ahead log is checkpointed and
+    truncated at the end: a pruned conversation's words do not stay in the file.
+
+    ``keep_per_thread`` below 1 raises ValueError: it would delete the state a
+    conversation resumes from.
     """
     if keep_per_thread < 1:
         raise ValueError("keep_per_thread must be at least 1")
     await saver.setup()
     async with saver.lock, saver.conn.cursor() as cursor:
+        await cursor.execute("PRAGMA secure_delete = ON")
         await cursor.execute(
-            "DELETE FROM writes WHERE (thread_id, checkpoint_ns, checkpoint_id)"
-            f" IN ({_STALE_CHECKPOINTS})",
-            (keep_per_thread,),
+            "CREATE TEMP TABLE IF NOT EXISTS stale_checkpoints"
+            " (thread_id TEXT, checkpoint_ns TEXT, checkpoint_id TEXT)"
         )
+        await cursor.execute("DELETE FROM temp.stale_checkpoints")
         await cursor.execute(
-            "DELETE FROM checkpoints WHERE (thread_id, checkpoint_ns, checkpoint_id)"
-            f" IN ({_STALE_CHECKPOINTS})",
-            (keep_per_thread,),
+            f"INSERT INTO temp.stale_checkpoints {_STALE_CHECKPOINTS}", {"keep": keep_per_thread}
         )
-        deleted = cursor.rowcount
         await saver.conn.commit()
+
+    deleted = 0
+    after = 0
+    try:
+        while True:
+            async with saver.lock, saver.conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT rowid, thread_id, checkpoint_ns, checkpoint_id"
+                    " FROM temp.stale_checkpoints WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (after, _PRUNE_BATCH),
+                )
+                batch = await cursor.fetchall()
+                if not batch:
+                    break
+                keys = [tuple(row[1:]) for row in batch]
+                await cursor.executemany(f"DELETE FROM writes WHERE {_KEY}", keys)
+                await cursor.executemany(f"DELETE FROM checkpoints WHERE {_KEY}", keys)
+                deleted += cursor.rowcount
+                await saver.conn.commit()
+            after = batch[-1][0]
+    finally:
+        async with saver.lock, saver.conn.cursor() as cursor:
+            await cursor.execute("DROP TABLE IF EXISTS temp.stale_checkpoints")
+            await saver.conn.commit()
+            await cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return deleted
 
 

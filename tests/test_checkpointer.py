@@ -16,6 +16,13 @@ import pytest
 
 from app.orchestrator.routing import check_negotiation_shortcut
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
+from tests.behaviour.conftest import (  # noqa: F401 - embeddings, jarvis and llm are fixtures
+    brain_dump,
+    decomposition,
+    embeddings,
+    jarvis,
+    llm,
+)
 from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, make_jarvis_state
 
 
@@ -376,6 +383,128 @@ async def test_prune_checkpoints__keeps_newest_n_per_thread(no_llm, tmp_path):
             values = (await graph.aget_state({"configurable": {"thread_id": thread_id}})).values
             assert values["negotiation_state"] == NegotiationPhase.ACCEPTED
             assert values["user_id"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_prune_checkpoints__planning_subgraph_namespaces__pruned_with_their_turn(
+    jarvis, llm, clock
+):
+    """Each module run checkpoints under its own namespace (``planning_module:<task>``),
+    with a handful of rows: fewer than the keep, so a per-namespace rule never deletes
+    them. Everything a sub-graph wrote before the thread's oldest kept root checkpoint
+    goes, and the thread still resumes."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import app.api.v1.endpoints.schedule as schedule_endpoint
+    from app.orchestrator.checkpoint import prune_checkpoints
+
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
+    llm.script(
+        "brain_dump_extraction",
+        lambda req: brain_dump(planning_goal="Revise DSA") if "DSA" in req.prompt else "{}",
+    )
+    llm.script("socratic_chunker", decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    planned = await jarvis.say("Plan my DSA revision for Friday")
+    session = planned.conversation_id
+    await jarvis.say("scrap it", session=session)
+    await jarvis.say("how was your day?", session=session)
+    saver = jarvis.state.jarvis_graph.checkpointer
+    before = await _checkpoint_rows(saver)
+    (thread,) = {thread_id for thread_id, _ in before}
+    subgraphs = [key for key in before if key[1]]
+    assert any(key[1].startswith("planning_module") for key in subgraphs)
+    assert all(len(before[key]) < 20 for key in subgraphs)
+
+    deleted = await prune_checkpoints(saver, keep_per_thread=2)
+
+    after = await _checkpoint_rows(saver)
+    kept_root = before[(thread, "")][-2:]
+    assert after[(thread, "")] == kept_root
+    expected_subgraph_ids = {
+        key: [cid for cid in ids if cid >= kept_root[0]][-2:]
+        for key, ids in before.items()
+        if key[1]
+    }
+    assert {k: v for k, v in after.items() if k[1]} == {
+        k: v for k, v in expected_subgraph_ids.items() if v
+    }
+    assert not any(key[1].startswith("planning_module") for key in after)  # turn 1's run
+    assert deleted == sum(map(len, before.values())) - sum(map(len, after.values()))
+    kept = {(t, ns, cid) for (t, ns), ids in after.items() for cid in ids}
+    assert await _write_checkpoint_ids(saver) <= kept
+    # The conversation carries on from where it was.
+    resumed = await jarvis.say("and how is the week looking?", session=session)
+    assert resumed.reply
+
+
+@pytest.mark.asyncio
+async def test_prune_checkpoints__deleted_turns__leave_no_bytes_on_disk(no_llm, tmp_path):
+    """secure_delete zeroes what a prune deletes, and the WAL is checkpointed and
+    truncated, so a pruned turn's words cannot be read back from the file."""
+    from app.orchestrator.checkpoint import open_checkpointer, prune_checkpoints
+
+    db_path = tmp_path / "ckpt.sqlite"
+    async with open_checkpointer(str(db_path)) as saver:
+        graph = build_jarvis_graph_for(saver)
+        cfg = {"configurable": {"thread_id": "u1:sess-1"}}
+        for message in ("ZEBRA-FIRST-TURN secret", "second turn", "third turn"):
+            await graph.ainvoke(_live_state(message), config=cfg)
+        assert b"ZEBRA-FIRST-TURN" in _file_bytes(db_path)
+
+        await prune_checkpoints(saver, keep_per_thread=2)
+
+        assert b"ZEBRA-FIRST-TURN" not in _file_bytes(db_path)
+        values = (await graph.aget_state(cfg)).values
+        assert values["user_message"] == "third turn"
+
+
+@pytest.mark.asyncio
+async def test_prune_checkpoints__large_backlog__deleted_in_bounded_batches(
+    no_llm, tmp_path, monkeypatch
+):
+    """The saver's lock is released between batches, so other turns' checkpoint
+    writes never wait behind one huge delete."""
+    import app.orchestrator.checkpoint as checkpoint
+    from app.orchestrator.checkpoint import open_checkpointer, prune_checkpoints
+
+    class _CountingLock(asyncio.Lock):
+        def __init__(self) -> None:
+            super().__init__()
+            self.acquired = 0
+
+        async def acquire(self) -> bool:
+            self.acquired += 1
+            return await super().acquire()
+
+    monkeypatch.setattr(checkpoint, "_PRUNE_BATCH", 3)
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph_for(saver)
+        await _three_turns_each(graph, ["u1:sess-1"])
+        before = await _checkpoint_rows(saver)
+        stale = sum(len(ids) - 1 for ids in before.values())
+        assert stale > 6
+        saver.lock = _CountingLock()
+
+        deleted = await prune_checkpoints(saver, keep_per_thread=1)
+
+        assert deleted == stale
+        assert saver.lock.acquired >= -(-stale // 3)  # at least one hold per batch
+        assert {k: len(v) for k, v in (await _checkpoint_rows(saver)).items()} == {
+            k: 1 for k in before
+        }
+
+
+def build_jarvis_graph_for(saver):
+    from app.orchestrator.graph import build_jarvis_graph
+
+    return build_jarvis_graph(checkpointer=saver)
+
+
+def _file_bytes(db_path) -> bytes:
+    """The database file and its write-ahead log, as they sit on disk."""
+    wal = db_path.with_name(db_path.name + "-wal")
+    return db_path.read_bytes() + (wal.read_bytes() if wal.exists() else b"")
 
 
 @pytest.mark.asyncio

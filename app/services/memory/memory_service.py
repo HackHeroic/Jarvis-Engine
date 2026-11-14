@@ -321,8 +321,9 @@ class MemoryService:
         nearest active ones from MEMORY_RECALL_MIN_SIMILARITY up, less the profile,
         ranked by similarity x (0.5 + 0.5 x strength now) x confidence, added while
         their lines fit MEMORY_RECALL_TOKENS. A line too long for what is left of a
-        budget is skipped, not the end of it. Superseded, expired and below-floor
-        memories never appear, nor any memory the user let go of or another user's.
+        budget is skipped, not the end of it. Ties go by id, so the order never depends
+        on the store's. Superseded, expired and below-floor memories never appear, nor
+        any memory the user let go of or another user's.
 
         A ``trivial`` message, or one with no words, gets the profile only, without an
         embedding call. An embedder that is down leaves the profile only, logged.
@@ -330,8 +331,15 @@ class MemoryService:
         now = now if now is not None else self._clock()
         active = await self.list_active(user_id, types=frozenset(_PROFILE_TYPES), now=now)
         standing = [m for m in active if m.confidence >= _PROFILE_MIN_CONFIDENCE]
-        standing.sort(key=lambda m: m.last_confirmed_at or m.created_at, reverse=True)
-        standing.sort(key=lambda m: _PROFILE_TYPES.index(m.memory_type))  # stable: newest first
+        # The id breaks ties, so the same memories always give the same note (and the
+        # same cacheable bytes), whatever order the store returns them in.
+        standing.sort(
+            key=lambda m: (
+                _PROFILE_TYPES.index(m.memory_type),
+                -(m.last_confirmed_at or m.created_at).timestamp(),
+                m.id or "",
+            )
+        )
         profile, profile_tokens = _within_budget(standing, now, config.MEMORY_PROFILE_TOKENS)
         if trivial or not _has_words(query):
             return Recall(profile=profile, relevant=[], tokens=profile_tokens)
@@ -355,10 +363,12 @@ class MemoryService:
             if match.memory.id not in shown and _in_use_at(match.memory, now)
         ]
         candidates.sort(
-            key=lambda match: match.similarity
-            * (0.5 + 0.5 * match.memory.strength_at(now))
-            * match.memory.confidence,
-            reverse=True,
+            key=lambda match: (
+                -match.similarity
+                * (0.5 + 0.5 * match.memory.strength_at(now))
+                * match.memory.confidence,
+                match.memory.id or "",
+            )
         )
         relevant, relevant_tokens = _within_budget(
             [match.memory for match in candidates], now, config.MEMORY_RECALL_TOKENS

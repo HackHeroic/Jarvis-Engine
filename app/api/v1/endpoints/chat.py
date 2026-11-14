@@ -1374,7 +1374,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         plate: list[str] = []
         try:
             pending = await container.repos.tasks.list_pending(request.user_id)
-            pending.sort(key=lambda t: (t.scheduled_start is None, t.scheduled_start or now))
+            pending.sort(  # soonest first; task_id breaks ties, so the note is stable
+                key=lambda t: (t.scheduled_start is None, t.scheduled_start or now, t.task_id)
+            )
             plate = [
                 f"{t.title} (due {t.deadline_hint})" if t.deadline_hint else t.title
                 for t in pending
@@ -1591,11 +1593,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                     # Empty graph output for CHAT — last-resort: invoke conversation module
                     # directly so the LLM still produces the reply (no hardcoded text).
                     from app.modules.conversation import run_general_chat as _run_gc
+                    # The note and history come from the turn's input: final_state holds
+                    # node outputs only, and neither is one.
                     _gc_out = await _run_gc({
                         "user_message": request.user_prompt,
                         "user_model": final_state.get("user_model"),
-                        "memory_context": final_state.get("memory_context", ""),
-                        "conversation_history": final_state.get("conversation_history", []),
+                        "memory_context": initial_state.get("memory_context", ""),
+                        "conversation_history": initial_state.get("conversation_history", []),
                     })
                     _llm_msg = _gc_out.get("response_message") or "Standing by, sir."
                     _llm_think = _gc_out.get("thinking_process")
@@ -1628,9 +1632,13 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                         from app.services.analytical.voice_of_jarvis import build_summary_from_state
                         _captured_summary = build_summary_from_state(final_state, _intent)
                         _captured_summary["user_prompt"] = request.user_prompt
+                        # From the turn's input, like the chat fallback above.
+                        _captured_summary["memory_context"] = initial_state.get(
+                            "memory_context", ""
+                        )
                         async for event_type, tok in synthesize_jarvis_response_stream(
                             _captured_summary,
-                            conversation_history=final_state.get("conversation_history"),
+                            conversation_history=initial_state.get("conversation_history"),
                         ):
                             if _ttft is None:
                                 _ttft = (time_mod.monotonic() - _turn_start) * 1000

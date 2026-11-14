@@ -271,7 +271,8 @@ RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE
 MEMORY_SUPPRESS_SIMILARITY: float = 0.85
 MEMORY_DEDUPE_SIMILARITY: float = 0.85
 MEMORY_RETENTION_FLOOR: float = 0.1
-# Recall's token budgets (MemoryService.recall), estimated at 4 characters a token: the
+# Recall's token budgets (MemoryService.recall), estimated at 3.5 characters a token
+# (CHARS_PER_TOKEN_ESTIMATE, low on purpose so newer tokenizers stay within them): the
 # always-on profile (constraints, preferences, goals) and the memories relevant to the
 # message, which count only from MEMORY_RECALL_MIN_SIMILARITY up. However many memories
 # a user has, the prompt carries at most the two budgets' worth.
