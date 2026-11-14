@@ -54,6 +54,29 @@ PLAN_PROMPT = (
 RULE_PROMPT = "From now on never schedule any study before 11 AM, I'm useless in the mornings."
 RULE_TEXT = re.compile(r"\b11\b|morning", re.IGNORECASE)
 TURN_TIMEOUT_S = 300.0  # a plan turn is several model calls plus a CP-SAT solve
+# How long to wait for work a turn leaves running in the background (memory
+# extraction, ledger writes) before calling it missing.
+BACKGROUND_DEADLINE_S = 20.0
+POLL_INTERVAL_S = 0.5
+
+
+def poll_until(
+    probe: Callable[[], Any],
+    deadline_s: float = BACKGROUND_DEADLINE_S,
+    interval_s: float = POLL_INTERVAL_S,
+) -> Any:
+    """Call ``probe`` until it returns something truthy or ``deadline_s`` has passed.
+
+    Returns as soon as background work lands, instead of sleeping a fixed time that
+    is either wasted or too short. Returns the last value probed, falsy if the
+    deadline passed, so the caller's assertion reports what was (not) found.
+    """
+    deadline = time.monotonic() + deadline_s
+    while True:
+        value = probe()
+        if value or time.monotonic() >= deadline:
+            return value
+        time.sleep(interval_s)
 
 
 # --- reporting -----------------------------------------------------------------------
@@ -238,10 +261,18 @@ def _core_loop(run: Run, client: Client, db: Any, user_id: str, state: dict) -> 
 
     def teach_rule() -> str:
         payload = client.say(RULE_PROMPT)
-        time.sleep(3)  # memory extraction finishes in the background
-        habits = [r["raw_text"] for r in rows(db, "behavioral_constraints", user_id, "raw_text")]
-        memories = [m["content"] for m in client.memories() if RULE_TEXT.search(m["content"])]
-        assert habits or memories, f"rule not stored; reply was {payload['message']!r}"
+
+        def stored() -> tuple[list[str], list[str]] | None:
+            # Memory extraction finishes in the background, after the reply.
+            habits = [r["raw_text"] for r in rows(db, "behavioral_constraints", user_id, "raw_text")]
+            memories = [m["content"] for m in client.memories() if RULE_TEXT.search(m["content"])]
+            return (habits, memories) if habits or memories else None
+
+        found = poll_until(stored)
+        assert found, (
+            f"rule not stored within {BACKGROUND_DEADLINE_S:.0f} s; reply was {payload['message']!r}"
+        )
+        habits, memories = found
         return f"habits={habits} memories={memories}"
 
     def replan() -> str:
@@ -267,9 +298,15 @@ def _core_loop(run: Run, client: Client, db: Any, user_id: str, state: dict) -> 
         return f"forgot {memory['content']!r}"
 
     def usage() -> str:
-        time.sleep(2)  # the ledger writes in the background
-        receipt = asyncio.run(_receipt(db, user_id))
-        assert receipt["cloud_calls"] > 0, f"no cloud calls recorded: {receipt}"
+        last: dict = {}
+
+        def recorded() -> dict | None:
+            # The ledger writes in the background, after each call.
+            last.update(asyncio.run(_receipt(db, user_id)))
+            return dict(last) if last["cloud_calls"] > 0 else None
+
+        receipt = poll_until(recorded)
+        assert receipt, f"no cloud calls recorded within {BACKGROUND_DEADLINE_S:.0f} s: {last}"
         return json.dumps(receipt)
 
     run.check("1 brain dump -> draft", brain_dump)

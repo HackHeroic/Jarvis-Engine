@@ -462,7 +462,8 @@ async def test_draft_action__accept__persists_tasks_and_closes_negotiation():
     assert [(r["task_id"], r["user_id"]) for r in rows] == [("t1", "test_user")]
     assert _draft_status(store) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
-    assert result["draft_id"] is None
+    # Kept: a repeated "looks good" on this thread must find this draft, closed.
+    assert result["draft_id"] == _DRAFT_ID
     assert "1 task is" in result["response_message"]
 
 
@@ -583,7 +584,7 @@ async def test_graph__accept_turn_reaches_draft_action_end_to_end(no_llm):
 
     assert _draft_status(store) == "accepted"
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
-    assert result["draft_id"] is None
+    assert result["draft_id"] == _DRAFT_ID  # kept for a repeated accept to find
     assert [r["task_id"] for r in user_model._db.supabase.rows.get("user_tasks", [])] == ["t1"]
 
 
@@ -894,7 +895,7 @@ async def test_draft_action__accept_already_accepted_draft__says_locked_in_and_w
 
     assert "already locked in" in result["response_message"]
     assert result["negotiation_state"] == NegotiationPhase.ACCEPTED
-    assert result["draft_id"] is None
+    assert result["draft_id"] == _DRAFT_ID  # kept for the next repeated accept
     assert supabase.rows["user_tasks"] == [done]
 
 
@@ -1533,3 +1534,15 @@ async def test_synthesis__clarification_with_anti_guilt__both_surface(monkeypatc
     result = await voice_of_jarvis_synthesis(state)
     assert "rolled forward" in result["response_message"]
     assert "reduce scope" in result["response_message"]
+
+
+def test_synthesis_summary__decomposition_without_a_schedule__is_not_a_generated_schedule():
+    """A decomposed task list is not a plan: only a solved schedule may be narrated as one."""
+    from app.services.analytical.voice_of_jarvis import build_summary_from_state
+
+    summary = build_summary_from_state(
+        {"schedule": None, "execution_graph": {"decomposition": [{"task_id": "t1", "title": "x"}]}},
+        "PLAN_DAY",
+    )
+
+    assert summary["schedule_generated"] is False

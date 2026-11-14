@@ -144,7 +144,55 @@ def test_adaptive_cap__composable_from_task_atoms():
     assert cap % 25 == 0 and cap >= 75, f"cap {cap} not composable from 25-min atoms"
 
 
-def test_run_schedule__five_atoms_two_days__feasible():
+@pytest.fixture
+def before_the_horizon(clock):
+    """Plans made at 07:30 UTC: the 08:00 horizon is still ahead, so none of it is past."""
+    from datetime import datetime, timezone
+
+    from app.api.v1.endpoints import schedule as sep
+
+    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), sep)
+
+
+def _five_task_graph():
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+
+    chunks = [TaskChunk(task_id=f"t{i}", title=f"part {i}", duration_minutes=25,
+                        difficulty_weight=0.5, dependencies=[], completion_criteria="done")
+              for i in range(5)]
+    return ExecutionGraph(goal_metadata=GoalMetadata(), decomposition=chunks,
+                          cognitive_load_estimate={"intrinsic_load": 0.5})
+
+
+def test_run_schedule__horizon_from_now__nothing_starts_before_now_rounded_up(clock):
+    from datetime import datetime, timezone
+
+    from app.api.v1.endpoints import schedule as sep
+
+    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=timezone.utc), sep)
+
+    resp = sep.run_schedule(_five_task_graph(), [], horizon_minutes=2880)
+
+    assert resp.horizon_start == datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
+    # 14:02 is 362 minutes in; the past is blocked to the next whole 5 minutes.
+    assert min(t.start_min for t in resp.schedule.values()) >= 365
+
+
+def test_run_schedule__explicit_horizon_start__is_left_as_given(clock):
+    from datetime import datetime, timezone
+
+    from app.api.v1.endpoints import schedule as sep
+
+    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=timezone.utc), sep)
+    eight_am = datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
+
+    resp = sep.run_schedule(_five_task_graph(), [], horizon_minutes=2880, horizon_start=eight_am)
+
+    assert resp.horizon_start == eight_am
+    assert min(t.start_min for t in resp.schedule.values()) < 362
+
+
+def test_run_schedule__five_atoms_two_days__feasible(before_the_horizon):
     from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
     from app.api.v1.endpoints import schedule as sep
 
@@ -246,7 +294,7 @@ def test_adaptive_cap__one_heavily_blocked_day__never_below_one_task_atom():
     assert cap >= 25, f"cap {cap} cannot fit a single 25-min task on any day"
 
 
-def test_run_schedule__memory_block_overlapping_habit_block__feasible():
+def test_run_schedule__memory_block_overlapping_habit_block__feasible(before_the_horizon):
     """The live repro: a memory-bridge block overlapping an expanded habit block.
 
     A "no study before 10am" habit expands to a daily 0-120 block; the memory

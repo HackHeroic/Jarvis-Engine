@@ -21,6 +21,7 @@ def test_planning_module__has_correct_steps():
         "fuse_tasks",
         "solve_schedule",
         "create_draft",
+        "report_unsolved",
         "handle_infeasible",
     ]
 

@@ -35,7 +35,11 @@ xfail — the single-task pacing bug — is fixed; see Known Issues #4.)
 
 ```bash
 .venv/bin/python -m pytest tests/ -q     # or just: pytest tests/
+.venv/bin/python -m pytest tests/ -q -m slow   # the slow tests, left out by default
 ```
+
+Tests marked `slow` (the solver run to its full time cap, ~10 s) are deselected
+by default (`addopts = -m "not slow"` in `pyproject.toml`); `pytest -m slow` runs them.
 
 ---
 
@@ -158,9 +162,15 @@ flowchart TD
   biological sleep fallback all live inside `run_schedule`. The call goes
   through `asyncio.to_thread`: CP-SAT is a synchronous solve, and a bare call
   freezes the event loop — every queued SSE frame stalls behind it. The solve
-  itself is capped at `SOLVER_MAX_TIME_SECONDS` (30s, `JARVIS_SOLVER_MAX_TIME_SECONDS`
+  itself is capped at `SOLVER_MAX_TIME_SECONDS` (10s, `JARVIS_SOLVER_MAX_TIME_SECONDS`
   overrides); an expired cap returns the best schedule found, or `UNKNOWN`,
-  which takes the INFEASIBLE branch.
+  which takes the INFEASIBLE branch. The step's own timeout
+  (`SOLVE_STEP_TIMEOUT_MS`) always outlasts the cap; a solve that still ends
+  without a schedule routes to `report_unsolved`, which says so plainly
+  ("couldn't work out a schedule… try again") instead of narrating a plan.
+- **Nothing is scheduled in the past.** Minute 0 is 08:00 UTC of today; for a
+  plan made later in the day `run_schedule` hard-blocks the minutes already
+  gone (rounded up to the next 5). An explicit `plan_start` is left as given.
 - **One goal, one namespace.** `decompose_goal` derives a `goal_id` via
   `derive_goal_id` (the model's `goal_metadata.goal_id` → a slug of the
   objective/planning goal → `plan_{uuid8}`) and prefixes every chunk and every

@@ -9,6 +9,7 @@ recalibration rather than user guilt.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, time, timezone
 from typing import Dict, List, Literal, Optional, Protocol
 
@@ -101,6 +102,24 @@ def _compute_horizon_start(plan_start: Optional[datetime] = None) -> datetime:
     """Compute horizon_start = 8 AM of plan date. Minute 0 = this datetime."""
     ref = plan_start or datetime.now(timezone.utc)
     return datetime.combine(ref.date(), time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
+
+
+# The past is blocked out to the next whole 5 minutes, so the first task never
+# starts a few seconds ago.
+PAST_BLOCK_STEP_MINUTES = 5
+
+
+def _minutes_already_past(horizon_start: datetime, now: datetime, horizon_minutes: int) -> int:
+    """How much of the horizon lies before ``now``, rounded up to the next 5 minutes.
+
+    0 when the horizon has not started yet (a plan made before 08:00), never more
+    than the horizon itself.
+    """
+    elapsed = (now - horizon_start).total_seconds() / 60
+    if elapsed <= 0:
+        return 0
+    rounded = math.ceil(elapsed / PAST_BLOCK_STEP_MINUTES) * PAST_BLOCK_STEP_MINUTES
+    return min(rounded, horizon_minutes)
 
 
 class ScheduleRequest(BaseModel):
@@ -203,8 +222,20 @@ def run_schedule(
     db_client: object = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
-    Raises HTTPException on INFEASIBLE."""
-    resolved_horizon_start = horizon_start or _compute_horizon_start()
+    Raises HTTPException on INFEASIBLE.
+
+    Without an explicit ``horizon_start`` the horizon starts at 08:00 today (UTC),
+    which is in the past for any plan made after 08:00: that stretch is blocked,
+    so nothing is scheduled before now. An explicit ``horizon_start`` is the
+    caller's to place, and is left exactly as given.
+    """
+    now = datetime.now(timezone.utc)
+    resolved_horizon_start = horizon_start or _compute_horizon_start(now)
+    already_past = (
+        _minutes_already_past(resolved_horizon_start, now, horizon_minutes)
+        if horizon_start is None
+        else 0
+    )
 
     # Per-task duration clamp when overrides provided
     clamped_durations: Dict[str, int] = {}
@@ -258,6 +289,12 @@ def run_schedule(
         max_daily_deep_work_minutes=cap if horizon_minutes > MINUTES_PER_DAY else None,
         slack_ratio=slack_ratio,
     )
+
+    # The part of the horizon already behind us. A hard block on the solver only,
+    # not a daily_context slot: in the context it would count as a short day in
+    # the adaptive cap and shrink every other day's budget along with it.
+    if already_past:
+        scheduler.add_hard_block(0, already_past, "past")
 
     # Enforce dynamic calendar blocks from daily_context
     for slot in daily_context:
@@ -358,7 +395,11 @@ def run_schedule(
 )
 def generate_schedule(request: ScheduleRequest) -> GenerateScheduleResponse:
     """Generate a deterministic schedule from an ExecutionGraph and daily context."""
-    horizon_start = _compute_horizon_start(request.plan_start)
+    # No plan_start: run_schedule derives the horizon from now, and blocks the
+    # part of it that has already gone by.
+    horizon_start = (
+        _compute_horizon_start(request.plan_start) if request.plan_start is not None else None
+    )
     return run_schedule(
         request.graph,
         request.daily_context,

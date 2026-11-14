@@ -1,8 +1,9 @@
-"""Anti-Guilt auto-reschedule: detect tasks past their deadline and push them forward.
+"""Anti-Guilt: detect tasks past their deadline and set them aside.
 
 Runs at the start of every PLAN_DAY flow. Past-deadline + status=pending tasks
-are marked as `missed`, queued for re-decomposition, and surfaced in the
-synthesis with anti-guilt framing — never shame language.
+are marked as `missed`, which takes them out of planning (fusion reads only
+pending tasks) without deleting them, and surfaced in the synthesis with
+anti-guilt framing — never shame language.
 """
 
 from datetime import datetime, timezone
@@ -81,7 +82,7 @@ async def detect_and_mark_missed(user_id: str, supabase: Any) -> list[dict]:
         except Exception as e:
             logger.warning(f"Failed to mark task {o['task_id']} missed: {e}")
 
-    logger.info(f"Auto-rescheduled {len(overdue)} missed tasks for user {user_id}")
+    logger.info(f"Set aside {len(overdue)} missed tasks for user {user_id}")
     return overdue
 
 
@@ -89,7 +90,9 @@ def build_anti_guilt_message(overdue: list[dict]) -> str:
     """Synthesize a short, blame-free framing of missed tasks.
 
     Anti-Guilt principle: missed deadlines are scope problems, not moral failures.
-    We acknowledge the change, propose a path forward, never use 'you failed' language.
+    The framing says only what is true: ``detect_and_mark_missed`` marked these
+    tasks ``missed``, so they are set aside and stay out of this plan (it fuses
+    pending tasks only). Nothing is deleted, and the user can ask for them back.
     """
     if not overdue:
         return ""
@@ -97,12 +100,13 @@ def build_anti_guilt_message(overdue: list[dict]) -> str:
     if n == 1:
         title = overdue[0]["title"] or "a task"
         return (
-            f"Sir, '{title}' slipped past its deadline. "
-            f"I've recalibrated the plan — this is a scope adjustment, not a setback."
+            f"Sir, '{title}' slipped past its deadline, so I've set it aside rather than "
+            f"cram it in — nothing is lost. Say the word and I'll work it into this plan."
         )
     titles = ", ".join(f"'{o['title']}'" for o in overdue[:3] if o.get("title"))
     extra = f" and {n - 3} more" if n > 3 else ""
     return (
-        f"Sir, {n} tasks have slipped past their deadlines ({titles}{extra}). "
-        f"I've folded them back into the planning queue. Scope, not failure."
+        f"Sir, {n} tasks have slipped past their deadlines ({titles}{extra}), so I've set "
+        f"them aside rather than cram them in — nothing is lost. Say the word and I'll "
+        f"work them into this plan."
     )

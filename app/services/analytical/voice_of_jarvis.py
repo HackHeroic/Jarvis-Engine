@@ -16,15 +16,9 @@ VOICE_OF_JARVIS_PROMPT = (
     "You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), the user's personal AI. "
     "Loyal, brilliant, composed. British cadence, formal but warm. Address the user as 'sir'. "
     "The user sent a message and we executed the following actions.\n\n"
-    "You MUST use this EXACT format — no exceptions:\n"
-    "<think>\n"
-    "2-4 sentences explaining what we did internally.\n"
-    "</think>\n"
-    "Your composed 1-2 sentence response to the user as JARVIS.\n\n"
+    "Reply with ONLY your composed 1-2 sentence response to the user as JARVIS — "
+    "nothing before it and nothing after it.\n\n"
     "VOICE RULES:\n"
-    "- You MUST start your response with <think> (the literal XML tag)\n"
-    "- You MUST close the thinking block with </think> (the literal XML tag)\n"
-    "- After </think>, write ONLY your 1-2 sentence response — nothing else\n"
     "- Use British cadence: 'Shall I...', 'If I may, sir...', 'I've taken the liberty of...'\n"
     "- Lead with information or status, not pleasantries\n"
     "- Show care through competence, not flattery. No 'I'd be happy to!' or 'Great!'\n"
@@ -33,19 +27,28 @@ VOICE_OF_JARVIS_PROMPT = (
     "- Never begin the response with 'I' — rephrase to lead with the fact or action\n"
     "- NEEDS_END_DATE_INSTRUCTION: If needs_end_date is true, ask when the semester ends\n\n"
     "EXAMPLES:\n"
-    "<think>\n"
-    "Classified as a planning request. Decomposed into 6 micro-tasks, applied gym habit as "
-    "a hard block, ran the CP-SAT solver with TMT priority weighting.\n"
-    "</think>\n"
-    "Your schedule is set, sir — six tasks, routed around your gym blocks. "
+    "Your draft schedule is ready, sir — six tasks, routed around your gym blocks. "
     "Deadline-adjacent items have been given priority.\n\n"
-    "<think>\n"
-    "User uploaded a PDF. Extracted 12 pages via Docling, chunked into 34 segments, "
-    "embedded in ChromaDB, linked to 3 active tasks.\n"
-    "</think>\n"
     "Document processed and linked to your active tasks, sir. "
     "Shall I pull the relevant sections into your next study session?"
 )
+
+
+def _fallback_reply(execution_summary: dict[str, Any]) -> str:
+    """The reply when no model could word one: in voice, and only what is true.
+
+    A generated schedule is a proposal awaiting review, so it is never called
+    "set"; with no schedule, nothing claims that the request was carried out.
+    """
+    if execution_summary.get("schedule_generated"):
+        return "A proposed schedule is ready for your review, sir."
+    if execution_summary.get("habits_saved"):
+        return "Your preferences are noted, sir; they will shape your next plan."
+    if execution_summary.get("knowledge_ingested"):
+        return "Your materials are processed and stored, sir."
+    if execution_summary.get("calendar_extracted"):
+        return "Your timetable is extracted and awaiting your review, sir."
+    return "My language model is out of reach at the moment, sir. Shall we try again shortly?"
 
 
 def _build_thinking_fallback(execution_summary: dict[str, Any]) -> str | None:
@@ -125,7 +128,9 @@ def build_summary_from_state(state: dict, intent: str = "") -> dict[str, Any]:
         "knowledge_ingested": bool(ingestion_result),
         "calendar_extracted": cal_extracted,
         "search_done": bool(research_results),
-        "schedule_generated": bool(schedule) or bool(execution_graph),
+        # Only a solved schedule is a plan. A decomposition without one (the solve
+        # timed out, or found nothing) must never be narrated as "your schedule".
+        "schedule_generated": bool(schedule),
         "task_count": (
             len(execution_graph.get("decomposition") or [])
             if isinstance(execution_graph, dict) else 0
@@ -235,27 +240,13 @@ async def synthesize_jarvis_response(
         )
         msg = result if isinstance(result, str) else str(result)
         msg = msg.strip() if msg else "Standing by, sir."
+        # A local model may still emit a <think> block; it is split off here. With
+        # none, there is no reasoning to show, and none is made up.
         message, thinking_process = _extract_thinking_process(msg)
-
-        # Use fallback for missing or trivially short thinking (e.g. model outputs "...")
-        if not thinking_process or len(thinking_process.strip(".").strip()) < 10:
-            thinking_process = _build_thinking_fallback(execution_summary)
-
         return (message, thinking_process)
     except Exception as e:
         print(f"[Voice of Jarvis] Synthesis failed: {e}")
-        thinking = _build_thinking_fallback(execution_summary)
-        if execution_summary.get("spread_across_days"):
-            return "I've spread this across multiple days to fit your constraints. Here's your schedule.", thinking
-        if execution_summary.get("schedule_generated"):
-            return "Here's your schedule.", thinking
-        if execution_summary.get("habits_saved"):
-            return "I've noted your preferences. I'll apply them to your next plan.", thinking
-        if execution_summary.get("knowledge_ingested"):
-            return "I've processed and stored your materials.", thinking
-        if execution_summary.get("calendar_extracted"):
-            return "I've extracted your timetable for review.", thinking
-        return "Standing by, sir.", thinking
+        return _fallback_reply(execution_summary), None
 
 
 async def synthesize_jarvis_response_stream(
@@ -316,13 +307,11 @@ async def synthesize_jarvis_response_stream(
         # Otherwise, we parse <think>...</think> tags from the content stream.
         in_think_block = False
         tag_buffer = ""
-        had_reasoning = False
         had_content = False
 
         async for evt_type, tok in token_gen:  # type: ignore[union-attr]
             # Native reasoning_content from LM Studio — yield directly
             if evt_type == "reasoning":
-                had_reasoning = True
                 yield ("thinking", tok)
                 continue
 
@@ -356,13 +345,11 @@ async def synthesize_jarvis_response_stream(
                             safe = tag_buffer[:-8]
                             tag_buffer = tag_buffer[-8:]
                             if safe:
-                                had_reasoning = True
                                 yield ("thinking", safe)
                         break
                     else:
                         before = tag_buffer[:close_idx]
                         if before:
-                            had_reasoning = True
                             yield ("thinking", before)
                         tag_buffer = tag_buffer[close_idx + 8:]
                         in_think_block = False
@@ -370,25 +357,15 @@ async def synthesize_jarvis_response_stream(
         # Flush remaining buffer
         if tag_buffer.strip():
             if in_think_block:
-                had_reasoning = True
                 yield ("thinking", tag_buffer)
             else:
                 had_content = True
                 yield ("message", tag_buffer)
 
-        # Fallback: if no reasoning was emitted at all, yield deterministic thinking
-        if not had_reasoning:
-            fallback_thinking = _build_thinking_fallback(execution_summary)
-            if fallback_thinking:
-                yield ("thinking", fallback_thinking)
-
+        # No reasoning streamed means there is none to show: nothing is invented.
         if not had_content:
             yield ("message", "Standing by, sir.")
 
     except Exception as e:
         print(f"[Voice of Jarvis Stream] Failed: {e}")
-        thinking = _build_thinking_fallback(execution_summary)
-        if thinking:
-            yield ("thinking", thinking)
-        msg = "Your schedule is set, sir." if execution_summary.get("schedule_generated") else "All sorted, sir."
-        yield ("message", msg)
+        yield ("message", _fallback_reply(execution_summary))
