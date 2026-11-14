@@ -24,6 +24,7 @@ from app.domain.entities import (
     ConsentDecision,  # noqa: F401  (defined beside Suggestion; this module's public name)
     ConsentReasonKind,
     Suggestion,
+    SuggestionExpiry,
     SuggestionStatus,
     UserProfile,
     check_suggestion_move,
@@ -295,16 +296,18 @@ async def move_suggestion(
     to: SuggestionStatus,
     *,
     consent: ConsentDecision | None = None,
+    expired_because: SuggestionExpiry | None = None,
 ) -> Suggestion:
     """The one way a suggestion's status changes: a move SUGGESTION_TRANSITIONS allows,
-    stored as a compare-and-set from ``frm``.
+    stored as a compare-and-set from ``frm``. An expiry says why (``expired_because``).
 
     InvalidStateTransition for a move the table forbids (nothing is written);
     otherwise as ``SuggestionRepository.set_status``.
     """
     to = check_suggestion_move(frm, to)
     return await suggestions.set_status(
-        user_id, suggestion_id, to, expected=frm, consent=consent
+        user_id, suggestion_id, to, expected=frm, consent=consent,
+        expired_because=expired_because,
     )
 
 

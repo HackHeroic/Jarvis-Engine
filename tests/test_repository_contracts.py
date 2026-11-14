@@ -971,6 +971,33 @@ async def test_suggestions__exists_today__true_after_add(repos):
 
 
 @pytest.mark.asyncio
+async def test_suggestions__exists_today__expired_by_a_newer_plan_still_counts_no_fit_does_not(
+    repos,
+):
+    """Replaced by a newer plan (out of date), today's brief was still made: no second
+    one that day, even after a restart. One that expired because its plan no longer fit
+    leaves room for a fresh one."""
+    from app.domain.entities import SuggestionExpiry
+
+    replaced = await repos.suggestions.add(U1, _suggestion(U1, trigger="morning_brief"))
+    moved = await repos.suggestions.set_status(
+        U1, replaced.id, SuggestionStatus.EXPIRED, expected=SuggestionStatus.PENDING,
+        expired_because=SuggestionExpiry.OUT_OF_DATE,
+    )
+    no_fit = await repos.suggestions.add(U2, _suggestion(U2, trigger="morning_brief"))
+    await repos.suggestions.set_status(
+        U2, no_fit.id, SuggestionStatus.EXPIRED, expected=SuggestionStatus.PENDING,
+        expired_because=SuggestionExpiry.NO_FIT,
+    )
+
+    assert moved.action == {**replaced.action, "expired_because": "out_of_date"}
+    assert await repos.suggestions.exists_today(U1, "morning_brief", T0.date()) is True
+    assert await repos.suggestions.exists_today(U2, "morning_brief", T0.date()) is False
+    stored = await repos.suggestions.get(U2, no_fit.id)
+    assert stored.action["expired_because"] == "no_fit" and stored.status is SuggestionStatus.EXPIRED
+
+
+@pytest.mark.asyncio
 async def test_suggestions__exists_today__expired_suggestion_does_not_count(repos):
     """A brief that expired (its plan no longer fit) leaves room for a fresh one that day."""
     stored = await repos.suggestions.add(U1, _suggestion(U1, trigger="morning_brief"))

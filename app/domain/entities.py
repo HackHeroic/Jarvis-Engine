@@ -49,6 +49,22 @@ class SuggestionStatus(str, Enum):
     AUTO_APPLIED = "auto_applied"
 
 
+class SuggestionExpiry(str, Enum):
+    """Why a suggestion expired, kept in its ``action`` JSON under EXPIRY_KEY.
+
+    OUT_OF_DATE: its time passed, or a newer plan replaced what it would put in place;
+    it was still made that day. NO_FIT: what it would put in place no longer fit (a
+    clash with the user's tasks); a fresh one may be made the same day.
+    """
+
+    OUT_OF_DATE = "out_of_date"
+    NO_FIT = "no_fit"
+
+
+# Where a suggestion's action JSON records why it expired (``SuggestionExpiry``).
+EXPIRY_KEY = "expired_because"
+
+
 class ConsentReasonKind(str, Enum):
     """Which link of the consent chain decided, so a reason can be shown by type.
 
@@ -181,6 +197,17 @@ SUGGESTION_TRANSITIONS: dict[SuggestionStatus, frozenset[SuggestionStatus]] = {
     SuggestionStatus.EXPIRED: frozenset(),
     SuggestionStatus.AUTO_APPLIED: frozenset(),
 }
+
+
+def made_that_day(status: SuggestionStatus | str, action: dict | None) -> bool:
+    """Whether a suggestion counts as its trigger's suggestion for the day it was made.
+
+    Every status does but an expiry that left room for a fresh one: NO_FIT, or one
+    whose reason was never recorded (expired before reasons were kept).
+    """
+    if SuggestionStatus(status) is not SuggestionStatus.EXPIRED:
+        return True
+    return (action or {}).get(EXPIRY_KEY) == SuggestionExpiry.OUT_OF_DATE.value
 
 
 def check_suggestion_move(frm: SuggestionStatus, to: SuggestionStatus) -> SuggestionStatus:
