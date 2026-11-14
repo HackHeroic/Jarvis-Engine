@@ -30,8 +30,9 @@ class DraftService:
         """Write the draft's tasks and mark it ACCEPTED, atomically; return tasks written.
 
         Raises NotFoundError if the user has no such draft, InvalidStateTransition
-        if it is no longer open (accepted, rejected, expired...), and
-        ValidationError if it holds no task that can be scheduled.
+        if it is no longer open (accepted, rejected, expired...), ValidationError
+        if it holds no task that can be scheduled, and ConflictError if one of its
+        task ids is already held by a task the user finished (or repeats).
         """
         draft = await self._drafts.get(user_id, draft_id)
         if draft is None:

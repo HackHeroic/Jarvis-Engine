@@ -214,7 +214,8 @@ async def test_chat__resumed_conversation__accepts_the_draft_it_proposed_not_the
     await jarvis.say("looks good", session=first.conversation_id)
 
     assert jarvis.draft(first.draft_id)["status"] == "accepted"
-    assert jarvis.draft(other.draft_id)["status"] == "pending"
+    # Not accepted: replaced by the accepted plan, as the accept_draft function does.
+    assert jarvis.draft(other.draft_id)["status"] == "superseded"
     assert sorted(r["task_id"] for r in jarvis.rows("user_tasks", user_id="alice")) == first_task_ids
 
 

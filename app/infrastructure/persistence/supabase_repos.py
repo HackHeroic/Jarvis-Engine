@@ -44,6 +44,7 @@ from app.infrastructure.persistence._mapping import (
     accepted_task_rows,
     apply_profile_update,
     day_bounds,
+    draft_closed,
     from_row,
     is_uuid,
     iso,
@@ -235,12 +236,20 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
     async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
         if not is_uuid(draft_id):
             raise not_found("draft", draft_id)
+        # Only an open draft takes the edit; the status filter makes the check and
+        # the write one statement, so an accept that lands first closes the door.
         rows = await self._run(
-            lambda q: q.update({"tasks": tasks}).eq("id", draft_id).eq("user_id", user_id)
+            lambda q: q.update({"tasks": tasks})
+            .eq("id", draft_id)
+            .eq("user_id", user_id)
+            .in_("status", [s.value for s in OPEN_DRAFT_STATUSES])
         )
-        if not rows:
+        if rows:
+            return _read(DraftSchedule, rows[0])
+        current = await self.get(user_id, draft_id)
+        if current is None:
             raise not_found("draft", draft_id)
-        return _read(DraftSchedule, rows[0])
+        raise draft_closed(draft_id, current.status)
 
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
@@ -279,7 +288,6 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             result = await asyncio.to_thread(
                 lambda: self._client.rpc("accept_draft", params).execute()
             )
-            return int(result.data)
         except Exception as exc:
             text = _error_text(exc)
             if "DRAFT_NOT_OPEN" in text:
@@ -293,6 +301,11 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
             if _TASK_ID_KEY in text or getattr(exc, "code", None) == "23505":
                 raise task_id_clash(draft_id) from exc
             raise errors.PersistenceError(_UNREACHABLE) from exc
+        try:
+            return int(result.data)
+        except (TypeError, ValueError) as exc:
+            # The database answered, with something that is not a row count.
+            raise errors.PersistenceError(_UNREADABLE) from exc
 
 
 def _error_text(exc: Exception) -> str:

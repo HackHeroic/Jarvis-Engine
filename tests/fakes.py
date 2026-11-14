@@ -254,6 +254,14 @@ class FakeSupabase:
                 # Table defaults the explicit column list leaves to Postgres.
                 tasks.append({"id": str(uuid.uuid4()), "created_at": now.isoformat(), **row})
             draft["status"] = "accepted"
+            # The accepted plan replaces every other plan the user had open.
+            for other in self.rows["draft_schedules"]:
+                if (
+                    other.get("user_id") == p_user_id
+                    and other is not draft
+                    and other.get("status") in ("pending", "modified")
+                ):
+                    other["status"] = "superseded"
             return _Result(len(p_rows))
 
 

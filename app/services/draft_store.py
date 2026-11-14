@@ -49,7 +49,11 @@ _OPEN_STATUSES = [DraftStatus.PENDING.value, DraftStatus.MODIFIED.value]
 
 
 def is_open_draft(draft: dict | None) -> bool:
-    """Whether a draft row is still under review, so it may be edited, accepted or rejected."""
+    """Whether a draft row's status is an open one (pending or modified).
+
+    Status only: a draft past its ``expires_at`` still reads as open here, and
+    accepting it is refused all the same.
+    """
     return bool(draft) and draft.get("status") in _OPEN_STATUSES
 
 

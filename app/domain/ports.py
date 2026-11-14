@@ -105,7 +105,11 @@ class DraftRepository(ABC):
 
     @abstractmethod
     async def replace_tasks(self, user_id: str, draft_id: str, tasks: list[dict]) -> DraftSchedule:
-        """Replace the draft's tasks and return the updated draft."""
+        """Replace an open draft's tasks and return the updated draft.
+
+        Raises NotFoundError if the user has no such draft, and InvalidStateTransition
+        if it is no longer open (accepted, rejected, expired or superseded).
+        """
 
     @abstractmethod
     async def set_status(
@@ -117,7 +121,12 @@ class DraftRepository(ABC):
     async def accept_atomic(self, user_id: str, draft_id: str, rows: list[dict]) -> int:
         """Atomically write ``rows`` and mark the draft ACCEPTED; return rows written.
 
-        Raises InvalidStateTransition if the draft is not open or has expired.
+        The user's other open drafts become SUPERSEDED in the same step.
+
+        Raises NotFoundError if the user has no such draft, InvalidStateTransition if
+        it is not open or has expired, ConflictError if a row's task_id is already held
+        by one of the user's remaining tasks or repeats within ``rows``, and
+        ValidationError for a row that is not the user's.
         """
 
 

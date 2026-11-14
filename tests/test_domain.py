@@ -77,6 +77,27 @@ def test_draft_transition__modified_to_modified__ok():
     assert draft.transition(DraftStatus.MODIFIED).status == DraftStatus.MODIFIED
 
 
+def test_draft_transition__raw_string__stored_as_the_status_enum():
+    accepted = _draft(DraftStatus.PENDING).transition("accepted")
+
+    assert accepted.status is DraftStatus.ACCEPTED
+    assert accepted.status.value == "accepted"
+
+
+def test_draft_transition__unknown_string__raises_and_never_becomes_a_status():
+    with pytest.raises(ValueError):
+        _draft(DraftStatus.PENDING).transition("archived")
+
+
+def test_draft_transition__copy__shares_no_tasks_with_the_original():
+    draft = _draft(DraftStatus.PENDING)
+
+    moved = draft.transition(DraftStatus.MODIFIED)
+    moved.tasks[0]["task_id"] = "changed"
+
+    assert draft.tasks == [{"task_id": "t1"}]
+
+
 # --- Task invariants --------------------------------------------------------
 
 

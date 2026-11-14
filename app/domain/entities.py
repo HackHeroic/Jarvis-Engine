@@ -181,13 +181,19 @@ class DraftSchedule(BaseModel):
     )
 
     def transition(self, to: DraftStatus) -> "DraftSchedule":
-        """Return a copy moved to ``to``; raise InvalidStateTransition if the move is illegal."""
+        """Return a deep copy moved to ``to``; raise InvalidStateTransition if the move is illegal.
+
+        ``to`` is coerced first: ``model_copy`` does not validate, so a raw string
+        would be stored as is and ``status`` would stop being a ``DraftStatus``. A
+        string that is no status raises ``ValueError``.
+        """
+        to = DraftStatus(to)
         if to not in DRAFT_TRANSITIONS[self.status]:
             raise InvalidStateTransition(
                 f"This draft is {self.status.value} and cannot become {to.value}.",
                 details={"draft_id": self.id, "from": self.status.value, "to": to.value},
             )
-        return self.model_copy(update={"status": to})
+        return self.model_copy(update={"status": to}, deep=True)
 
 
 class BehavioralConstraint(BaseModel):
