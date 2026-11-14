@@ -127,6 +127,10 @@ class DraftService:
         )
         return written
 
+    async def reschedule(self, user_id: str, draft_id: str, schedule: dict) -> DraftSchedule:
+        """Put a re-solved schedule on an open draft (InvalidStateTransition if closed)."""
+        return await self._drafts.replace_schedule(user_id, draft_id, schedule)
+
     async def reject(
         self, user_id: str, draft_id: str, reason: str | None = None
     ) -> DraftSchedule:

@@ -270,6 +270,20 @@ class InMemoryDraftRepository(DraftRepository):
             )
             return self._store.drafts[i].model_copy(deep=True)
 
+    async def replace_schedule(
+        self, user_id: str, draft_id: str, schedule: dict
+    ) -> DraftSchedule:
+        async with self._store.lock:  # a re-solve must not land in the middle of an accept
+            i = self._index(user_id, draft_id)
+            if i is None:
+                raise not_found("draft", draft_id)
+            if self._store.drafts[i].status not in OPEN_DRAFT_STATUSES:
+                raise draft_closed(draft_id, self._store.drafts[i].status)
+            self._store.drafts[i] = self._store.drafts[i].model_copy(
+                update={"schedule": copy.deepcopy(schedule)}
+            )
+            return self._store.drafts[i].model_copy(deep=True)
+
     async def set_status(
         self, user_id: str, draft_id: str, to: DraftStatus, *, reason: str | None = None
     ) -> DraftSchedule:

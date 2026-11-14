@@ -33,6 +33,7 @@ from app.schemas.draft import (
     DraftStateResponse,
     DraftTaskEdit,
 )
+from app.services.draft_actions import MOVED_ON_ACCEPT, accept_on_time
 from app.services.draft_store import is_open_draft
 from app.services.planning.task_rows import draft_slots
 from app.services.memory.memory_service import MemoryCandidate
@@ -120,12 +121,18 @@ async def accept_draft(
     This is the only REST path that commits a proposed schedule — the planning
     flow deliberately persists nothing until the user says yes. A second accept
     answers 409 and writes nothing, as does a plan whose every slot has gone by
-    (``DraftOutdatedError``).
+    (``DraftOutdatedError``). A plan some of whose slots have gone by is re-solved
+    from now and then accepted (``moved``); when the rest no longer fits, 422
+    (``ScheduleInfeasibleError``) and the draft stays open.
     """
     await _load_draft(http_request, draft_id, request.user_id)
     drafts = get_container(http_request).draft_service
+    db_client = getattr(http_request.app.state, "db_client", None)
     try:
-        task_count = await drafts.accept(request.user_id, draft_id)
+        # The chat accept's path too: times already gone by are moved first.
+        outcome = await accept_on_time(
+            drafts, request.user_id, draft_id, supabase=getattr(db_client, "supabase", None)
+        )
     except errors.ValidationError:
         # Nothing in the draft can be scheduled; nothing was written.
         return DraftAcceptResponse(status="empty", draft_id=draft_id, task_count=0)
@@ -136,7 +143,13 @@ async def accept_draft(
         raise errors.PersistenceError(
             "The schedule could not be saved. The draft is still open; try again."
         ) from exc
-    return DraftAcceptResponse(status="accepted", draft_id=draft_id, task_count=task_count)
+    return DraftAcceptResponse(
+        status="accepted",
+        draft_id=draft_id,
+        task_count=outcome.written,
+        moved=outcome.moved,
+        message=MOVED_ON_ACCEPT if outcome.moved else None,
+    )
 
 
 @router.post("/{draft_id}/reject", summary="Reject a draft")
