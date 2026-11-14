@@ -125,7 +125,9 @@ class DraftRepository(ABC):
     async def accept_atomic(self, user_id: str, draft_id: str, rows: list[dict]) -> int:
         """Atomically write ``rows`` and mark the draft ACCEPTED; return rows written.
 
-        The user's other open drafts become SUPERSEDED in the same step.
+        ``rows`` replace the user's PENDING tasks, plus their MISSED tasks whose
+        task_id appears in ``rows`` (a passed slot re-slotted under its own id). Every
+        other task stays. The user's other open drafts become SUPERSEDED in the same step.
 
         Raises NotFoundError if the user has no such draft, InvalidStateTransition if
         it is not open or has expired, ConflictError if a row's task_id is already held

@@ -274,10 +274,19 @@ class InMemoryDraftRepository(DraftRepository):
                 t if t.id is not None else t.model_copy(update={"id": str(uuid4())})
                 for t in new_tasks
             ]
+            # As the accept_draft SQL function does: the plan replaces the user's
+            # pending tasks, plus their missed tasks it re-slots under the same task_id.
+            reslotted = {task.task_id for task in new_tasks}
             remaining = [
                 t
                 for t in self._store.tasks
-                if not (t.user_id == user_id and t.status == TaskStatus.PENDING)
+                if not (
+                    t.user_id == user_id
+                    and (
+                        t.status == TaskStatus.PENDING
+                        or (t.status == TaskStatus.MISSED and t.task_id in reslotted)
+                    )
+                )
             ]
             # user_tasks is UNIQUE (user_id, task_id); checked before any write.
             taken = {t.task_id for t in remaining if t.user_id == user_id}

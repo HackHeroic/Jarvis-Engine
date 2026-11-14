@@ -6,13 +6,16 @@ must find the draft closed and write nothing. It must never duplicate the tasks.
 """
 
 import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 
 from app.domain import errors
-from app.domain.entities import DraftStatus, TaskStatus
+from app.domain.entities import DraftStatus, TaskEvent, TaskEventType, TaskStatus
 from app.domain.events import DomainEvent, DraftAccepted, EventBus, EventListener, NullEventBus
+from app.domain.ports import TaskEventRepository
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryStore
 from app.services.draft_service import DraftService
@@ -20,6 +23,8 @@ from tests.fakes import FakeSupabase
 
 U1 = "u1"
 HORIZON = "2026-08-13T08:00:00+00:00"
+H0 = datetime(2026, 8, 13, 8, 0, tzinfo=timezone.utc)  # HORIZON as an instant
+NOW = datetime(2026, 8, 13, 7, 0, tzinfo=timezone.utc)
 
 
 def _tasks(*task_ids: str) -> list[dict]:
@@ -49,13 +54,30 @@ def service(repos) -> DraftService:
     return DraftService(repos.drafts, NullEventBus())
 
 
-async def _draft(repos, tasks: list[dict] | None = None, user_id: str = U1):
+async def _draft(
+    repos, tasks: list[dict] | None = None, user_id: str = U1, schedule: dict | None = None
+):
     return await repos.drafts.create(
         user_id,
         tasks=tasks if tasks is not None else _tasks("g_t1", "g_t2"),
         horizon_start=HORIZON,
         goal_id="g",
-        schedule=None,
+        schedule=schedule,
+    )
+
+
+def _slots(**starts: int) -> dict:
+    """A solver map: each task_id -> a 25-minute slot that starts that many minutes in."""
+    return {task: {"start_min": start, "end_min": start + 25} for task, start in starts.items()}
+
+
+def _at(minute: int) -> datetime:
+    return H0 + timedelta(minutes=minute)
+
+
+def _recording_service(repos) -> DraftService:
+    return DraftService(
+        repos.drafts, NullEventBus(), task_events=repos.task_events, clock=lambda: NOW
     )
 
 
@@ -156,6 +178,97 @@ async def test_accept__preserves_completed_tasks(repos, service):
 
     assert (await repos.tasks.get(U1, "old_t1")).status is TaskStatus.COMPLETED
     assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["new_t1"]
+
+
+# --- accept: scheduled and rescheduled events ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_accept__new_tasks__one_scheduled_event_each_with_slot(repos):
+    """A task the solver placed gets one SCHEDULED event; one it did not place, none."""
+    draft = await _draft(repos, _tasks("g_t1", "g_t2", "g_t3"), schedule=_slots(g_t1=0, g_t2=30))
+
+    assert await _recording_service(repos).accept(U1, draft.id) == 3
+
+    events = await repos.task_events.list_for_user(U1)
+    slots = sorted((e.task_id, e.event_type, e.scheduled_start, e.scheduled_end) for e in events)
+    assert slots == [
+        ("g_t1", TaskEventType.SCHEDULED, _at(0), _at(25)),
+        ("g_t2", TaskEventType.SCHEDULED, _at(30), _at(55)),
+    ]
+    assert {e.occurred_at for e in events} == {NOW}
+    by_task = {e.task_id: e for e in events}
+    assert by_task["g_t1"].metadata == {"title": "do g_t1", "goal_id": "g", "deadline_hint": None}
+
+
+@pytest.mark.asyncio
+async def test_accept__replan_moves_a_task__rescheduled_event_with_previous_start(repos):
+    """The slot is compared with the task's LATEST slot event, not its first."""
+    service = _recording_service(repos)
+    for minute in (0, 60, 0):  # 08:00, then moved to 09:00, then back to 08:00
+        draft = await _draft(repos, _tasks("g_t1"), schedule=_slots(g_t1=minute))
+        await service.accept(U1, draft.id)
+
+    events = await repos.task_events.list_for_user(U1)
+    moves = [(e.event_type, e.scheduled_start, e.metadata.get("previous_start")) for e in events]
+    assert moves == [
+        (TaskEventType.SCHEDULED, _at(0), None),
+        (TaskEventType.RESCHEDULED, _at(60), _at(0).isoformat()),
+        (TaskEventType.RESCHEDULED, _at(0), _at(60).isoformat()),
+    ]
+    assert events[1].scheduled_end == _at(85)
+    assert events[1].metadata["title"] == "do g_t1"
+
+
+@pytest.mark.asyncio
+async def test_accept__replan_same_slot__no_new_event(repos):
+    service = _recording_service(repos)
+    for _ in range(2):
+        draft = await _draft(repos, schedule=_slots(g_t1=0, g_t2=30))
+        await service.accept(U1, draft.id)
+
+    events = await repos.task_events.list_for_user(U1)
+    assert sorted((e.task_id, e.event_type) for e in events) == [
+        ("g_t1", TaskEventType.SCHEDULED),
+        ("g_t2", TaskEventType.SCHEDULED),
+    ]
+
+
+class _EventStoreDown(TaskEventRepository):
+    """A task event store whose ``failing`` call raises as an unreachable database does."""
+
+    def __init__(self, failing: str) -> None:
+        self._failing = failing
+
+    async def append(self, user_id: str, event: TaskEvent) -> TaskEvent:
+        if self._failing == "append":
+            raise errors.PersistenceError("The database could not be reached.")
+        return event
+
+    async def list_for_user(self, user_id, *, since=None, types=None) -> list[TaskEvent]:
+        if self._failing == "list_for_user":
+            raise errors.PersistenceError("The database could not be reached.")
+        return []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["append", "list_for_user"])
+async def test_accept__event_store_down__accept_still_succeeds_and_logs(repos, caplog, failing):
+    service = DraftService(
+        repos.drafts, NullEventBus(), task_events=_EventStoreDown(failing), clock=lambda: NOW
+    )
+    draft = await _draft(repos, schedule=_slots(g_t1=0, g_t2=30))
+
+    with caplog.at_level(logging.WARNING, logger="app.services.draft_service"):
+        written = await service.accept(U1, draft.id)
+
+    assert written == 2
+    assert sorted(t.task_id for t in await repos.tasks.list_pending(U1)) == ["g_t1", "g_t2"]
+    assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.ACCEPTED
+    assert "task event" in caplog.text
+    assert any(
+        r.levelno == logging.WARNING and "task event" in r.getMessage() for r in caplog.records
+    )
 
 
 # --- reject -----------------------------------------------------------------

@@ -71,7 +71,7 @@ class AppContainer:
             repos=repos,
             events=events,
             llm=llm,
-            draft_service=DraftService(repos.drafts, events),
+            draft_service=DraftService(repos.drafts, events, task_events=repos.task_events),
             usage_ledger=usage_ledger,
             task_service=task_service,
             sweeps=[SlotPassedSweep(task_service)],

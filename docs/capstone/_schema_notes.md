@@ -285,7 +285,7 @@ It runs as one transaction:
 2. Locks the draft row (`select … for update`, matched on id *and* user).
 3. Raises `DRAFT_NOT_FOUND` if the draft is missing or belongs to someone else.
 4. Raises `DRAFT_NOT_OPEN` unless the status is `pending` or `modified` and the draft has not expired.
-5. Deletes that user's `status = 'pending'` tasks.
+5. Deletes that user's `status = 'pending'` tasks, plus their `status = 'missed'` tasks whose `task_id` appears in `p_rows` (v2, `20261115000001_accept_draft_reslots_missed.sql`: a passed slot comes back under its own id). Other missed, completed and skipped rows keep their ids.
 6. Inserts `p_rows`.
 7. Marks the draft `accepted`.
 8. Marks every other open draft of the user (`pending` / `modified`) `superseded`.
@@ -330,6 +330,7 @@ Rows were produced by `build_task_rows` + `accepted_task_rows`.
 | One bad row in `p_rows` | Whole call rolled back: pending tasks, the draft's status and the other draft's status are all untouched. |
 | Two sessions accept two different open drafts of one user at once | The second waits for the first. Only the first plan's tasks are pending, the other draft is `superseded`, the second session gets `DRAFT_NOT_OPEN`, and so does accepting that draft again afterwards. |
 | `anon` calls it | `permission denied for function accept_draft` |
+| v2: a plan re-slots one of two missed tasks (and the user also has a skipped one) | That row is pending with the new slot; the other missed row, the skipped row and another user's missed row with the same `task_id` are untouched. Re-using the skipped id is still a unique violation and writes nothing. `p_rows` null deletes only pending rows. |
 
 ### Fake vs SQL
 
