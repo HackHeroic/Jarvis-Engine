@@ -12,7 +12,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app.domain.errors import PersistenceError
+
 logger = logging.getLogger(__name__)
+
+_UNREACHABLE = "Could not reach the database."
 
 # ---------------------------------------------------------------------------
 # Pure helpers (no I/O — fully unit-testable)
@@ -243,9 +247,12 @@ async def get_recent_messages(
     The query sorts newest first so ``limit`` keeps the most recent messages; sorted
     ascending, it kept the *oldest* ones, freezing a long conversation's context at
     its opening turns.
+
+    No database, or a query that fails, is ``PersistenceError``: an outage is not an
+    empty conversation. (The chat turn's window degrades instead: ``build_context_messages``.)
     """
     if supabase is None:
-        return []
+        raise PersistenceError(_UNREACHABLE)
 
     try:
         def _fetch() -> list[dict]:
@@ -261,9 +268,11 @@ async def get_recent_messages(
             return list(reversed(resp.data or []))
 
         return await asyncio.to_thread(_fetch)
-    except Exception:
-        logger.warning("get_recent_messages: failed for session %s", session_id)
-        return []
+    except Exception as exc:
+        logger.warning(
+            "get_recent_messages: failed for session %s (%s)", session_id, type(exc).__name__
+        )
+        raise PersistenceError(_UNREACHABLE) from exc
 
 
 async def build_context_messages(
@@ -286,10 +295,18 @@ async def build_context_messages(
     if supabase is None:
         return []
 
-    # Fetch one extra message to detect whether there is overflow history
-    all_recent = await get_recent_messages(
-        session_id, user_id, limit=max_messages + 1, supabase=supabase
-    )
+    # Fetch one extra message to detect whether there is overflow history. A turn goes
+    # on without its history rather than fail: the outage is logged.
+    try:
+        all_recent = await get_recent_messages(
+            session_id, user_id, limit=max_messages + 1, supabase=supabase
+        )
+    except PersistenceError:
+        logger.warning(
+            "build_context_messages: session %s's history could not be read; "
+            "the turn goes on without it", session_id,
+        )
+        return []
 
     overflow = len(all_recent) > max_messages
     window = all_recent[-max_messages:] if overflow else all_recent
@@ -316,9 +333,13 @@ async def list_sessions(
     limit: int = 50,
     supabase: Any = None,
 ) -> list[dict]:
-    """List the user's non-archived sessions ordered by ``updated_at`` DESC."""
+    """List the user's non-archived sessions ordered by ``updated_at`` DESC.
+
+    No database, or a query that fails, is ``PersistenceError``: an outage must not
+    read as "no conversations".
+    """
     if supabase is None:
-        return []
+        raise PersistenceError(_UNREACHABLE)
 
     try:
         def _fetch() -> list[dict]:
@@ -335,6 +356,6 @@ async def list_sessions(
             return resp.data or []
 
         return await asyncio.to_thread(_fetch)
-    except Exception:
-        logger.warning("list_sessions: failed for user %s", user_id)
-        return []
+    except Exception as exc:
+        logger.warning("list_sessions: failed for user %s (%s)", user_id, type(exc).__name__)
+        raise PersistenceError(_UNREACHABLE) from exc
