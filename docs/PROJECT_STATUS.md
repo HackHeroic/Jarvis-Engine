@@ -429,8 +429,18 @@ checkpoint rows, one thread per `(user_id, session_id)`. Gitignored via `data/`.
 ### ChromaDB
 
 `CloudClient` when `CHROMA_API_KEY` + `CHROMA_TENANT` are set, otherwise a local
-in-process client. Collection `jarvis_knowledge`, cosine space, filtered by
-`user_id`. Read by `decompose_goal` for RAG-augmented decomposition.
+in-process client; one per process, built on first use. Collection
+`jarvis_knowledge`, cosine space. The search, `query_knowledge`
+(`app/utils/chroma_client.py`), always filters by `user_id` — there is no
+unfiltered fallback; a user with no matching chunks gets nothing, and a call
+without a user id raises — and keeps only matches within
+`RAG_MAX_COSINE_DISTANCE` (0.6, i.e. cosine similarity ≥ 0.4; env
+`JARVIS_RAG_MAX_COSINE_DISTANCE`). It is read on every chat turn (the
+conversation module), by `decompose_goal`, and as the workspace's fallback when
+a task has no linked materials, always through `asyncio.to_thread` (the call
+blocks). The documents API reads and deletes chunks by `source_id` **and**
+`user_id`. (Before 2026-11-14 an empty filtered result fell back to an
+unfiltered query, which put other users' chunks into the prompt.)
 
 ---
 

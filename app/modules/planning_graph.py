@@ -212,8 +212,9 @@ async def decompose_goal(state: PlanningState) -> dict:
     rag_context = ""
     try:
         from app.utils.chroma_client import query_knowledge
-        user_id = state.get("user_id", "demo")
-        chunks = query_knowledge(user_id, goal, n_results=3)
+        user_id = state.get("user_id")
+        # Blocking network call: off the event loop; no user, no search.
+        chunks = await asyncio.to_thread(query_knowledge, user_id, goal, 3) if user_id else []
         if chunks:
             rag_context = "\n\nRelevant knowledge from user's documents:\n" + "\n---\n".join(chunks[:3])
     except Exception:

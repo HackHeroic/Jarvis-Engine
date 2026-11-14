@@ -199,6 +199,14 @@ CHROMA_API_KEY: str | None = os.getenv("CHROMA_API_KEY")
 CHROMA_TENANT: str | None = os.getenv("CHROMA_TENANT")
 CHROMA_DATABASE: str = os.getenv("CHROMA_DATABASE", "Jarvis-Vector-Db")
 
+# Document search (RAG) relevance cut-off, as cosine distance (1 - cosine
+# similarity) under the collection's default embedder, all-MiniLM-L6-v2. Its
+# unrelated sentence pairs sit around 0.1-0.3 similarity and on-topic ones at
+# 0.4 and up, so 0.6 (similarity >= 0.4) keeps on-topic chunks and drops the
+# noise floor. A miss only means the reply has no document context; a weak
+# match pasted into the prompt misleads the model — so err strict.
+RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE", "0.6"))
+
 # AWS S3 (document storage)
 AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY: str | None = os.getenv("AWS_SECRET_ACCESS_KEY")
