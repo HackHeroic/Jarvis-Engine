@@ -8,7 +8,7 @@ when a slot has ended, the grace period has passed and no outcome was recorded.
 """
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar
@@ -31,13 +31,37 @@ logger = logging.getLogger(__name__)
 # A lost compare-and-set is retried against the status that won, up to this many tries.
 _CAS_ATTEMPTS = 3
 
-# Outcomes that settle a slot: one recorded since the slot began keeps the sweep away.
-_SLOT_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
+# Outcomes that settle a slot: completed, skipped, or missed (the slot passed). One
+# recorded since the slot began keeps the sweep away; learning counts only these.
+SLOT_OUTCOMES = frozenset({TaskEventType.COMPLETED, TaskEventType.SKIPPED, TaskEventType.MISSED})
 
 
 def utc_now() -> datetime:
     """The current instant, in UTC."""
     return datetime.now(timezone.utc)
+
+
+def as_aware(moment: datetime) -> datetime:
+    """``moment`` as an aware instant. Stored instants are UTC, so a naive one is read so."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def latest_outcome_per_slot(events: Iterable[TaskEvent]) -> list[TaskEvent]:
+    """The outcome each slot came to, oldest first: what learning counts.
+
+    A slot is a task's ``(task_id, scheduled_start)``. It can have more than one
+    outcome: the sweep marks it missed, then the user completes it after all. It
+    counts once, as its latest outcome by ``occurred_at``. Events that are not
+    outcomes are dropped. Outcomes with no ``scheduled_start`` are kept, one per task:
+    the latest of them, as that task's one unscheduled slot. A reader that needs an
+    hour skips them.
+    """
+    latest: dict[tuple[str, datetime | None], TaskEvent] = {}
+    for event in sorted(events, key=lambda e: as_aware(e.occurred_at)):
+        if event.event_type in SLOT_OUTCOMES:
+            start = as_aware(event.scheduled_start) if event.scheduled_start is not None else None
+            latest[(event.task_id, start)] = event
+    return sorted(latest.values(), key=lambda e: as_aware(e.occurred_at))
 
 
 @dataclass(frozen=True)
@@ -149,7 +173,7 @@ class TaskService:
             return []
 
         outcomes = await self._events.list_for_user(
-            user_id, since=min(task.scheduled_start for task in passed), types=set(_SLOT_OUTCOMES)
+            user_id, since=min(task.scheduled_start for task in passed), types=set(SLOT_OUTCOMES)
         )
         latest_outcome = {event.task_id: event.occurred_at for event in outcomes}  # oldest first
 

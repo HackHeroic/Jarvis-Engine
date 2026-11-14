@@ -27,7 +27,7 @@ from app.domain.events import (
 from app.domain.ports import TaskEventRepository, TaskRepository
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryStore
-from app.services.task_service import SlotPassedSweep, TaskService
+from app.services.task_service import SlotPassedSweep, TaskService, latest_outcome_per_slot
 
 IST = ZoneInfo("Asia/Kolkata")
 NOW = datetime(2026, 11, 14, 15, 0, tzinfo=IST)
@@ -554,3 +554,35 @@ async def test_detect_and_mark_missed__one_task_errors__others_still_marked_and_
 
     assert service.calls == ["t1", "t2", "t3"]
     assert [o["task_id"] for o in overdue] == ["t1", "t3"]
+
+
+# --- The latest outcome of each slot ------------------------------------------------------
+
+
+def _event(kind: TaskEventType, task_id: str, start: datetime | None, at: datetime) -> TaskEvent:
+    return TaskEvent(
+        user_id=U1, task_id=task_id, event_type=kind, occurred_at=at, scheduled_start=start,
+        scheduled_end=start + timedelta(minutes=25) if start else None,
+    )
+
+
+def test_latest_outcome_per_slot__missed_then_completed__counts_once_as_completed():
+    slot = NOW - timedelta(days=1)
+    missed = _event(TaskEventType.MISSED, "t1", slot, slot + timedelta(hours=1))
+    done = _event(TaskEventType.COMPLETED, "t1", slot, slot + timedelta(hours=5))
+    moved = _event(TaskEventType.SKIPPED, "t1", slot + timedelta(days=1), slot + timedelta(days=1))
+
+    assert latest_outcome_per_slot([done, missed, moved]) == [done, moved]  # oldest first
+
+
+def test_latest_outcome_per_slot__no_slot__one_per_task_and_non_outcomes_dropped():
+    at = NOW - timedelta(hours=3)
+    skipped = _event(TaskEventType.SKIPPED, "t1", None, at)
+    completed = _event(TaskEventType.COMPLETED, "t1", None, at + timedelta(hours=1))
+    other = _event(TaskEventType.SKIPPED, "t2", None, at)
+    scheduled = _event(TaskEventType.SCHEDULED, "t3", NOW, at)
+    deadline = _event(TaskEventType.DEADLINE_MISSED, "t4", None, at)
+
+    assert latest_outcome_per_slot([skipped, other, completed, scheduled, deadline]) == [
+        other, completed
+    ]
