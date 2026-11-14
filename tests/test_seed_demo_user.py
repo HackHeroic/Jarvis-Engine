@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import scripts.seed_demo_user as seed
-from app.domain.entities import LLMLocation, TaskEvent, TaskEventType
+from app.domain.entities import LLMLocation, TaskEvent, TaskEventType, TaskStatus
 from app.domain.events import EventBus
 from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
@@ -252,7 +252,7 @@ async def test_seed__every_row_shape_is_a_live_shape(family):
     assert {kind for kind, _ in events} <= {t.value for t in TaskEventType}
     for kind, metadata in events:
         assert set(metadata) <= LIVE_METADATA_KEYS, (kind, metadata)
-    assert len(tasks) == report["tasks"]
+    assert len(tasks) == report["tasks"] + report["plate"]
     assert all(user_id == DEMO and plan_id for user_id, plan_id in tasks)
 
 
@@ -279,7 +279,8 @@ async def test_seed__report__about_three_weeks_and_ninety_tasks():
     assert report["days"] == 21
     assert 80 <= report["tasks"] <= 100
     assert report["memories"] == 3
-    assert report["events_by_type"]["scheduled"] == report["tasks"]
+    assert 8 <= report["plate"] <= 10  # 8 ahead or due today, and up to two evening blocks
+    assert report["events_by_type"]["scheduled"] == report["tasks"] + report["plate"]
     assert "deadline_missed" not in report["events_by_type"]
 
 
@@ -724,3 +725,137 @@ def test_guard__demo_rows_but_no_history__partial_seed_exit_1_never_a_merge(
 
     assert "partial seed found — rerun with --reset" in capsys.readouterr().out
     assert _row_counts(fake) == before
+
+
+# --- the current plate: what the morning brief finds on the demo morning -------------
+
+
+def _deadline(task) -> date | None:
+    return date.fromisoformat(task.deadline_hint) if task.deadline_hint else None
+
+
+async def _set_aside_yesterday(repos, today: date) -> list:
+    """Yesterday's tasks the slot sweep set aside, still waiting for a new slot."""
+    missed = await repos.tasks.list_by_status(DEMO, frozenset({TaskStatus.MISSED}))
+    return [t for t in missed if t.scheduled_start is not None
+            and t.scheduled_start.astimezone(IST).date() == today - timedelta(days=1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("today", A_WEEK_OF_RUN_DAYS, ids=lambda d: f"{d:%a}")
+async def test_seed__current_plate__work_ahead_one_due_today_and_yesterdays_set_aside(today):
+    """The demo morning has something to plan: tasks due over the next few days (two of
+    them hard, neither due today), one due today, and yesterday's set-aside tasks."""
+    repos, report = await _seed(today)
+
+    pending = await repos.tasks.list_by_status(DEMO, frozenset({TaskStatus.PENDING}))
+    ahead = [t for t in pending if _deadline(t) is not None and _deadline(t) > today]
+    due_today = [t for t in pending if _deadline(t) == today]
+    assert 6 <= len(ahead) <= 8 and len(due_today) == 1
+    assert len(pending) == len(ahead) + 1
+    assert all(today + timedelta(days=2) <= _deadline(t) <= today + timedelta(days=4)
+               for t in ahead)
+    assert len([t for t in ahead if t.difficulty_weight >= 0.8]) >= 2
+    assert len({t.difficulty_weight for t in pending}) >= 4  # mixed difficulty
+    assert all(t.scheduled_start >= _start_of(today) for t in pending)  # slots still ahead
+    assert 2 <= len(await _set_aside_yesterday(repos, today)) <= 3
+    events = await repos.task_events.list_for_user(DEMO)
+    assert all(e.occurred_at < _start_of(today) for e in events)  # seeded through yesterday
+    assert sum(e.event_type is TaskEventType.SCHEDULED for e in events) == (
+        report["tasks"] + report["plate"]
+    )
+
+
+def _brief_world(fake, repos, now: datetime):
+    """The live anticipation wiring over the seeded store, on a clock frozen at ``now``."""
+    from app.domain.anticipation import ConsentPolicy
+    from app.modules.planning_replan import PlanningGraphReplanner
+    from app.services.anticipation.actions import build_action_factory
+    from app.services.anticipation.service import AnticipationService
+    from app.services.anticipation.triggers import MorningBriefTrigger, PatternRuleTrigger
+    from app.services.draft_service import DraftService
+    from app.services.memory.memory_service import MemoryService
+    from tests.fakes import FakeDBClient
+
+    clock = lambda: now  # noqa: E731
+    bus = EventBus()
+    planner = PlanningGraphReplanner(
+        repos.drafts, db_provider=lambda: FakeDBClient(fake), memory_provider=lambda: None
+    )
+    patterns = PatternService(repos.task_events, repos.memories, repos.profiles, bus, clock=clock)
+    drafts = DraftService(repos.drafts, bus, task_events=repos.task_events, tasks=repos.tasks,
+                          clock=clock)
+    actions = build_action_factory(
+        drafts=drafts, constraints=repos.constraints,
+        memory=MemoryService(repos.memories, BagOfWordsEmbedder(), clock=clock), planner=planner,
+    )
+    brief = MorningBriefTrigger(repos.tasks, repos.task_events, planner, _energy(repos), patterns,
+                                actions)
+    rule = PatternRuleTrigger(patterns, repos.suggestions, actions, repos.constraints)
+    return AnticipationService(
+        {brief.name: brief, rule.name: rule}, actions, ConsentPolicy.default(),
+        repos.suggestions, repos.profiles, repos.constraints, clock=clock,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at", [time(7, 5), time(10, 30)], ids=["07:05", "10:30"])
+async def test_seed__demo_morning__brief_plans_today_reslots_and_leans_on_the_evening_peak(
+    at, clock, deterministic_solver
+):
+    """Seeded history, live inference, on the demo morning: the real brief (real
+    planner, real CP-SAT) places at least four tasks today, finds yesterday's set-aside
+    tasks a new slot, and puts the hardest task not due today in the learned evening
+    peak; its words claim the strongest hour only when the hardest of today is there.
+    The real pattern-rule trigger offers the 9 AM window."""
+    import app.api.v1.endpoints.schedule as schedule_endpoint
+    import app.core.config as config
+    import app.modules.planning_graph as planning_graph
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.orchestrator.hooks import ActionHooks
+    from app.services.anticipation.triggers import PEAK_CLAIM_MIN_SCORE
+
+    fake = FakeSupabase()
+    repos, _ = await _seed(repos=RepositoryFactory.supabase(fake))
+    now = datetime.combine(TODAY, at, IST)
+    clock.freeze(now, schedule_endpoint, planning_graph)
+    runtime.set_container(AppContainer.build(  # planning reads the focus profile through it
+        supabase_client=fake, cfg=config, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    ))
+    set_aside = {t.task_id for t in await _set_aside_yesterday(repos, TODAY)}
+    pending = await repos.tasks.list_by_status(DEMO, frozenset({TaskStatus.PENDING}))
+    not_due_today = [t for t in pending if _deadline(t) != TODAY]
+    hardest = max(not_due_today, key=lambda t: t.difficulty_weight)
+    service = _brief_world(fake, repos, now)
+
+    outcomes = {o.suggestion.trigger: o for o in await service.run_due(DEMO, now)
+                if o.suggestion is not None}
+
+    brief = outcomes["morning_brief"].suggestion
+    draft = await repos.drafts.get(DEMO, brief.action["draft_id"])
+    origin = datetime.fromisoformat(draft.horizon_start)
+    starts = {task_id: (origin + timedelta(minutes=slot["start_min"])).astimezone(IST)
+              for task_id, slot in draft.schedule.items()}
+    today = {task_id: start for task_id, start in starts.items() if start.date() == TODAY}
+    assert len(today) >= 4, starts
+    assert min(starts.values()) >= now
+    assert set_aside <= set(starts)  # every set-aside task found a new slot
+    assert any(line.endswith("found a new slot.") for line in brief.body.splitlines())
+    profile = await _energy(repos).estimate(DEMO, IST, now=now)
+    scores = profile.scores()
+    assert profile.source == "learned"
+    peak_window = {h for h in range(24) if scores[h] >= PEAK_CLAIM_MIN_SCORE and h in EVENING}
+    assert starts[hardest.task_id].hour in peak_window, (hardest.title, starts)
+    titles = {t["task_id"]: t.get("title") for t in draft.tasks}
+    difficulty = {t["task_id"]: float(t.get("difficulty_weight", 0.5)) for t in draft.tasks}
+    top_today = max(today, key=lambda t: (difficulty[t], -today[t].timestamp()))
+    at_peak = scores[today[top_today].hour] >= max(max(scores), PEAK_CLAIM_MIN_SCORE)
+    first_line = brief.body.splitlines()[0]
+    assert f"'{titles[top_today]}', is at {today[top_today]:%H:%M}" in first_line
+    assert first_line.endswith(" — your strongest hour.") is at_peak
+    for line in brief.body.splitlines():
+        assert blame_phrases_in(line) == [] and "missed" not in line.lower()
+    rule = outcomes["pattern_rule"].suggestion
+    assert rule.action["pattern_key"] == "skip_time_window:9"

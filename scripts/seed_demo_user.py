@@ -11,6 +11,11 @@ only write the row and event shapes the app itself writes:
   23:59 ``TaskService.sweep_passed_slots`` sets aside whatever was left untouched;
 - three things the user said are remembered by ``MemoryService.remember`` on their
   own dates;
+- the evening before the demo the user accepts a plan for the days ahead (the current
+  plate, ``_UPCOMING``): tasks due over the next two to four days, two of them hard,
+  one due today, and an evening block or two they never get to, which the slot sweep
+  sets aside with whatever else of yesterday was left untouched. That is what the
+  morning brief finds to plan, and to re-slot, on the demo morning;
 - at the end PEARL (``PatternService.observe``) looks at the history once, as the
   app does after outcomes, and remembers what it finds.
 
@@ -104,6 +109,10 @@ SAID_AT = time(21, 30)  # when the user told Jarvis something, on its day
 SWEEP_AT = time(23, 59)  # the slot sweep sets aside what was left untouched
 OUTCOME_LAG = timedelta(minutes=5)  # an outcome is recorded just after its slot ends
 RESLOT_AT = time(18, 0)  # a 09:00 DSA slot left untouched finds a new slot next evening
+PLATE_AT = time(21, 0)  # the evening before the demo: the plan for the days ahead
+EVENING_BLOCKS = (time(21, 15), time(21, 45))  # planned that evening, never got to
+PLATE_STARTS = (time(11, 0), time(11, 30), time(14, 0), time(14, 30))  # each day, as planned
+YESTERDAYS_SET_ASIDE = 3  # at most this many of yesterday's tasks wait for a new slot
 
 DONE, SKIPPED, UNTOUCHED = "done", "skipped", "untouched"
 WEEKDAYS = frozenset(range(5))
@@ -245,6 +254,58 @@ _OS = _Routine(
 _ROUTINES = (_DSA, _LECTURES, _LAB, _PROJECT, _FLASHCARDS, _OS)
 
 
+@dataclass(frozen=True)
+class _Upcoming:
+    """One task on the current plate: due ``due_in`` days from today (None: no deadline)."""
+
+    goal_id: str
+    title: str
+    difficulty: float
+    due_in: int | None
+    criteria: str
+    obstacle: str
+    response: str
+
+
+# The plate the evening before the demo: due over the next two to four days, mixed
+# difficulty with two clearly hard tasks, and one due today. Ordered by deadline.
+_UPCOMING = (
+    _Upcoming("lecture_review", "Submit the DBMS quiz answers", 0.4, 0,
+              "Answer every question and submit the form",
+              "If a question stalls me", "then mark it, answer the rest, and come back"),
+    _Upcoming("dsa_practice", "DP practice: knapsack and its variants", 0.85, 2,
+              "Solve two variants without looking at the solutions",
+              "If I can't see the recurrence", "then write the brute force first"),
+    _Upcoming("lecture_review", "Revise DBMS normalisation", 0.5, 2,
+              "Normalise one schema to 3NF from memory",
+              "If the notes feel too long to start", "then revise only 2NF and stop there"),
+    _Upcoming("flashcards", "Flashcards: Computer Networks protocols", 0.2, 2,
+              "Review every due card once",
+              "If I feel like skipping the review", "then do ten cards before deciding"),
+    _Upcoming("dsa_practice", "Mock interview: graph traversal problems", 0.9, 3,
+              "Solve one BFS and one DFS problem aloud in 25 minutes",
+              "If I freeze on the first problem", "then say the brute force out loud first"),
+    _Upcoming("lab_report", "Write the networks lab report: discussion", 0.4, 3,
+              "Finish the discussion section with one figure",
+              "If I get stuck on the write-up", "then list the three results first"),
+    _Upcoming("os_assignment", "OS assignment: page replacement simulator", 0.6, 4,
+              "Run FIFO and LRU on the sample trace",
+              "If the simulator feels too big", "then write the FIFO queue first"),
+    _Upcoming("course_project", "Course project: write the README", 0.3, 4,
+              "Write setup and usage sections that a classmate can follow",
+              "If I keep polishing the code instead", "then set a timer and write for ten minutes"),
+)
+# What the user planned for that evening and never got to: set aside by the sweep.
+_EVENING = (
+    _Upcoming("reading", "Read the OS paper on scheduling", 0.5, None,
+              "Write a three-line summary of the paper",
+              "If the paper feels dense", "then read the abstract and conclusion first"),
+    _Upcoming("lecture_review", "Review the transactions lecture slides", 0.4, None,
+              "Write two recall questions and answer them",
+              "If the slides feel too long", "then review only the first ten"),
+)
+
+
 class SeedProblem(Exception):
     """Why the seed stopped, in words the operator can act on, and the exit code to return."""
 
@@ -348,12 +409,14 @@ def _deal(rng: random.Random, n: int, mix: tuple[tuple[str, int], ...]) -> list[
     return hand
 
 
-def _chunk(routine: _Routine, title: str, task_id: str, deadline: date | None) -> dict:
+def _chunk(
+    routine: _Routine | _Upcoming, title: str, task_id: str, deadline: date | None
+) -> dict:
     """A planner-shaped task: a valid TaskChunk with its WOOP if-then, plus its goal_id."""
     chunk = TaskChunk(
         task_id=task_id,
         title=title,
-        duration_minutes=routine.minutes,
+        duration_minutes=getattr(routine, "minutes", 25),
         difficulty_weight=routine.difficulty,
         completion_criteria=routine.criteria,
         implementation_intention={
@@ -364,6 +427,29 @@ def _chunk(routine: _Routine, title: str, task_id: str, deadline: date | None) -
     ).model_dump()
     chunk["goal_id"] = routine.goal_id
     return chunk
+
+
+def _plate(
+    yesterday: date, today: date, run: str, zone: ZoneInfo, *, evening: int
+) -> list[_Slot]:
+    """The plan accepted the evening before the demo, as the planner would name it.
+
+    ``evening`` blocks that same evening (never got to: no outcome, so the sweep sets
+    them aside), then ``_UPCOMING`` in deadline order, four a day from today 11:00.
+    """
+    slots: list[_Slot] = []
+
+    def add(item: _Upcoming, start: datetime) -> None:
+        deadline = today + timedelta(days=item.due_in) if item.due_in is not None else None
+        task_id = f"{item.goal_id}_{run}_task_{len(slots) + 1}"
+        slots.append(_Slot(_chunk(item, item.title, task_id, deadline), start, UNTOUCHED))
+
+    for item, at in zip(_EVENING[:evening], EVENING_BLOCKS):
+        add(item, datetime.combine(yesterday, at, zone))
+    for k, item in enumerate(_UPCOMING):
+        day = today + timedelta(days=k // len(PLATE_STARTS))
+        add(item, datetime.combine(day, PLATE_STARTS[k % len(PLATE_STARTS)], zone))
+    return slots
 
 
 def _plan_days(
@@ -470,8 +556,9 @@ async def seed_history(
 ) -> dict:
     """Write ``days`` days of history before ``today`` through the live services.
 
-    Returns ``{"days", "tasks", "events_by_type", "memories", "patterns"}``: tasks
-    written, the stored events counted by type, memories created and the keys of the
+    Returns ``{"days", "tasks", "plate", "events_by_type", "memories", "patterns"}``:
+    history tasks written, tasks on the current plate (accepted the evening before
+    today), the stored events counted by type, memories created and the keys of the
     patterns PEARL remembered.
     """
     _require_demo(user_id)
@@ -491,6 +578,7 @@ async def seed_history(
     due_friday: dict[date, list[str]] = {}  # OS chunk task ids, by their Friday deadline
     reslot: list[dict] = []  # DSA chunks the sweep set aside, for a new slot the next day
     tasks_written = 0
+    plate_written = 0
     memories = 0
 
     def local(day: date, at: time) -> datetime:
@@ -528,6 +616,16 @@ async def seed_history(
             s.clock.set(at)
             await act()
 
+        if day == calendar[-1]:  # the evening before the demo: the plan for the days ahead
+            s.clock.set(local(day, PLATE_AT))
+            # The minute sweep has set aside what was left of the day by now.
+            untouched = await s.tasks.sweep_passed_slots(user_id, s.clock())
+            evening = max(0, min(len(_EVENING), YESTERDAYS_SET_ASIDE - len(untouched)))
+            plate = _plate(day, today, _run_token(rng, used_tokens), zone, evening=evening)
+            await _accept_plan(s, user_id, plate, local(day, time(config.DAY_START_HOUR, 0)),
+                               at=local(day, PLATE_AT))
+            plate_written = len(plate)
+
         s.clock.set(local(day, SWEEP_AT))
         set_aside = await s.tasks.sweep_passed_slots(user_id, s.clock())
         chunks = {slot.task_id: slot.chunk for slot in slots}
@@ -541,6 +639,7 @@ async def seed_history(
     return {
         "days": days,
         "tasks": tasks_written,
+        "plate": plate_written,
         "events_by_type": dict(sorted(Counter(e.event_type.value for e in events).items())),
         "memories": memories,
         "patterns": sorted(change.pattern.pattern_key for change in changes),
@@ -627,8 +726,9 @@ async def _self_check(
 
     Every event happened before today (on the user's clock), and none at a real time
     while this run was writing (``started`` until now: what a backend's sweep would
-    stamp); one scheduled event per seeded task; and PEARL's closing look left its
-    pattern memory.
+    stamp); one scheduled event per seeded task, the current plate's included; and
+    PEARL's closing look left its pattern memory. (The plate's tasks still ahead are
+    pending with slots after today began: that is the plan, not an outcome.)
     """
     midnight = datetime.combine(today, time(0, 0), zone)
     while_seeding = (started - _CLOCK_SLACK, datetime.now(timezone.utc) + _CLOCK_SLACK)
@@ -638,8 +738,9 @@ async def _self_check(
     if late:
         problems.append(f"{len(late)} event(s) dated today or later; the seed ends yesterday")
     scheduled = sum(1 for e in events if e.event_type is TaskEventType.SCHEDULED)
-    if scheduled != report["tasks"]:
-        problems.append(f"{scheduled} scheduled events for {report['tasks']} seeded tasks")
+    seeded = report["tasks"] + report.get("plate", 0)
+    if scheduled != seeded:
+        problems.append(f"{scheduled} scheduled events for {seeded} seeded tasks")
     on_the_real_clock = [
         e for e in events
         if e.event_type in SLOT_OUTCOMES
@@ -768,6 +869,7 @@ def _format(report: dict) -> str:
     return "\n".join([
         f"Seeded {DEMO_USER_ID}: {report['days']} days, {report['tasks']} tasks,"
         f" {report['memories']} memories",
+        f"  current plate: {report.get('plate', 0)} tasks accepted yesterday evening",
         f"  events: {events}",
     ])
 
