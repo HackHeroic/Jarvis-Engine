@@ -8,7 +8,6 @@ import pytest
 import app.core.config as _cfg
 import app.models.brain.litellm_conf as _llm
 from app.container import AppContainer
-from app.core import runtime
 from app.core.model_router import attribute_llm_calls, route_llm_call
 from app.domain.entities import LLMLocation, LLMUsageEvent
 from app.domain.events import DraftAccepted, DomainEvent, EventListener, LLMCallCompleted
@@ -196,16 +195,6 @@ async def test_accept_draft_and_persist__the_containers_draft_service__draft_acc
     assert written == 1
     assert [type(e) for e in recorder.events] == [DraftAccepted]
     assert len(await container.repos.tasks.list_pending("u1")) == 1
-
-
-def test_runtime__reset_shared_clients__forgets_the_container():
-    runtime.set_container(_build())
-
-    runtime.reset_shared_clients()
-
-    assert runtime.registered_container() is None
-    # One name per meaning: get_container is the request-scoped dependency in app.api.deps.
-    assert not hasattr(runtime, "get_container")
 
 
 def test_container__pearl_detectors__chosen_here_and_only_here():

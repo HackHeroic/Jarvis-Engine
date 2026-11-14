@@ -59,9 +59,8 @@ class ChatTurn:
         self._state = state
         self._served = served
         self._ends = ends
-        # One checkpoint thread per (user, session). The user prefix matters: _load_context
-        # rebuilds the UserModel facade from the checkpointed user_id, so a session-only key
-        # would let a resumed turn rebuild another user's facade.
+        # One checkpoint thread per (user, session). The user prefix matters: a session-only
+        # key would let one user's turn resume another user's checkpointed conversation.
         self._thread_id = make_thread_id(request.user_id, session_id)
         self._config = {"configurable": {"thread_id": self._thread_id}}
         self._memories: list[dict] = []
@@ -240,8 +239,9 @@ class ChatTurnService:
 
     def __init__(self, graph: Any, *, container: "AppContainer | None",
                  db_client: Any = None) -> None:
-        # db_client: only for UserModel(db=...) and chat_history(supabase=...); a later
-        # task replaces it with repositories.
+        # db_client: only for the rows with no repository yet (Plan 3 cut Task 6): the
+        # session and its messages (chat_history), and a document the knowledge module
+        # records. Everything else comes from the container.
         self.graph = graph
         self.container = container
         self.db_client = db_client
@@ -267,7 +267,12 @@ class ChatTurnService:
         session_id = await chat_history.get_or_create_session(
             request.user_id, request.conversation_id, self.supabase
         )
-        user_model = UserModel(user_id=request.user_id, db=self.db_client)
+        # The user, read through the planning ports; without a container there is no
+        # facade, and every node that reads the user degrades as it does without one.
+        user_model = (
+            UserModel.for_planning(request.user_id, self.container.planning)
+            if self.container is not None else None
+        )
         # Progress bridge: sub-graph callbacks → SSE phase events.
         progress_queue: asyncio.Queue = asyncio.Queue()
 
@@ -278,6 +283,7 @@ class ChatTurnService:
             request, session_id=session_id, user_model=user_model,
             progress_callback=progress_cb, progress_queue=progress_queue,
             container=self.container,
+            db_client=self.db_client,
             force_cloud_request=force_cloud_request,
         )
         # Which provider and model answered each LLM call, recorded by the metering

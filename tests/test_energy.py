@@ -138,9 +138,13 @@ _USER_MODEL_TABLE = (
 async def test_heuristic__matches_user_model_table_for_every_hour(clock):
     import app.core.user_model as user_model_module
     from app.core.user_model import UserModel
+    from app.infrastructure.persistence.factory import RepositoryFactory
 
     heuristic = HeuristicEnergyEstimator()
-    user_model = UserModel("alice", db=None)
+    repos = RepositoryFactory.in_memory()
+    user_model = UserModel(
+        "alice", profiles=repos.profiles, constraints=repos.constraints, tasks=repos.tasks
+    )
 
     for hour in range(24):
         clock.freeze(datetime(2026, 11, 16, hour, 0, tzinfo=IST), user_model_module)

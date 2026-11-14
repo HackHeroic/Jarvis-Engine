@@ -44,13 +44,12 @@ async def test_synthesize_response_wraps_module_output(no_llm):
 
 @pytest.mark.asyncio
 async def test_coach_module_returns_message(no_llm):
-    from app.core import runtime
     from app.modules.coach import run_coaching_response
     from tests.fakes import build_test_container
 
-    # The mastery numbers come from the composition root's repositories (empty here).
-    runtime.set_container(build_test_container())  # conftest resets the registry afterwards
     state = {
+        # The mastery numbers come from the turn's composition root (empty here).
+        "container": build_test_container(),
         "user_model": MagicMock(),
         "user_message": "how am I doing?",
         "modules_invoked": [],
@@ -122,7 +121,7 @@ async def test_research_graph__reaches_search_evaluate_and_summarize(monkeypatch
     for step in research_module.steps:
         monkeypatch.setattr(step, "handler", _wrap(step.name, step.handler))
 
-    async def no_web_search(task_title, learning_style):
+    async def no_web_search(task_title, learning_style, *, bus=None):
         return []
 
     monkeypatch.setattr(

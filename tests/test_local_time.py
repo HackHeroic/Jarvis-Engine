@@ -136,7 +136,13 @@ def test_energy__read_on_the_users_clock(monkeypatch):
 
     monkeypatch.setattr(um, "datetime", _Frozen)
 
-    energy = asyncio.run(um.UserModel(user_id="u1", db=None).get_estimated_energy())
+    from app.infrastructure.persistence.factory import RepositoryFactory
+
+    repos = RepositoryFactory.in_memory()
+    user_model = um.UserModel(
+        "u1", profiles=repos.profiles, constraints=repos.constraints, tasks=repos.tasks
+    )
+    energy = asyncio.run(user_model.get_estimated_energy())
 
     assert energy == 0.9  # 10:00 local is the morning peak; 04:30 would read as 0.3
 

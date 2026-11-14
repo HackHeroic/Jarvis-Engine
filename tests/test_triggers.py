@@ -638,18 +638,10 @@ async def test_brief__learned_evening_peak__hard_task_in_the_peak_and_due_today_
     """The demo: what Jarvis learned moves the math. Evenings go well and mornings get set
     aside, so the hardest task that is not due today goes to the evening peak, while
     yesterday's set-aside task, due today, takes the first slot of the day."""
-    import app.core.config as config
     import app.modules.planning_graph as planning_graph
-    from app.container import AppContainer
-    from app.core import runtime
-    from app.orchestrator.hooks import ActionHooks
 
     clock.freeze(MONDAY_7_05, schedule_endpoint, planning_graph)
-    runtime.set_container(AppContainer.build(  # planning reads the focus profile through it
-        supabase_client=fake, cfg=config, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
-        install_chain=False,
-    ))
-    world = _world(fake, repos)
+    world = _world(fake, repos)  # the replanner reads the focus profile through its planning
     history = []
     for day in range(1, 15):  # two weeks of evenings done, mornings set aside
         date_ = MONDAY - timedelta(days=day)

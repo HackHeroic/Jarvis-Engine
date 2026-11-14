@@ -1171,15 +1171,17 @@ async def test_accept_after_replan__pre_existing_pending_rows_survive_in_user_ta
     """
     from app.core.user_model import UserModel
     from app.modules.planning_graph import decompose_goal, fuse_tasks
-    from tests.fakes import FakeDBClient, FakeSupabase, build_test_container
+    from tests.fakes import FakeSupabase, build_test_container
 
     supabase = FakeSupabase({"user_tasks": [
         {"user_id": "u1", "task_id": "task_1", "title": "read chapter 1",
-         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 25},
+         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 25,
+         "difficulty_weight": 0.5},  # the column's default
         {"user_id": "u1", "task_id": "calculus_task_1", "title": "integrals",
-         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 20},
+         "status": "pending", "plan_id": "plan-last-week", "duration_minutes": 20,
+         "difficulty_weight": 0.5},
     ]})
-    user_model = UserModel(user_id="u1", db=FakeDBClient(supabase))
+    user_model = UserModel.for_planning("u1", build_test_container(supabase).planning)
 
     _patch_decompose_transport(
         monkeypatch, _decompose_transport([_chunk("task_1"), _chunk("task_2")])
@@ -1265,15 +1267,13 @@ def _supabase_planning_state(supabase, message: str = "revise graph algorithms")
     """Planning-module input over one FakeSupabase: tasks, constraints and drafts alike."""
     from app.core.user_model import UserModel
     from app.modules.planning_graph import planning_state_in
-    from tests.fakes import FakeDBClient
 
+    planning = planning_services(RepositoryFactory.supabase(supabase))
     return planning_state_in({
         # A fresh UserModel per run: it caches pending tasks for its lifetime.
-        "user_model": UserModel(user_id="u1", db=FakeDBClient(supabase)),
+        "user_model": UserModel.for_planning("u1", planning),
         "user_message": message,
-        "container": SimpleNamespace(
-            planning=planning_services(RepositoryFactory.supabase(supabase))
-        ),
+        "container": SimpleNamespace(planning=planning),
     })
 
 
@@ -1363,10 +1363,10 @@ async def test_planning__carried_forward_pending_tasks__keep_their_ids(no_llm, m
     carried = [
         {"user_id": "u1", "task_id": "linear_algebra_9f3e2a_task_1", "goal_id": "linear_algebra",
          "title": "eigenvalues", "status": "pending", "duration_minutes": 20,
-         "dependencies": []},
+         "difficulty_weight": 0.5, "dependencies": []},  # the column's default weight
         {"user_id": "u1", "task_id": "linear_algebra_9f3e2a_task_2", "goal_id": "linear_algebra",
          "title": "eigenvectors", "status": "pending", "duration_minutes": 20,
-         "dependencies": ["linear_algebra_9f3e2a_task_1"]},
+         "difficulty_weight": 0.5, "dependencies": ["linear_algebra_9f3e2a_task_1"]},
     ]
     supabase = FakeSupabase({"user_tasks": [dict(r) for r in carried]})
     _patch_decompose_transport(
@@ -1490,22 +1490,18 @@ def test_belongs_to_goal__own_goal_id_decides__prefix_only_for_legacy_rows(
 # ---------------------------------------------------------------------------
 
 
-def _registered_container():
-    """A composition root registered process-wide (until Task 7 moves it into the state);
-    conftest resets the registry afterwards."""
-    from app.core import runtime
+def _container():
+    """A composition root; a planning turn's state carries its ``planning`` services."""
     from tests.fakes import build_test_container
 
-    container = build_test_container()
-    runtime.set_container(container)
-    return container
+    return build_test_container()
 
 
 @pytest.mark.asyncio
 async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    container = _registered_container()
+    container = _container()
 
     async def fake_detect(user_id, tasks, task_service, zone=None):
         assert user_id == "u1"
@@ -1516,7 +1512,7 @@ async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch)
         "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
     )
 
-    state = {"user_id": "u1", "user_model": None}
+    state = {"user_id": "u1", "user_model": None, "planning": container.planning}
     result = await mark_missed(state)
     assert result["missed_deadlines"] == [
         {"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}
@@ -1529,7 +1525,7 @@ async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch)
 async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    _registered_container()
+    planning = _container().planning
 
     async def fake_detect(user_id, tasks, task_service, zone=None):
         return []
@@ -1537,7 +1533,7 @@ async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
     monkeypatch.setattr(
         "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
     )
-    result = await mark_missed({"user_id": "u1", "user_model": None})
+    result = await mark_missed({"user_id": "u1", "user_model": None, "planning": planning})
     assert result == {"missed_deadlines": [], "anti_guilt_message": None}
 
 
@@ -1563,7 +1559,7 @@ async def test_mark_missed__no_container__nothing_scanned_or_restored(monkeypatc
 
     assert result == {"missed_deadlines": [], "anti_guilt_message": None}
     assert calls == []
-    assert any(r.levelno == logging.DEBUG and "container" in r.getMessage() for r in caplog.records)
+    assert any(r.levelno == logging.DEBUG and "planning" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -1571,7 +1567,7 @@ async def test_mark_missed__asks_back_with_nothing_set_aside__skips_the_scan(mon
     """Asking for the missed tasks never sets anything aside that turn, restored or not."""
     from app.modules.planning_graph import mark_missed
 
-    _registered_container()
+    planning = _container().planning
 
     async def fake_restore(user_id, tasks, task_service):
         return []
@@ -1588,7 +1584,8 @@ async def test_mark_missed__asks_back_with_nothing_set_aside__skips_the_scan(mon
     monkeypatch.setattr(
         "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
     )
-    state = {"user_id": "u1", "user_model": None, "user_message": "add the missed tasks back"}
+    state = {"user_id": "u1", "user_model": None, "user_message": "add the missed tasks back",
+             "planning": planning}
 
     result = await mark_missed(state)
 
@@ -1635,17 +1632,15 @@ _PLAN_NOW = datetime(2026, 11, 16, 8, 0, tzinfo=_IST)
 
 
 async def _container_with_evening_completions(count: int):
-    """A registered composition root whose history holds ``count`` 19:00 completions for u1."""
+    """A composition root whose history holds ``count`` 19:00 completions for u1."""
     from datetime import timedelta
 
     import app.core.config as cfg
     from app.container import AppContainer
-    from app.core import runtime
     from app.domain.entities import TaskEvent, TaskEventType
     from app.orchestrator.hooks import ActionHooks
 
     container = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
-    runtime.set_container(container)  # conftest resets the registry afterwards
     for day in range(1, count + 1):
         slot = (_PLAN_NOW - timedelta(days=day)).replace(hour=19)
         await container.repos.task_events.append("u1", TaskEvent(
@@ -1664,7 +1659,9 @@ async def test_fetch_constraints__learned_profile__focus_on_state(clock):
     clock.freeze(_PLAN_NOW, pg)
     container = await _container_with_evening_completions(12)
 
-    result = await pg.fetch_constraints({"user_id": "u1", "user_model": None})
+    result = await pg.fetch_constraints(
+        {"user_id": "u1", "user_model": None, "planning": container.planning}
+    )
 
     learned = await container.energy.estimate("u1", _IST, now=_PLAN_NOW)
     assert learned.source == "learned"
@@ -1677,8 +1674,10 @@ async def test_fetch_constraints__prior_profile__no_focus(clock):
     import app.modules.planning_graph as pg
 
     clock.freeze(_PLAN_NOW, pg)
-    await _container_with_evening_completions(9)  # one outcome short of a learned profile
+    container = await _container_with_evening_completions(9)  # one short of a learned profile
 
-    result = await pg.fetch_constraints({"user_id": "u1", "user_model": None})
+    result = await pg.fetch_constraints(
+        {"user_id": "u1", "user_model": None, "planning": container.planning}
+    )
 
     assert result["focus_by_hour"] is None

@@ -197,7 +197,6 @@ async def test_planning_memory_to_constraints__habit_keeps_the_hour__no_skip_blo
     """The planning node hands the bridge the user's habits along with their memories."""
     import app.core.config as cfg
     from app.container import AppContainer
-    from app.core import runtime
     from app.modules.planning_graph import memory_to_constraints
     from app.orchestrator.hooks import ActionHooks
     from tests.fakes import BagOfWordsEmbedder
@@ -206,7 +205,6 @@ async def test_planning_memory_to_constraints__habit_keeps_the_hour__no_skip_blo
         supabase_client=None, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
-    runtime.set_container(container)  # conftest resets the registry afterwards
     skips_9 = _memory(
         "behavioral_pattern", "User avoids tasks during hour 9 (3 of 3 set aside)",
         pattern_key="skip_time_window:9", confidence=0.9,
@@ -214,8 +212,11 @@ async def test_planning_memory_to_constraints__habit_keeps_the_hour__no_skip_blo
     await container.repos.memories.add("u1", skips_9)
     deep_work = {"raw_text": "Deep work 9-10 every morning", "constraint_type": "habit"}
 
-    without = await memory_to_constraints({"user_id": "u1", "constraints": []})
-    with_habit = await memory_to_constraints({"user_id": "u1", "constraints": [deep_work]})
+    planning = container.planning  # the sub-graph's collaborators, as planning_state_in copies them
+    without = await memory_to_constraints({"user_id": "u1", "constraints": [], "planning": planning})
+    with_habit = await memory_to_constraints(
+        {"user_id": "u1", "constraints": [deep_work], "planning": planning}
+    )
 
     assert {s["start_min"] % 1440 for s in without["time_slots"]} == {60}
     assert "time_slots" not in with_habit

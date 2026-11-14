@@ -104,20 +104,20 @@ def build_chain(cfg: ModuleType, hooks: ActionHooks, bus: EventBus) -> FallbackC
 
 
 async def metered_web_search(
-    search: Callable[[], Awaitable[str]], *, pii_redactions: int = 0
+    search: Callable[[], Awaitable[str]], *, bus: EventBus | None, pii_redactions: int = 0
 ) -> str:
     """Run a grounded web search and meter it into the usage ledger like any chain call.
 
     Web search is Gemini-only and runs outside the provider chain, so no
     ``MeteredProvider`` sees it. An answered search publishes ``LLMCallCompleted``
-    (provider ``gemini``, task ``web_search``) to the composition root's bus, with
-    the tokens the transport reported (zero when it reported none) and this turn's
-    attribution. An empty answer — the search failed or never ran — publishes
-    nothing: no answer, and no billed tokens anyone could see.
+    (provider ``gemini``, task ``web_search``) on ``bus`` (the composition root's, which
+    the usage ledger listens on), with the tokens the transport reported (zero when it
+    reported none) and this turn's attribution. An empty answer — the search failed or
+    never ran — publishes nothing: no answer, and no billed tokens anyone could see.
+    Without a bus (no composition root: tests, scripts) nothing is published.
     """
     from datetime import datetime, timezone
 
-    from app.core.runtime import registered_container
     from app.domain.entities import LLMUsageEvent
     from app.domain.events import LLMCallCompleted
     from app.infrastructure.llm.transport import TokenTally, collecting_tokens
@@ -126,8 +126,7 @@ async def metered_web_search(
     started = time.perf_counter()
     with collecting_tokens(tally):
         result = await search()
-    container = registered_container()
-    if not result or not result.strip() or container is None:
+    if not result or not result.strip() or bus is None:
         return result
     now = datetime.now(timezone.utc)
     usage = LLMUsageEvent(
@@ -145,7 +144,7 @@ async def metered_web_search(
         pii_redactions=pii_redactions,
         created_at=now,
     )
-    await container.events.publish(LLMCallCompleted(occurred_at=now, user_id=usage.user_id, usage=usage))
+    await bus.publish(LLMCallCompleted(occurred_at=now, user_id=usage.user_id, usage=usage))
     return result
 
 

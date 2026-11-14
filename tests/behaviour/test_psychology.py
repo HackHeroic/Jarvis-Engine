@@ -18,6 +18,7 @@ the deterministic fallbacks a user sees when the model is unavailable.
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -750,7 +751,8 @@ async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
 
     clock.freeze(MONDAY_8AM, schedule_endpoint)
     jarvis.db.table("behavioral_constraints").insert({
-        "user_id": "alice", "constraint_type": "habit", "raw_text": "I sleep from 11 PM to 7 AM",
+        "id": str(uuid4()), "user_id": "alice", "constraint_type": "habit",
+        "raw_text": "I sleep from 11 PM to 7 AM",  # the id is the table's uuid default
     }).execute()
     llm.script("habit_translation", {"semantic_slots": [
         {"name": "Sleep", "start_min": 900, "end_min": 1380,  # 23:00-07:00 local

@@ -75,13 +75,11 @@ def test_streak__completion_at_00_30_ist__counts_for_that_local_day():
 
 @pytest.mark.asyncio
 async def test_streak__reads_events_not_statuses(no_llm):
-    from app.core.runtime import set_container
     from app.core.user_model import UserModel
     from app.modules.coach import run_coaching_response
 
     supabase = FakeSupabase()
     container = _container(supabase)
-    set_container(container)
     today = datetime.now(IST).date()
     # Statuses say five days in a row ...
     for days_ago in range(5):
@@ -89,6 +87,7 @@ async def test_streak__reads_events_not_statuses(no_llm):
         supabase.table("user_tasks").insert({
             "user_id": "alice", "task_id": f"s{days_ago}", "goal_id": "g1",
             "title": "Task", "status": "completed", "duration_minutes": 25,
+            "difficulty_weight": 0.5,  # the column's default
             "completed_at": datetime.combine(day, time(12), IST).isoformat(),
         }).execute()
     # ... the outcome history says today and yesterday.
@@ -103,7 +102,8 @@ async def test_streak__reads_events_not_statuses(no_llm):
     )
 
     result = await run_coaching_response({
-        "user_model": UserModel("alice", FakeDBClient(supabase)),
+        "user_model": UserModel.for_planning("alice", container.planning),
+        "container": container,  # the turn's composition root
         "user_message": "how am I doing?",
         "modules_invoked": [],
         "error": None,

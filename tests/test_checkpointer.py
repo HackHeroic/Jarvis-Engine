@@ -22,13 +22,13 @@ from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtur
     jarvis,
     llm,
 )
-from tests.fakes import CANNED_LLM_REPLY, FakeDBClient, build_test_container, make_jarvis_state
+from tests.fakes import CANNED_LLM_REPLY, build_test_container, make_jarvis_state
 
 
 def _live_state(msg: str, **overrides) -> dict:
     """A turn carrying the real non-serializable objects the endpoint passes.
 
-    A real ``UserModel`` on purpose: it holds asyncio locks and a db client,
+    A real ``UserModel`` on purpose: it holds asyncio locks and repository ports,
     which is exactly what msgpack refuses to serialize.
     """
     from app.core.user_model import UserModel
@@ -38,7 +38,7 @@ def _live_state(msg: str, **overrides) -> dict:
     return make_jarvis_state(
         user_id="u1",
         user_message=msg,
-        user_model=UserModel(user_id="u1", db=FakeDBClient()),
+        user_model=UserModel.for_planning("u1", build_test_container().planning),
         progress_callback=lambda phase, **detail: queue.put_nowait(phase),
         progress_queue=queue,
         **overrides,
@@ -575,12 +575,10 @@ async def test_checkpointer__threads_are_isolated(no_llm, tmp_path):
 
 @pytest.mark.asyncio
 async def test_checkpointer__resumed_turn_rehydrates_the_facade(no_llm, tmp_path):
-    """The scrubbed user_model comes back as a working facade from user_id alone."""
-    from app.core.runtime import set_shared_clients
+    """The scrubbed user_model comes back as a working facade from user_id and the
+    container the next turn carries."""
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import _load_context, build_jarvis_graph
-
-    set_shared_clients(db=FakeDBClient())
 
     async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
         graph = build_jarvis_graph(checkpointer=saver)
@@ -589,7 +587,9 @@ async def test_checkpointer__resumed_turn_rehydrates_the_facade(no_llm, tmp_path
 
         resumed = (await graph.aget_state(cfg)).values
         assert resumed["user_model"] is None
+        assert resumed["container"] is None  # never checkpointed: the next turn brings its own
 
+        resumed["container"] = build_test_container()
         hydrated = (await _load_context(resumed))["user_model"]
         assert hydrated.user_id == "u1"
         assert await hydrated.get_behavioral_constraints() == []

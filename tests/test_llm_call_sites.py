@@ -673,7 +673,7 @@ async def test_research__user_message_with_an_email__redacted_before_the_search(
 
 
 class _UsageOnBus:
-    """A registered container whose bus records every LLMCallCompleted."""
+    """A composition root's bus that records every LLMCallCompleted."""
 
     def __init__(self) -> None:
         from app.domain.events import EventBus, EventListener, LLMCallCompleted
@@ -689,12 +689,8 @@ class _UsageOnBus:
 
 
 @pytest.fixture
-def usage_on_bus():
-    from app.core import runtime
-
-    container = _UsageOnBus()
-    runtime.set_container(container)  # conftest resets the registry afterwards
-    return container.recorded
+def usage_on_bus() -> _UsageOnBus:
+    return _UsageOnBus()
 
 
 @pytest.mark.asyncio
@@ -716,11 +712,13 @@ async def test_web_search__answered__metered_as_a_gemini_web_search_call(
 
     end = attribute_llm_calls("alice", "sess-1")
     try:
-        await perform_learning_style_search("graphs for madhav@example.com", "reader")
+        await perform_learning_style_search(
+            "graphs for madhav@example.com", "reader", bus=usage_on_bus.events
+        )
     finally:
         end()
 
-    (usage,) = usage_on_bus
+    (usage,) = usage_on_bus.recorded
     assert (usage.provider, usage.task, usage.role) == ("gemini", "web_search", "cloud")
     assert usage.location == LLMLocation.CLOUD
     assert (usage.user_id, usage.session_id) == ("alice", "sess-1")
@@ -735,9 +733,9 @@ async def test_web_search__transport_reports_no_tokens__metered_with_zero(
 ):
     from app.services.analytical.workspace_builder import perform_learning_style_search
 
-    await perform_learning_style_search("graphs", "reader")
+    await perform_learning_style_search("graphs", "reader", bus=usage_on_bus.events)
 
-    (usage,) = usage_on_bus
+    (usage,) = usage_on_bus.recorded
     assert (usage.task, usage.input_tokens, usage.output_tokens) == ("web_search", 0, 0)
 
 
@@ -746,6 +744,6 @@ async def test_web_search__failed__nothing_metered(web_search_down, usage_on_bus
     import app.services.analytical.workspace_builder as wb
 
     with pytest.raises(wb.WebSearchUnavailableError):
-        await wb.perform_learning_style_search("graphs", "reader")
+        await wb.perform_learning_style_search("graphs", "reader", bus=usage_on_bus.events)
 
-    assert usage_on_bus == []
+    assert usage_on_bus.recorded == []

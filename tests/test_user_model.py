@@ -1,50 +1,62 @@
 # tests/test_user_model.py
+from uuid import uuid4
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+import pytest_asyncio
 
 from app.core.user_model import UserModel
+from app.domain.entities import BehavioralConstraint
+from app.infrastructure.persistence.factory import RepositoryFactory
 
 
-@pytest.fixture
-def mock_db():
-    db = MagicMock()
-    table_mock = MagicMock()
-    select_mock = MagicMock()
-    eq_mock = MagicMock()
-    execute_mock = MagicMock()
-    execute_mock.data = [{"id": "c1", "raw_text": "no work before 11am", "constraint_type": "preference"}]
+class _CountingConstraints:
+    """The user's rules, counting each read (``ConstraintRepository.list_active``)."""
 
-    db.supabase.table.return_value = table_mock
-    table_mock.select.return_value = select_mock
-    select_mock.eq.return_value = eq_mock
-    eq_mock.execute.return_value = execute_mock
-    return db
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.reads = 0
+
+    async def list_active(self, user_id: str):
+        self.reads += 1
+        return await self.inner.list_active(user_id)
+
+
+@pytest_asyncio.fixture
+async def facade():
+    repos = RepositoryFactory.in_memory()
+    await repos.constraints.add("u1", BehavioralConstraint(
+        id=uuid4().hex, user_id="u1", raw_text="no work before 11am", constraint_type="preference",
+    ))
+    constraints = _CountingConstraints(repos.constraints)
+    user_model = UserModel(
+        "u1", profiles=repos.profiles, constraints=constraints, tasks=repos.tasks
+    )
+    return user_model, constraints
 
 
 @pytest.mark.asyncio
-async def test_get_behavioral_constraints_lazy_loads(mock_db):
-    um = UserModel(user_id="u1", db=mock_db)
-    constraints = await um.get_behavioral_constraints()
-    assert len(constraints) == 1
-    assert constraints[0]["raw_text"] == "no work before 11am"
-    mock_db.supabase.table.reset_mock()
-    constraints2 = await um.get_behavioral_constraints()
-    assert constraints2 == constraints
-    mock_db.supabase.table.assert_not_called()
+async def test_get_behavioral_constraints_lazy_loads(facade):
+    um, constraints = facade
+    first = await um.get_behavioral_constraints()
+    assert len(first) == 1
+    assert first[0]["raw_text"] == "no work before 11am"
+    second = await um.get_behavioral_constraints()
+    assert second == first
+    assert constraints.reads == 1
 
 
 @pytest.mark.asyncio
-async def test_invalidate_clears_cache(mock_db):
-    um = UserModel(user_id="u1", db=mock_db)
+async def test_invalidate_clears_cache(facade):
+    um, constraints = facade
     await um.get_behavioral_constraints()
     um.invalidate("constraints")
     await um.get_behavioral_constraints()
-    assert mock_db.supabase.table.call_count == 2
+    assert constraints.reads == 2
 
 
 @pytest.mark.asyncio
-async def test_get_estimated_energy_returns_float(mock_db):
-    um = UserModel(user_id="u1", db=mock_db)
+async def test_get_estimated_energy_returns_float(facade):
+    um, _constraints = facade
     energy = await um.get_estimated_energy()
     assert isinstance(energy, float)
     assert 0.0 <= energy <= 1.0

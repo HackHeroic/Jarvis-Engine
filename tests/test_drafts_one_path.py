@@ -217,16 +217,13 @@ def test_draft_routes__no_501_chat_route_and_every_route_typed():
 
 
 @pytest.mark.asyncio
-async def test_replanner__built_with_planning_services__no_process_wide_lookup(monkeypatch):
-    from app.core import runtime
+async def test_replanner__built_with_planning_services__no_process_wide_lookup():
+    from importlib.util import find_spec
+
     from app.modules.planning_replan import PlanningGraphReplanner
     from tests.fakes import planning_services
 
-    def no_lookup():
-        raise AssertionError("the replanner looked up a process-wide db")
-
-    monkeypatch.setattr(runtime, "get_db", no_lookup)
-    assert runtime.registered_container() is None
+    assert find_spec("app.core.runtime") is None  # there is no registry to look anything up in
     repos = RepositoryFactory.in_memory()
     seed = await repos.drafts.create(
         U, tasks=_tasks("seed"), horizon_start=None, goal_id=None, schedule=None

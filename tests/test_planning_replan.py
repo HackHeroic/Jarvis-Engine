@@ -25,7 +25,7 @@ from app.domain.events import NullEventBus
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.modules.planning_replan import PlanningGraphReplanner
 from app.services.draft_service import DraftService
-from tests.fakes import FakeDBClient, FakeSupabase, planning_services
+from tests.fakes import FakeSupabase, planning_services
 
 IST = ZoneInfo("Asia/Kolkata")
 U = "alice"
@@ -196,7 +196,9 @@ async def test_fetch_constraints__precomputed_slots__no_habit_translation_call(
     await repos.constraints.add(U, rule)
     await repos.constraints.add(U, _free_text_habit())
 
-    mixed = await fetch_constraints({"user_id": U, "user_model": UserModel(U, FakeDBClient(fake))})
+    mixed = await fetch_constraints(
+        {"user_id": U, "user_model": UserModel.for_planning(U, planning_services(repos))}
+    )
 
     assert mixed["habits_text"] == "I sleep from 11 PM to 7 AM"  # only free text is translated
     assert mixed["precomputed_slots"] == [
@@ -204,9 +206,11 @@ async def test_fetch_constraints__precomputed_slots__no_habit_translation_call(
          "valid_until": None, "max_task_duration": None, "max_difficulty": None}
     ]
 
-    only_rule = FakeSupabase()
-    await RepositoryFactory.supabase(only_rule).constraints.add(U, rule)
-    state = await fetch_constraints({"user_id": U, "user_model": UserModel(U, FakeDBClient(only_rule))})
+    only_rule = RepositoryFactory.supabase(FakeSupabase())
+    await only_rule.constraints.add(U, rule)
+    state = await fetch_constraints(
+        {"user_id": U, "user_model": UserModel.for_planning(U, planning_services(only_rule))}
+    )
     translated = await translate_habits(state)
 
     assert state["habits_text"] == ""

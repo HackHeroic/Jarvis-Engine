@@ -36,13 +36,14 @@ def initial_state(
     progress_callback: Callable[..., None],
     progress_queue: asyncio.Queue,
     container: Any,
+    db_client: Any = None,
     force_cloud_request: bool,
 ) -> dict:
     """The orchestrator's input for this turn. The conversation fields are filled under
     the turn lock (``read_conversation``), so a turn that waited sees the reply before it."""
     return {
-        # Serializable identity: survives checkpointing; user_model does not (the facade
-        # is rebuilt from user_id by _load_context only on checkpoint-resumed turns).
+        # Serializable identity: survives checkpointing; user_model does not (each turn
+        # brings its own; _load_context builds one from the container when it did not).
         "user_id": request.user_id,
         "user_model": user_model,
         "user_message": request.user_prompt,
@@ -60,6 +61,9 @@ def initial_state(
         # thread's "looks good" must resolve the draft that thread proposed, and a None
         # here would overwrite it.
         "container": container,
+        # The DatabaseClient, for the document rows with no repository yet (the knowledge
+        # module records an upload with it); transient, never checkpointed.
+        "db_client": db_client,
         "saved_constraints": None,
         "saved_rule_ids": None,
         "draft_response": None,

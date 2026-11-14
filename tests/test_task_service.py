@@ -679,18 +679,17 @@ def test_task_repository__no_reschedule__a_slot_moves_only_by_an_accepted_draft(
 
 
 @pytest.mark.asyncio
-async def test_planning_mark_missed__container_registered__deadline_missed_on_its_bus(
+async def test_planning_mark_missed__container_in_the_state__deadline_missed_on_its_bus(
     monkeypatch,
 ):
     """DeadlineMissed is published where it says: a pending task's deadline passed and a
     plan set it aside, through the composition root's TaskService."""
     import app.core.config as cfg
     from app.container import AppContainer
-    from app.core import runtime
     from app.core.user_model import UserModel
     from app.modules.planning_graph import mark_missed
     from app.orchestrator.hooks import ActionHooks
-    from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
+    from tests.fakes import BagOfWordsEmbedder, FakeSupabase
 
     fake = FakeSupabase({"user_tasks": [{
         "id": "row-t1", "user_id": U1, "task_id": "t1", "title": "Revise t1", "status": "pending",
@@ -700,13 +699,12 @@ async def test_planning_mark_missed__container_registered__deadline_missed_on_it
         supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
-    runtime.set_container(container)
     recorder = _Recorder()
     container.events.subscribe(DeadlineMissed, recorder)
 
     await mark_missed({
-        "user_id": U1, "user_model": UserModel(U1, FakeDBClient(fake)),
-        "user_message": "plan my week",
+        "user_id": U1, "user_model": UserModel.for_planning(U1, container.planning),
+        "planning": container.planning, "user_message": "plan my week",
     })
 
     assert [(type(e), e.task_id) for e in recorder.events] == [(DeadlineMissed, "t1")]
