@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.domain.entities import LLMLocation
 from app.domain.ports import LLMProvider, LLMRequest
+from app.infrastructure.llm.messages import fold_system_notes
 from app.infrastructure.llm.transport import coerce_to_schema, translated_errors
 
 
@@ -20,6 +21,7 @@ class GeminiProvider(LLMProvider):
 
     ``cfg`` is the config module, read at call time. The transport is looked up on its
     module at call time so tests that patch ``litellm_conf.hybrid_route_query`` reach it.
+    History system notes are folded into the prompt (``fold_system_notes``), as for Claude.
     """
 
     name = "gemini"
@@ -39,13 +41,14 @@ class GeminiProvider(LLMProvider):
     async def complete(self, req: LLMRequest) -> str | BaseModel:
         import app.models.brain.litellm_conf as _llm
 
+        history, prompt = fold_system_notes(req.conversation_history, req.prompt)
         with translated_errors(parse_errors=(_llm.EmptyLLMResponseError,)):
             result = await _llm.hybrid_route_query(
-                user_prompt=req.prompt,
+                user_prompt=prompt,
                 system_prompt=req.system_prompt,
                 response_schema=req.response_schema,
                 force_cloud=True,
-                conversation_history=req.conversation_history,
+                conversation_history=history,
             )
             if req.response_schema is None:
                 return result
@@ -54,13 +57,14 @@ class GeminiProvider(LLMProvider):
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
         import app.models.brain.litellm_conf as _llm
 
+        history, prompt = fold_system_notes(req.conversation_history, req.prompt)
         with translated_errors():
             tokens = await _llm.hybrid_route_query(
-                user_prompt=req.prompt,
+                user_prompt=prompt,
                 system_prompt=req.system_prompt,
                 response_schema=None,
                 force_cloud=True,
-                conversation_history=req.conversation_history,
+                conversation_history=history,
                 stream=True,
             )
             async with aclosing(tokens):

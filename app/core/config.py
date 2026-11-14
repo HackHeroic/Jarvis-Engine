@@ -167,6 +167,9 @@ DRAFT_TTL_SECONDS = 1800  # 30 minutes
 # LangGraph checkpointer — one SQLite file, one thread per (user, session).
 # Local-first: this is conversation working memory, never leaves the machine.
 CHECKPOINT_DB_PATH: str = os.getenv("JARVIS_CHECKPOINT_DB", "data/checkpoints.sqlite")
+# A daily sweep keeps this many newest checkpoints per thread (and sub-graph namespace)
+# and deletes the rest: a turn resumes from the newest, and nothing reads the history.
+CHECKPOINT_KEEP_PER_THREAD: int = 20
 
 # Horizon for scheduling (minutes)
 DEFAULT_HORIZON_MINUTES: int = 2880  # 48 hours
@@ -266,6 +269,13 @@ RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE
 MEMORY_SUPPRESS_SIMILARITY: float = 0.85
 MEMORY_DEDUPE_SIMILARITY: float = 0.85
 MEMORY_RETENTION_FLOOR: float = 0.1
+# Recall's token budgets (MemoryService.recall), estimated at 4 characters a token: the
+# always-on profile (constraints, preferences, goals) and the memories relevant to the
+# message, which count only from MEMORY_RECALL_MIN_SIMILARITY up. However many memories
+# a user has, the prompt carries at most the two budgets' worth.
+MEMORY_PROFILE_TOKENS: int = 200
+MEMORY_RECALL_TOKENS: int = 300
+MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
 
 # AWS S3 (document storage)
 AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")

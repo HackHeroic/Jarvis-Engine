@@ -274,12 +274,133 @@ async def test_checkpointer__unknown_live_object_is_dropped_not_fatal(no_llm, tm
         cfg = {"configurable": {"thread_id": "u1:sess-1"}}
 
         state = _live_state("hi")
-        state["memory_context"] = _Unserializable()  # stands in for a future live object
+        state["research_results"] = _Unserializable()  # stands in for a future live object
         result = await graph.ainvoke(state, config=cfg)
 
         assert result["response_message"] == CANNED_LLM_REPLY
-        assert (await graph.aget_state(cfg)).values["memory_context"] is None
-        assert "memory_context" in caplog.text
+        assert (await graph.aget_state(cfg)).values["research_results"] is None
+        assert "research_results" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_checkpoint__history_and_memory_context__not_persisted(no_llm, tmp_path, caplog):
+    """Both are read fresh every turn, under the turn lock, so a stored copy buys
+    nothing — and checkpoint rows would keep the user's words and memories forever."""
+    import logging
+
+    from app.orchestrator.checkpoint import open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+
+    caplog.set_level(logging.WARNING, logger="app.orchestrator.checkpoint")
+    db_path = tmp_path / "ckpt.sqlite"
+    history = [
+        {"role": "user", "content": "my bank PIN hint is ZEBRA-HISTORY"},
+        {"role": "assistant", "content": "Noted, sir."},
+    ]
+
+    async with open_checkpointer(str(db_path)) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        cfg = {"configurable": {"thread_id": "u1:sess-1"}}
+        await graph.ainvoke(
+            _live_state(
+                "hi",
+                conversation_history=history,
+                memory_context="<memory>\n- (you said, today) ZEBRA-MEMORY\n</memory>",
+            ),
+            config=cfg,
+        )
+        stored = (await graph.aget_state(cfg)).values
+
+    assert stored["conversation_history"] is None
+    assert stored["memory_context"] is None
+    on_disk = db_path.read_bytes()
+    assert b"ZEBRA-HISTORY" not in on_disk
+    assert b"ZEBRA-MEMORY" not in on_disk
+    assert "conversation_history" not in caplog.text  # the allowlist, not the fallback
+
+
+async def _checkpoint_rows(saver) -> dict[tuple[str, str], list[str]]:
+    """Checkpoint ids per (thread, namespace), oldest first."""
+    rows: dict[tuple[str, str], list[str]] = {}
+    async with saver.conn.execute(
+        "SELECT thread_id, checkpoint_ns, checkpoint_id FROM checkpoints ORDER BY checkpoint_id"
+    ) as cursor:
+        async for thread_id, ns, checkpoint_id in cursor:
+            rows.setdefault((thread_id, ns), []).append(checkpoint_id)
+    return rows
+
+
+async def _write_checkpoint_ids(saver) -> set[tuple[str, str, str]]:
+    async with saver.conn.execute(
+        "SELECT DISTINCT thread_id, checkpoint_ns, checkpoint_id FROM writes"
+    ) as cursor:
+        return {tuple(row) async for row in cursor}
+
+
+async def _three_turns_each(graph, threads: list[str]) -> None:
+    for thread_id in threads:
+        cfg = {"configurable": {"thread_id": thread_id}}
+        await graph.ainvoke(
+            _live_state("hi", negotiation_state=NegotiationPhase.ACCEPTED), config=cfg
+        )
+        for _ in range(2):
+            turn = _live_state("hi")
+            turn.pop("negotiation_state")
+            await graph.ainvoke(turn, config=cfg)
+
+
+@pytest.mark.asyncio
+async def test_prune_checkpoints__keeps_newest_n_per_thread(no_llm, tmp_path):
+    from app.orchestrator.checkpoint import open_checkpointer, prune_checkpoints
+    from app.orchestrator.graph import build_jarvis_graph
+
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        await _three_turns_each(graph, ["u1:sess-1", "u2:sess-1"])
+        before = await _checkpoint_rows(saver)
+        assert max(len(ids) for ids in before.values()) > 2
+
+        deleted = await prune_checkpoints(saver, keep_per_thread=2)
+
+        after = await _checkpoint_rows(saver)
+        assert set(after) == set(before)  # every thread and namespace keeps its newest
+        for key, ids in before.items():
+            assert after[key] == ids[-2:]
+        assert deleted == sum(len(ids) for ids in before.values()) - sum(
+            len(ids) for ids in after.values()
+        )
+        kept = {(t, ns, cid) for (t, ns), ids in after.items() for cid in ids}
+        assert await _write_checkpoint_ids(saver) <= kept  # no writes left for a pruned one
+        # The thread reads exactly as before: the newest checkpoint is whole.
+        for thread_id in ("u1:sess-1", "u2:sess-1"):
+            values = (await graph.aget_state({"configurable": {"thread_id": thread_id}})).values
+            assert values["negotiation_state"] == NegotiationPhase.ACCEPTED
+            assert values["user_id"] == "u1"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retention_sweep__returns_deleted_count(no_llm, tmp_path):
+    import inspect
+    from datetime import datetime, timedelta, timezone
+
+    from app.orchestrator.checkpoint import CheckpointRetentionSweep, open_checkpointer
+    from app.orchestrator.graph import build_jarvis_graph
+
+    async with open_checkpointer(str(tmp_path / "ckpt.sqlite")) as saver:
+        graph = build_jarvis_graph(checkpointer=saver)
+        await _three_turns_each(graph, ["u1:sess-1"])
+        before = sum(len(ids) for ids in (await _checkpoint_rows(saver)).values())
+        sweep = CheckpointRetentionSweep(saver, keep_per_thread=3)
+
+        deleted = await sweep.run(["u1"], datetime(2026, 11, 16, tzinfo=timezone.utc))
+        again = await sweep.run(["u1"], datetime(2026, 11, 17, tzinfo=timezone.utc))
+
+        after = sum(len(ids) for ids in (await _checkpoint_rows(saver)).values())
+        assert deleted == before - after > 0
+        assert again == 0
+        assert (sweep.name, sweep.interval) == ("checkpoint_retention", timedelta(hours=24))
+        keep = inspect.signature(CheckpointRetentionSweep).parameters["keep_per_thread"]
+        assert keep.default == 20  # CHECKPOINT_KEEP_PER_THREAD
 
 
 @pytest.mark.asyncio
