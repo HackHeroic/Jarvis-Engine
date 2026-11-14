@@ -5,12 +5,16 @@ and the scheduler's tick never overlap for one user: once a day holds (the check
 and the insert happen inside the lock), and no two triggers' model calls overlap.
 
 A trigger that has settled the user's local day (it made its suggestion, found one
-already made, was denied, or had nothing to say) is remembered in this process and
-not run again until the next local day, so a denied trigger does not gather and
-draft again every minute. Consent is read only when a run reaches it. Per user per
-tick that comes to: no reads while every trigger is settled; otherwise one profile
-read plus one existence check per unsettled trigger, and the two consent reads
-(constraints, dismissed keys) only when a run reaches consent.
+already made, was denied, or had nothing to say) is remembered in this process, and
+the scheduler's tick does not run it again until the next local day, so a denied
+trigger does not gather and draft again every minute. A manual run never trusts
+that memory: it always re-evaluates (once a day still holds, by the stored
+suggestion), and what it settles updates the memory. A second manual run of the
+same trigger within ``ANTICIPATION_MANUAL_COOLDOWN_SECONDS`` gets the first one's
+outcome. Consent is read only when a run reaches it. Per user per tick that comes
+to: no reads while every trigger is settled; otherwise one profile read plus one
+existence check per unsettled trigger, and the two consent reads (constraints,
+dismissed keys) only when a run reaches consent.
 
 Accepting a suggestion is claim-then-execute: a compare-and-set moves it from
 pending to accepted before its action runs, so a double-click runs the action once
@@ -25,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import app.core.config as config
 from app.domain import errors
 from app.domain.anticipation import (
     ActionResult,
@@ -127,6 +132,8 @@ class AnticipationService:
         self._locks = UserLocks()
         # One entry per (user, trigger), replaced each local day.
         self._settled: dict[tuple[str, str], _Settled] = {}
+        # The last manual run per (user, trigger): when it ran and how it ended.
+        self._manual: dict[tuple[str, str], tuple[datetime, TriggerOutcome]] = {}
 
     def register_trigger(self, trigger: Trigger) -> None:
         """Add ``trigger`` (or replace the one with its name)."""
@@ -137,19 +144,30 @@ class AnticipationService:
     ) -> TriggerOutcome:
         """Run one trigger for the user; NotFoundError if no trigger has that name.
 
-        A trigger that already settled the user's local day returns that outcome
-        without running again, forced or not.
+        A forced run is a manual one (``POST /anticipation/run``). It ignores the day
+        memory and always re-evaluates; the stored-suggestion check still keeps it to
+        one suggestion per local day. Within ``ANTICIPATION_MANUAL_COOLDOWN_SECONDS``
+        of the previous manual run of this trigger for this user, it returns that
+        run's outcome instead. An unforced run returns the remembered outcome of a
+        trigger that already settled the user's local day.
         """
         trigger = self._triggers.get(name)
         if trigger is None:
             raise errors.NotFoundError("That trigger does not exist.", details={"trigger": name})
         now = _aware(now or self._clock())
         async with self._locks.hold(user_id):
-            remembered = self._remembered(user_id, name, now)
-            if remembered is not None:
-                return remembered
+            previous = (
+                self._recent_manual(user_id, name, now)
+                if force
+                else self._remembered(user_id, name, now)
+            )
+            if previous is not None:
+                return previous
             ctx = await self._context(user_id, now, force=force)
-            return await self._run(trigger, ctx, self._consent_loader(ctx))
+            outcome = await self._run(trigger, ctx, self._consent_loader(ctx))
+            if force:
+                self._manual[(user_id, name)] = (now, outcome)
+            return outcome
 
     async def run_due(self, user_id: str, now: datetime) -> list[TriggerOutcome]:
         """Run every trigger for the user as of ``now``, one after another.
@@ -266,6 +284,15 @@ class AnticipationService:
                 else outcome,
             )
         return outcome
+
+    def _recent_manual(self, user_id: str, name: str, now: datetime) -> TriggerOutcome | None:
+        """The previous manual run's outcome, if it ran within the cooldown before ``now``."""
+        recent = self._manual.get((user_id, name))
+        if recent is None:
+            return None
+        ran_at, outcome = recent
+        cooldown = timedelta(seconds=config.ANTICIPATION_MANUAL_COOLDOWN_SECONDS)
+        return outcome if ran_at <= now < ran_at + cooldown else None
 
     def _remembered(self, user_id: str, name: str, now: datetime) -> TriggerOutcome | None:
         """The trigger's outcome if it already settled the local day ``now`` falls on."""

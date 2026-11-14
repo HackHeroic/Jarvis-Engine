@@ -340,10 +340,49 @@ async def test_run_trigger__concurrent_runs__one_suggestion(repos, log):
         service.run_due(U1, NOW),
     )
 
-    statuses = [o.status for o in outcomes[:3]] + [o.status for o in outcomes[3]]
-    assert sorted(statuses) == ["already_done", "already_done", "already_done", "created"]
+    every = [*outcomes[:3], *outcomes[3]]
+    assert "created" in [o.status for o in every]
+    assert len({o.suggestion.id for o in every if o.suggestion is not None}) == 1
     assert len(await repos.suggestions.list(U1, status=None)) == 1
     assert trigger.calls["gather"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_trigger__tick_settled_nothing_to_say__manual_run_re_evaluates(repos, log):
+    trigger = CountingTrigger(action=FakeAction(log), gathered=None)
+    service = _service(repos, log, trigger)
+    (settled,) = await service.run_due(U1, NOW)
+    trigger.gathered = "Your history now shows two hard tasks in low-focus hours."  # seeded
+
+    (still_settled,) = await service.run_due(U1, NOW + timedelta(minutes=1))
+    manual = await service.run_trigger(U1, trigger.name, force=True, now=NOW + timedelta(minutes=2))
+    (after,) = await service.run_due(U1, NOW + timedelta(minutes=3))
+
+    assert (settled.status, still_settled.status) == ("nothing_to_say", "nothing_to_say")
+    assert manual.status == "created"  # a manual run never trusts the day memory
+    assert after.status == "already_done"  # and what it made updates that memory
+    assert trigger.calls["gather"] == 2
+    assert len(await repos.suggestions.list(U1, status=None)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_trigger__two_manual_runs_inside_the_cooldown__evaluated_once(repos, log):
+    trigger = CountingTrigger(action=FakeAction(log), gathered=None)
+    service = _service(repos, log, trigger)
+
+    first = await service.run_trigger(U1, trigger.name, force=True, now=NOW)
+    second = await service.run_trigger(
+        U1, trigger.name, force=True, now=NOW + timedelta(seconds=5)
+    )
+    gathered_inside = trigger.calls["gather"]
+    third = await service.run_trigger(
+        U1, trigger.name, force=True, now=NOW + timedelta(seconds=11)
+    )
+
+    assert first.status == second.status == third.status == "nothing_to_say"
+    assert second is first  # the previous outcome, not a new evaluation
+    assert gathered_inside == 1
+    assert trigger.calls["gather"] == 2  # past the cooldown it evaluates again
 
 
 @pytest.mark.asyncio

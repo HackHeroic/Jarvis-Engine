@@ -190,6 +190,10 @@ SLOT_SWEEP_LOOKBACK_DAYS: int = 7
 # user's proactive triggers. JARVIS_ANTICIPATION=false keeps it from starting.
 ANTICIPATION_ENABLED: bool = os.getenv("JARVIS_ANTICIPATION", "true").lower() != "false"
 ANTICIPATION_TICK_SECONDS: int = 60
+# A manual run (POST /anticipation/run) always re-evaluates its trigger; a second manual
+# run of the same trigger for the same user within this many seconds gets the first
+# one's outcome instead, so repeated clicks cannot each spend a model call.
+ANTICIPATION_MANUAL_COOLDOWN_SECONDS: int = 10
 
 # The focus profile (app/services/energy.py) and the solver's energy term. Outcomes of
 # the last FOCUS_WINDOW_DAYS count for the local hour of their slot; each hour's score
