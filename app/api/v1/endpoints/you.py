@@ -70,9 +70,9 @@ class YouResponse(BaseModel):
     streak_days: int = Field(
         ge=0,
         description=(
-            "Consecutive days, ending today on the user's clock, with at least one task"
-            " completed (the coach's count, from the outcome history); 0 when nothing is"
-            " done yet today."
+            "Consecutive days on the user's clock with at least one task completed (the"
+            " coach's count, from the outcome history). Not broken until the day ends: with"
+            " nothing done yet today it counts back from yesterday."
         ),
     )
 

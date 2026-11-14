@@ -239,11 +239,13 @@ async def get_mastery_summary(
 
 
 def compute_streak_from_events(events: list[TaskEvent], zone: ZoneInfo, today: date) -> int:
-    """Consecutive local dates, ending ``today``, with at least one completion.
+    """Consecutive local dates with at least one completion, ending today or yesterday.
 
-    ``events`` is the outcome history; each slot counts as its latest outcome, and a
-    completion's day is the date it happened on in ``zone`` (00:30 IST is that IST day,
-    not the previous UTC one). No completion today is a streak of 0.
+    The one streak: the coach's and ``GET /you``'s. ``events`` is the outcome history;
+    each slot counts as its latest outcome, and a completion's day is the date it
+    happened on in ``zone`` (00:30 IST is that IST day, not the previous UTC one). A
+    streak is not broken until the local day ends: with nothing completed yet today it
+    counts back from yesterday, and only a day gone by with nothing done ends it.
     """
     days = {
         as_aware(event.occurred_at).astimezone(zone).date()
@@ -251,7 +253,7 @@ def compute_streak_from_events(events: list[TaskEvent], zone: ZoneInfo, today: d
         if event.event_type is TaskEventType.COMPLETED
     }
     streak = 0
-    day = today
+    day = today if today in days else today - timedelta(days=1)
     while day in days:
         streak += 1
         day -= timedelta(days=1)
