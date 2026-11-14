@@ -39,7 +39,7 @@ from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.llm.transport import strip_fences
-from tests.fakes import FakeDBClient, FakeSupabase, bag_of_words_embedding
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase, bag_of_words_embedding
 
 # --- the scripted language model ---------------------------------------------
 
@@ -293,9 +293,12 @@ class Jarvis:
 @pytest_asyncio.fixture
 async def jarvis(tmp_path) -> Jarvis:
     """A fresh Jarvis: empty database, empty checkpoint file, real orchestrator."""
-    from app.core.runtime import set_shared_clients
+    import app.core.config as config
+    from app.container import AppContainer
+    from app.core.runtime import set_container, set_shared_clients
     from app.orchestrator.checkpoint import open_checkpointer
     from app.orchestrator.graph import build_jarvis_graph
+    from app.orchestrator.hooks import get_hooks
     from app.services.memory.pearl import pearl_registry, register_default_patterns
 
     if not pearl_registry.registered_names():  # the lifespan's job in the app
@@ -305,6 +308,17 @@ async def jarvis(tmp_path) -> Jarvis:
         app = Jarvis(build_jarvis_graph(checkpointer=saver), supabase)
         # What the lifespan registers, for turns resumed from a checkpoint.
         set_shared_clients(db=app.state.db_client, memory_store=app.memory_store)
+        # The composition root, over the same database. The chain stays the test's:
+        # the ``llm`` fixture installs the scripted model.
+        container = AppContainer.build(
+            supabase_client=supabase,
+            cfg=config,
+            hooks=get_hooks(),
+            embedder=BagOfWordsEmbedder(),
+            install_chain=False,
+        )
+        set_container(container)
+        app.state.container = container
         yield app
         await settle_background_tasks()
 

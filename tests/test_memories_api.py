@@ -1,0 +1,176 @@
+"""The memories REST API (the Memory panel) over MemoryService.
+
+The composition root runs on the Supabase repositories over ``FakeSupabase``, with
+the bag-of-words embedder. Another user's memory reads as absent (404), and every
+error is the one envelope.
+"""
+
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+
+from app.domain.entities import MemorySource
+from app.services.memory.memory_service import MemoryCandidate
+from tests.fakes import BagOfWordsEmbedder, FakeSupabase
+
+MARATHON = "Training for the Mumbai marathon in March"
+SKIPS_AT_NINE = "Skips work around 9 AM"
+SECRET = "postgres://admin:hunter2@db.internal"
+
+_MEMORY_OUT_FIELDS = {
+    "memory_id",
+    "memory_type",
+    "content",
+    "confidence",
+    "provenance",
+    "freshness",
+    "noted_at",
+    "last_confirmed_at",
+    "observation_count",
+    "pattern_key",
+}
+
+
+def _container(supabase):
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+
+    return AppContainer.build(
+        supabase_client=supabase,
+        cfg=cfg,
+        hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+
+
+@asynccontextmanager
+async def _api(monkeypatch, container):
+    from app.main import app
+
+    monkeypatch.setattr(app.state, "container", container, raising=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest.fixture
+def supabase() -> FakeSupabase:
+    return FakeSupabase()
+
+
+@pytest.fixture
+def container(supabase):
+    return _container(supabase)
+
+
+async def _remember(container, content: str, memory_type: str = "goal", user: str = "alice", **kw):
+    outcome = await container.memory_service.remember(
+        user, MemoryCandidate(memory_type=memory_type, content=content, confidence=0.8), **kw
+    )
+    return outcome.memory
+
+
+def _row(supabase, memory_id: str) -> dict:
+    (row,) = [r for r in supabase.rows["user_memories"] if r["id"] == memory_id]
+    return row
+
+
+@pytest.mark.asyncio
+async def test_memories_api__forget_then_list__gone(monkeypatch, supabase, container):
+    marathon = await _remember(container, MARATHON)
+    pattern = await _remember(
+        container, SKIPS_AT_NINE, "behavioral_pattern",
+        provenance=MemorySource.INFERRED, origin="behavior",
+    )
+
+    async with _api(monkeypatch, container) as api:
+        forgot = await api.delete(f"/api/v1/memories/{marathon.id}", params={"user_id": "alice"})
+        panel = await api.get("/api/v1/memories/", params={"user_id": "alice"})
+
+    assert (forgot.status_code, forgot.json()) == (200, {"status": "forgotten"})
+    assert panel.status_code == 200
+    body = panel.json()
+    assert body["count"] == 1
+    (shown,) = body["memories"]
+    assert set(shown) == _MEMORY_OUT_FIELDS
+    assert (shown["memory_id"], shown["content"], shown["provenance"]) == (
+        pattern.id, SKIPS_AT_NINE, "inferred"
+    )
+    assert shown["freshness"] == pytest.approx(1.0, abs=1e-3)
+    row = _row(supabase, marathon.id)
+    assert (row["status"], row["content"]) == ("forgotten", "")
+    assert row["embedding"] is not None  # kept, so the fact is recognised if said again
+
+
+@pytest.mark.asyncio
+async def test_memories_api__other_users_memory__404(monkeypatch, supabase, container):
+    memory = await _remember(container, MARATHON)
+    before = dict(_row(supabase, memory.id))
+    path = f"/api/v1/memories/{memory.id}"
+
+    async with _api(monkeypatch, container) as api:
+        responses = [
+            await api.patch(path, params={"user_id": "bob"}, json={"content": "Hijacked"}),
+            await api.delete(path, params={"user_id": "bob"}),
+            await api.post(f"{path}/confirm", params={"user_id": "bob"}),
+            await api.post(f"{path}/dismiss", params={"user_id": "bob"}),
+        ]
+        bobs_panel = await api.get("/api/v1/memories/", params={"user_id": "bob"})
+
+    assert [r.status_code for r in responses] == [404, 404, 404, 404]
+    assert {r.json()["error"]["code"] for r in responses} == {"not_found"}
+    assert bobs_panel.json() == {"memories": [], "count": 0}
+    assert _row(supabase, memory.id) == before
+
+
+class _BrokenTable:
+    """A table whose every query fails with a planted secret."""
+
+    def __getattr__(self, _name):
+        def fail(*_args, **_kwargs):
+            raise RuntimeError(f"connection to {SECRET} refused")
+
+        return fail
+
+
+class _MemoriesDown(FakeSupabase):
+    def table(self, name: str):
+        return _BrokenTable() if name == "user_memories" else super().table(name)
+
+
+@pytest.mark.asyncio
+async def test_memories_api__store_down__503_envelope(monkeypatch):
+    container = _container(_MemoriesDown())
+
+    async with _api(monkeypatch, container) as api:
+        resp = await api.get("/api/v1/memories/", params={"user_id": "alice"})
+
+    assert resp.status_code == 503
+    error = resp.json()["error"]
+    assert set(error) == {"code", "message", "details", "request_id"}
+    assert error["code"] == "persistence_unavailable"
+    assert SECRET not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_memories_api__dismiss__status_dismissed(monkeypatch, supabase, container):
+    memory = await _remember(
+        container, SKIPS_AT_NINE, "behavioral_pattern",
+        provenance=MemorySource.INFERRED, origin="behavior",
+    )
+
+    async with _api(monkeypatch, container) as api:
+        dismissed = await api.post(
+            f"/api/v1/memories/{memory.id}/dismiss", params={"user_id": "alice"}
+        )
+        panel = await api.get("/api/v1/memories/", params={"user_id": "alice"})
+
+    assert dismissed.status_code == 200
+    assert set(dismissed.json()) == _MEMORY_OUT_FIELDS
+    assert dismissed.json()["memory_id"] == memory.id
+    row = _row(supabase, memory.id)
+    assert (row["status"], row["content"]) == ("dismissed", SKIPS_AT_NINE)  # hidden, kept
+    assert panel.json() == {"memories": [], "count": 0}

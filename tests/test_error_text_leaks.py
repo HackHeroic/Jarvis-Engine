@@ -308,15 +308,28 @@ def test_document_chunks__store_fails__503_fixed_message_secret_only_in_the_log(
 def test_edit_memory__database_fails__503_fixed_message_secret_only_in_the_log(
     app, client, monkeypatch, caplog
 ):
-    from types import SimpleNamespace
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder
 
-    store = SimpleNamespace(_supabase=_BrokenSupabase("user_memories"))
-    monkeypatch.setattr(app.state, "memory_store", store, raising=False)
+    container = AppContainer.build(
+        supabase_client=_BrokenSupabase("user_memories"),
+        cfg=cfg,
+        hooks=ActionHooks(),
+        embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
+    monkeypatch.setattr(app.state, "container", container, raising=False)
 
-    resp = client.patch("/api/v1/memories/m1", params={"user_id": "u1"}, json={"content": "x"})
+    resp = client.patch(
+        "/api/v1/memories/00000000-0000-4000-8000-000000000001",
+        params={"user_id": "u1"},
+        json={"content": "x"},
+    )
 
     assert resp.status_code == 503
-    assert resp.json()["error"]["message"] == "Could not update the memory."
+    assert resp.json()["error"]["message"] == "Could not reach the database."
     _assert_no_leak(resp)
     assert SECRET in caplog.text
 

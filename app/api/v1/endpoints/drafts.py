@@ -16,6 +16,7 @@ which would confirm the row exists.
 """
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -31,6 +32,9 @@ from app.schemas.draft import (
     DraftTaskEdit,
 )
 from app.services.draft_store import is_open_draft
+from app.services.memory.memory_service import MemoryCandidate
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -125,21 +129,27 @@ async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request:
     A draft that is no longer open raises ``InvalidStateTransition`` (409).
     """
     await _load_draft(http_request, draft_id, request.user_id)
-    await get_container(http_request).draft_service.reject(
-        request.user_id, draft_id, request.reason
-    )
+    container = get_container(http_request)
+    await container.draft_service.reject(request.user_id, draft_id, request.reason)
 
-    # The reason is behavioural signal — it is why the next plan should differ.
-    memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store and request.reason:
-        asyncio.create_task(
-            memory_store.store_memory(
-                user_id=request.user_id,
-                memory_type="feedback",
-                content=f"User rejected schedule draft: {request.reason}",
-                confidence=0.5,
+    # The reason is behavioural signal — it is why the next plan should differ — and
+    # the user's own words. The draft is rejected whether or not it is remembered.
+    reason = (request.reason or "").strip()
+    if reason:
+        try:
+            await container.memory_service.remember(
+                request.user_id,
+                MemoryCandidate(
+                    memory_type="feedback",
+                    content=f"Feedback on a proposed schedule: {reason}"[:2000],
+                ),
+                origin="draft_rejection",
             )
-        )
+        except Exception as exc:  # the rejection stands whatever happens here
+            logger.warning(
+                "The reason for rejecting draft %s was not remembered (%s)",
+                draft_id, type(exc).__name__, exc_info=exc,
+            )
 
     return {"status": "rejected", "draft_id": draft_id}
 

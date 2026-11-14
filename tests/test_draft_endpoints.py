@@ -15,7 +15,7 @@ fixture seeds through `create_draft`, exactly as the planning sub-graph does.
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.fakes import FakeDBClient, FakeSupabase
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 _UNSET = object()
 
@@ -51,7 +51,7 @@ def client():
     app.state.db_client = FakeDBClient(supabase)
     # The composition root the lifespan builds, over the same client.
     app.state.container = AppContainer.build(
-        supabase_client=supabase, cfg=cfg, hooks=ActionHooks()
+        supabase_client=supabase, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder()
     )
     app.state._test_draft_id = draft["id"]
     app.state._test_supabase = supabase
@@ -190,6 +190,38 @@ def test_reject__marks_the_draft_rejected_with_reason(client):
     row = _draft_row(client, draft_id)
     assert row["status"] == "rejected"
     assert row["rejection_reason"] == "too heavy"
+
+
+def test_reject__reason__remembered_as_feedback_the_user_said(client):
+    draft_id = client.app.state._test_draft_id
+    client.post(
+        f"/api/v1/drafts/{draft_id}/reject",
+        json={"user_id": "test_user", "reason": "too heavy"},
+    )
+
+    (row,) = client.app.state._test_supabase.rows["user_memories"]
+    assert (row["user_id"], row["memory_type"]) == ("test_user", "feedback")
+    assert (row["provenance"], row["source"], row["status"]) == ("said", "draft_rejection", "active")
+    assert "too heavy" in row["content"]
+
+
+def test_reject__memory_write_fails__still_rejected_and_logged(client, monkeypatch, caplog):
+    from app.domain import errors
+
+    async def down(*_args, **_kwargs):
+        raise errors.PersistenceError("Could not reach the database.")
+
+    monkeypatch.setattr(client.app.state.container.memory_service, "remember", down)
+    draft_id = client.app.state._test_draft_id
+
+    resp = client.post(
+        f"/api/v1/drafts/{draft_id}/reject",
+        json={"user_id": "test_user", "reason": "too heavy"},
+    )
+
+    assert resp.status_code == 200
+    assert _draft_row(client, draft_id)["status"] == "rejected"
+    assert "PersistenceError" in caplog.text
 
 
 def test_reject__never_persists_tasks(client):

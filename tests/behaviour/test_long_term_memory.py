@@ -2,7 +2,7 @@
 
 A fact mentioned in one conversation is in the model's context in the next. A
 contradiction replaces the old fact; "forget" removes it; dismissing a learned
-pattern lowers its confidence and confirming it raises it. Memories fade with
+pattern hides it and confirming it raises its confidence. Memories fade with
 time since they were last reinforced (SM-2 style decay) and drop out of context
 below the retention floor. Nobody else's memories are ever in your context.
 
@@ -76,10 +76,10 @@ def _memories(jarvis, user="alice", content=None) -> list[dict]:
 
 @asynccontextmanager
 async def _memory_api(jarvis, monkeypatch):
-    """The memories REST API (the Memory panel), over this test's store."""
+    """The memories REST API (the Memory panel), over this test's composition root."""
     from app.main import app
 
-    monkeypatch.setattr(app.state, "memory_store", jarvis.memory_store, raising=False)
+    monkeypatch.setattr(app.state, "container", jarvis.state.container, raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
@@ -164,22 +164,36 @@ async def test_memory__forget__gone_from_context_and_the_memory_panel(jarvis, ll
 
 
 @pytest.mark.asyncio
-async def test_memory__dismiss_lowers_and_confirm_raises_confidence(jarvis, llm, monkeypatch):
-    for content in ("Skips work around 9 AM", "Most productive after lunch"):
-        jarvis.memory_store.store_memory(
-            "alice", {"type": "behavioral_pattern", "content": content, "confidence": 0.8}
-        )
-    dismissed, confirmed = _memories(jarvis)
+async def test_memory__dismiss_hides_and_confirm_raises_confidence(jarvis, llm, monkeypatch):
+    from app.domain.entities import MemorySource
+    from app.services.memory.memory_service import MemoryCandidate
+
+    memory = jarvis.state.container.memory_service
+    dismissed, confirmed = [
+        (
+            await memory.remember(
+                "alice",
+                MemoryCandidate(memory_type="behavioral_pattern", content=content, confidence=0.8),
+                provenance=MemorySource.INFERRED,
+                origin="behavior",
+            )
+        ).memory
+        for content in ("Skips work around 9 AM", "Most productive after lunch")
+    ]
 
     async with _memory_api(jarvis, monkeypatch) as api:
-        r1 = await api.post(f"/api/v1/memories/{dismissed['id']}/dismiss", params={"user_id": "alice"})
-        r2 = await api.post(f"/api/v1/memories/{confirmed['id']}/confirm", params={"user_id": "alice"})
+        r1 = await api.post(f"/api/v1/memories/{dismissed.id}/dismiss", params={"user_id": "alice"})
+        r2 = await api.post(f"/api/v1/memories/{confirmed.id}/confirm", params={"user_id": "alice"})
         panel = (await api.get("/api/v1/memories/", params={"user_id": "alice"})).json()
 
     assert (r1.status_code, r2.status_code) == (200, 200)
-    confidence = {m["id"]: m["confidence"] for m in panel["memories"]}
-    assert confidence[dismissed["id"]] == pytest.approx(0.5)
-    assert confidence[confirmed["id"]] == pytest.approx(0.9)
+    confidence = {m["memory_id"]: m["confidence"] for m in panel["memories"]}
+    assert dismissed.id not in confidence
+    assert confidence[confirmed.id] == pytest.approx(0.9)
+    # Hidden from the model's context too, not only from the panel.
+    context = build_memory_context("alice", jarvis.memory_store)
+    assert dismissed.content not in context
+    assert confirmed.content in context
 
 
 # --- fading -------------------------------------------------------------------
