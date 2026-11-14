@@ -15,9 +15,12 @@ nested ``checkpoint_ns`` through this same saver:
   to survive the turn; the store itself is re-supplied from ``app.state``.
 * ``file_base64`` / ``file_bytes`` / ``file_name`` — the uploaded document in
   both its encoded and decoded forms, plus its name. Not a serialization
-  problem, a privacy one: checkpoint rows are append-only with no pruning, so
-  the upload turn's row would hold the whole document — trivially recoverable
-  with ``b64decode`` — in an unencrypted local SQLite file forever.
+  problem, a privacy one: the upload turn's rows would hold the whole document —
+  trivially recoverable with ``b64decode`` — in an unencrypted local SQLite file.
+* ``conversation_history`` / ``memory_context`` — the turn's window of earlier
+  messages and its context note (memories, plate, time). Both are read fresh
+  under the turn lock every turn, so a stored copy buys nothing, and it would
+  keep the user's words and memories (forgotten ones included) on disk.
 
 Without scrubbing, LangGraph's serializer raises
 ``TypeError: Type is not msgpack serializable: …`` and the whole turn dies.
@@ -30,15 +33,23 @@ re-supplied per turn, the file fields from the request (chat.py) and
 The key list is a fast path, not the safety net: any *new* live object added to
 any state class would silently reintroduce the crash. So the saver also catches
 what the serde rejects, nulls that value, and logs the key name.
+
+Checkpoints are written every step of every turn and nothing reads past the newest,
+so a daily ``CheckpointRetentionSweep`` keeps the newest ``CHECKPOINT_KEEP_PER_THREAD``
+per thread and deletes the rest (``prune_checkpoints``).
 """
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Mapping, Sequence
+from typing import Any, AsyncIterator, ClassVar, Mapping, Sequence
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+from app.core.config import CHECKPOINT_KEEP_PER_THREAD
+from app.domain.ports import Sweep
 
 _log = logging.getLogger(__name__)
 
@@ -51,6 +62,8 @@ _TRANSIENT_KEYS = (
     "file_base64",
     "file_bytes",
     "file_name",
+    "conversation_history",
+    "memory_context",
 )
 
 
@@ -156,6 +169,67 @@ async def open_checkpointer(db_path: str) -> AsyncIterator[ScrubbingSqliteSaver]
         yield ScrubbingSqliteSaver(conn=conn)
     finally:
         await conn.close()
+
+
+# Every checkpoint past the newest ``keep`` of its (thread, namespace). Checkpoint ids
+# are time-ordered (uuid6), so the newest sort last.
+_STALE_CHECKPOINTS = """
+    SELECT thread_id, checkpoint_ns, checkpoint_id FROM (
+        SELECT thread_id, checkpoint_ns, checkpoint_id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY thread_id, checkpoint_ns ORDER BY checkpoint_id DESC
+               ) AS newest_first
+        FROM checkpoints
+    ) WHERE newest_first > ?
+"""
+
+
+async def prune_checkpoints(saver: AsyncSqliteSaver, keep_per_thread: int) -> int:
+    """Keep the newest ``keep_per_thread`` checkpoints of each (thread, namespace).
+
+    Every older checkpoint is deleted with its ``writes`` rows, in one transaction,
+    under the saver's lock. A thread resumes from its newest checkpoint, which stays
+    whole. Returns how many checkpoints were deleted. ``keep_per_thread`` below 1
+    raises ValueError: it would delete the state a conversation resumes from.
+    """
+    if keep_per_thread < 1:
+        raise ValueError("keep_per_thread must be at least 1")
+    await saver.setup()
+    async with saver.lock, saver.conn.cursor() as cursor:
+        await cursor.execute(
+            "DELETE FROM writes WHERE (thread_id, checkpoint_ns, checkpoint_id)"
+            f" IN ({_STALE_CHECKPOINTS})",
+            (keep_per_thread,),
+        )
+        await cursor.execute(
+            "DELETE FROM checkpoints WHERE (thread_id, checkpoint_ns, checkpoint_id)"
+            f" IN ({_STALE_CHECKPOINTS})",
+            (keep_per_thread,),
+        )
+        deleted = cursor.rowcount
+        await saver.conn.commit()
+    return deleted
+
+
+class CheckpointRetentionSweep(Sweep):
+    """Runs ``prune_checkpoints`` over the whole checkpoint file, once a day.
+
+    Checkpoints are keyed by thread, not read per user, so ``user_ids`` is unused.
+    A failure propagates to the scheduler, which logs it by type.
+    """
+
+    name: ClassVar[str] = "checkpoint_retention"
+    interval: ClassVar[timedelta] = timedelta(hours=24)
+
+    def __init__(
+        self, saver: AsyncSqliteSaver, keep_per_thread: int = CHECKPOINT_KEEP_PER_THREAD
+    ) -> None:
+        self._saver = saver
+        self._keep_per_thread = keep_per_thread
+
+    async def run(self, user_ids: list[str], now: datetime) -> int:
+        """Prune every thread to its newest checkpoints; return how many were deleted."""
+        return await prune_checkpoints(self._saver, self._keep_per_thread)
 
 
 def make_thread_id(user_id: str, session_id: str) -> str:

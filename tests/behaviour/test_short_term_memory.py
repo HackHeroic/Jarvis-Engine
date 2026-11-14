@@ -83,10 +83,12 @@ async def test_chat__second_turn__model_sees_the_first_exchange_but_not_the_new_
 
     (reply_call,) = [c for c in llm.calls[calls_before:] if c.task == "voice_of_jarvis"]
     assert reply_call.prompt == "what was I revising?"
-    assert reply_call.conversation_history == [
+    *turns, note = reply_call.conversation_history  # the turn's context note comes last
+    assert turns == [
         {"role": "user", "content": "I'm revising graph algorithms today"},
         {"role": "assistant", "content": "Noted, sir: graphs today."},
     ]
+    assert note["role"] == "system" and "I'm revising" not in note["content"]
 
 
 @pytest.mark.asyncio
@@ -110,7 +112,10 @@ async def test_chat__new_conversation__starts_with_no_history_and_no_draft_under
     assert fresh.conversation_id != planned.conversation_id
     new_calls = llm.calls[calls_before:]
     assert new_calls, "the new conversation was answered by the model"
-    assert all(not c.conversation_history for c in new_calls)
+    # No earlier turns: at most the turn's context note.
+    assert all(
+        m["role"] == "system" for c in new_calls for m in (c.conversation_history or [])
+    )
     # "looks good" here is small talk: the other conversation's draft is untouched.
     assert jarvis.draft(planned.draft_id)["status"] == "pending"
     assert jarvis.rows("user_tasks") == []

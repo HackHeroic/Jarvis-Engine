@@ -3,8 +3,8 @@
 Built so the API credits buy answers, not waste:
 
 * the system prompt goes out as one cached block, so a repeated prompt is billed at
-  the cache-read rate — provided the caller keeps it byte-stable (volatile context
-  belongs in the user message);
+  the cache-read rate — provided the caller keeps it byte-stable: volatile context
+  rides in the history's system note, folded into the final user turn;
 * thinking effort follows the role (``CLAUDE_EFFORT_BY_ROLE``);
 * a structured request uses the API's structured outputs, so the reply is
   schema-valid by construction — no fence stripping, no repair loop;
@@ -44,6 +44,7 @@ from app.domain.errors import (
     LLMUnavailableError,
 )
 from app.domain.ports import LLMProvider, LLMRequest
+from app.infrastructure.llm.messages import fold_system_notes
 from app.infrastructure.llm.transport import report_token_usage
 
 logger = logging.getLogger(__name__)
@@ -227,28 +228,14 @@ class ClaudeProvider(LLMProvider):
 
 
 def _messages(req: LLMRequest) -> list[dict]:
-    """The prior turns, then the prompt as the last user turn.
+    """The prior turns, then the prompt as the last user turn (``fold_system_notes``).
 
-    Only ``role`` and ``content`` are sent. A ``system`` entry in the history goes to
-    the front of the user message, not into the cached system block: history notes
-    (e.g. how many earlier messages exist) change from turn to turn, and the system
-    block must stay byte-stable. The API wants a user turn first, so a window that
-    opens on an assistant reply drops that reply.
+    A ``system`` entry in the history (the turn's context note) goes to the front of
+    the final user message, never into the cached system block, which must stay
+    byte-stable from turn to turn to be read back from the cache.
     """
-    notes: list[str] = []
-    turns: list[dict] = []
-    for message in req.conversation_history or []:
-        role, content = message.get("role"), message.get("content")
-        if not content:
-            continue
-        if role == "system" and isinstance(content, str):
-            notes.append(content)
-        elif role in ("user", "assistant"):
-            turns.append({"role": role, "content": content})
-    while turns and turns[0]["role"] == "assistant":
-        turns.pop(0)
-    turns.append({"role": "user", "content": "\n\n".join([*notes, req.prompt])})
-    return turns
+    turns, prompt = fold_system_notes(req.conversation_history, req.prompt)
+    return [*turns, {"role": "user", "content": prompt}]
 
 
 _UNREADABLE_REPLY = "The language model sent a reply that could not be read."

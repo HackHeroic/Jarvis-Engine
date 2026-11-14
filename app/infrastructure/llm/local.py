@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
 from app.domain.ports import LLMProvider, LLMRequest
+from app.infrastructure.llm.messages import fold_system_notes
 from app.infrastructure.llm.transport import coerce_to_schema, translated_errors
 
 
@@ -18,6 +19,9 @@ class LocalLMStudioProvider(LLMProvider):
     ``cfg`` is the config module, read at call time so startup model detection and
     the ``*_PRIMARY`` switches are honoured. The transport is looked up on its module
     at call time too, so tests that patch ``litellm_conf.hybrid_route_query`` reach it.
+    History system notes are folded into the prompt (``fold_system_notes``): Gemma's chat
+    template rejects a system turn mid-conversation, and LM Studio's prefix cache keeps
+    the stable system prompt and earlier turns.
     """
 
     name = "local"
@@ -53,13 +57,14 @@ class LocalLMStudioProvider(LLMProvider):
         import app.models.brain.litellm_conf as _llm
 
         model = self._model(req)
+        history, prompt = fold_system_notes(req.conversation_history, req.prompt)
         with translated_errors(parse_errors=(_llm.EmptyLLMResponseError,)):
             result = await _llm.hybrid_route_query(
-                user_prompt=req.prompt,
+                user_prompt=prompt,
                 system_prompt=req.system_prompt,
                 response_schema=req.response_schema,
                 model_override=model,
-                conversation_history=req.conversation_history,
+                conversation_history=history,
             )
             if req.response_schema is None:
                 return result
@@ -69,13 +74,14 @@ class LocalLMStudioProvider(LLMProvider):
         import app.models.brain.litellm_conf as _llm
 
         model = self._model(req)
+        history, prompt = fold_system_notes(req.conversation_history, req.prompt)
         with translated_errors():
             tokens = await _llm.hybrid_route_query(
-                user_prompt=req.prompt,
+                user_prompt=prompt,
                 system_prompt=req.system_prompt,
                 response_schema=None,
                 model_override=model,
-                conversation_history=req.conversation_history,
+                conversation_history=history,
                 stream=True,
             )
             async with aclosing(tokens):

@@ -1217,7 +1217,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
     from contextlib import AsyncExitStack
 
     from app.api.error_handlers import error_envelope, request_id_of
+    from app.core.runtime import registered_container
     from app.domain.errors import JarvisError
+    from app.orchestrator.graph import _is_trivial_input
+    from app.services.memory.context import Recall, render_context_note
+    from app.services.planning.local_time import user_zone
+    from app.services.task_service import utc_now
     from app.services.turn_locks import thread_lock
 
     jarvis_graph = http_request.app.state.jarvis_graph
@@ -1242,7 +1247,7 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         request.user_id, request.conversation_id, supabase
     )
 
-    # Existing memories for the frontend MemoryPanel; filled by _read_conversation.
+    # The recalled memories, for the frontend MemoryPanel; filled by _read_conversation.
     _existing_memories: list[dict] = []
 
     user_model = UserModel(user_id=request.user_id, db=db_client)
@@ -1339,6 +1344,12 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         History first, then save: the window is the PRIOR context. Saved first, the
         message being answered also sat in its own history — the model read it
         twice and it took one of the ten slots.
+
+        Then the turn's context note (``memory_context``): what ``MemoryService.recall``
+        finds for this message within its token budgets (a trivial message gets the
+        profile only), the plate and the time on the user's clock. The memory panel
+        shows exactly the recalled memories. A read that fails is left out of the note
+        and logged; the turn goes on. Without a composition root there is no note.
         """
         initial_state["conversation_history"] = await build_context_messages(
             session_id, request.user_id, max_messages=10, max_chars_per_message=500, supabase=supabase
@@ -1346,15 +1357,44 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         initial_state["user_message_id"] = await save_user_message(
             session_id, request.user_id, request.user_prompt, supabase
         )
-        if memory_store:
-            # Archival memory for the model, and the active memories for the panel.
-            from app.services.memory.retriever import build_memory_context
-            initial_state["memory_context"] = await asyncio.to_thread(
-                build_memory_context, request.user_id, memory_store
+        container = registered_container()
+        if container is None:
+            return
+        now = utc_now()
+        recall = Recall(profile=[], relevant=[], tokens=0)
+        try:
+            recall = await container.memory_service.recall(
+                request.user_id,
+                request.user_prompt,
+                trivial=_is_trivial_input(request.user_prompt),
+                now=now,
             )
-            _existing_memories[:] = await asyncio.to_thread(
-                memory_store.get_active_memories, request.user_id
-            )
+        except Exception as exc:  # no memories this turn, never a failed turn
+            logger.warning(f"Recall unavailable this turn ({type(exc).__name__})")
+        plate: list[str] = []
+        try:
+            pending = await container.repos.tasks.list_pending(request.user_id)
+            pending.sort(key=lambda t: (t.scheduled_start is None, t.scheduled_start or now))
+            plate = [
+                f"{t.title} (due {t.deadline_hint})" if t.deadline_hint else t.title
+                for t in pending
+            ]
+        except Exception as exc:  # no plate this turn, never a failed turn
+            logger.warning(f"Pending tasks unavailable for the context note ({type(exc).__name__})")
+        zone = user_zone(await user_model.get_profile())
+        initial_state["memory_context"] = (
+            render_context_note(recall, now=now, zone=zone, plate=plate) or ""
+        )
+        _existing_memories[:] = [
+            {
+                "memory_id": m.id,
+                "memory_type": m.memory_type,
+                "content": m.content,
+                "confidence": m.confidence,
+                "provenance": m.provenance.value,
+            }
+            for m in recall.all()
+        ]
 
     # Which provider and model answered each LLM call of this turn, recorded by the
     # metering decorator; the reply is credited to the model that wrote it.
@@ -1675,13 +1715,9 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
                 "conversation_id": session_id,
                 "message_id": _msg_id,
                 "clarification_options": None,
-                "memories": (
-                    [
-                        {"memory_type": m.get("memory_type"), "content": m.get("content"), "confidence": m.get("confidence", 0.5)}
-                        for m in _existing_memories[:20]
-                    ]
-                    if _existing_memories else None
-                ),
+                # {memory_id, memory_type, content, confidence, provenance}: what the
+                # model was given about the user this turn.
+                "memories": list(_existing_memories) or None,
                 "pearl_insights": _insights,
                 "generation_metrics": {
                     "total_tokens": _token_count,

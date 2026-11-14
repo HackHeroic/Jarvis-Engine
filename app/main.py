@@ -154,6 +154,12 @@ async def lifespan(app: FastAPI):
         f"GEMINI_PRIMARY {'on' if _cfg.GEMINI_PRIMARY else 'off'}"
     )
 
+    # The checkpoint file is the orchestrator's own, so its daily retention sweep joins
+    # the container's sweeps here, where the checkpointer is open.
+    from app.orchestrator.checkpoint import CheckpointRetentionSweep
+
+    container.sweeps.append(CheckpointRetentionSweep(checkpointer))
+
     # Anticipation: one in-process loop runs every subsystem's sweeps, then the
     # proactive triggers. The first tick comes a full tick after startup.
     # JARVIS_ANTICIPATION=false keeps it off.

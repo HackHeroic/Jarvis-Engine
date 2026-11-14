@@ -66,9 +66,12 @@ _RULES = {
 }
 
 
-def _system_prompt_of_reply(llm, since: int) -> str:
+def _context_of_reply(llm, since: int) -> str:
+    """What the reply was told about the user: its context note, the last history entry
+    (the system prompt is the same constant for everyone)."""
     (reply_call,) = [c for c in llm.calls[since:] if c.task == "voice_of_jarvis"]
-    return reply_call.system_prompt
+    notes = [m["content"] for m in reply_call.conversation_history if m["role"] == "system"]
+    return "\n".join(notes)
 
 
 def _memories(jarvis, user="alice", content=None) -> list[dict]:
@@ -109,7 +112,7 @@ async def test_memory__fact_from_one_conversation__is_in_the_models_context_in_t
     second = await jarvis.say("What should I focus on this week?")
 
     assert second.conversation_id != first.conversation_id
-    assert MARATHON in _system_prompt_of_reply(llm, calls_before)
+    assert MARATHON in _context_of_reply(llm, calls_before)
     assert MARATHON in [m["content"] for m in second.payload["memories"]]
 
 
@@ -140,7 +143,7 @@ async def test_memory__contradiction__supersedes_the_old_fact_everywhere(jarvis,
     (new,) = _memories(jarvis, content=NIGHTS)
     assert _memories(jarvis, content=MORNINGS)[0]["superseded_by"] == new["id"]
     assert old["id"] != new["id"]
-    context = _system_prompt_of_reply(llm, calls_before)
+    context = _context_of_reply(llm, calls_before)
     assert NIGHTS in context
     assert MORNINGS not in context
     assert MORNINGS not in build_memory_context("alice", jarvis.memory_store)
@@ -163,7 +166,7 @@ async def test_memory__forget__gone_from_context_and_the_memory_panel(jarvis, ll
     assert MARATHON not in [m["content"] for m in panel.json()["memories"]]
     calls_before = len(llm.calls)
     await jarvis.say("What should I focus on this week?")
-    assert MARATHON not in _system_prompt_of_reply(llm, calls_before)
+    assert MARATHON not in _context_of_reply(llm, calls_before)
 
 
 @pytest.mark.asyncio
@@ -223,7 +226,7 @@ async def test_memory__unused_for_a_month__fades_below_the_floor_and_leaves_cont
     calls_before = len(llm.calls)
     turn = await jarvis.say("What should I focus on this week?")
 
-    assert MARATHON not in _system_prompt_of_reply(llm, calls_before)
+    assert MARATHON not in _context_of_reply(llm, calls_before)
     assert MARATHON not in [m["content"] for m in (turn.payload["memories"] or [])]
 
 
@@ -274,7 +277,7 @@ async def test_memory__another_users_memories__never_reach_my_context_or_panel(
 
     await jarvis.say("What should I focus on this week?", user="bob")
 
-    assert MARATHON not in _system_prompt_of_reply(llm, calls_before)
+    assert MARATHON not in _context_of_reply(llm, calls_before)
     # Bob's own extraction is not shown Alice's memories as known ones either.
     for call in llm.calls[calls_before:]:
         if call.task == "brain_dump_extraction":

@@ -325,6 +325,35 @@ async def test_claude__history_system_entry__prepended_to_user_message_not_syste
 
 
 @pytest.mark.asyncio
+async def test_claude__context_notes_differ__system_block_and_earlier_turns_byte_identical(
+    claude_cfg,
+):
+    """Two turns of one conversation, each with its own context note: only the final
+    user turn (which opens with the note) differs, so the cached system block is read."""
+    api = FakeAPI([_reply(), _reply()])
+    provider = _provider(claude_cfg, api)
+    earlier = [{"role": "user", "content": "plan my week"}, {"role": "assistant", "content": "Done."}]
+    later = [*earlier, {"role": "user", "content": "and Friday?"}, {"role": "assistant", "content": "Set."}]
+
+    await provider.complete(_req(
+        prompt="and Friday?", system_prompt="You are Jarvis.",
+        conversation_history=[*earlier, {"role": "system", "content": "<now>08:00</now>"}],
+    ))
+    await provider.complete(_req(
+        prompt="and Saturday?", system_prompt="You are Jarvis.",
+        conversation_history=[*later, {"role": "system", "content": "<memory>m</memory>\n<now>11:00</now>"}],
+    ))
+
+    first, second = api.bodies
+    assert json.dumps(first["system"]) == json.dumps(second["system"])
+    assert second["messages"][:2] == first["messages"][:2]
+    assert first["messages"][-1] == {"role": "user", "content": "<now>08:00</now>\n\nand Friday?"}
+    assert second["messages"][-1] == {
+        "role": "user", "content": "<memory>m</memory>\n<now>11:00</now>\n\nand Saturday?"
+    }
+
+
+@pytest.mark.asyncio
 async def test_claude__forbidden_params__never_sent(claude_cfg):
     api = FakeAPI([_reply(), _reply('{"color": "blue"}'), _Stream(["ready"], _reply())])
     provider = _provider(claude_cfg, api)

@@ -774,6 +774,90 @@ async def test_gemini__complete__forces_cloud_on_the_transport(monkeypatch, offl
     assert seen["conversation_history"] == [{"role": "user", "content": "x"}]
 
 
+# --- the context note, folded the same way for every provider ---------------------
+
+_NOTE = "<memory>\nAbout you:\n- (you said, today) Prefers mornings\n</memory>"
+_HISTORY_WITH_NOTE = [
+    {"role": "assistant", "content": "Morning, sir."},  # a window opening on a reply
+    {"role": "user", "content": "plan my week", "created_at": "2026-11-14"},
+    {"role": "assistant", "content": "Done, sir."},
+    {"role": "user", "content": ""},  # nothing to send
+    {"role": "system", "content": _NOTE},
+]
+
+
+def test_fold_system_notes__notes_prefixed_to_prompt_and_removed_from_turns():
+    from app.infrastructure.llm.messages import fold_system_notes
+
+    history = [
+        {"role": "system", "content": "[Context summary: 3 earlier messages.]"},
+        *_HISTORY_WITH_NOTE,
+    ]
+
+    turns, prompt = fold_system_notes(history, "and Friday?")
+
+    assert turns == [
+        {"role": "user", "content": "plan my week"},
+        {"role": "assistant", "content": "Done, sir."},
+    ]
+    assert prompt == f"[Context summary: 3 earlier messages.]\n\n{_NOTE}\n\nand Friday?"
+    assert fold_system_notes(None, "hi") == ([], "hi")
+    assert history[0]["role"] == "system"  # the caller's list is left as it was
+
+
+@pytest.mark.asyncio
+async def test_local_provider__system_note__folded_before_transport(monkeypatch, offline_cfg):
+    """Gemma's chat template rejects a system turn mid-conversation."""
+    seen: list[dict] = []
+
+    async def transport(**kwargs):
+        seen.append(kwargs)
+        if kwargs.get("stream"):
+            async def _gen():
+                yield ("content", "answer")
+            return _gen()
+        return "answer"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    local = LocalLMStudioProvider(offline_cfg)
+    req = _req(prompt="and Friday?", system_prompt="sys", conversation_history=_HISTORY_WITH_NOTE)
+
+    await local.complete(req)
+    await _collect(local.stream(req))
+
+    for sent in seen:
+        assert sent["system_prompt"] == "sys"
+        assert sent["user_prompt"] == f"{_NOTE}\n\nand Friday?"
+        assert sent["conversation_history"] == [
+            {"role": "user", "content": "plan my week"},
+            {"role": "assistant", "content": "Done, sir."},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_gemini_provider__system_note__folded_before_transport(monkeypatch, offline_cfg):
+    seen: list[dict] = []
+
+    async def transport(**kwargs):
+        seen.append(kwargs)
+        if kwargs.get("stream"):
+            async def _gen():
+                yield ("content", "answer")
+            return _gen()
+        return "answer"
+
+    monkeypatch.setattr(_llm, "hybrid_route_query", transport)
+    gemini = GeminiProvider(offline_cfg)
+    req = _req(prompt="and Friday?", conversation_history=_HISTORY_WITH_NOTE)
+
+    await gemini.complete(req)
+    await _collect(gemini.stream(req))
+
+    for sent in seen:
+        assert sent["user_prompt"] == f"{_NOTE}\n\nand Friday?"
+        assert all(m["role"] != "system" for m in sent["conversation_history"])
+
+
 # --- transport timeouts and usage ---------------------------------------------
 
 

@@ -5,7 +5,8 @@ old fact. Forget and dismiss stick: the row stays (a forgotten one loses its wor
 keeps its embedding and pattern key), so the same fact, said or noticed again, is
 recognised and not stored. Every memory carries its provenance: the user said it, or
 Jarvis inferred it from what happened. Strength decays with time unused; a daily sweep
-persists the decay and fades what has dropped below the retention floor.
+persists the decay and fades what has dropped below the retention floor. What the
+model is told for a message (``recall``) is a fixed token budget, whatever the count.
 
 DISMISSED and FORGOTTEN are terminal. Nothing automatic (a mention, a contradiction,
 the decay sweep) ever moves a memory out of them, and every write that could is a
@@ -33,7 +34,9 @@ from app.domain.entities import (
     MemoryStatus,
     MemoryType,
 )
+from app.domain.errors import EmbeddingUnavailableError
 from app.domain.ports import MemoryRepository, Sweep, TextEmbedder
+from app.services.memory.context import Recall, estimate_tokens, render_memory_line
 from app.services.task_service import utc_now
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,11 @@ _ACTIVE = frozenset({MemoryStatus.ACTIVE})
 _SUPERSEDE_IDS = uuid.UUID("6f1d3c2a-6b0e-4f6a-9a51-2f0c8e7d4b19")
 # A letter or digit in any script: text without one has nothing in it to remember.
 _WORD = re.compile(r"[^\W_]")
+# Recall's always-on profile: these types, in this order, from this sure up.
+_PROFILE_TYPES = ("constraint", "preference", "goal")
+_PROFILE_MIN_CONFIDENCE = 0.6
+# How many of the nearest memories recall considers for the message.
+_RECALL_CANDIDATES = 12
 
 
 class MemoryCandidate(BaseModel):
@@ -89,6 +97,30 @@ class RememberOutcome(BaseModel):
 
 def _has_words(text: str) -> bool:
     return _WORD.search(text) is not None
+
+
+def _in_use_at(memory: Memory, now: datetime) -> bool:
+    """Not expired and at least MEMORY_RETENTION_FLOOR strong at ``now``."""
+    return (memory.expires_at is None or memory.expires_at > now) and (
+        memory.strength_at(now) >= config.MEMORY_RETENTION_FLOOR
+    )
+
+
+def _within_budget(memories: list[Memory], now: datetime, budget: int) -> tuple[list[Memory], int]:
+    """The memories whose note lines fit ``budget`` tokens, taken in order, and their cost.
+
+    A line that does not fit is skipped, so one long memory never crowds out the
+    shorter ones after it. Each line is counted with its newline, so the lines
+    joined never come to more than the count.
+    """
+    chosen: list[Memory] = []
+    used = 0
+    for memory in memories:
+        cost = estimate_tokens(render_memory_line(memory, now) + "\n")
+        if used + cost <= budget:
+            chosen.append(memory)
+            used += cost
+    return chosen, used
 
 
 def _reinforcement(memory: Memory, now: datetime) -> dict:
@@ -275,9 +307,63 @@ class MemoryService:
         return [
             memory
             for memory in await self._memories.list(user_id, types=types)
-            if (memory.expires_at is None or memory.expires_at > now)
-            and memory.strength_at(now) >= config.MEMORY_RETENTION_FLOOR
+            if _in_use_at(memory, now)
         ]
+
+    async def recall(
+        self, user_id: str, query: str, *, trivial: bool = False, now: datetime | None = None
+    ) -> Recall:
+        """What to tell the model about the user for the message ``query``, within budget.
+
+        The profile: active constraints, preferences and goals at least 0.6 sure, in
+        that type order and newest (last confirmed, else created) first, added while
+        their lines fit MEMORY_PROFILE_TOKENS. Then the relevant memories: the 12
+        nearest active ones from MEMORY_RECALL_MIN_SIMILARITY up, less the profile,
+        ranked by similarity x (0.5 + 0.5 x strength now) x confidence, added while
+        their lines fit MEMORY_RECALL_TOKENS. A line too long for what is left of a
+        budget is skipped, not the end of it. Superseded, expired and below-floor
+        memories never appear, nor any memory the user let go of or another user's.
+
+        A ``trivial`` message, or one with no words, gets the profile only, without an
+        embedding call. An embedder that is down leaves the profile only, logged.
+        """
+        now = now if now is not None else self._clock()
+        active = await self.list_active(user_id, types=frozenset(_PROFILE_TYPES), now=now)
+        standing = [m for m in active if m.confidence >= _PROFILE_MIN_CONFIDENCE]
+        standing.sort(key=lambda m: m.last_confirmed_at or m.created_at, reverse=True)
+        standing.sort(key=lambda m: _PROFILE_TYPES.index(m.memory_type))  # stable: newest first
+        profile, profile_tokens = _within_budget(standing, now, config.MEMORY_PROFILE_TOKENS)
+        if trivial or not _has_words(query):
+            return Recall(profile=profile, relevant=[], tokens=profile_tokens)
+
+        try:
+            embedding = await self._embed(query)
+        except EmbeddingUnavailableError:
+            logger.warning("Recall without relevant memories: the text embedder is unavailable")
+            return Recall(profile=profile, relevant=[], tokens=profile_tokens)
+        matches = await self._memories.nearest(
+            user_id,
+            embedding,
+            statuses=_ACTIVE,
+            limit=_RECALL_CANDIDATES,
+            min_similarity=config.MEMORY_RECALL_MIN_SIMILARITY,
+        )
+        shown = {m.id for m in profile}
+        candidates = [
+            match
+            for match in matches
+            if match.memory.id not in shown and _in_use_at(match.memory, now)
+        ]
+        candidates.sort(
+            key=lambda match: match.similarity
+            * (0.5 + 0.5 * match.memory.strength_at(now))
+            * match.memory.confidence,
+            reverse=True,
+        )
+        relevant, relevant_tokens = _within_budget(
+            [match.memory for match in candidates], now, config.MEMORY_RECALL_TOKENS
+        )
+        return Recall(profile=profile, relevant=relevant, tokens=profile_tokens + relevant_tokens)
 
     async def fade_stale(self, user_id: str, now: datetime) -> int:
         """Persist each active memory's decay as of ``now``; return how many faded.
