@@ -1417,6 +1417,26 @@ async def test_fuse_tasks__legacy_row_with_guessed_goal_id__still_replaced():
     assert [c["task_id"] for c in out["task_chunks"]] == ["revise_graph_algorithms_ab12cd_task_1"]
 
 
+@pytest.mark.asyncio
+async def test_fuse_tasks__missed_task_the_user_asked_back__kept_even_for_the_same_goal():
+    """A task brought back from `missed` must be in the new draft, even though its goal
+    is the one being re-planned (whose other stale rows the decomposition replaces)."""
+    from app.modules.planning_graph import fuse_tasks
+
+    restored = {"task_id": "dsa_ab12cd_task_3", "goal_id": "dsa", "title": "Mock exam",
+                "duration_minutes": 25}
+    stale = {"task_id": "dsa_ab12cd_task_4", "goal_id": "dsa", "title": "stale",
+             "duration_minutes": 25}
+    out = await fuse_tasks({
+        "user_model": _PendingUserModel([restored, stale]),
+        "goal_id": "dsa",
+        "restored_task_ids": ["dsa_ab12cd_task_3"],
+        "task_chunks": [_chunk("dsa_ef34gh_task_1")],
+    })
+
+    assert [c["task_id"] for c in out["task_chunks"]] == ["dsa_ef34gh_task_1", "dsa_ab12cd_task_3"]
+
+
 @pytest.mark.parametrize(
     ("task_id", "row_goal", "goal", "expected"),
     [
