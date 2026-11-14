@@ -1,5 +1,7 @@
 """Domain entities: the things Jarvis reasons about, free of any framework or storage detail."""
 
+import hashlib
+import json
 import math
 from datetime import date, datetime, time
 from enum import Enum
@@ -156,7 +158,7 @@ BASE_HALFLIFE_HOURS = 168
 
 
 # The states a draft is still under review in. The only definition: the persistence
-# mapping and the legacy DraftStore both import it.
+# mapping imports it.
 OPEN_DRAFT_STATUSES: tuple[DraftStatus, ...] = (DraftStatus.PENDING, DraftStatus.MODIFIED)
 
 _OPEN_DRAFT_TARGETS = frozenset(
@@ -350,6 +352,20 @@ class DraftSchedule(BaseModel):
     rejection_reason: str | None = Field(
         default=None, description="Why the user rejected the draft, kept for learning."
     )
+    created_at: datetime | None = Field(
+        default=None, description="When it was stored; set by the store, None until then."
+    )
+
+    @property
+    def version(self) -> str:
+        """What the user is looking at, as one opaque value (an ETag): it changes whenever
+        the draft's tasks or slots change. An accept that names the version it read is
+        refused once the draft has changed since (``StaleVersionError``)."""
+        seen = json.dumps(
+            {"tasks": self.tasks, "schedule": self.schedule},
+            sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(seen.encode()).hexdigest()[:16]
 
     def transition(self, to: DraftStatus) -> "DraftSchedule":
         """Return a deep copy moved to ``to``; raise InvalidStateTransition if the move is illegal.

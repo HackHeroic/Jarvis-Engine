@@ -8,8 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.modules.planning_graph import planning_module
+from types import SimpleNamespace
+
 from app.core.module_framework import build_module_graph
+from app.domain.events import NullEventBus
+from app.infrastructure.persistence.factory import RepositoryFactory
+from app.modules.planning_graph import planning_module
+from app.services.draft_service import DraftService
+from tests.fakes import planning_services
 
 # Captured at import, before any fixture can swap it out: the decomposition
 # tests below want the REAL router in the loop and fake one layer lower.
@@ -259,13 +265,13 @@ async def test_solve_schedule__fused_pending_task_missing_fields__still_schedule
 
 @pytest.mark.asyncio
 async def test_solve_schedule__422_maps_to_infeasible():
-    """run_schedule raises HTTPException(422) on INFEASIBLE — map, don't leak."""
-    from fastapi import HTTPException
+    """run_schedule raises ScheduleInfeasibleError (422) on INFEASIBLE — map, don't leak."""
+    from app.domain.errors import ScheduleInfeasibleError
     from app.modules.planning_graph import solve_schedule
 
     with patch(
         "app.api.v1.endpoints.schedule.run_schedule",
-        side_effect=HTTPException(status_code=422, detail="INFEASIBLE"),
+        side_effect=ScheduleInfeasibleError("INFEASIBLE"),
     ):
         result = await solve_schedule(
             {
@@ -282,7 +288,7 @@ async def test_solve_schedule__422_maps_to_infeasible():
 
 @pytest.mark.asyncio
 async def test_solve_schedule__non_422_http_error__propagates():
-    """Only 422 means 'scope problem'. Anything else is a real failure."""
+    """Only infeasibility (422) means 'scope problem'. Anything else is a real failure."""
     from fastapi import HTTPException
     from app.modules.planning_graph import solve_schedule
 
@@ -439,27 +445,29 @@ async def test_solve_schedule__real_solver__single_small_task__is_feasible():
 # (DraftService.accept) happens on accept only — never in this node.
 
 
-class _FakeDraftStore:
-    """Records create_draft calls and returns whatever `row` is set to."""
+class _RecordingDrafts(DraftService):
+    """A real DraftService over ``repos`` (the InMemory family by default) that also
+    records each proposal as ``(user_id, tasks, horizon_start, goal_id)``."""
 
-    def __init__(self, row=None):
-        self.row = row if row is not None else {"draft_id": "d-123"}
+    def __init__(self, repos=None):
+        self.repos = repos if repos is not None else RepositoryFactory.in_memory()
+        super().__init__(
+            self.repos.drafts, NullEventBus(),
+            task_events=self.repos.task_events, tasks=self.repos.tasks,
+        )
         self.calls = []
-        self.other_calls = []
-        self.thread_idents = []
 
-    def create_draft(self, user_id, tasks, horizon_start, goal_id=None, schedule=None):
+    async def propose(self, user_id, *, tasks, horizon_start, goal_id, schedule):
         self.calls.append((user_id, tasks, horizon_start, goal_id))
-        self.thread_idents.append(threading.get_ident())
-        return self.row
+        return await super().propose(
+            user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
+        )
 
-    def accept_draft(self, *a, **k):
-        self.other_calls.append("accept_draft")
-        return True
 
-    def delete_draft(self, *a, **k):
-        self.other_calls.append("delete_draft")
-        return True
+def _planning(repos=None):
+    """The sub-graph's PlanningServices, its drafts recorded (``planning.drafts.calls``)."""
+    drafts = _RecordingDrafts(repos)
+    return planning_services(drafts.repos, drafts=drafts)
 
 
 def _solved_state(**overrides) -> dict:
@@ -477,11 +485,11 @@ def _solved_state(**overrides) -> dict:
 async def test_create_draft__stores_tasks_and_sets_draft_id():
     from app.modules.planning_graph import create_draft
 
-    store = _FakeDraftStore()
-    result = await create_draft(_solved_state(draft_store=store))
+    planning = _planning()
+    result = await create_draft(_solved_state(planning=planning))
 
-    assert result["draft_id"] == "d-123"
-    user_id, tasks, horizon_start, _goal = store.calls[0]
+    assert result["draft_id"] == (await planning.drafts.repos.drafts.get_open("u1")).id
+    user_id, tasks, horizon_start, _goal = planning.drafts.calls[0]
     assert user_id == "u1"
     assert tasks == [_chunk()]
     assert horizon_start == "2026-08-08T08:00:00+00:00"
@@ -489,19 +497,18 @@ async def test_create_draft__stores_tasks_and_sets_draft_id():
 
 @pytest.mark.asyncio
 async def test_create_draft__real_store_row_shape__reads_the_id_column():
-    """DraftStore.create_draft returns the Supabase row — its PK column is `id`.
-
-    draft_store.py:58-64 generates `draft_id` locally but inserts it as `"id"`
-    and returns `result.data[0]`, so a node that only reads `row["draft_id"]`
-    would hand the user a null id against a real (non-fake) store — exactly the
-    bug this task exists to remove.
-    """
+    """The draft_schedules row's PK column is `id`: the draft id handed to the user is
+    the stored row's, never a null read off a `draft_id` key the row does not have."""
     from app.modules.planning_graph import create_draft
+    from tests.fakes import FakeSupabase
 
-    store = _FakeDraftStore(row={"id": "row-uuid", "user_id": "u1", "status": "pending"})
-    result = await create_draft(_solved_state(draft_store=store))
+    supabase = FakeSupabase()
+    result = await create_draft(
+        _solved_state(planning=_planning(RepositoryFactory.supabase(supabase)))
+    )
 
-    assert result["draft_id"] == "row-uuid"
+    (row,) = supabase.rows["draft_schedules"]
+    assert result["draft_id"] == row["id"]
 
 
 @pytest.mark.asyncio
@@ -509,18 +516,21 @@ async def test_create_draft__never_persists__only_proposes():
     """Accept (Task 10) commits; this node must not touch the accept path."""
     from app.modules.planning_graph import create_draft
 
-    store = _FakeDraftStore()
-    await create_draft(_solved_state(draft_store=store))
+    from tests.fakes import FakeSupabase
 
-    assert store.other_calls == []
+    supabase = FakeSupabase()
+    await create_draft(_solved_state(planning=_planning(RepositoryFactory.supabase(supabase))))
+
+    assert supabase.rows.get("user_tasks", []) == []
+    assert [r["status"] for r in supabase.rows["draft_schedules"]] == ["pending"]
 
 
 @pytest.mark.asyncio
-async def test_create_draft__no_store__returns_none_draft_id():
+async def test_create_draft__no_planning_services__returns_none_draft_id():
     from app.modules.planning_graph import create_draft
 
     result = await create_draft(
-        {"user_id": "u1", "draft_store": None, "schedule": {"schedule": {}}, "task_chunks": []}
+        {"user_id": "u1", "planning": None, "schedule": {"schedule": {}}, "task_chunks": []}
     )
 
     assert result["draft_id"] is None
@@ -528,11 +538,16 @@ async def test_create_draft__no_store__returns_none_draft_id():
 
 @pytest.mark.asyncio
 async def test_create_draft__degraded_store__returns_none_draft_id():
-    """A clientless DraftStore returns None from every method — never crash."""
-    from app.services.draft_store import DraftStore
+    """The draft store is unreachable (PersistenceError) — never crash."""
     from app.modules.planning_graph import create_draft
+    from tests.fakes import FakeSupabase
 
-    result = await create_draft(_solved_state(draft_store=DraftStore(supabase_client=None)))
+    class _Unreachable(FakeSupabase):
+        def table(self, name):
+            raise ConnectionError("connection refused")
+
+    planning = _planning(RepositoryFactory.supabase(_Unreachable()))
+    result = await create_draft(_solved_state(planning=planning))
 
     assert result["draft_id"] is None
 
@@ -542,11 +557,11 @@ async def test_create_draft__no_schedule__does_not_call_the_store():
     """An infeasible/errored solve has nothing to propose."""
     from app.modules.planning_graph import create_draft
 
-    store = _FakeDraftStore()
-    result = await create_draft(_solved_state(draft_store=store, schedule=None))
+    planning = _planning()
+    result = await create_draft(_solved_state(planning=planning, schedule=None))
 
     assert result["draft_id"] is None
-    assert store.calls == []
+    assert planning.drafts.calls == []
 
 
 @pytest.mark.asyncio
@@ -554,15 +569,15 @@ async def test_create_draft__horizon_start_falls_back_to_the_schedule_payload():
     """solve_schedule sources it from the payload; read it there if the key is lost."""
     from app.modules.planning_graph import create_draft
 
-    store = _FakeDraftStore()
-    state = _solved_state(draft_store=store)
+    planning = _planning()
+    state = _solved_state(planning=planning)
     state.pop("horizon_start")
     state["schedule"] = {"schedule": {}, "horizon_start": "2026-08-08T08:00:00+00:00"}
 
     result = await create_draft(state)
 
-    assert result["draft_id"] == "d-123"
-    assert store.calls[0][2] == "2026-08-08T08:00:00+00:00"
+    assert result["draft_id"] is not None
+    assert planning.drafts.calls[0][2] == "2026-08-08T08:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -570,14 +585,14 @@ async def test_create_draft__no_horizon_start_anywhere__skips_the_insert():
     """draft_schedules.horizon_start is TEXT NOT NULL — inserting None can only fail."""
     from app.modules.planning_graph import create_draft
 
-    store = _FakeDraftStore()
-    state = _solved_state(draft_store=store)
+    planning = _planning()
+    state = _solved_state(planning=planning)
     state.pop("horizon_start")
 
     result = await create_draft(state)
 
     assert result["draft_id"] is None
-    assert store.calls == []
+    assert planning.drafts.calls == []
 
 
 @pytest.mark.asyncio
@@ -589,11 +604,18 @@ async def test_create_draft__does_not_block_the_event_loop():
     step timeout would be advisory only.
     """
     from app.modules.planning_graph import create_draft
+    from tests.fakes import FakeSupabase
 
-    store = _FakeDraftStore()
-    await create_draft(_solved_state(draft_store=store))
+    thread_idents = []
 
-    assert store.thread_idents[0] != threading.get_ident()
+    class _Recording(FakeSupabase):
+        def table(self, name):
+            thread_idents.append(threading.get_ident())
+            return super().table(name)
+
+    await create_draft(_solved_state(planning=_planning(RepositoryFactory.supabase(_Recording()))))
+
+    assert thread_idents and thread_idents[0] != threading.get_ident()
 
 
 @pytest.mark.asyncio
@@ -601,11 +623,14 @@ async def test_create_draft__store_raises__is_non_fatal():
     """A Supabase outage must not lose the schedule the solver just produced."""
     from app.modules.planning_graph import create_draft
 
-    class _Exploding:
-        def create_draft(self, **kwargs):
+    class _Exploding(_RecordingDrafts):
+        async def propose(self, user_id, **kwargs):
             raise RuntimeError("supabase down")
 
-    result = await create_draft(_solved_state(draft_store=_Exploding()))
+    drafts = _Exploding()
+    result = await create_draft(
+        _solved_state(planning=planning_services(drafts.repos, drafts=drafts))
+    )
 
     assert result["draft_id"] is None
 
@@ -707,14 +732,19 @@ async def test_solve_schedule__rule_copies_past_the_horizon__never_reach_the_sol
     ]
 
 
-def test_planning_state_in__carries_the_draft_store_into_the_subgraph():
+def test_planning_state_in__carries_the_planning_services_into_the_subgraph():
+    from types import SimpleNamespace
+
     from app.modules.planning_graph import planning_state_in
 
-    store = _FakeDraftStore()
-    module_state = planning_state_in({"user_model": None, "draft_store": store})
+    planning = _planning()
+    module_state = planning_state_in(
+        {"user_model": None, "container": SimpleNamespace(planning=planning)}
+    )
 
-    assert module_state["draft_store"] is store
+    assert module_state["planning"] is planning
     assert module_state["draft_id"] is None
+    assert planning_state_in({"user_model": None, "container": None})["planning"] is None
 
 
 def test_planning_state_out__exposes_draft_id_and_opens_review():
@@ -841,17 +871,18 @@ async def test_planning_subgraph__feasible_solve__reaches_create_draft(no_llm, m
 
     _patch_decompose_transport(monkeypatch)
 
-    store = _FakeDraftStore(row={"id": "row-uuid"})
+    planning = _planning()
     module_state = planning_state_in(
-        {"user_model": None, "user_message": "revise for the exam", "draft_store": store}
+        {"user_model": None, "user_message": "revise for the exam",
+         "container": SimpleNamespace(planning=planning)}
     )
 
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
     assert result["schedule"] is not None
-    assert result["draft_id"] == "row-uuid"
+    assert result["draft_id"] == (await planning.drafts.repos.drafts.get_open("demo")).id
     # The draft carries the fused chunks and the solver's own horizon_start.
-    _user_id, tasks, horizon_start, _goal = store.calls[0]
+    _user_id, tasks, horizon_start, _goal = planning.drafts.calls[0]
     assert len(tasks) == 6
     assert datetime.fromisoformat(horizon_start).hour == 8
 
@@ -903,7 +934,7 @@ async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(m
 
     module_state = planning_state_in(
         {"user_model": None, "user_message": "revise for the compilers exam",
-         "draft_store": None}
+         "container": None}
     )
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
@@ -913,7 +944,7 @@ async def test_planning_subgraph__clear_goal__decompose_goal_runs_exactly_once(m
         "fuse_tasks": 1, "solve_schedule": 1, "create_draft": 1,
     }
     assert result["schedule"] is not None
-    assert result["draft_id"] is None  # degrades gracefully with no draft_store
+    assert result["draft_id"] is None  # degrades gracefully with no planning services
 
 
 @pytest.mark.asyncio
@@ -934,7 +965,7 @@ async def test_planning_subgraph__unclear_goal__decompose_goal_never_runs(monkey
     _patch_decompose_transport(monkeypatch)
 
     module_state = planning_state_in(
-        {"user_model": None, "user_message": "hi", "draft_store": None}
+        {"user_model": None, "user_message": "hi", "container": None}
     )
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
@@ -954,7 +985,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
     pipeline; if it re-triggered the fan-in the user would pay for a fresh 27B
     decomposition on every rung of the horizon ladder.
     """
-    from fastapi import HTTPException
+    from app.domain.errors import ScheduleInfeasibleError
     from app.modules.planning_graph import planning_module, planning_state_in
 
     counts = _count_invocations(
@@ -973,7 +1004,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
     def flaky_run_schedule(*args, **kwargs):
         attempts.append(kwargs.get("horizon_minutes"))
         if len(attempts) <= 2:
-            raise HTTPException(status_code=422, detail="INFEASIBLE")
+            raise ScheduleInfeasibleError("INFEASIBLE")
         return ok
 
     monkeypatch.setattr(
@@ -982,7 +1013,7 @@ async def test_planning_subgraph__infeasible_ladder__reruns_solve_only(monkeypat
 
     module_state = planning_state_in(
         {"user_model": None, "user_message": "revise for the compilers exam",
-         "draft_store": None}
+         "container": None}
     )
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
@@ -1199,18 +1230,18 @@ async def test_planning_subgraph__namespaced_ids__reach_the_solver_and_the_draft
         _decompose_transport([_chunk("task_1"), _chunk("task_2", dependencies=["task_1"])]),
     )
 
-    store = _FakeDraftStore(row={"id": "row-uuid"})
+    planning = _planning()
     module_state = planning_state_in({
         "user_model": _PendingUserModel(
             [{"task_id": "calculus_task_1", "title": "integrals", "duration_minutes": 20}]
         ),
         "user_message": "revise graph algorithms",
-        "draft_store": store,
+        "container": SimpleNamespace(planning=planning),
     })
 
     result = await build_module_graph(planning_module).ainvoke(module_state)
 
-    _user_id, tasks, _horizon_start, goal = store.calls[0]
+    _user_id, tasks, _horizon_start, goal = planning.drafts.calls[0]
     assert goal == "revise_graph_algorithms"  # the draft row names its own namespace
     draft_ids = [t["task_id"] for t in tasks]
     run = _run_token(draft_ids[0], "revise_graph_algorithms")
@@ -1234,14 +1265,15 @@ def _supabase_planning_state(supabase, message: str = "revise graph algorithms")
     """Planning-module input over one FakeSupabase: tasks, constraints and drafts alike."""
     from app.core.user_model import UserModel
     from app.modules.planning_graph import planning_state_in
-    from app.services.draft_store import DraftStore
     from tests.fakes import FakeDBClient
 
     return planning_state_in({
         # A fresh UserModel per run: it caches pending tasks for its lifetime.
         "user_model": UserModel(user_id="u1", db=FakeDBClient(supabase)),
         "user_message": message,
-        "draft_store": DraftStore(supabase_client=supabase),
+        "container": SimpleNamespace(
+            planning=planning_services(RepositoryFactory.supabase(supabase))
+        ),
     })
 
 
@@ -1376,15 +1408,15 @@ async def test_planning__replan_learn__leaves_learn_dsa_tasks_untouched(no_llm, 
     stale_learn = {"task_id": "learn_1a2b3c_task_1", "goal_id": "learn", "title": "old",
                    "duration_minutes": 20, "dependencies": []}
     _patch_decompose_transport(monkeypatch, _decompose_transport([_chunk("task_1")]))
-    store = _FakeDraftStore(row={"id": "row-uuid"})
+    planning = _planning()
 
     await build_module_graph(planning_module).ainvoke(planning_state_in({
         "user_model": _PendingUserModel([*learn_dsa, stale_learn]),
         "user_message": "learn",
-        "draft_store": store,
+        "container": SimpleNamespace(planning=planning),
     }))
 
-    _user_id, tasks, _horizon_start, goal = store.calls[0]
+    _user_id, tasks, _horizon_start, goal = planning.drafts.calls[0]
     assert goal == "learn"
     by_id = {t["task_id"]: t for t in tasks}
     for row in learn_dsa:  # carried forward exactly as they were

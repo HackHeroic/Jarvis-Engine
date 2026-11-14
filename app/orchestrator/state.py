@@ -90,9 +90,6 @@ class JarvisState(TypedDict):
     progress_callback: Any
     progress_queue: Any
 
-    # Live Supabase-backed DraftStore from app.state — transient like
-    # user_model, re-supplied per turn by ChatTurnService, never checkpointed.
-    draft_store: Any
     # The composition root (AppContainer) the turn was opened with, or None (unit tests,
     # scripts: a feature that needs it is then off). Transient, set fresh every turn.
     container: Any
@@ -108,6 +105,10 @@ class JarvisState(TypedDict):
     # PEARL's insights from the turn's own look, for the complete frame; None when the
     # look did not finish (the frame then asks PEARL itself).
     pearl_insights: Optional[list[dict]]
+    # What the learning step sent this turn (memory_extracted / pattern_detected frames),
+    # for its phase frame. Undeclared, LangGraph dropped both and the frame said 0 and 0.
+    memories_extracted_count: Optional[int]
+    patterns_detected_count: Optional[int]
 
     # Per-turn flags
     trivial_input: Optional[bool]            # set when greeting/emotional fast-path fires

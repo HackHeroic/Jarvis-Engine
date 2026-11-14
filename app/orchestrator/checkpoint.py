@@ -10,11 +10,11 @@ nested ``checkpoint_ns`` through this same saver:
 * ``progress_callback`` — a closure over the SSE queue
 * ``progress_queue``  — the ``asyncio.Queue`` itself
 * ``db_client``       — the live ``DatabaseClient`` (KnowledgeState)
-* ``draft_store``     — the live ``DraftStore`` wrapping the Supabase client
-  (JarvisState and PlanningState). Only ``draft_id`` — a plain string — needs
-  to survive the turn; the store itself is re-supplied from ``app.state``.
 * ``container``       — the turn's ``AppContainer`` (composition root), re-supplied
-  by ``ChatTurnService`` every turn.
+  by ``ChatTurnService`` every turn. Only ``draft_id`` — a plain string — needs to
+  survive the turn; the drafts are reached through the container's ``DraftService``.
+* ``planning``        — the planning sub-graph's ``PlanningServices`` (PlanningState),
+  copied from the container by ``planning_state_in`` every turn.
 * ``file_base64`` / ``file_bytes`` / ``file_name`` — the uploaded document in
   both its encoded and decoded forms, plus its name. Not a serialization
   problem, a privacy one: the upload turn's rows would hold the whole document —
@@ -62,8 +62,8 @@ _TRANSIENT_KEYS = (
     "progress_callback",
     "progress_queue",
     "db_client",
-    "draft_store",
     "container",
+    "planning",
     "file_base64",
     "file_bytes",
     "file_name",

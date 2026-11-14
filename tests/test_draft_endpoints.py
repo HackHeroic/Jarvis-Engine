@@ -8,9 +8,12 @@ Supabase persistence and 9d3c09f reduced to no-op shims — `get()` was a
 hardcoded `return None`, so every read/accept/reject 404'd regardless of what
 was seeded, while `jarvis-frontend/lib/api.ts:485-556` called all four.
 
-The endpoints now run on the real DraftStore API, so the markers are gone. The
-fixture seeds through `create_draft`, exactly as the planning sub-graph does.
+The endpoints now run on the composition root's DraftService, so the markers are
+gone. The fixture seeds through `DraftService.propose`, exactly as the planning
+sub-graph does.
 """
+
+import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,38 +31,33 @@ def client():
     from app.container import AppContainer
     from app.main import app
     from app.orchestrator.hooks import ActionHooks
-    from app.services.draft_store import DraftStore
 
-    original_store = getattr(app.state, "draft_store", _UNSET)
     original_db = getattr(app.state, "db_client", _UNSET)
     original_container = getattr(app.state, "container", _UNSET)
 
-    # One FakeSupabase behind both the draft store and the db client, so an
-    # accept can be observed writing user_tasks in the same place it reads
-    # draft_schedules — the real deployment shares one client too.
+    # One FakeSupabase behind both the drafts and the db client, so an accept can be
+    # observed writing user_tasks in the same place it reads draft_schedules — the
+    # real deployment shares one client too.
     supabase = FakeSupabase()
-    store = DraftStore(supabase_client=supabase, ttl_seconds=300)
-    draft = store.create_draft(
-        user_id="test_user",
+    app.state.db_client = FakeDBClient(supabase)
+    # The composition root the lifespan builds, over the same client.
+    app.state.container = AppContainer.build(
+        supabase_client=supabase, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder()
+    )
+    draft = _propose(
+        app.state.container,
         tasks=[
             {"task_id": "t1", "title": "Read ch1", "duration_minutes": 25},
             {"task_id": "t2", "title": "Practice problems", "duration_minutes": 20},
         ],
         horizon_start=HORIZON,
     )
-    app.state.draft_store = store
-    app.state.db_client = FakeDBClient(supabase)
-    # The composition root the lifespan builds, over the same client.
-    app.state.container = AppContainer.build(
-        supabase_client=supabase, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder()
-    )
-    app.state._test_draft_id = draft["id"]
+    app.state._test_draft_id = draft.id
     app.state._test_supabase = supabase
 
     yield TestClient(app)
 
     for name, original in (
-        ("draft_store", original_store),
         ("db_client", original_db),
         ("container", original_container),
     ):
@@ -69,8 +67,17 @@ def client():
             setattr(app.state, name, original)
 
 
+def _propose(container, *, tasks: list[dict], horizon_start: str, schedule=None):
+    """A draft proposed the way the planning sub-graph proposes one."""
+    return asyncio.run(container.draft_service.propose(
+        "test_user", tasks=tasks, horizon_start=horizon_start, goal_id=None, schedule=schedule
+    ))
+
+
 def _draft_row(client, draft_id: str, user_id: str = "test_user") -> dict | None:
-    return client.app.state.draft_store.get_draft(draft_id, user_id)
+    """The stored draft_schedules row, or None when the user has no such draft."""
+    rows = client.app.state._test_supabase.rows.get("draft_schedules", [])
+    return next((r for r in rows if r["id"] == draft_id and r["user_id"] == user_id), None)
 
 
 # ── read ────────────────────────────────────────────────────────────────────
@@ -88,9 +95,8 @@ def test_get_draft(client):
 
 
 def test_get_draft__solved_draft__schedule_slots_with_local_times(client):
-    store = client.app.state.draft_store
-    draft = store.create_draft(
-        user_id="test_user",
+    draft = _propose(
+        client.app.state.container,
         tasks=[
             {"task_id": "t1", "title": "Read ch1", "duration_minutes": 25},
             {"task_id": "t2", "title": "Practice problems", "duration_minutes": 20},
@@ -100,7 +106,7 @@ def test_get_draft__solved_draft__schedule_slots_with_local_times(client):
         schedule={"t1": {"start_min": 60, "end_min": 85}, "t2": {"start_min": 0, "end_min": 20}},
     )
 
-    body = client.get(f"/api/v1/drafts/{draft['id']}?user_id=test_user").json()
+    body = client.get(f"/api/v1/drafts/{draft.id}?user_id=test_user").json()
 
     # The chat complete payload's shape (horizon_start + task_id -> minutes), plus the
     # wall-clock start and end on the user's clock and each slot's length.
@@ -351,13 +357,15 @@ def test_modify_unknown_component(client):
         f"/api/v1/drafts/{draft_id}/modify",
         json={"user_id": "test_user", "component": "habits", "data": []},
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
 
 
 def test_delete_draft(client):
+    """DELETE is a discard (decision 11): the draft expires and its row is kept."""
     draft_id = client.app.state._test_draft_id
     assert client.delete(f"/api/v1/drafts/{draft_id}?user_id=test_user").status_code == 200
-    assert _draft_row(client, draft_id) is None
+    assert _draft_row(client, draft_id)["status"] == "expired"
 
 
 def test_delete_draft_wrong_user(client):
@@ -366,11 +374,11 @@ def test_delete_draft_wrong_user(client):
     assert _draft_row(client, draft_id) is not None
 
 
-def test_endpoints_require_a_draft_store(client):
-    """Degraded startup (no Supabase) must answer 503, not crash."""
+def test_endpoints_require_a_draft_service(client):
+    """No composition root to reach the drafts through must answer 503, not crash."""
     from app.main import app
 
-    app.state.draft_store = None
+    app.state.container = None
     assert client.get("/api/v1/drafts/whatever?user_id=test_user").status_code == 503
 
 
@@ -502,30 +510,9 @@ def test_reject_endpoint__accepted_draft__409_envelope(client):
     assert row.get("rejection_reason") is None
 
 
-def test_chat_modify__is_not_implemented(client):
-    """It used to answer `{"status": "modified"}` having modified nothing.
-
-    The handler branched on `app.state.schedule_modifier`, which is assigned
-    nowhere in the codebase, so the fallback — a bare "modified" — was the only
-    reachable path. No frontend caller exists (jarvis-frontend/lib/api.ts calls
-    accept/reject/edit/delete on drafts, never /chat), so 501 costs nothing and
-    stops the endpoint lying to whoever finds it next.
-    """
-    draft_id = client.app.state._test_draft_id
-    resp = client.post(
-        f"/api/v1/drafts/{draft_id}/chat",
-        json={"user_id": "test_user", "message": "move the second task to tomorrow"},
-    )
-
-    assert resp.status_code == 501
-    assert resp.json()["error"]["message"] == "draft chat modification not implemented"
-    # The draft is untouched — a 501 must not have half-applied anything.
-    assert [t["task_id"] for t in _draft_row(client, draft_id)["tasks"]] == ["t1", "t2"]
-
-
 def test_accept__draft_with_no_tasks__is_not_reported_accepted(client):
     draft_id = client.app.state._test_draft_id
-    client.app.state.draft_store.replace_tasks(draft_id, "test_user", [])
+    asyncio.run(client.app.state.container.repos.drafts.replace_tasks("test_user", draft_id, []))
 
     resp = client.post(f"/api/v1/drafts/{draft_id}/accept", json={"user_id": "test_user"})
 

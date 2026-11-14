@@ -238,22 +238,20 @@ class ChatTurn:
 class ChatTurnService:
     """Opens chat turns over the orchestrator graph and the composition root."""
 
-    def __init__(self, graph: Any, *, container: "AppContainer | None", db_client: Any = None,
-                 draft_store: Any = None) -> None:
-        # db_client: only for UserModel(db=...) and chat_history(supabase=...); draft_store:
-        # only for planning's create_draft. Later tasks replace both with repositories.
+    def __init__(self, graph: Any, *, container: "AppContainer | None",
+                 db_client: Any = None) -> None:
+        # db_client: only for UserModel(db=...) and chat_history(supabase=...); a later
+        # task replaces it with repositories.
         self.graph = graph
         self.container = container
         self.db_client = db_client
         self.supabase = getattr(db_client, "supabase", None) if db_client else None
-        self.draft_store = draft_store
 
     @classmethod
     def for_app(cls, state: Any) -> "ChatTurnService":
         """The service over what the lifespan put on ``app.state``."""
         return cls(state.jarvis_graph, container=getattr(state, "container", None),
-                   db_client=getattr(state, "db_client", None),
-                   draft_store=getattr(state, "draft_store", None))
+                   db_client=getattr(state, "db_client", None))
 
     async def open_turn(self, request: ChatStreamRequest, *, request_id: str) -> ChatTurn:
         """Open one turn in the caller's context: the cloud flag (when the model picker
@@ -279,7 +277,7 @@ class ChatTurnService:
         state = initial_state(
             request, session_id=session_id, user_model=user_model,
             progress_callback=progress_cb, progress_queue=progress_queue,
-            draft_store=self.draft_store, container=self.container,
+            container=self.container,
             force_cloud_request=force_cloud_request,
         )
         # Which provider and model answered each LLM call, recorded by the metering

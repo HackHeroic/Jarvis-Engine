@@ -1,84 +1,78 @@
 # app/api/v1/endpoints/drafts.py
 """Draft review/accept/reject endpoints.
 
-Routing and parsing only. Accepting (write the tasks and mark the draft accepted,
-in one transaction) and rejecting are ``DraftService`` moves, taken from the
-composition root (``get_container``) — the same service the orchestrator's
-``draft_action`` node reaches through ``app.services.draft_actions``.
+Routing and parsing only. Every handler goes through the composition root's
+``DraftService`` (``get_container``) — the same service the orchestrator's
+``draft_action`` node uses, reached through ``app.services.draft_actions``.
 
 A draft that is no longer open (already accepted, rejected or expired) cannot be
-accepted, rejected or edited: ``InvalidStateTransition`` reaches the global
-handler, which answers 409 in the error envelope.
+accepted, rejected, edited or discarded: the draft state machine raises
+``InvalidStateTransition`` before anything is written, and the global handler answers
+409 in the error envelope.
 
-Every handler passes ``user_id`` into ``DraftStore``, which filters on it, so a
-draft belonging to somebody else reads as absent and answers 404 — never 403,
-which would confirm the row exists.
+Every ``DraftService`` call takes ``user_id`` and the repository filters on it, so a
+draft belonging to somebody else reads as absent and answers 404 — never 403, which
+would confirm the row exists.
 """
 
-import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
 
-from app.api.deps import get_container
+from app.api.deps import container_of
 from app.domain import errors
+from app.domain.entities import DraftSchedule
 from app.schemas.draft import (
     DraftAcceptRequest,
     DraftAcceptResponse,
-    DraftChatRequest,
+    DraftDiscardResponse,
+    DraftEditResponse,
     DraftModifyRequest,
     DraftRearrangeRequest,
+    DraftRearrangeResponse,
     DraftRejectRequest,
+    DraftRejectResponse,
     DraftScheduleView,
     DraftStateResponse,
     DraftTaskEdit,
 )
 from app.services.draft_actions import MOVED_ON_ACCEPT, accept_on_time
-from app.services.draft_store import is_open_draft
-from app.services.planning.task_rows import draft_slots
+from app.services.draft_service import DraftService
 from app.services.memory.memory_service import MemoryCandidate
+from app.services.planning.task_rows import draft_slots
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_NOT_FOUND = "Draft not found or expired"
+
+def _drafts(request: Request) -> DraftService:
+    """The composition root's ``DraftService``; 503 when the app has no container."""
+    container = container_of(request)
+    if container is None:
+        raise errors.PersistenceError("Drafts are not available right now.")
+    return container.draft_service
 
 
-def _get_draft_store(request: Request):
-    store = getattr(request.app.state, "draft_store", None)
-    if store is None:
-        raise HTTPException(status_code=503, detail="Draft store not available")
-    return store
-
-
-async def _load_draft(request: Request, draft_id: str, user_id: str) -> tuple:
-    """Fetch the draft or 404. Returns ``(store, row)``.
-
-    DraftStore is a synchronous Supabase client, so every call goes through
-    ``to_thread`` — a bare call would block the event loop for the whole HTTP
-    round-trip (house rule, same as planning_graph.create_draft).
-    """
-    store = _get_draft_store(request)
-    draft = await asyncio.to_thread(store.get_draft, draft_id, user_id)
-    if draft is None:
-        raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    return store, draft
-
-
-async def _refused_edit(store, draft_id: str, user_id: str, not_found: str) -> Exception:
-    """Why an edit wrote nothing: a closed draft is a 409, anything else a 404.
-
-    An edit must never reopen an accepted draft, or a second accept would write
-    its tasks again.
-    """
-    draft = await asyncio.to_thread(store.get_draft, draft_id, user_id)
-    if draft is not None and not is_open_draft(draft):
-        return errors.InvalidStateTransition(
-            "This draft is no longer open, so it cannot be changed.",
-            details={"draft_id": draft_id, "from": draft.get("status"), "to": "modified"},
-        )
-    return HTTPException(status_code=404, detail=not_found)
+def _state_view(draft: DraftSchedule) -> DraftStateResponse:
+    """A draft as the review UI reads it, with its solved slots' times."""
+    slots = draft_slots(draft.tasks, draft.schedule, draft.horizon_start)
+    return DraftStateResponse(
+        draft_id=draft.id,
+        user_id=draft.user_id,
+        goal_id=draft.goal_id,
+        tasks=draft.tasks,
+        horizon_start=draft.horizon_start,
+        status=draft.status,
+        rejection_reason=draft.rejection_reason,
+        created_at=draft.created_at.isoformat() if draft.created_at else None,
+        schedule=(
+            DraftScheduleView(horizon_start=draft.horizon_start, schedule=slots)
+            if slots
+            else None
+        ),
+        version=draft.version,
+    )
 
 
 @router.get(
@@ -86,26 +80,9 @@ async def _refused_edit(store, draft_id: str, user_id: str, not_found: str) -> E
     response_model=DraftStateResponse,
     summary="Get draft state",
 )
-async def get_draft(draft_id: str, user_id: str, http_request: Request):
+async def get_draft(draft_id: str, user_id: str, http_request: Request) -> DraftStateResponse:
     """Retrieve the current state of a draft for user review, with its solved slots' times."""
-    _, draft = await _load_draft(http_request, draft_id, user_id)
-    tasks = draft.get("tasks") or []
-    slots = draft_slots(tasks, draft.get("schedule"), draft.get("horizon_start"))
-    return DraftStateResponse(
-        draft_id=draft["id"],
-        user_id=draft["user_id"],
-        goal_id=draft.get("goal_id"),
-        tasks=tasks,
-        horizon_start=draft.get("horizon_start"),
-        status=draft.get("status", "pending"),
-        rejection_reason=draft.get("rejection_reason"),
-        created_at=str(draft["created_at"]) if draft.get("created_at") else None,
-        schedule=(
-            DraftScheduleView(horizon_start=draft["horizon_start"], schedule=slots)
-            if slots
-            else None
-        ),
-    )
+    return _state_view(await _drafts(http_request).get(user_id, draft_id))
 
 
 @router.post(
@@ -121,18 +98,25 @@ async def accept_draft(
     This is the only REST path that commits a proposed schedule — the planning
     flow deliberately persists nothing until the user says yes. A second accept
     answers 409 and writes nothing, as does a plan whose every slot has gone by
-    (``DraftOutdatedError``). A plan some of whose slots have gone by is re-solved
-    from now and then accepted (``moved``); when the rest no longer fits, 422
-    (``ScheduleInfeasibleError``) and the draft stays open.
+    (``DraftOutdatedError``) and, when ``expected_version`` is given, a draft changed
+    since that read (``StaleVersionError``, with the latest draft in its details). A
+    plan some of whose slots have gone by is re-solved from now and then accepted
+    (``moved``); when the rest no longer fits, 422 (``ScheduleInfeasibleError``) and the
+    draft stays open.
     """
-    await _load_draft(http_request, draft_id, request.user_id)
-    drafts = get_container(http_request).draft_service
-    db_client = getattr(http_request.app.state, "db_client", None)
+    drafts = _drafts(http_request)
+    planner = container_of(http_request).planner
     try:
         # The chat accept's path too: times already gone by are moved first.
         outcome = await accept_on_time(
-            drafts, request.user_id, draft_id, supabase=getattr(db_client, "supabase", None)
+            drafts, planner, request.user_id, draft_id, expected_version=request.expected_version
         )
+    except errors.StaleVersionError as exc:
+        # "Here is the latest": the draft as it is now, read the way GET reads it.
+        latest = _state_view(await drafts.get(request.user_id, draft_id))
+        raise errors.StaleVersionError(
+            exc.message, details={**(exc.details or {}), "draft": latest.model_dump(mode="json")}
+        ) from exc
     except errors.ValidationError:
         # Nothing in the draft can be scheduled; nothing was written.
         return DraftAcceptResponse(status="empty", draft_id=draft_id, task_count=0)
@@ -152,22 +136,22 @@ async def accept_draft(
     )
 
 
-@router.post("/{draft_id}/reject", summary="Reject a draft")
-async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request: Request):
+@router.post("/{draft_id}/reject", response_model=DraftRejectResponse, summary="Reject a draft")
+async def reject_draft(
+    draft_id: str, request: DraftRejectRequest, http_request: Request
+) -> DraftRejectResponse:
     """Reject the draft. Nothing is persisted to ``user_tasks``.
 
     A draft that is no longer open raises ``InvalidStateTransition`` (409).
     """
-    await _load_draft(http_request, draft_id, request.user_id)
-    container = get_container(http_request)
-    await container.draft_service.reject(request.user_id, draft_id, request.reason)
+    await _drafts(http_request).reject(request.user_id, draft_id, request.reason)
 
     # The reason is behavioural signal — it is why the next plan should differ — and
     # the user's own words. The draft is rejected whether or not it is remembered.
     reason = (request.reason or "").strip()
     if reason:
         try:
-            await container.memory_service.remember(
+            await container_of(http_request).memory_service.remember(
                 request.user_id,
                 MemoryCandidate(
                     memory_type="feedback",
@@ -181,103 +165,95 @@ async def reject_draft(draft_id: str, request: DraftRejectRequest, http_request:
                 draft_id, type(exc).__name__, exc_info=exc,
             )
 
-    return {"status": "rejected", "draft_id": draft_id}
+    return DraftRejectResponse(status="rejected", draft_id=draft_id)
 
 
-@router.post("/{draft_id}/modify", summary="Replace a draft's task list")
-async def modify_draft(draft_id: str, request: DraftModifyRequest, http_request: Request):
+@router.post(
+    "/{draft_id}/modify",
+    response_model=DraftEditResponse,
+    response_model_exclude={"task_id", "updated_draft"},
+    summary="Replace a draft's task list",
+)
+async def modify_draft(
+    draft_id: str, request: DraftModifyRequest, http_request: Request
+) -> DraftEditResponse:
     """Replace the draft's tasks wholesale.
 
     Only ``component == "tasks"`` is meaningful: draft_schedules stores a task
     array, and habits/action_items are no longer part of a draft at all.
     """
     if request.component != "tasks":
-        raise HTTPException(
-            status_code=400,
-            detail="Only the 'tasks' component is modifiable on a draft schedule",
+        raise errors.ValidationError(
+            "Only the 'tasks' component is modifiable on a draft schedule.",
+            details={"component": request.component},
         )
     if not isinstance(request.data, list):
-        raise HTTPException(status_code=400, detail="'data' must be a list of tasks")
+        raise errors.ValidationError("'data' must be a list of tasks.")
 
-    store, _ = await _load_draft(http_request, draft_id, request.user_id)
-    updated = await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, request.data)
-    if updated is None:
-        raise await _refused_edit(store, draft_id, request.user_id, _NOT_FOUND)
-    return {"status": "modified", "component": "tasks", "draft_id": draft_id}
+    await _drafts(http_request).edit_tasks(request.user_id, draft_id, request.data)
+    return DraftEditResponse(status="modified", component="tasks", draft_id=draft_id)
 
 
-@router.delete("/{draft_id}", summary="Discard a draft")
-async def delete_draft(draft_id: str, user_id: str, http_request: Request):
-    """Discard an entire draft (user decided not to proceed)."""
-    store, _ = await _load_draft(http_request, draft_id, user_id)
-    await asyncio.to_thread(store.delete_draft, draft_id, user_id)
-    return {"status": "deleted", "draft_id": draft_id}
+@router.delete("/{draft_id}", response_model=DraftDiscardResponse, summary="Discard a draft")
+async def discard_draft(draft_id: str, user_id: str, http_request: Request) -> DraftDiscardResponse:
+    """Discard an open draft (the user decided not to proceed): it expires, its row stays."""
+    await _drafts(http_request).discard(user_id, draft_id)
+    return DraftDiscardResponse(status="discarded", draft_id=draft_id)
 
 
-@router.patch("/{draft_id}/tasks/{task_id}", summary="Edit one task in a draft")
+@router.patch(
+    "/{draft_id}/tasks/{task_id}",
+    response_model=DraftEditResponse,
+    response_model_exclude={"component"},
+    summary="Edit one task in a draft",
+)
 async def edit_draft_task(
     draft_id: str,
     task_id: str,
     edits: DraftTaskEdit,
+    request: Request,
     user_id: str = Query(..., description="User ID for authorization"),
-    request: Request = None,
-):
-    """Edit a single task in a draft."""
-    store = _get_draft_store(request)
-
+) -> DraftEditResponse:
+    """Edit a single task in a draft (404 when the draft holds no such task)."""
     edits_dict = edits.model_dump(exclude_none=True)
     if not edits_dict:
-        raise HTTPException(status_code=400, detail="No edits provided")
+        raise errors.ValidationError("No edits provided.")
 
-    result = await asyncio.to_thread(
-        store.edit_task_in_draft, draft_id, user_id, task_id, edits_dict
+    draft = await _drafts(request).edit_task(user_id, draft_id, task_id, edits_dict)
+    return DraftEditResponse(
+        status="modified",
+        draft_id=draft_id,
+        task_id=task_id,
+        updated_draft=draft.model_dump(mode="json"),
     )
-    if result is None:
-        raise await _refused_edit(store, draft_id, user_id, "Draft or task not found")
-
-    return {"status": "modified", "draft_id": draft_id, "task_id": task_id, "updated_draft": result}
 
 
-@router.post("/{draft_id}/rearrange", summary="Rearrange task order in draft")
-async def rearrange_draft(draft_id: str, request: DraftRearrangeRequest, http_request: Request):
+@router.post(
+    "/{draft_id}/rearrange",
+    response_model=DraftRearrangeResponse,
+    summary="Rearrange task order in draft",
+)
+async def rearrange_draft(
+    draft_id: str, request: DraftRearrangeRequest, http_request: Request
+) -> DraftRearrangeResponse:
     """Reorder tasks within a draft according to the user-specified order."""
-    store, draft = await _load_draft(http_request, draft_id, request.user_id)
+    drafts = _drafts(http_request)
+    draft = await drafts.get(request.user_id, draft_id)
 
-    tasks = draft.get("tasks") or []
-    by_id = {t["task_id"]: t for t in tasks if isinstance(t, dict) and t.get("task_id")}
+    by_id = {t["task_id"]: t for t in draft.tasks if isinstance(t, dict) and t.get("task_id")}
 
     # Requested ids first, in order; anything unmentioned keeps its relative
     # place at the back rather than being silently dropped.
     reordered = [by_id.pop(tid) for tid in request.task_order if tid in by_id]
     reordered.extend(by_id.values())
 
-    updated = await asyncio.to_thread(store.replace_tasks, draft_id, request.user_id, reordered)
-    if updated is None:
-        raise await _refused_edit(store, draft_id, request.user_id, _NOT_FOUND)
+    await drafts.edit_tasks(request.user_id, draft_id, reordered)
 
     # TODO: re-solve with OR-Tools after a rearrange — the stored start times
     # are the solver's and no longer match the new order.
-    return {
-        "status": "rearranged",
-        "draft_id": draft_id,
-        "task_count": len(reordered),
-        "needs_resolve": True,
-    }
-
-
-@router.post("/{draft_id}/chat", summary="Modify draft via natural language (not implemented)")
-async def chat_modify_draft(draft_id: str, request: DraftChatRequest, http_request: Request):
-    """501 — natural-language draft modification has no implementation.
-
-    The handler used to dispatch to ``app.state.schedule_modifier`` and, when
-    that was absent, answer ``{"status": "modified"}`` anyway. Nothing in the
-    codebase ever assigns ``schedule_modifier``, so "modified" was the only
-    reachable reply and it was always false: the draft came back unchanged
-    while the caller was told the edit had landed.
-
-    Nothing calls this today (``jarvis-frontend/lib/api.ts`` uses
-    accept/reject/edit/rearrange/delete), so saying so plainly costs no caller.
-    The conversational path to editing a plan is the orchestrator's negotiation
-    flow at /api/v1/chat/stream.
-    """
-    raise HTTPException(status_code=501, detail="draft chat modification not implemented")
+    return DraftRearrangeResponse(
+        status="rearranged",
+        draft_id=draft_id,
+        task_count=len(reordered),
+        needs_resolve=True,
+    )

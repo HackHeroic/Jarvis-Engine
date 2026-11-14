@@ -14,12 +14,13 @@ from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional, Protocol
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 import app.core.config as config
 from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
 from app.core.config import DEFAULT_HORIZON_MINUTES
+from app.domain.errors import ScheduleInfeasibleError
 from app.services.planning.local_time import day_start_on, logical_day_start, user_zone
 from app.utils.deadline_parser import parse_deadline_to_date
 from app.utils.pacing import compute_adaptive_daily_cap
@@ -271,7 +272,7 @@ def run_schedule(
     focus_by_hour: list[float] | None = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
-    Raises HTTPException on INFEASIBLE.
+    Raises ScheduleInfeasibleError on INFEASIBLE.
 
     ``focus_by_hour`` is a learned focus profile (24 scores, index == local hour).
     With it, and with ``ENERGY_OBJECTIVE_ENABLED``, each task not due today leans
@@ -407,11 +408,10 @@ def run_schedule(
             "OR-Tools returned INFEASIBLE",
             {"horizon_min": horizon_minutes, "num_blocks": len(daily_context)},
         )
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Schedule infeasible; consider reducing scope or extending deadline."
-            ),
+        # A scope problem, never the user's failure: the error envelope answers 422
+        # (schedule_infeasible), and planning's horizon ladder catches it first.
+        raise ScheduleInfeasibleError(
+            "Schedule infeasible; consider reducing scope or extending deadline."
         )
 
     # Build response with schedule and TMT scores

@@ -443,6 +443,34 @@ def build_test_container(supabase: FakeSupabase | None = None) -> "AppContainer"
     )
 
 
+def planning_services(repos: Any, *, drafts: Any = None, events: Any = None) -> Any:
+    """The planning sub-graph's ``PlanningServices`` over ``repos``, wired as the
+    composition root wires them (``drafts`` defaults to a ``DraftService`` over the same
+    repositories; ``events`` to a ``NullEventBus``). Memories are embedded by
+    ``BagOfWordsEmbedder``."""
+    from app.domain.events import NullEventBus
+    from app.services.draft_service import DraftService
+    from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
+    from app.services.memory.memory_service import MemoryService
+    from app.services.planning.services import PlanningServices
+    from app.services.task_service import TaskService
+
+    events = events if events is not None else NullEventBus()
+    if drafts is None:
+        drafts = DraftService(
+            repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
+        )
+    return PlanningServices(
+        drafts=drafts,
+        tasks=TaskService(repos.tasks, repos.task_events, events),
+        task_repo=repos.tasks,
+        constraints=repos.constraints,
+        profiles=repos.profiles,
+        memory=MemoryService(repos.memories, BagOfWordsEmbedder()),
+        energy=HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
+    )
+
+
 def make_jarvis_state(**overrides: Any) -> dict:
     """A complete ``JarvisState`` with sane defaults; override any key.
 
@@ -463,7 +491,6 @@ def make_jarvis_state(**overrides: Any) -> dict:
         "initiated_by": "user",
         "execution_graph": None,
         "schedule": None,
-        "draft_store": None,
         "draft_id": None,
         "draft_response": None,
         "research_results": None,
@@ -483,6 +510,7 @@ def make_jarvis_state(**overrides: Any) -> dict:
         "memory_context": "",
         "progress_callback": None,
         "progress_queue": None,
+        "container": None,
         "trivial_input": None,
         "force_cloud_request": None,
     }

@@ -173,12 +173,12 @@ async def test_container__draft_service__publishes_draft_accepted_on_its_bus():
 
 
 @pytest.mark.asyncio
-async def test_accept_draft_and_persist__container_registered__uses_its_draft_service():
-    """The orchestrator's draft_action node goes through this shim: DraftAccepted must reach the bus."""
+async def test_accept_draft_and_persist__the_containers_draft_service__draft_accepted_on_its_bus():
+    """The orchestrator's draft_action node goes through this helper with the turn's
+    container: DraftAccepted must reach the container's bus."""
     from app.services.draft_actions import accept_draft_and_persist
 
     container = _build()
-    runtime.set_container(container)
     recorder = _Recorder()
     container.events.subscribe(DraftAccepted, recorder)
     draft = await container.repos.drafts.create(
@@ -189,7 +189,9 @@ async def test_accept_draft_and_persist__container_registered__uses_its_draft_se
         schedule=None,
     )
 
-    written = await accept_draft_and_persist(None, "u1", {"id": draft.id}, supabase=None)
+    written = await accept_draft_and_persist(
+        container.draft_service, container.planner, "u1", draft
+    )
 
     assert written == 1
     assert [type(e) for e in recorder.events] == [DraftAccepted]

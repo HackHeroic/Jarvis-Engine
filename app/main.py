@@ -54,10 +54,6 @@ async def lifespan(app: FastAPI):
         print("   → Check SUPABASE_URL in .env (e.g. https://xxx.supabase.co) and network access.")
         app.state.db_client = _StubDBClient()
 
-    # Initialize draft store (Supabase-backed, no TTL — persistence across restarts)
-    from app.services.draft_store import DraftStore
-    app.state.draft_store = DraftStore(supabase_client=getattr(app.state.db_client, 'supabase', None))
-
     # The same db client, reachable from code with no request scope — notably
     # _load_context rebuilding the UserModel facade on a checkpoint-resumed turn.
     from app.core.runtime import set_shared_clients

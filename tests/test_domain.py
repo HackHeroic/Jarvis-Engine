@@ -79,15 +79,13 @@ def test_draft_transition__modified_to_modified__ok():
 
 
 def test_open_draft_statuses__are_exactly_the_states_with_a_way_out():
-    """One definition of "open", and it agrees with the state machine; the legacy
-    DraftStore filters on the same states."""
+    """One definition of "open", and it agrees with the state machine; the persistence
+    mapping filters on the same states."""
     from app.domain.entities import DRAFT_TRANSITIONS, OPEN_DRAFT_STATUSES
     from app.infrastructure.persistence import _mapping
-    from app.services import draft_store
 
     assert set(OPEN_DRAFT_STATUSES) == {s for s, targets in DRAFT_TRANSITIONS.items() if targets}
     assert _mapping.OPEN_DRAFT_STATUSES is OPEN_DRAFT_STATUSES
-    assert draft_store._OPEN_STATUSES == [s.value for s in OPEN_DRAFT_STATUSES]
 
 
 def test_draft_transition__raw_string__stored_as_the_status_enum():

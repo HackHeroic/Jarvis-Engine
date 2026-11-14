@@ -273,8 +273,8 @@ async def test_chat__two_users__neither_sees_nor_accepts_the_others_draft(jarvis
     assert jarvis.draft(alice.draft_id)["status"] == "pending"
     assert jarvis.rows("user_tasks", user_id="alice") == []
     assert {r["user_id"] for r in jarvis.rows("user_tasks")} == {"bob"}
-    # Bob's store lookups cannot reach Alice's draft at all.
-    assert jarvis.draft_store.get_draft(alice.draft_id, "bob") is None
+    # Bob's draft lookups cannot reach Alice's draft at all.
+    assert await jarvis.state.container.repos.drafts.get("bob", alice.draft_id) is None
 
 
 @pytest.mark.asyncio

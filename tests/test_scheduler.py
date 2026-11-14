@@ -636,3 +636,55 @@ def test_energy_term__learned_profile__dependencies_still_hold(before_the_horizo
 
     for i in range(1, len(difficulties)):
         assert resp.schedule[f"s{i}"].start_min >= resp.schedule[f"s{i - 1}"].end_min
+
+
+def _too_much_work_graph(tasks: int = 3) -> dict:
+    return {
+        "goal_metadata": {"objective": "Revise"},
+        "decomposition": [
+            {"task_id": f"t{i}", "title": f"Task {i}", "duration_minutes": 25,
+             "difficulty_weight": 0.5, "completion_criteria": "done"}
+            for i in range(tasks)
+        ],
+        "cognitive_load_estimate": {"intrinsic_load": 0.5},
+    }
+
+
+def test_run_schedule__infeasible__raises_schedule_infeasible_error():
+    """INFEASIBLE is a scope problem the domain names (spec section 10), not an HTTP detail."""
+    from app.api.v1.endpoints.reasoning import ExecutionGraph
+    from app.api.v1.endpoints.schedule import run_schedule
+    from app.domain.errors import ScheduleInfeasibleError
+    from app.schemas.context import TimeSlot
+
+    blocked = [TimeSlot(name="Lectures", start_min=0, end_min=60, availability="blocked")]
+
+    with pytest.raises(ScheduleInfeasibleError) as caught:
+        run_schedule(ExecutionGraph.model_validate(_too_much_work_graph()), blocked,
+                     horizon_minutes=60)
+
+    assert "scope" in caught.value.message
+
+
+def test_generate_schedule__infeasible__422_schedule_infeasible_envelope():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    body = {
+        "graph": _too_much_work_graph(),
+        "horizon_minutes": 60,
+        "plan_start": "2026-11-16T08:00:00+05:30",
+        "daily_context": [
+            {"name": "Lectures", "start_min": 0, "end_min": 60, "availability": "blocked"}
+        ],
+    }
+
+    response = TestClient(app).post("/api/v1/schedule/generate-schedule", json=body)
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "schedule_infeasible"
+    assert error["message"] == (
+        "Schedule infeasible; consider reducing scope or extending deadline."
+    )

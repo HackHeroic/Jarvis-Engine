@@ -103,9 +103,7 @@ async def _swept_after(container) -> list:
 @asynccontextmanager
 async def _api(monkeypatch, container, fake):
     from app.main import app
-    from app.services.draft_store import DraftStore
 
-    monkeypatch.setattr(app.state, "draft_store", DraftStore(supabase_client=fake), raising=False)
     monkeypatch.setattr(app.state, "container", container, raising=False)
     monkeypatch.setattr(app.state, "db_client", FakeDBClient(fake), raising=False)
     transport = httpx.ASGITransport(app=app)
@@ -188,14 +186,13 @@ async def _chat_accept(container, fake, draft_id: str) -> dict:
     from app.core.user_model import UserModel
     from app.orchestrator.graph import handle_draft_action
     from app.schemas.context import IntentType
-    from app.services.draft_store import DraftStore
 
     db = FakeDBClient(fake)
     return await handle_draft_action({
         "user_id": U,
         "user_model": UserModel(user_id=U, db=db),
         "intent": IntentType.ACCEPT_DRAFT,
-        "draft_store": DraftStore(supabase_client=fake),
+        "container": container,
         "draft_id": draft_id,
         "user_message": "looks good",
     })

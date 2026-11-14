@@ -561,12 +561,14 @@ def test_build_task_rows__legacy_dict_without_goal_id__falls_back_to_prefix():
 # --- the legacy entry point ---------------------------------------------------
 
 
-def _store_with_draft(supabase: FakeSupabase) -> tuple:
-    from app.services.draft_store import DraftStore
+async def _container_with_draft(supabase: FakeSupabase) -> tuple:
+    from tests.fakes import build_test_container
 
-    store = DraftStore(supabase_client=supabase)
-    row = store.create_draft(user_id=U1, tasks=_tasks("g_t1", "g_t2"), horizon_start=HORIZON)
-    return store, row
+    container = build_test_container(supabase)
+    draft = await container.draft_service.propose(
+        U1, tasks=_tasks("g_t1", "g_t2"), horizon_start=HORIZON, goal_id=None, schedule=None
+    )
+    return container, draft
 
 
 @pytest.mark.asyncio
@@ -574,11 +576,12 @@ async def test_accept_draft_and_persist__already_accepted__raises_invalid_state_
     from app.services.draft_actions import accept_draft_and_persist
 
     supabase = FakeSupabase()
-    store, row = _store_with_draft(supabase)
-    assert await accept_draft_and_persist(store, U1, row, supabase) == 2
+    container, draft = await _container_with_draft(supabase)
+    drafts, planner = container.draft_service, container.planner
+    assert await accept_draft_and_persist(drafts, planner, U1, draft) == 2
 
     with pytest.raises(errors.InvalidStateTransition):
-        await accept_draft_and_persist(store, U1, row, supabase)
+        await accept_draft_and_persist(drafts, planner, U1, draft)
 
     assert sorted(r["task_id"] for r in supabase.rows["user_tasks"]) == ["g_t1", "g_t2"]
 
@@ -593,8 +596,11 @@ async def test_accept_draft_and_persist__database_unreachable__returns_none_and_
             raise ConnectionError("connection refused")
 
     supabase = _RpcDown()
-    store, row = _store_with_draft(supabase)
+    container, draft = await _container_with_draft(supabase)
 
-    assert await accept_draft_and_persist(store, U1, row, supabase) is None
-    assert store.get_draft(row["id"], U1)["status"] == "pending"
+    assert await accept_draft_and_persist(
+        container.draft_service, container.planner, U1, draft
+    ) is None
+    (row,) = supabase.rows["draft_schedules"]
+    assert row["status"] == "pending"
     assert supabase.rows.get("user_tasks", []) == []

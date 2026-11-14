@@ -67,6 +67,10 @@ class DraftStateResponse(BaseModel):
         description="The solved slots with their times on the user's clock; None for a draft "
         "stored without them.",
     )
+    version: str = Field(
+        description="What this read saw, as one opaque value: send it back as the accept's "
+        "expected_version, and a draft changed since is not accepted (409 stale_version)."
+    )
 
 
 class DraftAcceptRequest(BaseModel):
@@ -78,6 +82,15 @@ class DraftAcceptRequest(BaseModel):
         description=(
             "Ignored — kept so existing frontend callers keep validating. A draft "
             "is accepted whole; there are no per-component statuses any more."
+        ),
+    )
+    expected_version: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "The draft's version from the read the user acted on (GET /drafts/{id}). When"
+            " given and the draft has changed since, nothing is written: 409 stale_version"
+            " with the latest draft. Omitted: no check."
         ),
     )
 
@@ -100,6 +113,47 @@ class DraftAcceptResponse(BaseModel):
     message: Optional[str] = Field(
         default=None, description="What to tell the user when times were moved; null otherwise."
     )
+
+
+class DraftRejectResponse(BaseModel):
+    """What rejecting a draft did."""
+
+    status: Literal["rejected"] = Field(description="The draft is rejected; nothing was written.")
+    draft_id: str = Field(description="The draft rejected.")
+
+
+class DraftEditResponse(BaseModel):
+    """What editing a draft's tasks did: the whole list (modify) or one task (edit)."""
+
+    status: Literal["modified"] = Field(description="The draft holds the edit and is modified.")
+    draft_id: str = Field(description="The draft edited.")
+    component: Optional[Literal["tasks"]] = Field(
+        default=None, description="'tasks' when the whole task list was replaced (modify)."
+    )
+    task_id: Optional[str] = Field(default=None, description="The task edited (edit one task).")
+    updated_draft: Optional[dict] = Field(
+        default=None, description="The draft as stored after the edit (edit one task)."
+    )
+
+
+class DraftRearrangeResponse(BaseModel):
+    """What reordering a draft's tasks did."""
+
+    status: Literal["rearranged"] = Field(description="The draft holds the new order.")
+    draft_id: str = Field(description="The draft rearranged.")
+    task_count: int = Field(ge=0, description="Tasks in the draft, in their new order.")
+    needs_resolve: bool = Field(
+        description="True: the stored times are the solver's and no longer match the order."
+    )
+
+
+class DraftDiscardResponse(BaseModel):
+    """What discarding a draft did: it is closed (expired), and its row is kept."""
+
+    status: Literal["discarded"] = Field(
+        description="The draft is set aside (expired); nothing was written or deleted."
+    )
+    draft_id: str = Field(description="The draft discarded.")
 
 
 class DraftRejectRequest(BaseModel):
@@ -164,13 +218,6 @@ class DraftRearrangeRequest(BaseModel):
 
     user_id: str = Field(..., description="User identifier")
     task_order: List[str] = Field(..., description="Ordered list of task IDs defining new order")
-
-
-class DraftChatRequest(BaseModel):
-    """Modify a draft via natural language."""
-
-    user_id: str = Field(..., description="User identifier")
-    message: str = Field(..., description="Natural language modification request")
 
 
 class DraftAction(BaseModel):

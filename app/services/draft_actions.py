@@ -1,6 +1,6 @@
 """Draft accept/resolve logic shared by the orchestrator node and the REST API.
 
-Two callers act on the same draft rows and must behave identically:
+Two callers act on the same drafts and must behave identically:
 
 * ``app/orchestrator/graph.py::handle_draft_action`` — the conversational
   "accept"/"reject" turn inside the LangGraph orchestrator.
@@ -9,64 +9,37 @@ Two callers act on the same draft rows and must behave identically:
 
 Accepting is the *only* moment v2 writes to ``user_tasks``: the planning
 sub-graph proposes a draft and persists nothing. Accepting is
-``DraftService.accept``, one atomic write, on the composition root's service:
-the REST endpoint takes it from the container, the orchestrator node reaches it
-through ``accept_draft_and_persist`` here.
+``DraftService.accept``, one atomic write. Both callers hand these functions the
+composition root's ``DraftService`` (and its ``DraftPlanner``, for a draft some of
+whose times have gone by); nothing here looks a collaborator up.
 
-Every store call takes ``user_id`` — ``DraftStore`` filters on it, so a draft
-belonging to somebody else simply reads as absent (house IDOR rule).
+Every ``DraftService`` call takes ``user_id`` and the repository filters on it, so a
+draft belonging to somebody else simply reads as absent (house IDOR rule).
 """
 
-import asyncio
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.core.runtime import registered_container
 from app.domain import errors
 from app.domain.clock import utc_now
-from app.domain.entities import DraftStatus
-from app.domain.events import NullEventBus
-from app.services.draft_service import DraftService, slot_starts
+from app.domain.entities import DraftSchedule, DraftStatus
+from app.domain.ports import DraftPlanner
+from app.services.draft_service import DraftService, check_version, slot_starts
 from app.services.task_service import as_aware
-# Moved to app.services.planning.task_rows; planning_graph still imports it from here.
-from app.services.planning.task_rows import to_task_chunk  # noqa: F401
-
-
-def draft_id_of(row: Any) -> Optional[str]:
-    """Read the draft id out of a ``draft_schedules`` row.
-
-    The table's primary key column is ``id`` (migration 20260329000002) and
-    ``DraftStore.create_draft`` echoes the inserted row back verbatim — the
-    locally generated uuid is *written* as ``id``, never returned as
-    ``draft_id``. Accept both names so callers work against the live store and
-    against any wrapper that hands back the friendlier one.
-    """
-    if not isinstance(row, dict):
-        return None
-    return row.get("draft_id") or row.get("id")
 
 
 async def resolve_draft(
-    draft_store: Any, user_id: str, draft_id: Optional[str] = None
-) -> Optional[dict]:
-    """Find the draft this turn is about: the named one, else the newest pending.
+    drafts: DraftService, user_id: str, draft_id: Optional[str] = None
+) -> Optional[DraftSchedule]:
+    """Find the draft this turn is about: the named one, else the newest open one.
 
-    ``draft_id`` is authoritative when the caller has one — orphaned pending
-    rows can accumulate (a re-plan proposes a second draft without resolving the
-    first), so ``get_pending_draft`` alone could act on the wrong schedule. It
-    stays as the fallback for turns resumed without a draft_id in state.
-
-    ``DraftStore`` is a synchronous Supabase client; ``to_thread`` keeps the
-    round-trip off the event loop (same pattern as planning_graph.create_draft).
+    ``draft_id`` is authoritative when the caller has one — orphaned open drafts
+    can accumulate (a re-plan proposes a second draft without resolving the first),
+    so the newest open one alone could act on the wrong schedule. It stays as the
+    fallback for turns resumed without a draft_id in state.
     """
-    if draft_store is None:
-        return None
-    if draft_id:
-        row = await asyncio.to_thread(draft_store.get_draft, draft_id, user_id)
-        if row:
-            return row
-    return await asyncio.to_thread(draft_store.get_pending_draft, user_id)
+    return await drafts.open_draft(user_id, draft_id)
 
 
 # What the user is told when an accept moved times that had gone by, or could not.
@@ -86,7 +59,12 @@ class AcceptOutcome:
 
 
 async def accept_on_time(
-    service: DraftService, user_id: str, draft_id: str, *, supabase: Any = None
+    drafts: DraftService,
+    planner: DraftPlanner,
+    user_id: str,
+    draft_id: str,
+    *,
+    expected_version: Optional[str] = None,
 ) -> AcceptOutcome:
     """Accept the draft, never with a slot that has already begun (both accept paths).
 
@@ -97,59 +75,50 @@ async def accept_on_time(
     aside by the next sweep as if the user had, feeding PEARL and the focus profile
     evidence that never happened. Every slot begun: ``DraftOutdatedError``, as before.
 
+    ``expected_version``: the draft's version the client read. If the draft has changed
+    since, StaleVersionError and nothing is written; None compares nothing.
+
     Raises ScheduleInfeasibleError (NO_ROOM_ON_ACCEPT) when the re-solve finds no room,
     and LLMUnavailableError when the user's habits could not be read for it: either
     way nothing is accepted and the draft stays open. Otherwise as
-    ``DraftService.accept``. ``supabase`` is unused (kept for the callers).
+    ``DraftService.accept``.
     """
-    draft = await service.get(user_id, draft_id)
+    draft = await drafts.get(user_id, draft_id)
     draft.transition(DraftStatus.ACCEPTED)  # a closed draft fails fast, as accept does
+    check_version(draft, expected_version)
     starts = slot_starts(draft)
     now = as_aware(utc_now())
     begun = [task for task, start in starts.items() if start <= now]
     if not begun or len(begun) == len(starts):
-        return AcceptOutcome(written=await service.accept(user_id, draft_id))
-    schedule = await _resolved_from_now(user_id, draft)
+        written = await drafts.accept(user_id, draft_id, expected_version=expected_version)
+        return AcceptOutcome(written=written)
+    schedule = await planner.reslot_from_now(user_id, draft)
     if schedule is None:
         raise errors.ScheduleInfeasibleError(NO_ROOM_ON_ACCEPT, details={"draft_id": draft_id})
-    await service.reschedule(user_id, draft_id, schedule)
-    return AcceptOutcome(written=await service.accept(user_id, draft_id), moved=True)
-
-
-async def _resolved_from_now(user_id: str, draft: Any) -> Optional[dict]:
-    """The draft's tasks re-solved from now (``DraftPlanner.reslot_from_now``: every rule a
-    plan keeps); None if they no longer fit. LLMUnavailableError when the user's habits
-    could not be read."""
-    container = registered_container()
-    if container is None:  # tests and scripts: no planner to re-solve with
-        return None
-    return await container.planner.reslot_from_now(user_id, draft)
+    await drafts.reschedule(user_id, draft_id, schedule)
+    return AcceptOutcome(written=await drafts.accept(user_id, draft_id), moved=True)
 
 
 async def accept_draft_on_time(
-    draft_store: Any, user_id: str, draft: dict, supabase: Any
+    drafts: DraftService, planner: DraftPlanner, user_id: str, draft: DraftSchedule
 ) -> Optional[AcceptOutcome]:
     """``accept_draft_and_persist``, also saying whether passed times were moved.
 
     ``written`` 0: nothing schedulable, nothing written. None: the write did not land
     (the draft is still open). Raises as ``accept_on_time``.
     """
-    service = _draft_service(supabase)
-    if service is None:
-        logger.error(f"Draft {draft_id_of(draft)} not accepted: no Supabase client to write through")
-        return None
     try:
-        return await accept_on_time(service, user_id, draft_id_of(draft), supabase=supabase)
+        return await accept_on_time(drafts, planner, user_id, draft.id)
     except errors.ValidationError:
-        logger.warning(f"Draft {draft_id_of(draft)} holds no persistable tasks — nothing accepted")
+        logger.warning(f"Draft {draft.id} holds no persistable tasks — nothing accepted")
         return AcceptOutcome(written=0)
     except errors.PersistenceError:
-        logger.error(f"Draft {draft_id_of(draft)} accept did not land — left open for retry")
+        logger.error(f"Draft {draft.id} accept did not land — left open for retry")
         return None
 
 
 async def accept_draft_and_persist(
-    draft_store: Any, user_id: str, draft: dict, supabase: Any
+    drafts: DraftService, planner: DraftPlanner, user_id: str, draft: DraftSchedule
 ) -> Optional[int]:
     """Accept the draft: write its tasks to ``user_tasks`` and mark it accepted, atomically.
 
@@ -158,7 +127,7 @@ async def accept_draft_and_persist(
         ``0`` — the draft held nothing schedulable. Nothing was written and the
         status is untouched; there is nothing here to accept.
         ``None`` — the write did not land. The draft is still open, so
-        ``get_pending_draft`` can find it and the user can retry; the caller
+        ``resolve_draft`` can find it and the user can retry; the caller
         must not report success.
 
     Raises:
@@ -172,57 +141,20 @@ async def accept_draft_and_persist(
     ``DraftService.accept`` writes the tasks and flips the status in one
     transaction, so they land together or not at all. A second accept therefore
     finds the draft closed instead of writing every task again. A draft some of whose
-    slots have begun is re-solved from now first (``accept_on_time``). ``draft_store``
-    is unused; it stays in the signature for the callers.
+    slots have begun is re-solved from now first (``accept_on_time``).
     """
-    outcome = await accept_draft_on_time(draft_store, user_id, draft, supabase)
+    outcome = await accept_draft_on_time(drafts, planner, user_id, draft)
     return outcome.written if outcome is not None else None
 
 
 async def reject_draft(
-    draft_store: Any, user_id: str, draft_id: str, reason: Optional[str], supabase: Any
+    drafts: DraftService, user_id: str, draft_id: str, reason: Optional[str]
 ) -> None:
     """Mark the draft REJECTED, keeping ``reason`` (the signal PEARL learns from).
 
     Returns only when this call rejected it. Raises ``InvalidStateTransition`` when
     the draft is no longer open — accepted from the review UI, say — and
     ``NotFoundError`` when the user has no such draft, so no caller can report a
-    discard that did not happen. Goes through ``DraftService``; with no service to
-    go through (no container, no Supabase client) the store rejects, and its
-    ``False`` (absent or closed) raises the same way.
+    discard that did not happen.
     """
-    service = _draft_service(supabase)
-    if service is not None:
-        await service.reject(user_id, draft_id, reason)
-        return
-    if not await asyncio.to_thread(draft_store.reject_draft, draft_id, user_id, reason):
-        raise errors.InvalidStateTransition(
-            "That draft is no longer open.", details={"draft_id": draft_id}
-        )
-
-
-def _draft_service(supabase: Any) -> Optional[DraftService]:
-    """The composition root's ``DraftService``, whose bus delivers ``DraftAccepted``.
-
-    With no container registered (tests, scripts) one is built here over
-    ``supabase``, with nobody listening; ``None`` when there is no client either.
-    """
-    container = registered_container()
-    if container is not None:
-        return container.draft_service
-    if supabase is None:
-        return None
-    # The no-container fallback: the one place outside the composition root that
-    # builds a repository itself.
-    from app.infrastructure.persistence.supabase_repos import (
-        SupabaseDraftRepository,
-        SupabaseTaskEventRepository,
-        SupabaseTaskRepository,
-    )
-
-    return DraftService(
-        SupabaseDraftRepository(supabase),
-        NullEventBus(),
-        task_events=SupabaseTaskEventRepository(supabase),
-        tasks=SupabaseTaskRepository(supabase),
-    )
+    await drafts.reject(user_id, draft_id, reason)

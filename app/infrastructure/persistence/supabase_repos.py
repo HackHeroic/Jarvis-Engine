@@ -74,6 +74,7 @@ from app.infrastructure.persistence._mapping import (
     day_bounds,
     deadline_update_to_row,
     draft_closed,
+    draft_to_row,
     embedding_values,
     from_row,
     is_uuid,
@@ -330,7 +331,7 @@ class SupabaseDraftRepository(_SupabaseRepository, DraftRepository):
         draft = new_draft(
             user_id, tasks=tasks, horizon_start=horizon_start, goal_id=goal_id, schedule=schedule
         )
-        rows = await self._run(lambda q: q.insert(to_row(draft)))
+        rows = await self._run(lambda q: q.insert(draft_to_row(draft)))
         return _read(DraftSchedule, rows[0]) if rows else draft
 
     async def get(self, user_id: str, draft_id: str) -> DraftSchedule | None:

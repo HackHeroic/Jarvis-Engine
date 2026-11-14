@@ -25,7 +25,7 @@ from app.domain.events import NullEventBus
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.modules.planning_replan import PlanningGraphReplanner
 from app.services.draft_service import DraftService
-from tests.fakes import FakeDBClient, FakeSupabase
+from tests.fakes import FakeDBClient, FakeSupabase, planning_services
 
 IST = ZoneInfo("Asia/Kolkata")
 U = "alice"
@@ -49,9 +49,7 @@ def repos(fake):
 
 @pytest.fixture
 def replanner(fake, repos) -> PlanningGraphReplanner:
-    return PlanningGraphReplanner(
-        repos.drafts, db_provider=lambda: FakeDBClient(fake)
-    )
+    return PlanningGraphReplanner(planning_services(repos))
 
 
 def _row(task_id: str, *, status: str = "pending", start: datetime | None = None, **extra) -> dict:

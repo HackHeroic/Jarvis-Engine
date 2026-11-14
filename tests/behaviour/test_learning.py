@@ -146,6 +146,28 @@ async def test_pearl__learning_moment__carries_confidence_and_how_often_it_was_s
 
 
 @pytest.mark.asyncio
+async def test_learning_step__memory_and_pattern_sent__phase_reports_their_real_counts(
+    jarvis, llm
+):
+    """The learning step's phase frame counts the learning frames the turn sent; it used
+    to say 0 and 0 whatever was learned (the graph state dropped both counts)."""
+    await _seed_history_at_nine(jarvis, ["skipped"] * 3)
+    llm.script("brain_dump_extraction", brain_dump(memories=[
+        {"type": "preference", "content": "Prefers studying in the mornings", "confidence": 0.8},
+    ]))
+
+    turn = await jarvis.say("I prefer studying in the mornings")
+
+    memories = [data for event, data in turn.events if event == "memory_extracted"]
+    (learning,) = [
+        data for event, data in turn.events
+        if event == "phase" and data.get("phase") == "learning" and "detail" in data
+    ]
+    assert len(memories) == 1 and len(_patterns(turn)) == 1
+    assert learning["detail"] == {"memories_extracted": 1, "patterns_detected": 1}
+
+
+@pytest.mark.asyncio
 async def test_pearl__another_users_skips__teach_me_nothing(jarvis, llm):
     await _seed_history_at_nine(jarvis, ["skipped"] * 3, user="bob")
 

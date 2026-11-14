@@ -141,14 +141,9 @@ def test_infrastructure__imports_nothing_from_api_or_orchestrator():
 
 # --- services and the composition root --------------------------------------------
 
-# The one legacy shim: with no container registered (tests, scripts) the draft-accept
-# helper builds a DraftService over the Supabase repository itself.
-_LEGACY_SHIM = _APP_DIR / "services" / "draft_actions.py"
-
 # Files under app/ (not the composition roots) that may import app.infrastructure, and
 # why. The list can only shrink: an entry that no longer imports it is a failure too.
 _INFRASTRUCTURE_IMPORTS_ALLOWED: dict[str, str] = {
-    "services/draft_actions.py": "the legacy shim above",
     "core/model_router.py": (
         "route_llm_call drives the provider chain the container installs (set_chain,"
         " current_chain) and its transport helpers"
@@ -198,7 +193,6 @@ def test_layering__services_orchestrator_modules_core_api__do_not_import_infrast
 
     assert unexpected == [], "take the concrete from the container instead"
     assert stale == [], "no longer imports infrastructure: drop it from the allow-list"
-    assert _imports_under(_LEGACY_SHIM, "app.infrastructure"), "the shim is gone: drop the exception"
 
 
 # Services, the domain and infrastructure never reach up into the API layer. This
@@ -298,7 +292,7 @@ def test_layering__only_container_builds_repositories():
     anywhere else under app/, except in the persistence package that defines them.
     """
     defined_in = _INFRASTRUCTURE_DIR / "persistence"
-    builds_concrete_allowed = {_APP_DIR / "container.py", _LEGACY_SHIM}
+    builds_concrete_allowed = {_APP_DIR / "container.py"}
 
     referencing = [
         str(path.relative_to(_APP_DIR))
