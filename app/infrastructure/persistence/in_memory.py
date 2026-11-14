@@ -564,16 +564,30 @@ class InMemoryMemoryRepository(MemoryRepository):
         *,
         statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
         types: frozenset[str] | None = None,
+        newest_first: bool = False,
+        limit: int | None = None,
     ) -> list[Memory]:
-        found = [
-            m
-            for m in self._store.memories
-            if m.user_id == user_id
-            and m.status in statuses
-            and (types is None or m.memory_type in types)
-            and m.superseded_by is None
-        ]
-        return [m.model_copy(deep=True) for m in sorted(found, key=lambda m: m.created_at)]
+        if limit is not None:
+            check_limit(limit)
+        found = sorted(
+            (
+                m
+                for m in self._store.memories
+                if m.user_id == user_id
+                and m.status in statuses
+                and (types is None or m.memory_type in types)
+                and m.superseded_by is None
+            ),
+            key=lambda m: m.created_at,
+            reverse=newest_first,
+        )
+        return [m.model_copy(deep=True) for m in found[:limit]]
+
+    async def list_ids(
+        self, user_id: str, *, statuses: frozenset[MemoryStatus], limit: int
+    ) -> list[str]:
+        newest = await self.list(user_id, statuses=statuses, newest_first=True, limit=limit)
+        return [m.id for m in newest]
 
     async def find_by_pattern_key(self, user_id: str, pattern_key: str) -> Memory | None:
         return next(

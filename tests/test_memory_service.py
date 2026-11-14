@@ -538,3 +538,41 @@ async def test_legacy_store__memory_noticed_from_behaviour__stored_as_inferred(l
 
     assert (await memories.get("alice", noticed["id"])).provenance is MemorySource.INFERRED
     assert (await memories.get("alice", said["id"])).provenance is MemorySource.SAID
+
+
+# --- the turn's one read of the memories: bounded, and no words it does not need ------
+
+
+@pytest.mark.asyncio
+async def test_snapshot__bounded_active_memories_and_only_the_ids_of_let_go_ones(clock):
+    """Recall and the known memories need the active memories, newest first and bounded;
+    the forget check needs only which memories were let go of (the store compares their
+    embeddings itself), never their words."""
+    import app.services.memory.memory_service as memory_service
+
+    fake = FakeSupabase()
+    memories = RepositoryFactory.supabase(fake).memories
+    service = MemoryService(memories, BagOfWordsEmbedder(), clock=clock)
+    for n in range(3):
+        await service.remember("alice", _candidate(f"Fact number {n} about the user"))
+        clock.advance(minutes=1)
+    dismissed = (await service.remember("alice", _candidate("Hates early starts"))).memory
+    await service.dismiss("alice", dismissed.id)
+    before = len(fake.selects)
+    original = memory_service.MEMORY_SNAPSHOT_LIMIT
+    memory_service.MEMORY_SNAPSHOT_LIMIT = 2
+    try:
+        snapshot = await service.snapshot("alice")
+    finally:
+        memory_service.MEMORY_SNAPSHOT_LIMIT = original
+
+    assert [m.content for m in snapshot.in_use(clock())] == [
+        "Fact number 1 about the user", "Fact number 2 about the user",
+    ]  # the newest 2, oldest first as list_active gives them
+    assert snapshot.let_go_ids == frozenset({dismissed.id})
+    assert all(m.status is MemoryStatus.ACTIVE for m in snapshot.memories)  # no tombstones
+    reads = fake.selects[before:]
+    assert len(reads) == 2 and ("user_memories", ("id",)) in reads
+    assert await service.drop_suppressed(
+        "alice", ["hates early starts", "likes tea"], let_go_ids=snapshot.let_go_ids
+    ) == ["likes tea"]  # suppression still works from the ids alone

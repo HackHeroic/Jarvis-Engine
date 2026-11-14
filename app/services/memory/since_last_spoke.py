@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import app.core.config as config
 from app.domain.clock import utc_now
-from app.domain.entities import ConversationSession, Memory, SuggestionStatus, TaskEventType
+from app.domain.entities import ConversationSession, SuggestionStatus, TaskEventType
 from app.domain.ports import ConversationRepository, SuggestionRepository, TaskEventRepository
 from app.services.memory.context import as_data
 from app.services.memory.memory_service import MemoryService, MemorySnapshot
@@ -102,7 +102,9 @@ class SinceLastSpoke:
         now = self._clock()
         clauses, subject = await asyncio.gather(
             self._since_then(user_id, as_aware(previous.updated_at), now, snapshot),
-            self._subject(user_id, previous, snapshot.let_go if snapshot is not None else None),
+            self._subject(
+                user_id, previous, snapshot.let_go_ids if snapshot is not None else None
+            ),
         )
         head = f"Since we last spoke ({gap(previous.updated_at, now, zone)}): "
         then = f" Since then: {', '.join(clauses)}." if clauses else ""
@@ -119,12 +121,14 @@ class SinceLastSpoke:
         return f"{head}{', '.join(clauses)}." if clauses else None
 
     async def _subject(
-        self, user_id: str, previous: ConversationSession, let_go: list[Memory] | None
+        self, user_id: str, previous: ConversationSession, let_go_ids: frozenset[str] | None
     ) -> CleanSummary | str | None:
         """What the previous conversation was about: its summary (what the filter left),
         else its title; None when nothing may be said about it."""
         if previous.summary:
-            clean = await self._summaries.clean(user_id, previous.summary, let_go=let_go)
+            clean = await self._summaries.clean(
+                user_id, previous.summary, let_go_ids=let_go_ids
+            )
             if clean is None:  # could not be checked: say nothing about it
                 return None
             if clean.sentences or clean.threads:
@@ -132,7 +136,7 @@ class SinceLastSpoke:
         title = " ".join((previous.title or "").split()).rstrip(" .!?")
         if not title:
             return None
-        checked = await self._summaries.clean(user_id, title, let_go=let_go)
+        checked = await self._summaries.clean(user_id, title, let_go_ids=let_go_ids)
         if checked is None or checked.dropped:
             return None
         return f'you were talking about "{as_data(title)}"'

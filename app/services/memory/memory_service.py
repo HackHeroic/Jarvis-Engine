@@ -71,6 +71,9 @@ _PROFILE_MIN_CONFIDENCE = 0.6
 _RECALL_CANDIDATES = 12
 # How many drop_suppressed answers are kept (oldest dropped first).
 _KEPT_CACHE_SIZE = 256
+# The most memories a turn's snapshot reads: its newest active ones, and the ids of its
+# newest let-go ones (each a bounded read, under PostgREST's 1000-row cap).
+MEMORY_SNAPSHOT_LIMIT = 500
 
 
 class MemoryCandidate(BaseModel):
@@ -147,14 +150,18 @@ def _reinforcement(memory: Memory, now: datetime) -> dict:
 
 @dataclass(frozen=True)
 class MemorySnapshot:
-    """The user's memories as one read found them: every status, superseded left out.
+    """The user's memories as a turn reads them once (``MemoryService.snapshot``).
 
-    A turn reads them once (``MemoryService.snapshot``) and hands the same snapshot to
-    recall, the extraction's known memories and the forget check, instead of each
-    listing the table again.
+    ``memories``: the newest MEMORY_SNAPSHOT_LIMIT active ones, oldest first (recall's
+    profile, the extraction's known memories, the new-pattern count). ``let_go_ids``:
+    the ids of the newest MEMORY_SNAPSHOT_LIMIT the user forgot or dismissed, and
+    nothing else of them: the forget check compares embeddings in the store itself, so
+    their words are never read. Handed to every reader instead of each listing the
+    table again.
     """
 
     memories: tuple[Memory, ...]
+    let_go_ids: frozenset[str] = frozenset()
 
     def in_use(self, now: datetime, *, types: frozenset[str] | None = None) -> list[Memory]:
         """What ``MemoryService.list_active`` would return at ``now``, oldest first."""
@@ -165,11 +172,6 @@ class MemorySnapshot:
             and (types is None or m.memory_type in types)
             and _in_use_at(m, now)
         ]
-
-    @property
-    def let_go(self) -> list[Memory]:
-        """The memories the user forgot or dismissed."""
-        return [m for m in self.memories if m.status in SUPPRESSING_STATUSES]
 
 
 class MemoryService:
@@ -351,10 +353,16 @@ class MemoryService:
         ]
 
     async def snapshot(self, user_id: str) -> MemorySnapshot:
-        """The user's memories in every status but superseded, in one read, oldest first."""
-        return MemorySnapshot(
-            tuple(await self._memories.list(user_id, statuses=frozenset(MemoryStatus)))
+        """The turn's memories (``MemorySnapshot``): two bounded reads, made at once."""
+        active, let_go = await asyncio.gather(
+            self._memories.list(
+                user_id, statuses=_ACTIVE, newest_first=True, limit=MEMORY_SNAPSHOT_LIMIT
+            ),
+            self._memories.list_ids(
+                user_id, statuses=SUPPRESSING_STATUSES, limit=MEMORY_SNAPSHOT_LIMIT
+            ),
         )
+        return MemorySnapshot(tuple(reversed(active)), frozenset(let_go))
 
     async def recall(
         self,
@@ -439,7 +447,7 @@ class MemoryService:
         texts: list[str],
         *,
         min_similarity: float = config.SUMMARY_SUPPRESS_SIMILARITY,
-        let_go: list[Memory] | None = None,
+        let_go_ids: frozenset[str] | None = None,
     ) -> list[str]:
         """``texts``, in order, less each one close to a memory the user forgot or dismissed.
 
@@ -450,8 +458,9 @@ class MemoryService:
         answer is kept for the same texts and the same set of let-go memories (their
         embeddings never change), so a summary shown on every turn is checked once.
 
-        ``let_go`` is the user's forgotten and dismissed memories when the caller has
-        already read them (``MemorySnapshot.let_go``); otherwise they are read here.
+        ``let_go_ids`` are the ids of the user's forgotten and dismissed memories when the
+        caller has already read them (``MemorySnapshot.let_go_ids``); otherwise they are
+        read here (ids only).
 
         Raises EmbeddingUnavailableError when there is something to check against and
         the embedder is down: the caller must not show the texts unchecked.
@@ -459,11 +468,13 @@ class MemoryService:
         texts = list(texts)
         if not texts:
             return []
-        if let_go is None:
-            let_go = await self._memories.list(user_id, statuses=SUPPRESSING_STATUSES)
-        if not let_go:
+        if let_go_ids is None:
+            let_go_ids = frozenset(await self._memories.list_ids(
+                user_id, statuses=SUPPRESSING_STATUSES, limit=MEMORY_SNAPSHOT_LIMIT
+            ))
+        if not let_go_ids:
             return texts
-        key = (user_id, tuple(texts), frozenset(m.id for m in let_go), min_similarity)
+        key = (user_id, tuple(texts), frozenset(let_go_ids), min_similarity)
         if key in self._kept:
             return list(self._kept[key])
         worded = [text for text in texts if _has_words(text)]
