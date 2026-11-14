@@ -64,6 +64,11 @@ class IngestionRequest(BaseModel):
         default=None,
         description="One of 'pdf', 'image', 'png', 'jpeg'. Required when file_base64 is set.",
     )
+    file_name: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="The uploaded file's own name, shown in the document list.",
+    )
 
     _file_within_the_limit = field_validator("file_base64")(within_upload_limit)
 
@@ -190,6 +195,7 @@ async def process_full_pipeline(
         media_type=request.media_type,
         user_id=request.user_id,
         db_client=db_client,
+        file_name=request.file_name,
         constraints=repos.constraints if repos is not None else None,
         tasks=repos.tasks if repos is not None else None,
         goals=repos.goals if repos is not None else None,

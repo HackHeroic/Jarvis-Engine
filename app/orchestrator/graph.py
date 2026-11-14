@@ -136,6 +136,10 @@ _DRAFT_NEGATION_RE = re.compile(
 )
 
 # EDITING is included: a user mid-edit can still accept or scrap the whole thing.
+# A text-only message is read as material to keep (notes, a syllabus pasted in) only
+# from this length; shorter ones that mention documents are questions.
+PASTED_MATERIAL_MIN_CHARS = 400
+
 _NEGOTIATION_ACTIVE = (
     NegotiationPhase.PROPOSED,
     NegotiationPhase.REVIEWING,
@@ -405,7 +409,11 @@ async def _classify_intent(state: JarvisState) -> dict:
         return {"intent": IntentType.PLAN_DAY}
     if bd.has_calendar:
         return {"intent": IntentType.CALENDAR_SYNC}
-    if bd.has_knowledge:
+    # No file reached this point (an upload returned above), so "knowledge" here is text.
+    # Only pasted material is something to ingest; a short message that mentions the
+    # user's notes ("according to my uploaded notes, what...?") is a question about
+    # documents already stored, and the conversation path answers it from them.
+    if bd.has_knowledge and len((state.get("user_message") or "").strip()) >= PASTED_MATERIAL_MIN_CHARS:
         return {"intent": IntentType.KNOWLEDGE_INGESTION}
     if bd.inline_habits:
         return {"intent": IntentType.BEHAVIORAL_CONSTRAINT}

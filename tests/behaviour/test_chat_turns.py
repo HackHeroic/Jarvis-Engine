@@ -422,3 +422,25 @@ async def test_chat__plan_discarded_from_its_card__next_message_is_a_conversatio
     assert turn.intent != "PLAN_DAY"
     assert "socratic_chunker" not in llm.tasks(since=calls_before)
     assert jarvis.rows("user_tasks", user_id="alice") == []
+
+
+@pytest.mark.asyncio
+async def test_chat__question_that_mentions_my_notes_with_no_file__answered_not_ingested(jarvis, llm):
+    """ "According to my uploaded notes, what…?" has nothing to ingest: it is a question
+    about documents already kept, and must reach the conversation path."""
+    llm.script("brain_dump_extraction", brain_dump(has_knowledge=True))
+
+    turn = await jarvis.say("According to my uploaded notes, what is the rule of thumb?")
+
+    assert turn.intent == "CHAT"
+    assert "Standing by" not in turn.reply
+
+
+@pytest.mark.asyncio
+async def test_chat__long_notes_pasted_as_text__still_read_as_material_to_keep(jarvis, llm):
+    llm.script("brain_dump_extraction", brain_dump(has_knowledge=True))
+    notes = "Operating systems notes. " + "Paging replaces segments with fixed frames. " * 12
+
+    turn = await jarvis.say(notes)
+
+    assert turn.intent == "KNOWLEDGE_INGESTION"

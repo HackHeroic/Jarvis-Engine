@@ -7,8 +7,13 @@ def _summary(new_titles: list[str], slots: int) -> dict:
     return {
         "schedule_generated": True,
         "schedule": {"schedule": {f"t{i}": {"start_min": i, "end_min": i + 1} for i in range(slots)}},
-        "execution_graph": {"decomposition": [{"task_id": f"n{i}", "title": t}
-                                              for i, t in enumerate(new_titles)]},
+        "execution_graph": {"decomposition": [
+            {"task_id": f"n{i}", "title": t, "completion_criteria": "done"}
+            for i, t in enumerate(new_titles)
+        ] + [  # the plate's tasks, carried into the plan by fuse_tasks
+            {"task_id": f"old{i}", "goal_id": "g0", "title": f"Carried {i}"}
+            for i in range(max(0, slots - len(new_titles)))
+        ]},
     }
 
 
@@ -30,7 +35,7 @@ def test_voice_parts__many_new_tasks__names_a_few_and_counts_the_rest():
 
 def test_voice_parts__no_schedule__no_plan_facts():
     parts = _build_voj_parts({"schedule_generated": False, "execution_graph": {
-        "decomposition": [{"title": "X"}]}})
+        "decomposition": [{"title": "X", "completion_criteria": "done"}]}})
 
     assert not any(p.startswith(("tasks_in_draft", "new_")) for p in parts)
 

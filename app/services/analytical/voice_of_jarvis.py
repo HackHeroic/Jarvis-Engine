@@ -187,10 +187,13 @@ def _drafted_plan_facts(execution_summary: dict[str, Any]) -> list[str]:
     total = len(slots) if isinstance(slots, dict) else 0
     graph = execution_summary.get("execution_graph")
     decomposition = graph.get("decomposition") if isinstance(graph, dict) else None
+    # The decomposition is this turn's new tasks plus the plate's carried forward
+    # (fuse_tasks). Only a freshly decomposed task has completion criteria; a carried
+    # row is the stored task's few columns.
     new_titles = [
         str(task.get("title")).strip()
         for task in (decomposition or [])
-        if isinstance(task, dict) and task.get("title")
+        if isinstance(task, dict) and task.get("title") and "completion_criteria" in task
     ]
     if total:
         facts.append(f"tasks_in_draft: {total}")
