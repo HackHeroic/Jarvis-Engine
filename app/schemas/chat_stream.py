@@ -162,6 +162,12 @@ class ChatCompletePayload(BaseModel):
         description="The draft this turn proposed (accept it at /drafts/{draft_id}/accept); "
         "null for a turn that proposed none."
     )
+    draft_version: str | None = Field(
+        default=None,
+        description="That draft's version (as GET /drafts/{draft_id} reports it): send it as "
+        "expected_version on accept, and a plan changed since is refused (409 stale_version). "
+        "Present only when draft_id is.",
+    )
     saved_constraints: list[str] | None = Field(
         description="The rules this turn saved, in the user's words."
     )

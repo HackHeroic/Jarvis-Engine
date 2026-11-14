@@ -45,12 +45,15 @@ _REQUEST_ID = re.compile(r'"request_id": "[0-9a-f]{32}"')
 _TIMING = re.compile(r'"(total_time_s|tok_per_sec|ttft_ms|duration_ms)": [0-9.e-]+')
 # A planning run's token (six hex characters), minted per decomposition: {goal_id}_{run}_{task_id}.
 _RUN_TOKEN = re.compile(r"_[0-9a-f]{6}_(?=task_)")
+# A draft's version hashes its tasks, whose ids carry that run token: it differs per run too.
+_DRAFT_VERSION = re.compile(r'"draft_version": "[0-9a-f]{16}"')
 
 
 def _masked(raw: str) -> str:
     raw = _UUID.sub("<uuid>", raw)
     raw = _REQUEST_ID.sub('"request_id": "<request_id>"', raw)
     raw = _TIMING.sub(lambda m: f'"{m.group(1)}": "<n>"', raw)
+    raw = _DRAFT_VERSION.sub('"draft_version": "<draft_version>"', raw)
     return _RUN_TOKEN.sub("_<run>_", raw)
 
 
@@ -190,6 +193,7 @@ async def test_sse_golden__scripted_planning_turn__bytes_unchanged(monkeypatch, 
                          "schedule": {"t1": {"start_min": 0, "end_min": 25}}},
             "execution_graph": {"decomposition": [{"task_id": "t1", "title": "Graphs"}]},
             "draft_id": "draft-1",
+            "draft_version": "0123456789abcdef",
             "response_message": "Here's the plan, sir.",
             "thinking_process": "Three tasks fit before noon.",
             "saved_constraints": ["never before 11 AM"],

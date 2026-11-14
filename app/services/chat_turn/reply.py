@@ -151,6 +151,8 @@ class FinalReply:
     message: str
     thinking: str
     draft_id: str | None
+    # The handed-over draft's version, when there is one: what the review card accepts with.
+    draft_version: str | None
     total_s: float
 
 
@@ -173,6 +175,10 @@ def final_reply(
         # A draft id belongs to the turn that proposed it: only a turn that produced a
         # schedule did. Any other turn would re-announce the thread's draft as new.
         draft_id=final_state.get("draft_id") if has_schedule else None,
+        draft_version=(
+            final_state.get("draft_version")
+            if has_schedule and final_state.get("draft_id") else None
+        ),
         total_s=total_s,
     )
 
@@ -194,7 +200,7 @@ def build_complete_payload(
     it did not fit, a re-plan hint, what the model was given and how the reply was made."""
     infeasible = final_state.get("error") == "INFEASIBLE_EXHAUSTED"
     replan = final_state.get("saved_constraints") or final_state.get("anti_guilt_message")
-    return {
+    payload = {
         "intent": intent,
         "message": reply.message,
         "schedule": final_state.get("schedule"),
@@ -224,3 +230,6 @@ def build_complete_payload(
             "model": text.model,
         },
     }
+    if reply.draft_version:  # only a turn that hands over a draft carries its version
+        payload["draft_version"] = reply.draft_version
+    return payload
