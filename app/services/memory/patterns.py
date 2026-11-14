@@ -402,6 +402,8 @@ class PatternService:
         self._by_name = {detector.name: detector for detector in self._detectors}
         self._clock = clock
         self._pending: dict[str, deque[PatternChange]] = {}
+        # The look running for each user, for a caller that arrives meanwhile to join.
+        self._looking: dict[str, asyncio.Future[PatternLook]] = {}
 
     async def observe(self, user_id: str) -> list[PatternChange]:
         """Remember what the detectors find now; return what changed, each one announced.
@@ -425,7 +427,35 @@ class PatternService:
         there are. ``events`` (the user's outcome events of the last FOCUS_WINDOW_DAYS)
         and ``zone`` may be given by a caller that has already read them; otherwise
         they are read here.
+
+        One look per user at a time: a caller arriving while one is running (two page
+        loads at once, a turn while the background observer looks) waits for it and gets
+        its answer, rather than racing it to the same writes. A caller that stops
+        waiting (a time cap) never cancels the look for the others: it runs to its end,
+        and what it learns is held for the user's next turn.
         """
+        running = self._looking.get(user_id)
+        if running is None:
+            running = asyncio.ensure_future(self._look_now(user_id, events=events, zone=zone))
+            self._looking[user_id] = running
+            running.add_done_callback(lambda done: self._looked(user_id, done))
+        return await asyncio.shield(running)
+
+    def _looked(self, user_id: str, done: asyncio.Future) -> None:
+        """A look ended: the next caller starts a new one. Its outcome is retrieved, so
+        a look nobody waits for any more that then fails is not reported as unretrieved."""
+        if self._looking.get(user_id) is done:
+            del self._looking[user_id]
+        if not done.cancelled():
+            done.exception()
+
+    async def _look_now(
+        self,
+        user_id: str,
+        *,
+        events: list[TaskEvent] | None = None,
+        zone: ZoneInfo | None = None,
+    ) -> PatternLook:
         now = self._clock()
         patterns = await self._detect(user_id, now, events=events, zone=zone)
         held = await self._held(user_id, patterns)

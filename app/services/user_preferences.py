@@ -3,13 +3,13 @@
 from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from supabase import create_client
+from app.db.supabase_py import build_supabase_client
 
 
 def _get_supabase():
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
 async def get_learning_style(
