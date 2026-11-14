@@ -9,6 +9,8 @@ Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own se
 
 They record why each choice was made. They are also the source for the ER diagram: every key, relationship and constraint below was checked by introspecting a database built from `supabase/migrations/` alone (PostgreSQL 18, local).
 
+**Refreshed at `e76bff9`.** No migration changed after `5c6ffd3`. The plan 3 restructure changed only the application side, and the notes on who reads and writes each table are updated for it: repositories now own tasks, rules, goals' deadline updates, habit trackers and drafts, and the legacy `DraftStore`, the v1 memory store and PEARL module, `_persist_fused_tasks` and the task edit and delete routes are gone. `docs/capstone/08-database-schema.md` is the full schema reference.
+
 ## Before you apply
 
 1. **Check the backend key.** `SUPABASE_SERVICE_KEY` must hold the project's service-role (secret) key: `sb_secret_…`, or the legacy `service_role` JWT. The capstone enables row-level security on every user table, and only the service role bypasses it.
@@ -32,7 +34,7 @@ They record why each choice was made. They are also the source for the ER diagra
 
 | | Baseline |
 |---|---|
-| **Contains** | `app/db/migrations/001`–`004` and `006`–`008`: `pending_calendar_updates`, `behavioral_constraints`, `habit_trackers`, base `user_tasks`, `task_materials`, `user_plan_updates`, `ingested_documents`, plus the `user_tasks` columns from `006`/`007`. Also the three `user_tasks` columns from `014` (`quality_score`, `reschedule_count`, `completed_at`). No CLI file ever added those three, yet the Skip endpoint wrote `reschedule_count` (until plan 2) and `mastery_tracker` reads all three. |
+| **Contains** | `app/db/migrations/001`–`004` and `006`–`008`: `pending_calendar_updates`, `behavioral_constraints`, `habit_trackers`, base `user_tasks`, `task_materials`, `user_plan_updates`, `ingested_documents`, plus the `user_tasks` columns from `006`/`007`. Also the three `user_tasks` columns from `014` (`quality_score`, `reschedule_count`, `completed_at`). No CLI file ever added those three, yet the Skip endpoint wrote `reschedule_count` (until plan 2) and `mastery_tracker` read `quality_score` (until plan 3 moved it onto task events). Nothing reads or writes any of the three now. |
 | **Leaves out** | `005` (`user_calendar_anchors`, which is dead) and the status CHECK from `014` (superseded). |
 
 **One older CLI file was edited:** `20260329000000_chat_sessions.sql` now says `CREATE INDEX IF NOT EXISTS` on its three indexes. Before the edit, a second application of the set failed on them. Supabase does not checksum applied migrations, so the edit has no effect on the live history.
@@ -66,29 +68,29 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | Table | Entity | Written by |
 |---|---|---|
 | `user_profiles` | `UserProfile` | `SupabaseProfileRepository`; the `ensure_user_profile` trigger |
-| `goals` | `Goal` | the `ensure_goal` trigger (there is no repository yet) |
-| `user_tasks` | `Task` | `accept_draft()` via `SupabaseDraftRepository.accept_atomic`; `SupabaseTaskRepository`; v1 `_persist_fused_tasks`; `/tasks` endpoints |
+| `goals` | `Goal` | the `ensure_goal` trigger only; `SupabaseGoalRepository.get` reads it |
+| `user_plan_updates` | `GoalDeadlineUpdate` | `SupabaseGoalRepository.add_deadline_update` (read by `latest_context`) |
+| `user_tasks` | `Task` | `accept_draft()` via `SupabaseDraftRepository.accept_atomic` (inserts); `SupabaseTaskRepository` (status compare-and-set, `bring_back`) |
 | `task_events` | `TaskEvent` | `SupabaseTaskEventRepository` |
-| `draft_schedules` | `DraftSchedule` | `SupabaseDraftRepository`, `DraftStore` |
-| `behavioral_constraints` | `BehavioralConstraint` | `SupabaseConstraintRepository`, `behavioral_store` |
+| `draft_schedules` | `DraftSchedule` | `SupabaseDraftRepository`, reached only through `DraftService` |
+| `behavioral_constraints` | `BehavioralConstraint` | `SupabaseConstraintRepository` (`behavioral_store` and the adopted-rule action call it) |
+| `habit_trackers` | `HabitTracker` | `SupabaseHabitTrackerRepository.record_review` (SM-2 reviews); nothing in the app creates a tracker |
 | `proactive_suggestions` | `Suggestion` | `SupabaseSuggestionRepository` |
 | `llm_usage_events` | `LLMUsageEvent` | `SupabaseUsageRepository` |
-| `user_memories` | `Memory` | `SupabaseMemoryRepository`; the v1 memory store and PEARL (until plan 2 moves them) |
-| `chat_sessions` | `ConversationSession` | `chat_history` (sessions, titles, activity); `SupabaseConversationRepository.set_summary` (the summary columns only) |
+| `user_memories` | `Memory` | `SupabaseMemoryRepository` |
+| `chat_sessions` | `ConversationSession` | `chat_history` and the sessions endpoints (sessions, titles, pins, archive, activity); `SupabaseConversationRepository.set_summary` (the summary columns only) |
 | `chat_messages` | `ChatMessage` | `chat_history` (read by `SupabaseConversationRepository`) |
 
-`Pattern` is computed and never stored. The other user tables have no domain entity yet:
+`Pattern` is computed and never stored. The other user tables have no domain entity, and the code that reaches them is on the raw-table allow-list in `tests/test_layering.py` (`_RAW_TABLE_CALLS_ALLOWED`):
 
-| Table | Written by |
+| Table | Read or written by |
 |---|---|
-| `habit_trackers` | SM-2 (`sm2_engine`) |
-| `task_materials` | `task_material_linker` |
-| `ingested_documents` | ingestion orchestrator |
-| `pending_calendar_updates` | calendar extraction |
-| `user_plan_updates` | goal deadlines |
-| `user_preferences` | learning style |
-| `task_workspaces` | workspace cache |
-| `task_completion_signals` | completion telemetry |
+| `task_materials` | `task_material_linker`, the documents endpoint, `workspace_builder` |
+| `ingested_documents` | ingestion orchestrator, the documents endpoint |
+| `pending_calendar_updates` | calendar extraction (insert), the pending-calendar endpoints |
+| `user_preferences` | the learning-style read (nothing writes it) |
+| `task_workspaces` | workspace cache (`workspace_builder`) |
+| `task_completion_signals` | nothing since plan 3: Complete's `completed` task event is the one outcome record |
 
 ## Keys and relationships
 
@@ -174,22 +176,22 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 
 ### Decisions behind the constraints
 
-**`user_tasks` status.** `grep` over `app/` finds exactly these writes:
+**`user_tasks` status.** When the capstone migration was written, `grep` over `app/` found exactly these writes:
 - `pending` (`build_task_rows`)
 - `completed` (`/tasks/{id}/complete`)
 - `pacing_pushed` (`/tasks/{id}/skip`; since plan 2 it writes `skipped`, see below)
 - `missed` (`missed_deadlines`)
 - `TaskStatus` values (repository `update_status`)
 
-No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `updateTask` could send a free-form status through `PATCH /tasks/{id}`, but nothing calls `updateTask`. Those three statuses are therefore not allowed. One mismatch remains: `TaskUpdateRequest.status` still describes `rolled_forward`, and such a PATCH now fails the CHECK.
+No code wrote `in_progress`, `cancelled` or `rolled_forward`, so those three statuses are not allowed. At `e76bff9` every status write goes through `TaskRepository` (`update_status`, `bring_back`) or `accept_draft()`, with `TaskStatus` values only. Plan 3 deleted `PATCH /tasks/{id}` and its `TaskUpdateRequest`, the last place that described `rolled_forward`, so no route can send a free-form status.
 
-**`duration_minutes` / `difficulty_weight` NOT NULL.** Both live insert paths, `accept_draft` and `_persist_fused_tasks`, build their rows with `build_task_rows` from validated `TaskChunk`s, which always carry both values. The `Task` entity also requires both, and `accepted_task_rows` rejects a row without them before the RPC is sent.
+**`duration_minutes` / `difficulty_weight` NOT NULL.** The one insert path, `accept_draft()`, takes rows that `build_task_rows` builds from validated `TaskChunk`s, which always carry both values. (The v1 `_persist_fused_tasks` path did the same; plan 3 deleted it.) The `Task` entity also requires both, and `accepted_task_rows` (`app/infrastructure/persistence/_mapping.py:205`) rejects a row without them before the RPC is sent.
 
 **`draft_schedules.horizon_start` stays TEXT and becomes nullable.** The app writes an ISO string, and `build_task_rows` parses that same string back. A `timestamptz` column would hand back a reformatted string and would read a naive value as UTC.
 
 **`ingested_documents.s3_key text` is new.** The ingestion pipeline writes it whenever the S3 upload succeeds, but no migration created it.
 
-**`task_completion_signals` keeps its `quality` column.**
+**`task_completion_signals` keeps its `quality` column.** Since plan 3 nothing writes the table at all; it is kept, not dropped.
 
 ## Plan 2: Skip writes `skipped`
 
@@ -198,7 +200,7 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 - **Why.** Complete and Skip now go through `TaskService` (`app/services/task_service.py`). Each outcome is a compare-and-set on `user_tasks.status` plus one append-only `task_events` row, and Skip writes `skipped`. Nothing writes `pacing_pushed` any more.
 - **What it does.** First it runs `update user_tasks set status = 'skipped' where status = 'pacing_pushed'`. Then it replaces `user_tasks_status_check` with `pending, completed, skipped, missed`, the `TaskStatus` values.
 - **Old reads.** `_mapping._LEGACY_TASK_STATUSES` stays, so a stray `pacing_pushed` row still reads as `skipped`.
-- **No status by PATCH.** `PATCH /tasks/{id}` answers 422 to any `status`. It would move the status with no event, so status changes go through Complete and Skip only. Nothing in the frontend sends one (`updateTask` has no callers).
+- **No status by PATCH.** Plan 2 made `PATCH /tasks/{id}` answer 422 to any `status`, because it would move the status with no event. Plan 3 deleted the route, with `DELETE /tasks/{id}` and `DELETE /tasks/`, so status changes go through `TaskService` only: Complete, Skip, the passed-slot sweep, the deadline scan and "bring them back".
 - **What Skip no longer writes.** The `reschedule_count` column and the "needs re-decomposition" memory. Later plan 2 tasks replace both from the `skipped` events: a repeated-skip detector (Task 6) and a per-task event count (Task 12).
 - **Missed tasks.** A missed slot is inferred, not asked about. `SlotPassedSweep` marks a pending task `missed`, with a `missed` event, once `scheduled_end + SLOT_GRACE_MINUTES` (30) has passed with no outcome recorded since the slot began. A passed deadline gives status `missed` with a `deadline_missed` event.
 - **Re-runs.** The file is idempotent: a re-run maps nothing and re-creates the same CHECK. `tests/test_migrations.py` pins the mapping, its order before the CHECK, and the final CHECK values.
@@ -207,7 +209,7 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 
 `supabase/migrations/20261115000002_memory_lifecycle_and_vectors.sql` makes `user_memories` the storage of the `Memory` entity (`app/domain/entities.py`), behind `MemoryRepository` (`SupabaseMemoryRepository` / `InMemoryMemoryRepository`, one contract suite).
 
-**Apply note.** Apply it live only together with Task 7. Until then the legacy extractor (`MemoryStore.find_similar_memory`) still reads `embedding` as a float array, and after this migration PostgREST returns a vector as a string.
+**Apply note (historical).** The file had to go live together with plan 2's Task 7: the legacy extractor (`MemoryStore.find_similar_memory`) read `embedding` as a float array, and after this migration PostgREST returns a vector as a string. Plan 3 deleted that extractor and `MemoryStore`; only `SupabaseMemoryRepository` touches the table now.
 
 **What it does.**
 1. `create extension if not exists vector with schema extensions`, then `set local search_path = public, extensions`. Every later statement names the type unqualified (`vector(384)`), so the file works wherever pgvector lives: in `extensions`, or in `public` on a database that installed it there before (where the `create extension` does nothing). `SET LOCAL` needs the transaction the CLI and the SQL editor run each file in.
@@ -231,10 +233,10 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 8. Revokes `execute` on it from `public` and `anon`, and grants it to `service_role` and `authenticated`.
 
 **Column mapping.**
-- The entity's `origin` (conversation, behavior, …) is the legacy `source` column, which the v1 path still writes. The new `provenance` column says whether the user said it.
+- The entity's `origin` (conversation, behavior, …) is the legacy `source` column. The new `provenance` column says whether the user said it.
 - The legacy `source_id`, `last_accessed`, `last_reinforced` and `updated_at` columns have no entity field.
 - Every read names its columns (`_mapping.MEMORY_COLUMNS`) and never selects `embedding`, which is 384 floats a row. Inserts and updates still get the written row back, embedding included: postgrest-py cannot narrow a write's returned columns.
-- A row the v1 path wrote with NULL in a column the entity has a default for reads with that default; a missing `created_at` reads as `updated_at`, then `strength_as_of` (`_mapping.memory_from_row`).
+- A legacy row (written by the v1 path before plan 3 deleted it) with NULL in a column the entity has a default for reads with that default; a missing `created_at` reads as `updated_at`, then `strength_as_of` (`_mapping.memory_from_row`).
 
 **What both repository families check before writing.** The checks live in `_mapping`, so the families cannot disagree:
 - An embedding, and the query of `nearest`, must be exactly 384 finite numbers with a non-zero norm, or the call raises `ValidationError`. The column rejects any other length, and pgvector's cosine distance to a zero vector is NaN, which Postgres sorts above every number, so such a query would return every row.
@@ -260,7 +262,7 @@ No code writes `in_progress`, `cancelled` or `rolled_forward`. The frontend's `u
 
 ## Plan 2: Session summaries
 
-`supabase/migrations/20261115000003_session_summaries.sql` gives each conversation a running summary of its older turns, read and written through `ConversationRepository` (`SupabaseConversationRepository` / `InMemoryConversationRepository`, one contract suite). The repository reads `chat_sessions` and `chat_messages` (which `app/services/chat_history.py` still writes) and writes only the three summary columns. Entities: `ConversationSession`, `ChatMessage`.
+`supabase/migrations/20261115000003_session_summaries.sql` gives each conversation a running summary of its older turns, read and written through `ConversationRepository` (`SupabaseConversationRepository` / `InMemoryConversationRepository`, one contract suite). The repository reads `chat_sessions` and `chat_messages` (which `app/services/chat_history.py` still writes) and writes only the summary columns: the three below, and `summary_covered_through` from `20261115000006_session_summary_reach.sql`. Entities: `ConversationSession`, `ChatMessage`.
 
 **Apply note.** Apply it with the code that reads it: `SupabaseConversationRepository` names the summary columns in every session read, so until it is applied each of those reads fails. The chat turn then falls back to the plain newest-ten window, with no summary and no "since we last spoke", and logs a warning each turn. The migration never wipes or rewrites a row.
 
@@ -384,7 +386,7 @@ None of these differences matters for well-formed rows from `build_task_rows`, e
 
 ## Dropped tables
 
-`grep -rn '<name>' app/ tests/` finds no reads or writes for any of the six tables below. The only hit in code is a comment in `app/services/documents/registry.py:27` naming two of them. All six are dropped with `drop table if exists … cascade`, and none was kept.
+`grep -rn '<name>' app/ tests/` finds no reads or writes for any of the six tables below. Apart from `tests/test_migrations.py`, which lists them as dropped, the only hit is a comment in `app/services/documents/registry.py:27` naming two of them. All six are dropped with `drop table if exists … cascade`, and none was kept.
 
 | Table | Origin |
 |---|---|
@@ -397,13 +399,11 @@ None of these differences matters for well-formed rows from `build_task_rows`, e
 
 ## Known gaps (not schema bugs; the app needs a follow-up)
 
-1. **Re-planning a goal can collide on `task_id`.** The planner's task ids are positional (`task_1…`), namespaced by a goal slug (`learn_dsa_task_1`).
-   - Suppose a user completes `learn_dsa_task_1` and later re-plans the same goal. The new draft carries `learn_dsa_task_1` again.
-   - `accept_draft` deletes only *pending* rows, so the insert hits `user_tasks_user_id_task_id_key` and the whole accept rolls back, surfacing as `PersistenceError`.
-   - Without the key, the duplicate rows would make every `/tasks/{task_id}` call ambiguous. That is why the key stays.
-   - The fix belongs in the planner: mint per-plan-unique task ids.
-2. **`goal_id` on tasks and on drafts can disagree.**
-   - `build_task_rows` takes a task's `goal_id` as the text before the *first* underscore (`learn_dsa_task_1` → `learn`).
+1. **Re-planning a goal no longer collides on `task_id` (closed).** Each planning run mints a run token, so new ids are `{goal_id}_{run}_{task_id}` (`mint_run_token` and `namespace_chunk`, `app/services/planning/goal_ids.py:37, 51`).
+   - A plan that still reuses a completed or skipped task's id hits `user_tasks_user_id_task_id_key` (`accept_draft` deletes only *pending* rows and the re-slotted missed ones). The whole accept rolls back, and the repository maps it to `ConflictError` (`task_id_clash`, 409), not `PersistenceError`.
+   - Without the key, duplicate rows would make every `/tasks/{task_id}` call ambiguous. That is why the key stays.
+2. **`goal_id` on tasks and on drafts can disagree, for chunks without a `goal_id`.**
+   - `build_task_rows` takes a task's `goal_id` from the chunk. Only a chunk without one falls back to the text before the *first* underscore (`learn_dsa_task_1` → `learn`; `app/services/planning/task_rows.py:192`).
    - `draft_schedules.goal_id` is the full slug (`learn_dsa`).
-   - So one plan can create two goals.
+   - So an older plan can create two goals.
 3. **The ingestion order.** `task_materials` is written before `ingested_documents`; the `ensure_ingested_document` trigger papers over this.

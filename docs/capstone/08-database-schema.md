@@ -1,6 +1,6 @@
 # 08 — Database schema
 
-Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 19 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files at commit `5c6ffd3` (branch `capstone-lld`), not from memory. Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
+Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 19 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (branch `capstone-lld`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -280,7 +280,7 @@ Rows are created on demand: by `SupabaseProfileRepository.get_or_create` and by 
 
 ### 3.2 `goals`
 
-*Origin:* capstone §1. Entity: `Goal`. No repository writes it; only the `ensure_goal` trigger does.
+*Origin:* capstone §1. Entity: `Goal`. `GoalRepository.get` can read it (`supabase_repos.py:507`). No application code writes it; only the `ensure_goal` trigger does.
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
@@ -301,7 +301,7 @@ Primary key `(user_id, id)`. Triggers: `ensure_user_profile`. RLS: `owner_all`.
 |---|---|---|---|---|
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** (surrogate). `accept_draft()` never takes it from the row it is given. |
 | `user_id` | `text` | NO | — | FK `user_tasks_user_id_fkey` → `user_profiles` CASCADE |
-| `plan_id` | `text` | yes | — | a fresh UUID per `build_task_rows` call (`app/services/planning/task_rows.py:174`); no plans table |
+| `plan_id` | `text` | yes | — | a fresh UUID per `build_task_rows` call (`app/services/planning/task_rows.py:173`); no plans table |
 | `task_id` | `text` | NO | — | **UK** `user_tasks_user_id_task_id_key` `(user_id, task_id)` |
 | `title` | `text` | NO | — | |
 | `topic_keywords` | `text[]` | yes | `'{}'` | |
@@ -312,17 +312,17 @@ Primary key `(user_id, id)`. Triggers: `ensure_user_profile`. RLS: `owner_all`.
 | `difficulty_weight` | `float8` | NO | `0.5` | `user_tasks_difficulty_weight_range` CHECK `between 0 and 1` |
 | `dependencies` | `jsonb` | yes | `'[]'` | JSON array of `task_id`s (soft, §5) |
 | `deadline_hint` | `text` | yes | — | free text |
-| `quality_score` | `int` | yes | — | dead: read by `mastery_tracker`, written by nothing (§10) |
-| `reschedule_count` | `int` | yes | `0` | dead: Skip stopped writing it in plan 2 (§10) |
-| `completed_at` | `timestamptz` | yes | — | dead: read by `mastery_tracker`, written by nothing |
+| `quality_score` | `int` | yes | — | dead: nothing reads or writes it; mastery reads the `quality` of `completed` events instead (§10) |
+| `reschedule_count` | `int` | yes | `0` | dead: Skip stopped writing it in plan 2, and mastery counts `skipped` events instead (§10) |
+| `completed_at` | `timestamptz` | yes | — | dead: nothing reads or writes it |
 | `scheduled_start` | `timestamptz` | yes | — | `user_tasks_scheduled_window_check`: `scheduled_end is null or scheduled_start is null or scheduled_end > scheduled_start` |
 | `scheduled_end` | `timestamptz` | yes | — | see above |
 | `completion_criteria` | `text` | yes | — | |
 | `implementation_intention` | `jsonb` | yes | — | the WOOP if-then plan |
-| `scheduled_hour` | `smallint` | yes | — | dead: backfilled once by `20260501000001`, never written since |
-| `actual_duration_minutes` | `integer` | yes | — | dead column: Complete now records the value in `task_events.metadata` and `task_completion_signals.metadata` |
-| `original_duration_minutes` | `integer` | yes | — | `user_tasks_original_duration_minutes_check`: `null or > 0`; read by the legacy PEARL query, written by nothing |
-| `original_deadline_hint` | `text` | yes | — | read by the legacy PEARL query, written by nothing |
+| `scheduled_hour` | `smallint` | yes | — | dead: backfilled once by `20260501000001`; nothing reads or writes it |
+| `actual_duration_minutes` | `integer` | yes | — | dead column: Complete records the value in `task_events.metadata` (`app/services/task_service.py:124`) |
+| `original_duration_minutes` | `integer` | yes | — | `user_tasks_original_duration_minutes_check`: `null or > 0`; dead: nothing reads or writes it |
+| `original_deadline_hint` | `text` | yes | — | dead: nothing reads or writes it |
 
 Indexes:
 
@@ -355,6 +355,7 @@ Triggers: `ensure_user_profile`, `ensure_goal`. RLS: `owner_all`.
 | `metadata` | `jsonb` | NO | `'{}'` | title, goal_id, deadline_hint, plus per-event detail: `reason` (skip), `quality` and `actual_duration_minutes` (complete), `previous_start` (rescheduled) |
 
 Indexes: `idx_task_events_user_occurred (user_id, occurred_at desc)`, `idx_task_events_user_task (user_id, task_id)`. RLS: `owner_all`.
+This table is the one outcome record. Mastery and the completion streak read it (`app/services/analytical/mastery_tracker.py`; the streak is `compute_streak_from_events`, line 241, served through `streak_as_of`, line 263), as do the PEARL detectors and the focus profile (§4.2).
 
 ### 3.5 `draft_schedules` — proposed plans under review
 
@@ -370,10 +371,11 @@ Indexes: `idx_task_events_user_occurred (user_id, occurred_at desc)`, `idx_task_
 | `status` | `text` | NO | `'pending'` | `draft_schedules_status_check` IN (`pending`, `modified`, `accepted`, `rejected`, `expired`, `superseded`) |
 | `rejection_reason` | `text` | yes | — | |
 | `created_at` | `timestamptz` | NO | `now()` | |
-| `expires_at` | `timestamptz` | yes | `now() + interval '24 hours'` | `accept_draft()` refuses a draft past it |
+| `expires_at` | `timestamptz` | yes | `now() + interval '24 hours'` | `accept_draft()` refuses a draft past it. Both repository families stamp every new draft from the one constant `_mapping.DRAFT_TTL` (24 h, `app/infrastructure/persistence/_mapping.py:46`), which matches the default. |
 | `schedule` | `jsonb` | yes | — | solver output: `task_id → {start_min, end_min}` |
 
 Indexes: `idx_draft_schedules_user_status (user_id, status)`, `idx_draft_schedules_user_goal (user_id, goal_id)`. Triggers: `ensure_user_profile`, `ensure_goal`. RLS: `owner_all`.
+**No version column.** `GET /drafts/{id}` returns a `version` that is computed, not stored: the first 16 hex characters of a sha256 over the draft's `tasks` and `schedule` as canonical JSON (`DraftSchedule.version`, `app/domain/entities.py:360`). An accept that names a stale `expected_version` is refused with 409 `stale_version` before `accept_draft()` is called (`check_version`, `app/services/draft_service.py:62`).
 
 ### 3.6 `behavioral_constraints` — rules plans must respect
 
@@ -385,9 +387,9 @@ Indexes: `idx_draft_schedules_user_status (user_id, status)`, `idx_draft_schedul
 | `user_id` | `text` | NO | — | FK `behavioral_constraints_user_id_fkey` → `user_profiles` CASCADE |
 | `raw_text` | `text` | NO | — | the rule in the user's words |
 | `constraint_type` | `text` | NO | `'preference'` | no CHECK |
-| `structured_override` | `jsonb` | yes | `'{}'` | written by the legacy `behavioral_store` |
+| `structured_override` | `jsonb` | yes | `'{}'` | dead: nothing in `app/` reads or writes it |
 | `created_at` | `timestamptz` | NO | `now()` | |
-| `recurrence` | `text` | yes | `'daily'` | no CHECK. The repository writes the entity's `None` as an explicit NULL, so the default applies only to legacy inserts. |
+| `recurrence` | `text` | yes | `'daily'` | no CHECK. The repository writes the entity's `None` as an explicit NULL, so the default applies only to inserts that leave the column out. Both application writers set `'daily'` (`app/services/extraction/behavioral_store.py:42`, `app/services/anticipation/actions.py:229`). |
 | `valid_from` | `timestamptz` | yes | — | read by `SupabaseConstraintRepository.list_active` (`_applies_at`) |
 | `valid_until` | `timestamptz` | yes | — | same |
 | `structured_semantics` | `jsonb` | yes | `'{}'` | what the scheduler consumes; `memory_id` inside it is a soft link to the memory of stating the rule (§5) |
@@ -397,7 +399,7 @@ Indexes: `idx_behavioral_user (user_id)`. RLS: `owner_all`.
 
 ### 3.7 `habit_trackers` — SM-2 spaced-repetition state
 
-*Origin:* baseline (003); capstone §5, §8. No entity (§4).
+*Origin:* baseline (003); capstone §5, §8. Entity: `HabitTracker`, through `HabitTrackerRepository` (§4). The application reads and updates trackers (`sm2_engine`); no application code creates one.
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
@@ -430,8 +432,8 @@ Indexes: `idx_habit_trackers_user (user_id)`, `idx_habit_trackers_last_done (use
 | `confidence` | `float8` | NO | `0.5` | `user_memories_confidence_range` CHECK `between 0 and 1` |
 | `strength` | `float8` | NO | `1.0` | `user_memories_strength_range` CHECK `between 0 and 1`; the value as of `strength_as_of` |
 | `stability` | `float8` | NO | `1.0` | `user_memories_stability_range` CHECK `between 0.01 and 20` |
-| `last_accessed` | `timestamptz` | yes | `now()` | legacy (v1 `MemoryStore`); no entity field |
-| `last_reinforced` | `timestamptz` | yes | `now()` | legacy; no entity field |
+| `last_accessed` | `timestamptz` | yes | `now()` | legacy: no entity field, and nothing in `app/` reads or writes it |
+| `last_reinforced` | `timestamptz` | yes | `now()` | legacy: same |
 | `superseded_by` | `uuid` | yes | — | FK `user_memories_superseded_by_fkey` *(generated)* → `user_memories (id)` NO ACTION |
 | `expires_at` | `timestamptz` | yes | — | temporal events |
 | `observation_count` | `integer` | NO | `1` | `user_memories_observation_count_check` CHECK `>= 1` |
@@ -595,7 +597,7 @@ Indexes: `idx_pending_calendar_user_status (user_id, status)`. RLS: `owner_all`.
 
 ### 3.16 `user_plan_updates` — goal-level deadlines
 
-*Origin:* baseline (006); capstone §5, §6. No entity.
+*Origin:* baseline (006); capstone §5, §6. Entity: `GoalDeadlineUpdate`, through `GoalRepository` (`latest_context` reads the newest snippet for a goal; `add_deadline_update` inserts).
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
@@ -612,7 +614,7 @@ Indexes: `idx_user_plan_updates_user (user_id)`; `idx_user_plan_updates_goal (us
 
 ### 3.17 `user_preferences`
 
-*Origin:* `20260329000002`; capstone §5. No entity.
+*Origin:* `20260329000002`; capstone §5. No entity. The application only reads it (`app/services/user_preferences.py:25`).
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
@@ -640,18 +642,18 @@ Indexes: the UK; `idx_user_preferences_user (user_id)`, which duplicates the UK'
 
 Indexes: the UK; `task_workspaces_user_task_idx (user_id, task_id)`, which duplicates the UK's index; `task_workspaces_expires_idx (expires_at)`. RLS: `owner_all`.
 
-### 3.19 `task_completion_signals` — completion telemetry
+### 3.19 `task_completion_signals` — completion telemetry (no longer written)
 
-*Origin:* `20260329000002`; capstone §5. No entity.
+*Origin:* `20260329000002`; capstone §5. No entity. Nothing in `app/` reads or writes it: plan 3 (commit `7547d4f`) removed the insert from Complete, because the `completed` task event is the one outcome record. No migration drops the table.
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** |
 | `user_id` | `text` | NO | — | FK `task_completion_signals_user_id_fkey` → `user_profiles` CASCADE |
 | `task_id` | `text` | NO | — | soft → `user_tasks` |
-| `signal_type` | `text` | NO | — | only `completed` is written (`tasks.py:426`); no CHECK |
-| `quality` | `integer` | yes | — | 0–5 in the request model; no DB CHECK |
-| `metadata` | `jsonb` | yes | `'{}'::jsonb` | `{"actual_duration_minutes": …}` |
+| `signal_type` | `text` | NO | — | no CHECK; the old writer only ever wrote `completed` |
+| `quality` | `integer` | yes | — | no DB CHECK |
+| `metadata` | `jsonb` | yes | `'{}'::jsonb` | old rows hold `{"actual_duration_minutes": …}` |
 | `created_at` | `timestamptz` | yes | `now()` | |
 
 Indexes: `idx_task_completion_signals_user (user_id, task_id)`. RLS: `owner_all`.
@@ -660,35 +662,39 @@ Indexes: `idx_task_completion_signals_user (user_id, task_id)`. RLS: `owner_all`
 
 ## 4. Class → table mapping
 
-Entities live in `app/domain/entities.py`. Both repository families, Supabase (`app/infrastructure/persistence/supabase_repos.py`) and InMemory (`in_memory.py`), map them through the shared rules in `app/infrastructure/persistence/_mapping.py`. `RepositoryFactory` (`factory.py`) builds the families. A storage row may carry columns its entity does not model. `from_row` builds the entity from the fields it declares and ignores the rest (`_mapping.py:152`).
+Entities live in `app/domain/entities.py`. Both repository families, Supabase (`app/infrastructure/persistence/supabase_repos.py`) and InMemory (`in_memory.py`), map them through the shared rules in `app/infrastructure/persistence/_mapping.py`. `RepositoryFactory` (`factory.py`) builds the families, and the composition root (`app/container.py`) is the only place that builds one (`tests/test_layering.py::test_layering__only_container_builds_repositories`). A storage row may carry columns its entity does not model. `from_row` builds the entity from the fields it declares and ignores the rest (`_mapping.py:167`).
+
+Since plan 3, `draft_schedules`, `behavioral_constraints`, `user_memories`, `habit_trackers` and `user_plan_updates` each have one persistence path, their repository, and so does `user_tasks` apart from three raw reads (end of §4.2). Gone: the legacy `DraftStore` (`app/services/draft_store.py`), the v1 `MemoryStore` (`app/services/memory/store.py`) and the legacy `app/services/memory/pearl.py`, and the raw `.table(...)` reads and writes in `behavioral_store`, `mastery_tracker`, `sm2_engine`, `missed_deadlines`, `core/user_model.py` and the task and habit endpoints. `chat_sessions` and `chat_messages` still have raw writers beside their read repository (below).
 
 ### 4.1 Entities that are stored
 
 | Entity (`entities.py` line) | Table | Repository | Mapping notes |
 |---|---|---|---|
-| `UserProfile` (227) | `user_profiles` | `SupabaseProfileRepository` | 1:1. `created_at` and `updated_at` have no field. |
-| `Goal` (243) | `goals` | **none** | The entity exists, but no repository reads or writes it. Rows come only from the `ensure_goal` trigger. `created_at` has no field. |
-| `Task` (255) | `user_tasks` | `SupabaseTaskRepository` (reads, status CAS); writes through `accept_draft()` | 13 fields ↔ 24 columns. Unmapped: `topic_keywords`, `created_at`, `completion_criteria`, `implementation_intention`, `quality_score`, `reschedule_count`, `completed_at`, `scheduled_hour`, `actual_duration_minutes`, `original_duration_minutes`, `original_deadline_hint`. A stored `pacing_pushed` reads as `skipped` (`_mapping._LEGACY_TASK_STATUSES`, line 46). |
-| `TaskEvent` (290) | `task_events` | `SupabaseTaskEventRepository` | 1:1, all 8 columns. |
-| `DraftSchedule` (309) | `draft_schedules` | `SupabaseDraftRepository`, plus the legacy `DraftStore` (`app/services/draft_store.py`) | 9 fields ↔ 10 columns; `created_at` is unmapped. |
-| `BehavioralConstraint` (348) | `behavioral_constraints` | `SupabaseConstraintRepository`, plus the legacy `behavioral_store` | 8 fields ↔ 11 columns. Unmapped: `structured_override`, `valid_from`, `valid_until`. The validity window is read from the raw row (`supabase_repos._applies_at`). |
-| `Memory` (370) | `user_memories` | `SupabaseMemoryRepository`, plus the legacy `MemoryStore` insert (`app/services/memory/store.py:80`) | 20 fields ↔ 25 columns. **Renamed:** field `origin` ↔ column `source` (`_mapping._MEMORY_COLUMN_FOR`). Unmapped: `source_id`, `last_accessed`, `last_reinforced`, `updated_at`; `embedding` is passed beside the entity, never inside it. |
-| `Suggestion` (537) | `proactive_suggestions` | `SupabaseSuggestionRepository` | 13 fields ↔ 14 columns; `resolved_at` is unmapped. `ConsentDecision` (523) is a value object stored in `consent_behavior` + `consent_kind` + `consent_reason`. |
-| `LLMUsageEvent` (612) | `llm_usage_events` | `SupabaseUsageRepository` | 13 fields ↔ 14 columns: the entity has no `id`. The ledger only appends and summarises. |
-| `ConversationSession` (565) | `chat_sessions` | `SupabaseConversationRepository` (reads; writes only the four summary columns); `app/services/chat_history.py` writes the rest | 9 fields ↔ 12 columns; `is_archived`, `is_pinned` and `metadata` are unmapped. |
-| `ChatMessage` (601) | `chat_messages` | `SupabaseConversationRepository` (read-only); `chat_history.py` writes | 6 fields ↔ 8 columns; `intent` and `metadata` are unmapped. |
+| `UserProfile` (229) | `user_profiles` | `SupabaseProfileRepository` | 1:1. `created_at` and `updated_at` have no field. |
+| `Goal` (245) | `goals` | `SupabaseGoalRepository.get` (read only) | No application code writes a goal. Rows come only from the `ensure_goal` trigger. `created_at` has no field. |
+| `GoalDeadlineUpdate` (257) | `user_plan_updates` | `SupabaseGoalRepository` (`latest_context`, `add_deadline_update`) | 7 fields ↔ 8 columns: the entity has no `id`. |
+| `Task` (275) | `user_tasks` | `SupabaseTaskRepository` (reads; status compare-and-set; `bring_back`); inserts only through `accept_draft()` | 13 fields ↔ 24 columns. Unmapped: `topic_keywords`, `created_at`, `completion_criteria`, `implementation_intention`, `quality_score`, `reschedule_count`, `completed_at`, `scheduled_hour`, `actual_duration_minutes`, `original_duration_minutes`, `original_deadline_hint`. A stored `pacing_pushed` reads as `skipped` (`_mapping._LEGACY_TASK_STATUSES`, line 49). |
+| `TaskEvent` (314) | `task_events` | `SupabaseTaskEventRepository` | 1:1, all 8 columns. |
+| `DraftSchedule` (333) | `draft_schedules` | `SupabaseDraftRepository`, reached only through `DraftService` | 10 fields ↔ 10 columns. `version` is a computed property, not a column (§3.5). An unset `created_at` is left out of the insert so the column default stamps it (`_mapping.draft_to_row`, line 256). |
+| `BehavioralConstraint` (386) | `behavioral_constraints` | `SupabaseConstraintRepository` | 8 fields ↔ 11 columns. Unmapped: `structured_override`, `valid_from`, `valid_until`. The validity window is read from the raw row (`supabase_repos._applies_at`, line 493). |
+| `HabitTracker` (412) | `habit_trackers` | `SupabaseHabitTrackerRepository` (`get`, `list_for_user`, `record_review`) | 9 fields ↔ 11 columns; `created_at` and `updated_at` are unmapped. |
+| `Memory` (438) | `user_memories` | `SupabaseMemoryRepository` | 20 fields ↔ 25 columns. **Renamed:** field `origin` ↔ column `source` (`_mapping._MEMORY_COLUMN_FOR`, line 64). Unmapped: `source_id`, `last_accessed`, `last_reinforced`, `updated_at`; `embedding` is passed beside the entity, never inside it. |
+| `Suggestion` (605) | `proactive_suggestions` | `SupabaseSuggestionRepository` | 13 fields ↔ 14 columns; `resolved_at` is unmapped. `ConsentDecision` (591) is a value object stored in `consent_behavior` + `consent_kind` + `consent_reason`. |
+| `LLMUsageEvent` (680) | `llm_usage_events` | `SupabaseUsageRepository` | 13 fields ↔ 14 columns: the entity has no `id`. The ledger only appends and summarises. |
+| `ConversationSession` (633) | `chat_sessions` | `SupabaseConversationRepository` (reads; writes only the four summary columns); `app/services/chat_history.py` and `app/api/v1/endpoints/sessions.py` write the rest | 9 fields ↔ 12 columns; `is_archived`, `is_pinned` and `metadata` are unmapped. |
+| `ChatMessage` (669) | `chat_messages` | `SupabaseConversationRepository` (read-only); `chat_history.py` writes | 6 fields ↔ 8 columns; `intent` and `metadata` are unmapped. |
 
 ### 4.2 What does not map 1:1
 
 | Item | Why |
 |---|---|
-| `Pattern` (450) | Computed by the PEARL detectors from `task_events`; never stored as itself. A pattern the user keeps is stored as a `Memory` with `memory_type = 'behavioral_pattern'` and the pattern's `pattern_key`. |
-| `FocusProfile` (495), `HourFocus` (482) | Computed by `HistoryEnergyEstimator` from `task_events`; never stored. |
-| `ConsentDecision` (523) | A value object embedded in `proactive_suggestions` (three columns), not a table. |
-| `MemoryMatch` (`app/domain/ports.py:307`) | A port DTO: one row of the `match_memories()` result (a `Memory` plus `similarity`). |
-| `Goal` | Has a table but no repository (see above). |
-| 8 tables with no entity | `habit_trackers`, `task_materials`, `ingested_documents`, `pending_calendar_updates`, `user_plan_updates`, `user_preferences`, `task_workspaces`, `task_completion_signals`. Each is written by one legacy service (`sm2_engine`, `task_material_linker`, the ingestion orchestrator, calendar extraction, goal deadlines, learning style, `workspace_builder`, `tasks.py`), straight through supabase-py. |
-| Two persistence paths | `draft_schedules`, `behavioral_constraints` and `user_memories` each still have a legacy writer beside their repository (named in §4.1). The plan 2 ledger records this as I2, carried to plan 3. |
+| `Pattern` (518) | Computed by the PEARL detectors from `task_events`; never stored as itself. A pattern the user keeps is stored as a `Memory` with `memory_type = 'behavioral_pattern'` and the pattern's `pattern_key`. |
+| `FocusProfile` (563), `HourFocus` (550) | Computed by `HistoryEnergyEstimator` from `task_events`; never stored. |
+| `ConsentDecision` (591) | A value object embedded in `proactive_suggestions` (three columns), not a table. |
+| `MemoryMatch` (`app/domain/ports.py:391`) | A port DTO: one row of the `match_memories()` result (a `Memory` plus `similarity`). |
+| `Goal` | Read-only repository; written only by a trigger (see above). |
+| 6 tables with no entity | `task_materials`, `ingested_documents`, `pending_calendar_updates`, `user_preferences`, `task_workspaces`, `task_completion_signals`. The first five are reached straight through supabase-py: `task_material_linker` and the documents endpoint (`task_materials`), the ingestion orchestrator and the documents endpoint (`ingested_documents`), calendar extraction and the pending-calendar endpoints (`pending_calendar_updates`), the learning-style read (`user_preferences`), and `workspace_builder` (`task_workspaces`). Nothing reads or writes `task_completion_signals` (§3.19). |
+| Raw table access that remains | `tests/test_layering.py` holds an allow-list of exactly 8 files that may still call `.table(...)` (`_RAW_TABLE_CALLS_ALLOWED`, lines 438–453), each with its reason: `workspace_builder` (the `task_workspaces` cache, `task_materials`, and two `user_tasks` reads that need `topic_keywords` and `implementation_intention`, which `Task` does not carry), `user_preferences`, `chat_history` (`chat_sessions` / `chat_messages`), the sessions, documents and ingestion endpoints, the ingestion orchestrator (`pending_calendar_updates` / `ingested_documents`) and `task_material_linker`. Plan 3 cut the task that would have given sessions, documents and calendar rows their repositories. Outside the scanned directories, the health probe in `app/db/supabase_py.py:49` also reads `user_tasks` raw. |
 
 ### 4.3 Associations ↔ keys
 
@@ -697,12 +703,14 @@ Entities live in `app/domain/entities.py`. Both repository families, Supabase (`
 | UserProfile owns everything | 1 → * | FK `user_id` → `user_profiles`, CASCADE (SET NULL for usage) |
 | Goal groups Tasks | 0..1 → * | FK `(user_id, goal_id)` → `goals`, SET NULL (`goal_id`) |
 | Goal is planned by DraftSchedules | 0..1 → * | same FK on `draft_schedules` |
-| DraftSchedule *produces* Tasks on accept | 1 → * | **no column**. `user_tasks.plan_id` is a UUID minted per accept, not the draft id (`task_rows.py:174`). The link exists only in time (the accept) and in `task_events` (`scheduled` events written by `DraftService._record_slots`). |
+| Goal has GoalDeadlineUpdates | 0..1 → * | FK `(user_id, goal_id)` on `user_plan_updates` → `goals`, SET NULL (`goal_id`) |
+| DraftSchedule *produces* Tasks on accept | 1 → * | **no column**. `user_tasks.plan_id` is a UUID minted per accept, not the draft id (`task_rows.py:173`). The link exists only in time (the accept) and in `task_events` (`scheduled` events written by `DraftService._record_slots`, `draft_service.py:263`). |
 | Task has TaskEvents | 1 → * | **soft**: `task_events.task_id` |
 | Task depends on Tasks | * ↔ * | **soft**: `user_tasks.dependencies` (JSON array) |
 | Memory supersedes Memory | 0..1 → 0..1 | FK `superseded_by` → `user_memories (id)` |
 | Memory learned in a session / message | 0..1 → * | **soft**: `source_session_id`, `source_message_id` |
-| BehavioralConstraint ↔ the Memory of stating it | * → 0..1 | **soft**: `structured_semantics.memory_id` (`app/services/memory/stated_rules.py:30`) |
+| BehavioralConstraint ↔ the Memory of stating it (or the pattern memory it was adopted from) | * → 0..1 | **soft**: `structured_semantics.memory_id` (`RULE_MEMORY_KEY`, `app/services/memory/stated_rules.py:30`; set for an adopted rule at `app/services/anticipation/actions.py:236`) |
+| HabitTracker tracks a BehavioralConstraint | * → 0..1 | FK `habit_trackers.constraint_id` → `behavioral_constraints (id)`, SET NULL |
 | Suggestion holds a ProactiveAction (Command) | 1 → 1 | embedded JSON `action` (§10) |
 | Suggestion's action → DraftSchedule / Memory | * → 0..1 | **soft**: `action.draft_id`, `action.memory_id` |
 | ConversationSession contains ChatMessages | 1 → * | FK `chat_messages.session_id`, CASCADE |
@@ -722,7 +730,7 @@ These columns name another row, but no database constraint enforces the link. Ea
 | `user_tasks.plan_id` | the plan id `build_task_rows` mints | There is no plans table. |
 | `draft_schedules.tasks`, `draft_schedules.schedule` | proposed chunks and slots | A draft is a proposal snapshot, stored as JSON (§10). |
 | `user_memories.source_id` | a message or a task | Polymorphic: one column, two possible parents. |
-| `user_memories.source_session_id`, `source_message_id` | `chat_sessions (id)`, `chat_messages (id)` | A memory learned in a conversation that was never saved (Supabase down, ephemeral session id) must still be stored. A key on the id alone would also not check that the session belongs to the same user. Both repository families check only the UUID form (`_mapping._MEMORY_UUID_FIELDS`, line 57). |
+| `user_memories.source_session_id`, `source_message_id` | `chat_sessions (id)`, `chat_messages (id)` | A memory learned in a conversation that was never saved (Supabase down, ephemeral session id) must still be stored. A key on the id alone would also not check that the session belongs to the same user. Both repository families check only the UUID form (`_mapping._MEMORY_UUID_FIELDS`, line 60). |
 | `behavioral_constraints.structured_semantics ->> 'memory_id'` | `user_memories (id)` | A key inside JSON. Forgetting the memory deletes the linked rules in code (`StatedRules.forget_memory`), not in SQL. |
 | `proactive_suggestions.action ->> 'draft_id'` / `'memory_id'` | `draft_schedules (id)` / `user_memories (id)` | The Command payload is polymorphic by `kind`. Accept handles a vanished target by marking the suggestion `expired` (409). |
 | `chat_messages.metadata ->> 'draft_id'` | `draft_schedules (id)` | Display metadata on an assistant reply. |
@@ -737,7 +745,7 @@ All seven functions are `SECURITY INVOKER`, the default: none declares `SECURITY
 
 ### 6.1 `accept_draft(p_draft_id uuid, p_user_id text, p_rows jsonb) returns integer`
 
-Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `20261115000001_accept_draft_reslots_missed.sql` (v2, the live version). `plpgsql`, `set search_path = public`. Called only by `SupabaseDraftRepository.accept_atomic` (`supabase_repos.py:390`), which `DraftService.accept` reaches (`app/services/draft_service.py:92`).
+Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `20261115000001_accept_draft_reslots_missed.sql` (v2, the live version). `plpgsql`, `set search_path = public`. Called only by `SupabaseDraftRepository.accept_atomic` (`supabase_repos.py:419`, the call at line 427), which `DraftService.accept` reaches (`app/services/draft_service.py:185`, the call at line 213). The REST accept, the chat accept (both through `app/services/draft_actions.py`) and the morning brief's `ApplyDraftAction` (`app/services/anticipation/actions.py:73`) all go through `DraftService.accept`. A stale `expected_version` is refused in `DraftService.accept` before the call (§3.5); the function itself never sees the version, so an edit that lands between that check and the call is not caught.
 
 **Contract.** The function accepts an open draft and replaces the user's pending tasks with `p_rows` in one transaction. It returns how many tasks it inserted. On any error it rolls everything back.
 
@@ -758,7 +766,7 @@ Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `2026111500000
 7. `UPDATE draft_schedules SET status = 'superseded'` for every *other* `pending`/`modified` draft of the user.
 8. Return the insert count.
 
-**Idempotency.** A second call on the same draft finds it `accepted`, raises `DRAFT_NOT_OPEN` and writes nothing. Two concurrent accepts, of the same draft or of two different drafts, serialise on the profile row: exactly one succeeds, and the other gets `DRAFT_NOT_OPEN`. The repository maps the errors as follows (`supabase_repos.py:400–412`):
+**Idempotency.** A second call on the same draft finds it `accepted`, raises `DRAFT_NOT_OPEN` and writes nothing. Two concurrent accepts, of the same draft or of two different drafts, serialise on the profile row: exactly one succeeds, and the other gets `DRAFT_NOT_OPEN`. The repository maps the errors as follows (`supabase_repos.py:430–441`):
 
 | Database error | Domain error | API |
 |---|---|---|
@@ -773,7 +781,7 @@ Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `2026111500000
 
 ### 6.2 `match_memories(p_user_id text, p_query vector(384), p_statuses text[], p_types text[], p_limit int, p_min_similarity double precision)`
 
-Defined in `20261115000002_memory_lifecycle_and_vectors.sql` §7. Called only by `SupabaseMemoryRepository.nearest` (`supabase_repos.py:715`).
+Defined in `20261115000002_memory_lifecycle_and_vectors.sql` §7. Called only by `SupabaseMemoryRepository.nearest` (`supabase_repos.py:821`, the call at line 841).
 
 | Property | Value |
 |---|---|
@@ -810,21 +818,21 @@ Each vocabulary is defined **once in code**, and a CHECK constraint in SQL mirro
 
 | Column | Values | Defined in code | SQL constraint |
 |---|---|---|---|
-| `user_tasks.status` | `pending`, `completed`, `skipped`, `missed` | `TaskStatus`, `app/domain/entities.py:13` | `user_tasks_status_check` |
-| `draft_schedules.status` | `pending`, `modified`, `accepted`, `rejected`, `expired`, `superseded` | `DraftStatus`, `entities.py:20` | `draft_schedules_status_check` |
-| `task_events.event_type` | `scheduled`, `completed`, `skipped`, `missed`, `rescheduled`, `deadline_missed` | `TaskEventType`, `entities.py:29` | `task_events_event_type_check` |
-| `user_profiles.autonomy_mode` | `suggest_only`, `ask_first`, `auto_low_risk` | `AutonomyMode`, `entities.py:38` | `user_profiles_autonomy_mode_check` |
-| `proactive_suggestions.status` | `pending`, `accepted`, `dismissed`, `expired`, `auto_applied` | `SuggestionStatus`, `entities.py:44` | `proactive_suggestions_status_check` |
-| `proactive_suggestions.action ->> 'expired_because'` | `out_of_date`, `no_fit` | `SuggestionExpiry`, `entities.py:52` (key `EXPIRY_KEY`, line 65) | none (JSON) |
-| `proactive_suggestions.consent_kind` | `rule_match`, `mode_decision`, `risk_check`, `learned_preference` | `ConsentReasonKind`, `entities.py:68` | `proactive_suggestions_consent_kind_check` |
-| `proactive_suggestions.consent_behavior` | `allow`, `ask`, `deny` | `ConsentBehavior`, `entities.py:105` | `proactive_suggestions_consent_behavior_check` |
-| `llm_usage_events.location` | `local`, `cloud` | `LLMLocation`, `entities.py:80` | `llm_usage_events_location_check` |
-| `user_memories.status` | `active`, `dismissed`, `forgotten`, `faded` | `MemoryStatus`, `entities.py:85` | `user_memories_status_check` |
-| `user_memories.provenance`, `behavioral_constraints.source` | `said`, `inferred` | `MemorySource`, `entities.py:92` | `user_memories_provenance_check`, `behavioral_constraints_source_check` |
-| `user_memories.memory_type` | `fact`, `preference`, `behavioral_pattern`, `temporal_event`, `goal`, `feedback`, `constraint` | `MemoryType`, `entities.py:100` | `user_memories_memory_type_check` *(generated)* |
-| `chat_messages.role` | `user`, `assistant`, `system` | `ChatMessage.role`, `entities.py:607` | `chat_messages_role_check` *(generated)* |
-| `user_preferences.learning_style` | `watcher`, `reader`, `interactive` | `LearningStyle`, `app/schemas/context.py:49` | `user_preferences_learning_style_check` *(generated)* |
-| `pending_calendar_updates.status` | `pending`, `approved`, `rejected` | **SQL only**; the code writes string literals (`app/api/v1/endpoints/ingestion.py:189, 213, 233`) | `pending_calendar_updates_status_check` *(generated)* |
+| `user_tasks.status` | `pending`, `completed`, `skipped`, `missed` | `TaskStatus`, `app/domain/entities.py:15` | `user_tasks_status_check` |
+| `draft_schedules.status` | `pending`, `modified`, `accepted`, `rejected`, `expired`, `superseded` | `DraftStatus`, `entities.py:22` | `draft_schedules_status_check` |
+| `task_events.event_type` | `scheduled`, `completed`, `skipped`, `missed`, `rescheduled`, `deadline_missed` | `TaskEventType`, `entities.py:31` | `task_events_event_type_check` |
+| `user_profiles.autonomy_mode` | `suggest_only`, `ask_first`, `auto_low_risk` | `AutonomyMode`, `entities.py:40` | `user_profiles_autonomy_mode_check` |
+| `proactive_suggestions.status` | `pending`, `accepted`, `dismissed`, `expired`, `auto_applied` | `SuggestionStatus`, `entities.py:46` | `proactive_suggestions_status_check` |
+| `proactive_suggestions.action ->> 'expired_because'` | `out_of_date`, `no_fit` | `SuggestionExpiry`, `entities.py:54` (key `EXPIRY_KEY`, line 67) | none (JSON) |
+| `proactive_suggestions.consent_kind` | `rule_match`, `mode_decision`, `risk_check`, `learned_preference` | `ConsentReasonKind`, `entities.py:70` | `proactive_suggestions_consent_kind_check` |
+| `proactive_suggestions.consent_behavior` | `allow`, `ask`, `deny` | `ConsentBehavior`, `entities.py:107` | `proactive_suggestions_consent_behavior_check` |
+| `llm_usage_events.location` | `local`, `cloud` | `LLMLocation`, `entities.py:82` | `llm_usage_events_location_check` |
+| `user_memories.status` | `active`, `dismissed`, `forgotten`, `faded` | `MemoryStatus`, `entities.py:87` | `user_memories_status_check` |
+| `user_memories.provenance`, `behavioral_constraints.source` | `said`, `inferred` | `MemorySource`, `entities.py:94` | `user_memories_provenance_check`, `behavioral_constraints_source_check` |
+| `user_memories.memory_type` | `fact`, `preference`, `behavioral_pattern`, `temporal_event`, `goal`, `feedback`, `constraint` | `MemoryType`, `entities.py:102` | `user_memories_memory_type_check` *(generated)* |
+| `chat_messages.role` | `user`, `assistant`, `system` | `ChatMessage.role`, `entities.py:675` | `chat_messages_role_check` *(generated)* |
+| `user_preferences.learning_style` | `watcher`, `reader`, `interactive` | `LearningStyle`, `app/schemas/context.py:31` | `user_preferences_learning_style_check` *(generated)* |
+| `pending_calendar_updates.status` | `pending`, `approved`, `rejected` | **SQL only**; the code uses string literals (`app/api/v1/endpoints/ingestion.py:214, 235, 257, 275`) | `pending_calendar_updates_status_check` *(generated)* |
 
 **Columns with no enum and no CHECK:** `goals.status`, `behavioral_constraints.constraint_type`, `behavioral_constraints.recurrence`, `proactive_suggestions.trigger` and `.kind`, `llm_usage_events.role`, `task_completion_signals.signal_type`, `user_memories.source` and `.applied_as`.
 
@@ -838,24 +846,25 @@ The legal moves are the `_Move` table in `app/services/task_service.py:74–84`.
 | `pending` / `missed` / `skipped` → `completed` | Complete ("I actually did that" is allowed) | `completed` (metadata `quality`, `actual_duration_minutes`) | `_COMPLETE`, `task_service.py:74` |
 | `pending` → `skipped` | Skip | `skipped` (metadata `reason`) | `_SKIP`, line 80 |
 | `pending` → `missed` | Deadline passed | `deadline_missed` | `_DEADLINE_MISS`, line 81 |
-| `pending` → `missed` | Slot passed: `scheduled_end` + 30 min grace, no outcome since the slot began | `missed` | `_SLOT_MISS`, line 84; `SlotPassedSweep` |
-| `missed` → `pending` (same row) | Chat "bring them back" | **none** | `missed_deadlines.py:195` (`update_status(..., expected=MISSED)`) |
+| `pending` → `missed` | Slot passed: `scheduled_end` + 30 min grace, no outcome since the slot began | `missed` | `_SLOT_MISS`, line 84; `SlotPassedSweep` (line 310) |
+| `missed` → `pending` (same row) | Chat "bring them back" | **none**: bringing a task back is not an outcome | `restore_missed` (`app/services/analytical/missed_deadlines.py:129`) → `TaskService.bring_back` (`task_service.py:154`) → `TaskRepository.bring_back` (`supabase_repos.py:259`): one compare-and-set from `missed` that also clears `deadline_hint` |
 | `missed` → (deleted) → `pending` (new row, same `task_id`) | A new plan re-slots it | `rescheduled` | `accept_draft()` v2 delete rule |
 | `pending` → (deleted) | Every accept replaces the pending set | none | `accept_draft()` step 4 |
-| any → (deleted) | `DELETE /tasks/{id}`, `DELETE /tasks/` | none | `app/api/v1/endpoints/tasks.py:332, 361` |
+
+No route deletes or edits a task: plan 3 removed `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/` (commit `7547d4f`).
 
 A row's `id` is therefore not stable across accepts. `task_id` is the stable identity, which is why `task_events` keys on it.
 
-### 7.2 Draft status (`DRAFT_TRANSITIONS`, `entities.py:174`)
+### 7.2 Draft status (`DRAFT_TRANSITIONS`, `entities.py:176`)
 
 | From | Allowed to | Writer of each target |
 |---|---|---|
-| `pending`, `modified` (open: `OPEN_DRAFT_STATUSES`, line 160) | `modified`, `accepted`, `rejected`, `expired`, `superseded` | `modified`: legacy `DraftStore.replace_tasks` (`draft_store.py:130`), reached by `/modify`, `/rearrange` and the per-task `PATCH` (the repository's `replace_tasks` keeps the status as it is) • `accepted` and `superseded`: `accept_draft()` only (the legacy `DraftStore.accept_draft` has no caller) • `rejected`: `DraftService.reject` → `set_status` (CAS on the status it read) • `expired`: `DraftService.expire` (anticipation actions; the deprecated accept-schedule on failure) |
+| `pending`, `modified` (open: `OPEN_DRAFT_STATUSES`, line 162) | `modified`, `accepted`, `rejected`, `expired`, `superseded` | `modified`: `DraftService.edit_tasks` (`draft_service.py:147`), reached by `/modify`, `/rearrange` and the per-task `PATCH` (through `edit_task`). It checks the move first, then calls the repository's `replace_tasks`, which writes only to an open draft and keeps the status, then `set_status(MODIFIED)` • `accepted` and `superseded`: `accept_draft()` only • `rejected`: `DraftService.reject` → `set_status` (CAS on the status it read) • `expired`: `DraftService.discard` (`DELETE /drafts/{id}`, line 178) and `DraftService.expire` (the morning brief's `ApplyDraftAction`, `app/services/anticipation/actions.py:85, 88`) |
 | `accepted`, `rejected`, `expired`, `superseded` | none (terminal) | — |
 
-A draft past its `expires_at` keeps status `pending`. Expiry is checked when someone tries to accept it (`DRAFT_NOT_OPEN`); no job writes `expired`. `DELETE /drafts/{id}` hard-deletes a draft in any status.
+A draft past its `expires_at` keeps status `pending`. Expiry is checked when someone tries to accept it (`DRAFT_NOT_OPEN`); no job writes `expired`. `DELETE /drafts/{id}` no longer deletes the row: it discards an open draft (status `expired`, row kept) and answers 409 `invalid_state_transition` for a closed one (`app/api/v1/endpoints/drafts.py:197`).
 
-### 7.3 Memory status (`MEMORY_TRANSITIONS`, `entities.py:121`)
+### 7.3 Memory status (`MEMORY_TRANSITIONS`, `entities.py:123`)
 
 | From | Allowed to |
 |---|---|
@@ -864,9 +873,9 @@ A draft past its `expires_at` keeps status `pending`. Expiry is checked when som
 | `dismissed` | `forgotten` |
 | `forgotten` | none: nothing automatic brings back what the user let go of |
 
-`SUPPRESSING_STATUSES = {dismissed, forgotten}` (line 109). When a fact in one of those states is said again, the store recognises it by its `pattern_key` and does not store it again. Every write that changes the status is guarded in the UPDATE itself (`only_if_status`, `supabase_repos.py:770`), so a forget that lands between a read and a write still wins.
+`SUPPRESSING_STATUSES = {dismissed, forgotten}` (line 111). When a fact in one of those states is said again, the store recognises it by its `pattern_key` and does not store it again. Every write that changes the status is guarded in the UPDATE itself (`only_if_status`, `supabase_repos.py:853`), so a forget that lands between a read and a write still wins.
 
-### 7.4 Suggestion status (`SUGGESTION_TRANSITIONS`, `entities.py:188`)
+### 7.4 Suggestion status (`SUGGESTION_TRANSITIONS`, `entities.py:190`)
 
 | From | Allowed to |
 |---|---|
@@ -908,13 +917,13 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 
 | Data | Lifecycle | Where enforced |
 |---|---|---|
-| **`task_events`** | **Append-only.** No code in `app/` updates or deletes a row. Rows go only through the profile's CASCADE and the demo seed's reset. Learning reads the *latest* outcome per `(task_id, scheduled_start)` (`task_service.latest_outcome_per_slot`). Reads are ordered newest first, so PostgREST's 1000-row cap (`supabase/config.toml` `max_rows`) can drop only the oldest rows. Callers narrow every read by `since`, `types` or `task_ids` (a plan 2 ruling; the port allows an unnarrowed read). | `supabase_repos.SupabaseTaskEventRepository` (append, append_many, list_for_user) |
+| **`task_events`** | **Append-only.** No code in `app/` updates or deletes a row. Rows go only through the profile's CASCADE and the demo seed's reset. Learning, mastery and the streak read the *latest* outcome per `(task_id, scheduled_start)` (`task_service.latest_outcome_per_slot`, line 45). Reads are ordered newest first, so PostgREST's 1000-row cap (`supabase/config.toml` `max_rows`) can drop only the oldest rows. Callers narrow every read by `since`, `types` or `task_ids` (a plan 2 ruling; the port allows an unnarrowed read). | `supabase_repos.SupabaseTaskEventRepository` (append, append_many, list_for_user) |
 | **`user_tasks`** | Holds the current state only. The pending set is deleted and rewritten on every accept, so row ids change and `task_id` stays. The history lives in `task_events`. | `accept_draft()`; `TaskService` |
-| **Forgotten memories** | **Tombstone, not delete.** `DELETE /memories/{id}` sets `status = 'forgotten'` and `content = ''`. It keeps `embedding` and `pattern_key`, so the same fact said or noticed again is recognised and not stored again. Linked rules are deleted (`StatedRules.forget_memory`). Not covered: the user's own words stay in `chat_messages`, which a forget does not rewrite. A summary holding the fact is filtered before it is shown, and written back without it by the next background compaction. | `MemoryService.forget` (`memory_service.py:300`); `SummaryFilter` (`conversation_memory.py`) |
+| **Forgotten memories** | **Tombstone, not delete.** `DELETE /memories/{id}` sets `status = 'forgotten'` and `content = ''`. It keeps `embedding` and `pattern_key`, so the same fact said or noticed again is recognised and not stored again. Linked rules are deleted (`StatedRules.forget_memory`). Not covered: the user's own words stay in `chat_messages`, which a forget does not rewrite. A summary holding the fact is filtered before it is shown, and written back without it by the next background compaction. | `MemoryService.forget` (`memory_service.py:304`); `SummaryFilter` (`app/services/memory/summary_text.py:145`) |
 | **Dismissed / faded memories** | `dismissed` hides the memory for good but keeps its text. The daily `MemoryDecaySweep` stores the decayed `strength` as of now (`strength_as_of`) and marks memories below `MEMORY_RETENTION_FLOOR` (0.1) `faded`, except `constraint` memories. A faded memory comes back when it is mentioned. | `MemoryService.fade_stale` |
-| **Session summaries and coverage markers** | `summary_through` is where the verbatim window starts. It never moves back: `set_summary` is a compare-and-set in the UPDATE's own filter (`summary_through <= through`, or NULL). `summary_covered_through` is how far the summary reaches, which is past the window start once an idle summary also covered the newest 8 turns. Compaction runs after a turn once more than 16 messages are past `summary_through` (`COMPACT_AFTER_MESSAGES`, `COMPACT_KEEP_RECENT = 8`). `SessionSummarySweep` summarises conversations idle for 30 minutes. A summary write leaves `updated_at` alone (§6.4). | `SupabaseConversationRepository.set_summary` (`supabase_repos.py:875`); `app/core/config.py:294–296` |
+| **Session summaries and coverage markers** | `summary_through` is where the verbatim window starts. It never moves back: `set_summary` is a compare-and-set in the UPDATE's own filter (`summary_through <= through`, or NULL). `summary_covered_through` is how far the summary reaches, which is past the window start once an idle summary also covered the newest 8 turns. Compaction runs after a turn once more than 16 messages are past `summary_through` (`COMPACT_AFTER_MESSAGES`, `COMPACT_KEEP_RECENT = 8`). `SessionSummarySweep` summarises conversations idle for 30 minutes. A summary write leaves `updated_at` alone (§6.4). | `SupabaseConversationRepository.set_summary` (`supabase_repos.py:981`); `app/core/config.py:298–300` |
 | **Usage ledger (`llm_usage_events`)** | Append-only, one row per completed model call, including billed failures. Deleting a user sets `user_id` to NULL and keeps the cost record. The You page's privacy receipt reads the last 30 days in pages of 1000 rows, up to 20 pages, and sets `truncated` if it stops early. There is no retention or purge job. | `SupabaseUsageRepository.summary` |
-| **Drafts** | Created `pending` with `expires_at = now() + 24 h`. They are closed by accept, reject, supersede or expire (§7.2), and nothing purges closed drafts. `DELETE /drafts/{id}` removes one. | §7.2 |
+| **Drafts** | Created `pending` with `expires_at = now() + 24 h` (`_mapping.DRAFT_TTL`). They are closed by accept, reject, supersede, expire or discard (§7.2), and nothing purges closed drafts. No route deletes a draft row: `DELETE /drafts/{id}` marks it `expired`. | §7.2 |
 | **Chat sessions** | "Delete" in the API is a soft archive (`is_archived = true`). Rows are removed only by the profile's CASCADE. | `app/api/v1/endpoints/sessions.py` |
 | **Workspace cache** | `task_workspaces` rows expire after 24 h. They are rebuilt on a miss or after expiry, and busted when a document is linked to the task. | `workspace_builder.py` |
 | **Deleting a user** | Deleting the `user_profiles` row cascades to all 17 CASCADE tables (`chat_messages` also through `chat_sessions`, `task_materials` also through `ingested_documents`) and nulls `llm_usage_events.user_id`. | FKs, §2 |
@@ -946,32 +955,35 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 | `task_events.metadata` | per-event detail (reason, quality, actual duration, previous start, title) | Fields vary by `event_type` |
 | `proactive_suggestions.action` | the Command payload, polymorphic by `kind` | One table for every kind of proposal |
 | `behavioral_constraints.structured_semantics` / `.structured_override` | the scheduler's machine form (+ the memory link) | Shape owned by the scheduler |
-| `pending_calendar_updates.extracted_slots`, `task_workspaces.workspace_json`, `chat_*.metadata`, `task_completion_signals.metadata` | snapshots and caches | Written and read whole |
+| `pending_calendar_updates.extracted_slots`, `task_workspaces.workspace_json`, `chat_*.metadata` | snapshots and caches | Written and read whole |
 
-**Legacy tables kept.** Eight tables have no domain entity (§4.2). They are kept because live features write them: SM-2 habits, document linking, ingestion, calendar approval, goal deadlines, learning style, the workspace cache and completion telemetry. Six dead tables were dropped instead (capstone §3: `pending_action_items`, `extracted_problems`, `task_completion_criteria`, `user_calendar_anchors`, `conversation_messages`, `conversation_sessions`).
+**Legacy tables kept.** Six tables have no domain entity (§4.2). Five are kept because live features use them: document linking, ingestion, calendar approval, learning style and the workspace cache. The sixth, `task_completion_signals`, has had no reader or writer since plan 3 (§3.19); no migration drops it. Six dead tables were dropped instead (capstone §3: `pending_action_items`, `extracted_problems`, `task_completion_criteria`, `user_calendar_anchors`, `conversation_messages`, `conversation_sessions`).
 
 **Dead columns** (no writer in `app/`; checked with `grep` at HEAD):
 
 | Column | Status |
 |---|---|
-| `user_tasks.scheduled_hour` | read by the legacy `app/services/memory/pearl.py`; written only by the one-time backfill |
-| `user_tasks.quality_score`, `.completed_at`, `.reschedule_count` | read by `app/services/analytical/mastery_tracker.py`; no writer since plan 2 (the reschedule count is now derived from `skipped` events) |
-| `user_tasks.actual_duration_minutes` | no writer: Complete records it in `task_events.metadata` and `task_completion_signals.metadata` |
-| `user_tasks.original_duration_minutes`, `.original_deadline_hint` | read by the legacy PEARL fetch; nothing records the planned value before a `PATCH /tasks/{id}` edit |
+| `user_tasks.scheduled_hour` | written only by the one-time backfill; no reader since the legacy `app/services/memory/pearl.py` was deleted in plan 3 |
+| `user_tasks.quality_score`, `.completed_at`, `.reschedule_count` | no reader or writer. Mastery reads the `quality` of `completed` events and counts `skipped` events instead (`app/services/analytical/mastery_tracker.py:97`, `:148`) |
+| `user_tasks.actual_duration_minutes` | no writer: Complete records it in `task_events.metadata` (`task_service.py:124`) |
+| `user_tasks.original_duration_minutes`, `.original_deadline_hint` | no reader or writer |
+| `behavioral_constraints.structured_override` | no reader or writer |
 | `proactive_suggestions.resolved_at` | never read or written |
-| `goals.deadline`, `goals.status` | only their defaults; no repository |
-| `user_profiles.display_name` | only the demo seed writes it; `PATCH /you/settings` forbids it (`SettingsUpdate`, `extra="forbid"`) |
-| `user_memories.source_id`, `.last_accessed`, `.last_reinforced` | the legacy `MemoryStore` only; no entity field |
+| `goals.deadline`, `goals.status` | only their defaults; `GoalRepository.get` would read them, and no application code calls it |
+| `user_profiles.display_name` | only the demo seed writes it (`scripts/seed_demo_user.py:571`); `PATCH /you/settings` forbids it (`SettingsUpdate`, `extra="forbid"`, `app/api/v1/endpoints/you.py:83`) |
+| `user_memories.source_id`, `.last_accessed`, `.last_reinforced` | no entity field, and no reader or writer since the v1 `MemoryStore` was deleted in plan 3 |
+| every column of `task_completion_signals` | no reader or writer since plan 3 (§3.19) |
 
 **Other known gaps** (from `_schema_notes.md`, "Known gaps", and the plan ledgers):
-- **`goal_id` disagreement.** `build_task_rows` takes a task's `goal_id` from the chunk when present, and only for legacy ids from the text before the first underscore. `draft_schedules.goal_id` is the full slug, so older plans could create two goals.
-- **No constraint on `user_memories.content` length.** The entity caps it at 2000 characters; the column has no length CHECK.
+- **`goal_id` disagreement.** `build_task_rows` takes a task's `goal_id` from the chunk when present, and only for a chunk without one from the text before the first underscore (`task_rows.py:192`, `_goal_id_of` at line 55). `draft_schedules.goal_id` is the full slug, so older plans could create two goals.
+- **No constraint on `user_memories.content` length.** The entity caps it at 2000 characters (`entities.py:445`); the column has no length CHECK.
+- **No application code creates a habit tracker.** `HabitTrackerRepository` reads and updates rows (`get`, `list_for_user`, `record_review`); none of its methods inserts one.
 
 ---
 
 ## 11. Where the spec and the code differ
 
-The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md`. In every case below, the code wins.
+The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md`. The rows compare the code with the design as first written; the spec's own amendments of 2026-11-14 record the rulings in its §15 decision log. In every case below, the code wins. Plan 3 closed one earlier row: the spec's `GoalRepository` port (§6.2) now exists (`app/domain/ports.py:257`).
 
 | Spec says | Code does | Reason / source |
 |---|---|---|
@@ -979,10 +991,9 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 | §11: `goals` "backfilled from distinct `goal_id`s" | No backfill; the `ensure_goal` trigger creates goals on first use | The live rows were wiped (owner decision, 2026-11-14). |
 | §11: "point the health check at `user_profiles`" | `DatabaseClient.check_connection` queries `user_tasks` | `app/db/supabase_py.py:49`; pinned by `tests/test_schema_alignment.py::test_check_connection__health_probe__queries_user_tasks` |
 | §11: CHECK "enums for status, kind, recurrence and signal_type" | Status columns have CHECKs; `kind`, `recurrence`, `signal_type` (and `goals.status`, `constraint_type`) have none | §7 |
-| §11: "every entity maps to exactly one table, every association arrow maps to an FK" | `Pattern` and `FocusProfile` are computed and not stored; `Goal` has no repository; several associations are soft references (12 are drawn dashed in §2) | §4–§5 |
+| §11: "every entity maps to exactly one table, every association arrow maps to an FK" | `Pattern` and `FocusProfile` are computed and not stored; `Goal` is read-only and written only by a trigger; several associations are soft references (12 are drawn dashed in §2) | §4–§5 |
 | §11: "N001–N014 ported in; `app/db/migrations/` retired" | The baseline ports 001–004, 006–008 and three columns of 014; 005 and 014's CHECK are left out. `app/db/migrations/` is still in the tree, though nothing applies it. | baseline header |
-| §6.2: a `GoalRepository` port | None exists | `app/domain/ports.py` has no Goal port |
-| §6.1: `DraftSchedule` has a `version` | No `version` field or column; concurrency is a status compare-and-set plus the user lock in `accept_draft()` | `entities.py:309`; `supabase_repos.py:363` |
+| §6.1: `DraftSchedule` has a `version` | No `version` column: `version` is a property computed from `tasks` and `schedule`. It is checked in `DraftService.accept` before `accept_draft()` runs, not inside the SQL function. Concurrency is otherwise a status compare-and-set plus the user lock in `accept_draft()`. | `entities.py:360`; `draft_service.py:62`; `supabase_repos.py:392` |
 | §10: `accept_draft(draft_id, user_id)` checks `status = 'pending'` | `accept_draft(p_draft_id, p_user_id, p_rows)` accepts `pending` or `modified`, checks expiry, supersedes the user's other open drafts and re-slots missed rows | §6.1 |
 | §9.1: re-slotting a missed task "updates the same `user_tasks` row" | `accept_draft()` deletes the missed row and inserts a new one with the same `task_id` (new `id`) | `20261115000001` |
 | §6.3: draft states "Pending → UnderReview → …" | `pending` / `modified` are the open states | `DraftStatus` |
@@ -996,14 +1007,19 @@ From `Jarvis-Engine/` on branch `capstone-lld`:
 ```bash
 # The migrations: tables created, RLS on every table, every user_id an FK,
 # idempotent statements, accept_draft column list / lock order / supersede / grants,
-# status CHECKs == domain enums, memory + session-summary + consent-kind columns.
+# status CHECKs == domain enums, memory + session-summary + consent-kind columns (expect 40 passed).
 .venv/bin/python -m pytest tests/test_migrations.py -q
 
-# Writes and probes name only columns the migrations create.
+# The health probe queries a table the migrations create (expect 1 passed).
 .venv/bin/python -m pytest tests/test_schema_alignment.py -q
 
-# One contract suite, run against both repository families (InMemory and Supabase-over-fake).
+# One contract suite, run against both repository families (InMemory and Supabase-over-fake)
+# (expect 223 passed).
 .venv/bin/python -m pytest tests/test_repository_contracts.py -q
+
+# One persistence path per table: repositories built only in the container, raw .table(...)
+# calls only in the 8 allow-listed files, task / rule / draft paths through their services.
+.venv/bin/python -m pytest tests/test_layering.py tests/test_tasks_one_path.py tests/test_drafts_one_path.py -q
 
 # Live: introspect the real database (read-only queries in the Supabase SQL editor).
 #   select tablename, rowsecurity from pg_tables where schemaname = 'public' order by 1;   -- 19 rows, all true
