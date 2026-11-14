@@ -350,6 +350,16 @@ class Pattern(BaseModel):
     evidence: list[str] = Field(
         default_factory=list, description="References to the observations behind it."
     )
+    pattern_key: str | None = Field(
+        default=None,
+        description=(
+            "Stable identity of the pattern (e.g. skip_time_window:9), so the same habit"
+            " found again is recognised; the remembered pattern carries the same key."
+        ),
+    )
+    hour: int | None = Field(
+        default=None, ge=0, le=23, description="Local hour of the day it is about, if any."
+    )
 
 
 HOURS_PER_DAY = 24

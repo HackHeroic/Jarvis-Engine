@@ -15,7 +15,7 @@ from typing import Any
 
 from app.core.model_router import build_chain
 from app.domain.anticipation import ConsentPolicy
-from app.domain.events import EventBus, LLMCallCompleted
+from app.domain.events import EventBus, LLMCallCompleted, TaskCompleted, TaskMissed, TaskSkipped
 from app.domain.ports import EnergyEstimator, Sweep, TextEmbedder
 from app.infrastructure.embedding import MiniLMEmbedder
 from app.infrastructure.llm.chain import FallbackChainProvider
@@ -26,6 +26,7 @@ from app.services.anticipation.service import ActionFactory, AnticipationService
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
+from app.services.memory.patterns import PatternObserver, PatternService
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 
@@ -46,6 +47,7 @@ class AppContainer:
     energy: EnergyEstimator
     embedder: TextEmbedder
     memory_service: MemoryService
+    patterns: PatternService
     consent: ConsentPolicy
     actions: ActionFactory
     anticipation: AnticipationService
@@ -87,6 +89,10 @@ class AppContainer:
         task_service = TaskService(repos.tasks, repos.task_events, events)
         embedder = embedder if embedder is not None else MiniLMEmbedder()
         memory_service = MemoryService(repos.memories, embedder)
+        patterns = PatternService(repos.task_events, repos.memories, repos.profiles, events)
+        observer = PatternObserver(patterns)  # PEARL looks again after every outcome
+        for outcome in (TaskCompleted, TaskSkipped, TaskMissed):
+            events.subscribe(outcome, observer)
         # Triggers register themselves with the service; each one's action kind with
         # the factory, so an accepted suggestion can be rebuilt from its payload.
         consent = ConsentPolicy.default()
@@ -103,6 +109,7 @@ class AppContainer:
             energy=HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
             embedder=embedder,
             memory_service=memory_service,
+            patterns=patterns,
             consent=consent,
             actions=actions,
             anticipation=AnticipationService(

@@ -268,19 +268,36 @@ def _on_every_day(slots: list[dict]) -> list[dict]:
     ]
 
 
-async def memory_to_constraints(state: PlanningState) -> dict:
-    """Convert PEARL behavioral patterns into time slot constraints for OR-Tools."""
+async def _memory_slots(state: PlanningState) -> list:
+    """The user's stated rules and learned skip windows, as time slots.
+
+    Through ``MemoryService`` when the composition root is registered: active
+    constraint and behavioural-pattern memories, so a dismissed or forgotten one never
+    blocks time. Otherwise (tests, scripts) the legacy memory store and bridge.
+    """
+    container = registered_container()
+    if container is not None:
+        from app.services.memory.constraint_bridge import memory_slots
+
+        memories = await container.memory_service.list_active(
+            state.get("user_id", "demo"), types=frozenset({"constraint", "behavioral_pattern"})
+        )
+        return memory_slots(memories)
     user_model = state.get("user_model")
-    if not user_model:
-        return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
+    memory_store = await user_model.get_memory_store() if user_model else None
+    if not memory_store:
+        return []
+    from app.services.memory.constraint_bridge import memories_to_constraints
+
+    return await asyncio.to_thread(
+        memories_to_constraints, state.get("user_id", "demo"), memory_store
+    )
+
+
+async def memory_to_constraints(state: PlanningState) -> dict:
+    """Convert stated rules and PEARL behavioral patterns into time slot constraints."""
     try:
-        memory_store = await user_model.get_memory_store()
-        if not memory_store:
-            return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
-        from app.services.memory.constraint_bridge import memories_to_constraints
-        import asyncio
-        user_id = state.get("user_id", "demo")
-        slots = await asyncio.to_thread(memories_to_constraints, user_id, memory_store)
+        slots = await _memory_slots(state)
         if not slots:
             return {"_tool_detail": {"formula": "quality×0.5 + SR×0.3 + reschedule_penalty×0.2"}}
         extra = _on_every_day(

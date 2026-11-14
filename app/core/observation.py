@@ -11,6 +11,7 @@ import asyncio
 import json
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.core.runtime import registered_container
 
 
 def _emit_event(state: dict, event_type: str, data: dict) -> None:
@@ -45,10 +46,36 @@ async def extract_and_store_memories(state: dict) -> list[dict]:
 
 
 async def detect_pearl_patterns(state: dict) -> list[dict]:
-    """Detect recurring behavioral patterns from task history."""
+    """Detect recurring behavioral patterns from task history.
+
+    With the composition root registered, PEARL reads the outcome history
+    (``PatternService.observe``) and returns one learning-moment frame per pattern it
+    created or strengthened: nothing when there is no new evidence, and never a
+    pattern the user dismissed or forgot. Without one (tests, scripts), the legacy
+    detectors over ``user_tasks``.
+    """
     user_model = state.get("user_model")
     if not user_model:
         return []
+    container = registered_container()
+    if container is not None:
+        try:
+            changes = await container.patterns.observe(user_model.user_id)
+        except Exception as e:
+            logger.warning(f"PEARL pattern detection failed (non-fatal): {e!r}")
+            return []
+        return [
+            {
+                "type": change.pattern.detector,
+                "content": change.pattern.description,
+                "confidence": change.pattern.confidence,
+                "occurrence_count": change.pattern.occurrences,
+                "action": change.action,
+                "pattern_key": change.pattern.pattern_key,
+                "memory_id": change.memory_id,
+            }
+            for change in changes
+        ]
     try:
         db = getattr(user_model, "_db", None)
         supabase = db.supabase if db and hasattr(db, "supabase") else None
@@ -173,6 +200,8 @@ async def _run_inline_observation(state: dict) -> dict:
             "confidence": pattern.get("rate", pattern.get("confidence", 0.0)),
             "occurrence_count": pattern.get("total", pattern.get("occurrence_count", 1)),
             "action": pattern.get("action", "detected"),
+            "pattern_key": pattern.get("pattern_key"),
+            "memory_id": pattern.get("memory_id"),
         })
 
     await update_cognitive_state(state)
