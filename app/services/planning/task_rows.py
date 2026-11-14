@@ -127,7 +127,10 @@ def build_task_rows(
     Args:
         schedule: Optional map of task_id -> {"start_min", "end_min"} (solver
             output). A task in it gets wall-clock ``scheduled_start``/``_end``.
-        horizon_start: ISO-8601 instant that the schedule's minute 0 stands for.
+        horizon_start: ISO-8601 instant that the schedule's minute 0 stands for:
+            08:00 in the user's zone, with its offset. A legacy value without an
+            offset was written when the horizon was UTC's, and is read as UTC.
+            Either way ``scheduled_start``/``_end`` are offset-aware instants.
     """
     plan_id = str(uuid.uuid4())
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -138,6 +141,9 @@ def build_task_rows(
             horizon = datetime.fromisoformat(horizon_start)
         except (ValueError, TypeError):
             logger.warning("Could not parse horizon_start %r; tasks stay timeless", horizon_start)
+        else:
+            if horizon.tzinfo is None:
+                horizon = horizon.replace(tzinfo=timezone.utc)
 
     rows: list[dict[str, Any]] = []
     for chunk in chunks:

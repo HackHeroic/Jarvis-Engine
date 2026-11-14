@@ -6,45 +6,50 @@ pending tasks) without deleting them, and surfaced in the synthesis with
 anti-guilt framing — never shame language.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.services.planning.local_time import end_of_local_day, user_zone
 
 
-def _parse_deadline(value: Any) -> Optional[datetime]:
-    """Parse a deadline; ALWAYS returns tz-aware UTC datetime or None.
+def _parse_deadline(value: Any, zone: ZoneInfo) -> Optional[datetime]:
+    """Parse a deadline into an aware datetime, or None.
 
-    Naive datetimes (older Supabase rows) are coerced to UTC. Without this,
-    `dl < now()` raises TypeError and silently breaks the missed-deadline scan.
+    Deadlines are the user's: a plain date passes at the end of that day on their
+    clock (23:59:59 in ``zone``, not in UTC, which for India is 05:29 the next
+    morning), and a timestamp without an offset is their wall time. Aware always,
+    or ``dl < now`` raises TypeError and silently breaks the scan.
     """
     if not value:
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return value if value.tzinfo else value.replace(tzinfo=zone)
     try:
         s = str(value).strip()
         if not s:
             return None
-        # Allow plain dates and ISO timestamps
         if "T" not in s and len(s) == 10:
-            s = f"{s}T23:59:59+00:00"
+            return end_of_local_day(date.fromisoformat(s), zone)
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=zone)
     except Exception:
         return None
 
 
-async def detect_and_mark_missed(user_id: str, supabase: Any) -> list[dict]:
+async def detect_and_mark_missed(
+    user_id: str, supabase: Any, zone: Optional[ZoneInfo] = None
+) -> list[dict]:
     """Find pending tasks whose deadline has passed; mark them `missed`.
 
-    Returns the list of (task_id, title, deadline) tuples that were just marked.
-    Empty list if none. Tolerates supabase=None (returns []).
+    ``zone`` is the user's (default ``user_zone()``): it decides when a date-only
+    deadline has passed. Returns the list of (task_id, title, deadline) tuples
+    that were just marked. Empty list if none. Tolerates supabase=None (returns []).
     """
     if not supabase:
         return []
+    zone = zone or user_zone()
     now = datetime.now(timezone.utc)
     try:
         result = (
@@ -61,7 +66,7 @@ async def detect_and_mark_missed(user_id: str, supabase: Any) -> list[dict]:
 
     overdue: list[dict] = []
     for row in rows:
-        dl = _parse_deadline(row.get("deadline_hint"))
+        dl = _parse_deadline(row.get("deadline_hint"), zone)
         if dl and dl < now:
             overdue.append({
                 "id": row.get("id"),

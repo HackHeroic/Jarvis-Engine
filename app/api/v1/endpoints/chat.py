@@ -849,20 +849,23 @@ async def confirm_schedule_stream(
                 except Exception as exc:
                     print(f"[ConfirmSchedule] habit translation failed (non-fatal): {exc}")
 
-            # Time context
+            # Time context: the user's day, never UTC's.
+            from app.services.planning.local_time import user_zone
+
+            _zone = user_zone()
             resolved_day_start = request.day_start_hour or DAY_START_HOUR
-            plan_start = datetime.now(timezone.utc)
+            plan_start = datetime.now(_zone)
             plan_date = plan_start.date()
             if plan_start.hour < resolved_day_start:
                 plan_date -= timedelta(days=1)
-            horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
-            # Safety: snap forward if horizon_start is stale (timezone mismatch)
+            horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
+            # After midnight, start today's day instead of yesterday's mostly-past one.
             past_min = max(0, int((plan_start - horizon_start).total_seconds() / 60))
             if past_min > 960:
                 plan_date = plan_start.date()
-                horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+                horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
                 if horizon_start < plan_start:
-                    horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=timezone.utc)
+                    horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=_zone)
 
             expanded_slots = expand_semantic_slots_to_time_slots(
                 semantic_slots,
@@ -1112,8 +1115,8 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
     from app.services.analytical.habit_translator import translate_habits_to_slots
     from app.services.analytical.horizon_expander import expand_semantic_slots_to_time_slots
     from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
-    from app.core.config import DAY_START_HOUR, DEFAULT_HORIZON_MINUTES
-    from datetime import datetime, timedelta, time, timezone
+    from app.core.config import DEFAULT_HORIZON_MINUTES
+    from datetime import datetime, timezone
 
     db_client = getattr(http_request.app.state, "db_client", None)
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -1139,28 +1142,24 @@ async def modify_schedule(request: ModifyScheduleRequest, http_request: Request)
         except Exception:
             pass
 
-    plan_start = datetime.now(timezone.utc)
-    plan_date = plan_start.date()
-    if plan_start.hour < DAY_START_HOUR:
-        plan_date -= timedelta(days=1)
-    horizon_start = datetime.combine(plan_date, time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
-    # Safety: snap forward if horizon_start is stale (timezone mismatch)
-    _past = max(0, int((plan_start - horizon_start).total_seconds() / 60))
-    if _past > 960:
-        plan_date = plan_start.date()
-        horizon_start = datetime.combine(plan_date, time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
-        if horizon_start < plan_start:
-            horizon_start = datetime.combine(plan_date + timedelta(days=1), time(DAY_START_HOUR, 0), tzinfo=timezone.utc)
+    # The user's day, never UTC's: minute 0 is DAY_START_HOUR in their zone.
+    from app.api.v1.endpoints.schedule import current_horizon_start
+    from app.services.planning.local_time import user_zone
+
+    horizon_start = current_horizon_start(user_zone())
     if request.horizon_start:
         try:
-            horizon_start = datetime.fromisoformat(request.horizon_start)
+            parsed = datetime.fromisoformat(request.horizon_start)
+            # A legacy horizon without an offset was written in UTC.
+            horizon_start = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         except ValueError:
             pass
 
+    # Weekdays are counted from the horizon's own first day.
     expanded_slots = expand_semantic_slots_to_time_slots(
         semantic_slots,
         horizon_minutes=DEFAULT_HORIZON_MINUTES,
-        plan_start=plan_start,
+        plan_start=horizon_start,
     )
 
     # Build execution graph dict

@@ -1,7 +1,7 @@
 """The live end-to-end script waits for background work by polling, never a fixed sleep.
 
 The script itself needs a running server and real credentials, so it is never run
-here; only its waiting helper is.
+here; only its helpers are.
 """
 
 import pytest
@@ -46,3 +46,19 @@ def test_poll_until__work_never_lands__gives_up_at_the_deadline_with_the_last_va
     assert found == []
     assert live_e2e.BACKGROUND_DEADLINE_S <= fake_time.now <= 20.0 + live_e2e.POLL_INTERVAL_S
     assert set(fake_time.sleeps) == {live_e2e.POLL_INTERVAL_S}
+
+
+def test_slots_in_window__window_is_read_on_the_users_clock():
+    """The 08:00-11:00 check uses the zone the backend plans in, not UTC."""
+    from zoneinfo import ZoneInfo
+
+    payload = {"schedule": {
+        "horizon_start": "2026-11-16T08:00:00+05:30",
+        "schedule": {
+            "a": {"title": "Graphs", "start_min": 60, "end_min": 85},    # 09:00 IST = 03:30 UTC
+            "b": {"title": "DP", "start_min": 240, "end_min": 265},      # 12:00 IST
+        },
+    }}
+
+    assert live_e2e.slots_in_window(payload, 8, 11, ZoneInfo("Asia/Kolkata")) == ["Graphs @ Mon 09:00"]
+    assert live_e2e.slots_in_window(payload, 8, 11, ZoneInfo("UTC")) == []

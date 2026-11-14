@@ -777,23 +777,25 @@ async def _run_plan_day_flow(
                 "phase_summary": f"Converted {len(habits.splitlines())} constraints into {len(semantic_slots)} scheduling slots",
             })
 
-    plan_start = datetime.now(timezone.utc)
+    from app.services.planning.local_time import user_zone
+
+    _zone = user_zone()  # the user's day, never UTC's
+    plan_start = datetime.now(_zone)
     resolved_day_start = day_start_hour_override or DAY_START_HOUR
     plan_date = plan_start.date()
-    # Logical Day Fix: If it's before DAY_START_HOUR UTC, we are still in "yesterday's" schedule window
+    # Logical Day Fix: before DAY_START_HOUR (local) we are still in "yesterday's" schedule window
     if plan_start.hour < resolved_day_start:
         plan_date -= timedelta(days=1)
-    horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+    horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
 
-    # Safety: if horizon_start is more than 16 hours in the past, snap forward to today/tomorrow
-    # This handles timezone mismatches where UTC date != user's local date
+    # After midnight, start today's day instead of yesterday's mostly-past one.
     past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
     if past_minutes > 960:  # More than 16 hours ago — horizon is stale
         plan_date = plan_start.date()
-        horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+        horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
         if horizon_start < plan_start:
             # DAY_START already passed today — start from tomorrow
-            horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=timezone.utc)
+            horizon_start = datetime.combine(plan_date + timedelta(days=1), time(resolved_day_start, 0), tzinfo=_zone)
         past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
 
     # Inject memory-derived constraints (PEARL patterns + explicit constraints)
@@ -1227,15 +1229,19 @@ async def _run_schedule_modify_flow(
             memories=_get_modify_memories(),
         )
 
-    # Parse horizon_start
+    # Parse horizon_start; without one, today's plan start on the user's clock.
+    from app.api.v1.endpoints.schedule import current_horizon_start
+
     horizon_start = None
     if horizon_start_str:
         try:
             horizon_start = datetime.fromisoformat(horizon_start_str)
         except (ValueError, TypeError):
-            horizon_start = datetime.now(timezone.utc)
-    else:
-        horizon_start = datetime.now(timezone.utc)
+            horizon_start = None
+    if horizon_start is None:
+        horizon_start = current_horizon_start()
+    elif horizon_start.tzinfo is None:
+        horizon_start = horizon_start.replace(tzinfo=timezone.utc)  # legacy drafts were UTC
 
     # Build time slots for re-scheduling
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
@@ -1246,7 +1252,7 @@ async def _run_schedule_modify_flow(
     time_slots = expand_semantic_slots_to_time_slots(
         semantic_slots,
         horizon_minutes=DEFAULT_HORIZON_MINUTES,
-        plan_start=datetime.now(timezone.utc),
+        plan_start=horizon_start,
     )
 
     # Apply the modification
@@ -1795,12 +1801,15 @@ async def trigger_replan(
     from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar
     from app.utils.deadline_parser import compute_horizon_from_deadlines
 
-    plan_start = datetime.now(timezone.utc)
+    from app.services.planning.local_time import user_zone
+
+    _zone = user_zone()  # the user's day, never UTC's
+    plan_start = datetime.now(_zone)
     resolved_day_start = DAY_START_HOUR
     plan_date = plan_start.date()
     if plan_start.hour < resolved_day_start:
         plan_date -= timedelta(days=1)
-    horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=timezone.utc)
+    horizon_start = datetime.combine(plan_date, time(resolved_day_start, 0), tzinfo=_zone)
     past_minutes = max(0, int((plan_start - horizon_start).total_seconds() / 60))
 
     # Fetch and translate habits

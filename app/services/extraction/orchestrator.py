@@ -255,7 +255,11 @@ async def process_ingestion(
                         goal_id_val = result.data[0].get("goal_id")
                 except Exception:
                     pass
-            plan_date = datetime.now(timezone.utc).date()
+            from app.services.planning.local_time import local_today
+
+            # "Today" is the user's date: in UTC, a deadline due today in India
+            # counted as tomorrow's until 05:30.
+            plan_date = local_today()
             for raw_deadline in kr.deadlines:
                 parsed = parse_deadline_to_date(raw_deadline, datetime.now(timezone.utc))
                 if parsed and parsed.date() > plan_date:

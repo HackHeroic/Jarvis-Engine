@@ -17,7 +17,8 @@ the deterministic fallbacks a user sees when the model is unavailable.
 
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -28,13 +29,16 @@ from app.domain.errors import LLMUnavailableError
 from app.utils.pacing import compute_adaptive_daily_cap
 from tests.behaviour.conftest import blame_phrases_in, brain_dump, decomposition
 
-MONDAY_0730 = datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc)
-HORIZON_START = datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
+# The user's clock (India). Plans are made at 08:00 local, the start of their day;
+# these were UTC times when the horizon was UTC-anchored.
+IST = ZoneInfo("Asia/Kolkata")
+MONDAY_8AM = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
+HORIZON_START = datetime(2026, 11, 16, 8, 0, tzinfo=IST)
 MINUTES_PER_DAY = 1440
 
 
 def _day(offset: int) -> str:
-    return (MONDAY_0730 + timedelta(days=offset)).date().isoformat()
+    return (MONDAY_8AM + timedelta(days=offset)).date().isoformat()
 
 
 def _script_plan(llm, chunker_reply: str, goal: str = "Revise DSA") -> None:
@@ -59,7 +63,7 @@ def _minutes_per_day(turn) -> dict[int, int]:
 
 @pytest.fixture
 def monday_morning(clock):
-    clock.freeze(MONDAY_0730, schedule_endpoint, missed_deadlines)
+    clock.freeze(MONDAY_8AM, schedule_endpoint, missed_deadlines)
     return clock
 
 
@@ -445,7 +449,7 @@ async def test_anti_guilt__learned_skip_pattern__insight_and_note_are_blame_free
     for i in range(3):
         jarvis.db.table("user_tasks").insert({
             "user_id": "alice", "task_id": f"t{i}", "status": "skipped",
-            "scheduled_start": f"2026-11-1{i}T09:00:00+00:00",
+            "scheduled_start": f"2026-11-1{i}T09:00:00+05:30",  # 9 AM on the user's clock
         }).execute()
 
     detect_patterns("alice", jarvis.db, jarvis.memory_store)
@@ -626,7 +630,7 @@ async def test_biology__own_sleep_habit__replaces_the_default_night(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clock):
-    clock.freeze(datetime(2026, 11, 16, 3, 0, tzinfo=timezone.utc), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 3, 0, tzinfo=IST), schedule_endpoint)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
     planned = await jarvis.say("Plan my DSA revision")
 
@@ -634,8 +638,8 @@ async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clo
 
     starts = [datetime.fromisoformat(r["scheduled_start"]) for r in jarvis.rows("user_tasks")]
     assert len(starts) == 5
-    assert min(starts) >= datetime(2026, 11, 16, 8, 0, tzinfo=timezone.utc)
-    assert not [s for s in starts if s.hour < 8]
+    assert min(starts) >= datetime(2026, 11, 16, 8, 0, tzinfo=IST)
+    assert not [s for s in starts if s.astimezone(IST).hour < 8]
 
 
 @pytest.mark.parametrize("hour", [14, 22])
@@ -643,7 +647,7 @@ async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clo
 async def test_late_day__plan_made_after_8am__nothing_scheduled_in_the_past(
     jarvis, llm, clock, hour
 ):
-    made_at = datetime(2026, 11, 16, hour, 0, tzinfo=timezone.utc)
+    made_at = datetime(2026, 11, 16, hour, 0, tzinfo=IST)
     clock.freeze(made_at, schedule_endpoint)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
     planned = await jarvis.say("Plan my DSA revision")

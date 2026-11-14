@@ -18,7 +18,8 @@ does, as a throwaway user, and prints a pass/fail table:
 Cost: five chat turns, roughly 12-14 model calls (about half through the metered
 chain - brain-dump extraction, decomposition, the chat reply - and half through
 modules still on the old transport: reply synthesis, memory extraction, habit
-translation). Times are UTC, as the scheduler's are (minute 0 = 08:00 UTC).
+translation). Times are on the user's clock, as the scheduler's are (minute 0 =
+08:00 in the user's zone: their profile's timezone, else DEFAULT_TIMEZONE).
 
 Usage, from the Jarvis-Engine directory, with the server running:
     .venv/bin/python scripts/live_e2e.py [--base-url http://localhost:8000]
@@ -176,14 +177,23 @@ def rows(db: Any, table: str, user_id: str, columns: str = "*") -> list[dict]:
     return db.table(table).select(columns).eq("user_id", user_id).execute().data or []
 
 
-def slots_in_window(payload: dict, from_hour: int, to_hour: int) -> list[str]:
-    """Titles of scheduled tasks that overlap [from_hour, to_hour) UTC on any day."""
+def user_zone_of(db: Any, user_id: str) -> Any:
+    """The zone the backend plans this user's day in: the same rule, the same profile row."""
+    from app.domain.entities import UserProfile
+    from app.services.planning.local_time import user_zone
+
+    found = rows(db, "user_profiles", user_id, "user_id, timezone")
+    return user_zone(UserProfile.model_validate(found[0]) if found else None)
+
+
+def slots_in_window(payload: dict, from_hour: int, to_hour: int, zone: Any) -> list[str]:
+    """Titles of scheduled tasks that overlap [from_hour, to_hour) in ``zone`` on any day."""
     schedule = payload.get("schedule") or {}
     start = datetime.fromisoformat(schedule["horizon_start"])
     hits = []
     for task in schedule["schedule"].values():
-        begin = start + timedelta(minutes=task["start_min"])
-        end = start + timedelta(minutes=task["end_min"])
+        begin = (start + timedelta(minutes=task["start_min"])).astimezone(zone)
+        end = (start + timedelta(minutes=task["end_min"])).astimezone(zone)
         window = begin.replace(hour=from_hour, minute=0, second=0, microsecond=0)
         if begin < window + timedelta(hours=to_hour - from_hour) and end > window:
             hits.append(f"{task.get('title')} @ {begin:%a %H:%M}")
@@ -276,12 +286,13 @@ def _core_loop(run: Run, client: Client, db: Any, user_id: str, state: dict) -> 
         return f"habits={habits} memories={memories}"
 
     def replan() -> str:
-        before = slots_in_window(state["plan"], 8, 11)
+        zone = user_zone_of(db, user_id)
+        before = slots_in_window(state["plan"], 8, 11, zone)
         payload = client.say(PLAN_PROMPT)  # a new conversation
         assert payload.get("schedule"), f"no schedule: {payload['message']!r}"
-        after = slots_in_window(payload, 8, 11)
-        assert not after, f"still in 08:00-11:00 UTC: {after}"
-        return f"08:00-11:00 tasks: {len(before)} before, 0 after"
+        after = slots_in_window(payload, 8, 11, zone)
+        assert not after, f"still in 08:00-11:00 {zone.key}: {after}"
+        return f"08:00-11:00 {zone.key} tasks: {len(before)} before, 0 after"
 
     def recall() -> str:
         payload = client.say("Good morning")  # a new conversation: one model call

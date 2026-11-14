@@ -165,6 +165,16 @@ def _fresh_llm_chain():
     reset_chain()
 
 
+@pytest.fixture(autouse=True)
+def _users_live_in_india(monkeypatch):
+    """Every test runs with DEFAULT_TIMEZONE = Asia/Kolkata (UTC+5:30, no DST),
+    whatever JARVIS_DEFAULT_TIMEZONE the machine sets: a plan's day is the user's
+    local day, so frozen clocks in the suite are local times in India."""
+    import app.core.config as config
+
+    monkeypatch.setattr(config, "DEFAULT_TIMEZONE", "Asia/Kolkata")
+
+
 @pytest.fixture
 def mock_supabase():
     """Mock Supabase client that returns empty results by default."""

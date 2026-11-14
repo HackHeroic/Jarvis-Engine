@@ -3,6 +3,7 @@
 import re
 import threading
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,14 +18,17 @@ from app.core.model_router import route_llm_call as _real_route_llm_call
 
 @pytest.fixture
 def before_the_horizon(clock):
-    """Plans made at 07:30 UTC: the 08:00 horizon is still ahead, so none of it is past.
+    """Plans made at 08:00 in India, the start of the user's day: none of it is past.
 
     Planning reads the wall clock (run_schedule blocks the part of today already
-    gone by), so a real solve is only repeatable with "now" frozen.
+    gone by), so a real solve is only repeatable with "now" frozen. The horizon is
+    the user's local day now, not UTC's: this froze 07:30 UTC when minute 0 was
+    08:00 UTC, and freezes the start of the local day instead (before 08:00 the
+    logical day is yesterday's, most of it past).
     """
     import app.api.v1.endpoints.schedule as schedule_endpoint
 
-    clock.freeze(datetime(2026, 11, 16, 7, 30, tzinfo=timezone.utc), schedule_endpoint)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=ZoneInfo("Asia/Kolkata")), schedule_endpoint)
 
 
 def _chunk(task_id: str = "t1", **overrides) -> dict:
@@ -1442,7 +1446,7 @@ def test_belongs_to_goal__own_goal_id_decides__prefix_only_for_legacy_rows(
 async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    async def fake_detect(user_id, supabase):
+    async def fake_detect(user_id, supabase, zone=None):
         assert user_id == "u1"
         return [{"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}]
 
@@ -1469,7 +1473,7 @@ async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch)
 async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    async def fake_detect(user_id, supabase):
+    async def fake_detect(user_id, supabase, zone=None):
         return []
 
     monkeypatch.setattr(

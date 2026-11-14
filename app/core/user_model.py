@@ -42,6 +42,34 @@ class UserModel:
     def set_semantic_store(self, store: Any) -> None:
         self._cache["semantic_store"] = store
 
+    async def get_profile(self) -> Any:
+        """The user's ``UserProfile``, or None when there is none or it cannot be read.
+
+        Read once per facade (one turn) and off the event loop. The planner takes
+        the user's timezone from it.
+        """
+        async with self._get_lock("profile"):
+            if "profile" not in self._cache:
+                from app.domain.entities import UserProfile
+
+                profile = None
+                supabase = getattr(self._db, "supabase", None)
+                if supabase is not None:
+                    try:
+                        result = await asyncio.to_thread(
+                            lambda: supabase.table("user_profiles")
+                            .select("*")
+                            .eq("user_id", self._user_id)
+                            .limit(1)
+                            .execute()
+                        )
+                        rows = result.data or []
+                        profile = UserProfile.model_validate(rows[0]) if rows else None
+                    except Exception as exc:  # no profile is a default, never a failed turn
+                        _log.warning("Profile read failed for %s: %r", self._user_id, exc)
+                self._cache["profile"] = profile
+            return self._cache["profile"]
+
     async def get_behavioral_constraints(self) -> list[dict]:
         async with self._get_lock("constraints"):
             if "constraints" not in self._cache:
@@ -107,7 +135,10 @@ class UserModel:
         self._cache["pearl_patterns"] = patterns
 
     async def get_estimated_energy(self) -> float:
-        hour = datetime.now().hour
+        from app.services.planning.local_time import user_zone
+
+        # The user's hour, not the server's: energy follows their day.
+        hour = datetime.now(user_zone(self._cache.get("profile"))).hour
         if 9 <= hour <= 12:
             return 0.9
         elif 15 <= hour <= 17:

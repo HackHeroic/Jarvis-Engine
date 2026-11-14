@@ -171,7 +171,10 @@ CHECKPOINT_DB_PATH: str = os.getenv("JARVIS_CHECKPOINT_DB", "data/checkpoints.sq
 # Horizon for scheduling (minutes)
 DEFAULT_HORIZON_MINUTES: int = 2880  # 48 hours
 MAX_HORIZON_MINUTES: int = 43200  # 30 days (per PDF: month-long planning)
-DAY_START_HOUR: int = 8  # Planning day starts at 8 AM (habit translator convention)
+DAY_START_HOUR: int = 8  # Planning day starts at 8 AM local (habit translator convention)
+# The zone a user's day runs in when their profile names none (IANA name). Minute 0
+# of every plan is DAY_START_HOUR in the user's zone, never in UTC.
+DEFAULT_TIMEZONE: str = os.getenv("JARVIS_DEFAULT_TIMEZONE", "Asia/Kolkata")
 
 # CP-SAT wall-clock cap. An uncapped solve has no upper bound, and it sits on
 # the request path — on the streaming plan flow that is an unbounded stall with
