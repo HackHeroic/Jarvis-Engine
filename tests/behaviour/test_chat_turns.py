@@ -234,3 +234,29 @@ async def test_chat__two_users__neither_sees_nor_accepts_the_others_draft(jarvis
     assert {r["user_id"] for r in jarvis.rows("user_tasks")} == {"bob"}
     # Bob's store lookups cannot reach Alice's draft at all.
     assert jarvis.draft_store.get_draft(alice.draft_id, "bob") is None
+
+
+@pytest.mark.asyncio
+async def test_chat__research_while_web_search_is_down__says_so_plainly_with_no_links(
+    jarvis, llm, monkeypatch
+):
+    import app.core.config as config
+    import app.models.brain.litellm_conf as transport
+
+    async def search_down(**_kwargs):
+        raise RuntimeError("HTTP 402: prepaid credits depleted")
+
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(transport.litellm, "acompletion", search_down)
+    llm.script(
+        "brain_dump_extraction",
+        lambda req: brain_dump(search_queries=["Dijkstra's algorithm tutorial"])
+        if "look up" in req.prompt else "{}",
+    )
+
+    turn = await jarvis.say("Can you look up a good Dijkstra's algorithm tutorial?")
+
+    assert turn.intent == "RESEARCH"
+    assert "web results are unavailable" in turn.reply.lower()
+    assert "http" not in turn.reply.lower() and "www." not in turn.reply.lower()
+    assert turn.payload["schedule"] is None

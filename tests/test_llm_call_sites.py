@@ -428,7 +428,7 @@ async def test_practice_quiz__model_down__returns_no_assets(llm):
 
 
 @pytest.mark.asyncio
-async def test_document_classification__routes_through_the_chain(llm):
+async def test_document_classification__routes_through_the_chain__returns_the_classification(llm):
     from app.schemas.document import DocumentClassification
     from app.services.documents.pipeline import classify_document
 
@@ -442,7 +442,7 @@ async def test_document_classification__routes_through_the_chain(llm):
 
 
 @pytest.mark.asyncio
-async def test_action_item_proposal__routes_through_the_chain(llm):
+async def test_action_item_proposal__routes_through_the_chain__returns_the_proposal(llm):
     from app.services.extraction.action_item_handler import propose_action_item
 
     model = llm(action_item_extraction={
@@ -459,7 +459,7 @@ async def test_action_item_proposal__routes_through_the_chain(llm):
 
 
 @pytest.mark.asyncio
-async def test_calendar_extraction__routes_through_the_chain(llm):
+async def test_calendar_extraction__routes_through_the_chain__on_the_primary_model(llm):
     from app.schemas.context import ExtractedTimeSlots
     from app.services.extraction.calendar_extractor import extract_calendar_slots
 
@@ -471,11 +471,14 @@ async def test_calendar_extraction__routes_through_the_chain(llm):
     result = await extract_calendar_slots("Mon 9:00-10:00 OS Lec")
 
     assert model.tasks == ["calendar_parsing"]
+    # Heavy structured generation (minute arithmetic, day offsets), and a wrong slot
+    # becomes a hard block in the scheduler: the heavy model, not the fast one.
+    assert model.calls[0].role == "primary"
     assert isinstance(result, ExtractedTimeSlots) and [s.name for s in result.slots] == ["OS Lec"]
 
 
 @pytest.mark.asyncio
-async def test_proactive_extraction__routes_through_the_chain(llm):
+async def test_proactive_extraction__routes_through_the_chain__returns_items_and_topics(llm):
     from app.services.extraction.knowledge_ingester import _run_proactive_extraction
 
     model = llm(action_item_extraction={
@@ -500,7 +503,7 @@ async def test_proactive_extraction__model_down__returns_empty_lists(llm):
 
 
 @pytest.mark.asyncio
-async def test_ingestion_classifier__routes_through_the_chain(llm):
+async def test_ingestion_classifier__routes_through_the_chain__returns_the_intent(llm):
     from app.schemas.context import IntentType
     from app.services.extraction.orchestrator import _classify
 
@@ -514,7 +517,7 @@ async def test_ingestion_classifier__routes_through_the_chain(llm):
 
 
 @pytest.mark.asyncio
-async def test_ingest_endpoint__routes_through_the_chain(llm):
+async def test_ingest_endpoint__routes_through_the_chain__returns_the_classification(llm):
     from app.api.v1.endpoints.ingestion import IngestionRequest, ingest
 
     model = llm(intent_classification={"intent": "CALENDAR_SYNC", "confidence": 0.9, "summary": "Timetable"})
@@ -710,3 +713,78 @@ async def test_research__web_search_fails__result_says_web_results_are_unavailab
     assert out["error"] == WEB_RESULTS_UNAVAILABLE
     assert "search_results" not in out  # nothing invented, nothing kept
     assert needs_more({**state, **out}) is False  # one honest failure, not three silent retries
+
+
+@pytest.fixture
+def web_search_recorded(monkeypatch):
+    """Gemini's grounded search answers one link, and every request it got is kept."""
+    import app.models.brain.litellm_conf as _llm
+
+    sent: list[dict] = []
+
+    class _Message:
+        content = "https://docs.example.org/graphs | Graphs, explained"
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    async def recording_completion(**kwargs):
+        sent.append(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(_cfg, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(_llm.litellm, "acompletion", recording_completion)
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_web_search__email_in_the_query__redacted_before_it_leaves(web_search_recorded):
+    from app.services.analytical.workspace_builder import perform_learning_style_search
+
+    assets = await perform_learning_style_search(
+        "graphs, and mail the notes to madhav@example.com", "reader"
+    )
+
+    (request,) = web_search_recorded
+    sent_text = json.dumps(request["messages"])
+    assert "madhav@example.com" not in sent_text
+    assert "[EMAIL]" in sent_text
+    assert [a.content_or_url for a in assets] == ["https://docs.example.org/graphs"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["deny", "ask"])
+async def test_web_search__privacy_gate_refuses__no_search_and_says_results_are_unavailable(
+    web_search_recorded, monkeypatch, decision
+):
+    import app.services.analytical.workspace_builder as wb
+    from app.orchestrator.hooks import ActionHooks, HookDecision, HookResult
+
+    async def refuse(prompt: str, **_kwargs) -> HookResult:
+        return HookResult(decision=HookDecision(decision), reason="needs consent")
+
+    hooks = ActionHooks()
+    hooks.register("PreCloudLLM", refuse)
+    monkeypatch.setattr(wb, "get_hooks", lambda: hooks)
+
+    with pytest.raises(wb.WebSearchUnavailableError) as raised:
+        await wb.perform_learning_style_search("graphs for madhav@example.com", "reader")
+
+    assert raised.value.message == wb.WEB_RESULTS_UNAVAILABLE
+    assert web_search_recorded == []  # nothing left the machine
+
+
+@pytest.mark.asyncio
+async def test_research__user_message_with_an_email__redacted_before_the_search(web_search_recorded):
+    from app.modules.research_graph import execute_search
+
+    out = await execute_search(
+        {"query": "graph algorithms; reply to madhav@example.com", "search_results": [], "iteration_count": 0}
+    )
+
+    assert out["search_results"]
+    assert "madhav@example.com" not in json.dumps(web_search_recorded)
+
