@@ -25,7 +25,7 @@ Owner: ______
 
 ## 1. Layering
 
-A request passes through four layers, and each layer depends only on the one below it. `tests/test_layering.py` enforces the import direction: nothing below the API imports the API (`test_layering__nothing_below_the_api__imports_the_api`), and raw table calls are allowed only in eight listed files (`_RAW_TABLE_CALLS_ALLOWED`, `tests/test_layering.py:438-453`).
+A request passes through four layers, and each layer depends only on the one below it. `tests/test_layering.py` enforces the import direction: nothing below the API imports the API (`test_layering__nothing_below_the_api__imports_the_api`), and raw table calls are allowed only in eight listed files (`_RAW_TABLE_CALLS_ALLOWED`, `tests/test_layering.py:451-466`).
 
 ```mermaid
 flowchart TB
@@ -75,7 +75,7 @@ flowchart TB
 
 | Layer | Responsibility | Where |
 |---|---|---|
-| **App shell** | Gives every request an id (`RequestIdMiddleware`: `request.state.request_id` and the `X-Request-ID` response header, exposed through CORS). CORS allows `localhost` and `127.0.0.1` on ports 3000 and 3001 only. Routes every exception to one envelope (`register_error_handlers`). `redirect_slashes=False`. `responses=ERROR_RESPONSES` documents the envelope on every operation. | `app/main.py:184-210`, `app/api/error_handlers.py:34-47, 192-197` |
+| **App shell** | Gives every request an id (`RequestIdMiddleware`: `request.state.request_id` and the `X-Request-ID` response header, exposed through CORS). CORS allows `localhost` and `127.0.0.1` on ports 3000 and 3001 only. Routes every exception to one envelope (`register_error_handlers`). `redirect_slashes=False`. `responses=ERROR_RESPONSES` documents the envelope on every operation. | `app/main.py:185-214`, `app/api/error_handlers.py:34-47, 197-202` |
 | **Routes** | Routing and parsing only. A Pydantic model validates the body or query; a dependency resolves who is asking; the route calls a service and maps the result to its response model. No route raises `HTTPException` (`tests/test_api_contract.py::test_endpoints__raise_no_http_exception`). | `app/api/v1/endpoints/*.py` |
 | **Dependencies** | `CurrentUser`: the **auth seam**. Today it reads a required `user_id` query parameter (1–128 characters); when auth lands, a verified JWT subject replaces it here, and every route that declares `user: CurrentUser` follows. `require_supabase`: the live client, or `PersistenceError` (503). Without the database the container falls back to in-memory repositories, which would answer "no memories" or "no suggestions" when the true answer is "can't tell". `get_container` / `container_of`: the composition root (`AppContainer`) the lifespan put on `app.state`. | `app/api/deps.py:16-51` |
 | **Services** | Domain rules and transactions. Examples: `DraftService.accept` (atomic accept), `TaskService` (status compare-and-set plus one event), `MemoryService` (lifecycle), `AnticipationService` (triggers, consent, suggestions), `UserModelService` (the You page), `ChatTurnService` (one chat turn). | `app/services/` |
@@ -83,7 +83,7 @@ flowchart TB
 
 **Routes that follow the layering fully:** `memories`, `you`, `anticipation`, `drafts`, `tasks` (complete, skip, list) and `habits` (trackers and rules).
 
-**Routes that still reach the database directly.** These files are on the raw-table allow-list (`tests/test_layering.py:438-453`), each with its reason; Task 6 of the restructure (repositories for sessions, documents and the pending calendar) was dropped:
+**Routes that still reach the database directly.** These files are on the raw-table allow-list (`tests/test_layering.py:451-466`), each with its reason; Task 6 of the restructure (repositories for sessions, documents and the pending calendar) was dropped:
 - `sessions` (`chat_sessions`);
 - `documents` (`ingested_documents`, `task_materials`);
 - `ingestion` pending-calendar routes (`pending_calendar_updates`), and `/ingestion/process` through `services/extraction/orchestrator.py` and `task_material_linker.py`;
@@ -102,7 +102,7 @@ The documents and pending-calendar handlers make synchronous supabase-py calls i
 - **State transitions are `POST` to a verb sub-resource:** `/drafts/{id}/accept`, `/drafts/{id}/reject`, `/tasks/{id}/complete`, `/tasks/{id}/skip`, `/memories/{id}/confirm`, `/memories/{id}/dismiss`, `/anticipation/suggestions/{id}/accept`, `/anticipation/suggestions/{id}/dismiss`, `/anticipation/run`. Each one is a move in a state machine (see `08-database-schema.md` §7), not a field update, so it is not a `PATCH`.
 - `PATCH` edits fields (`/memories/{id}`, `/drafts/{id}/tasks/{task_id}`, `/you/settings`). `PUT` appears once (`/sessions/{id}`). `DELETE` removes, and what that means differs per resource (§8).
 - **No route edits or deletes a task.** A task's row is written by draft acceptance alone (`app/api/v1/endpoints/tasks.py:1-7`).
-- **Trailing slashes matter.** The app sets `redirect_slashes=False` (`app/main.py:187`), so `/api/v1/memories/` is a route and `/api/v1/memories` is a 404. Collection roots declared as `"/"` keep the slash: `/tasks/`, `/memories/`, `/sessions/`, `/documents/`. The newer `/you` does not.
+- **Trailing slashes matter.** The app sets `redirect_slashes=False` (`app/main.py:188`), so `/api/v1/memories/` is a route and `/api/v1/memories` is a 404. Collection roots declared as `"/"` keep the slash: `/tasks/`, `/memories/`, `/sessions/`, `/documents/`. The newer `/you` does not.
 
 ### 2.2 Who is asking: three transports for `user_id`
 
@@ -149,8 +149,8 @@ The places where this vocabulary is not yet followed are listed in §8.
 | Field | Bound | Model |
 |---|---|---|
 | `user_id` (via `CurrentUser`) | 1–128 chars | `app/api/deps.py:16-25` |
-| `ChatStreamRequest.user_prompt` | ≤ 8,000 chars (`MAX_CHAT_PROMPT_CHARS`, `app/core/config.py:284`) | `app/schemas/chat_stream.py:57-59` |
-| `ChatStreamRequest.file_base64`, `IngestionRequest.file_base64` | ≤ 10 MB decoded (`MAX_CHAT_UPLOAD_BYTES`, `config.py:285`), checked by `within_upload_limit` | `app/schemas/upload.py:16-27` |
+| `ChatStreamRequest.user_prompt` | ≤ 8,000 chars (`MAX_CHAT_PROMPT_CHARS`, `app/core/config.py:278`) | `app/schemas/chat_stream.py:57-59` |
+| `ChatStreamRequest.file_base64`, `IngestionRequest.file_base64` | ≤ 10 MB decoded (`MAX_CHAT_UPLOAD_BYTES`, `config.py:279`), checked by `within_upload_limit` | `app/schemas/upload.py:16-27` |
 | `ChatStreamRequest.media_type`, `IngestionRequest.media_type` | `"pdf"`, `"image"`, `"png"` or `"jpeg"` (`UploadMediaType`) | `upload.py:13` |
 | `ChatStreamRequest.model_mode` | `"auto"`, `"cloud"`, `"gemini"` or `"4b"` (`ModelMode`) | `chat_stream.py:44, 77-85` |
 | `TaskSkipRequest.reason` | ≤ 500 chars | `app/api/v1/endpoints/tasks.py:44-56` |
@@ -183,7 +183,7 @@ The places where this vocabulary is not yet followed are listed in §8.
 | `POST /memories/{id}/dismiss` | 200 again (no change); a forgotten memory gives 409 | `MemoryService.dismiss` |
 | `POST /memories/{id}/confirm` | **Not idempotent**: each call reinforces the memory again (observation count, strength) | `MemoryService.confirm` |
 | `POST /anticipation/suggestions/{id}/accept`, `/dismiss` | 409 once the suggestion is no longer pending | `move_suggestion` compare-and-set on the status |
-| `POST /anticipation/run` | Once a day per trigger: the second run reports `already_done` with the existing suggestion. A manual repeat within 10 s returns the first run's outcome. | `AnticipationService.run_trigger`; `ANTICIPATION_MANUAL_COOLDOWN_SECONDS` (`app/core/config.py:197`) |
+| `POST /anticipation/run` | Once a day per trigger: the second run reports `already_done` with the existing suggestion. A manual repeat within 10 s returns the first run's outcome. | `AnticipationService.run_trigger`; `ANTICIPATION_MANUAL_COOLDOWN_SECONDS` (`app/core/config.py:194`) |
 | `POST /chat/stream` | Turns on one conversation run one at a time. A turn that waits more than 120 s ends in an `error` frame with code `conflict`. | `app/services/turn_locks.py:24` (`TURN_LOCK_WAIT_SECONDS = 120.0`) |
 
 ### 2.6 Status codes
@@ -196,6 +196,7 @@ No route answers 400, 501 or 502 any more: malformed input is 422, and a model t
 | **404** | Unknown id, or another user's id | `not_found`; `http_error` only for Starlette's own 404 on a path no route matches |
 | **405** | A method no route declares on a known path (for example `DELETE /tasks/`, a retired route; `GET /tasks/` remains) | `http_error` (Starlette's) |
 | **409** | State conflicts: a closed draft, a draft changed since it was read, a suggestion that is no longer pending, a lost compare-and-set, a task-id clash on accept, a draft whose every slot has begun, a queued turn timing out | `invalid_state_transition`, `stale_version`, `conflict`, `draft_outdated` |
+| **413** | A body larger than any valid request on `POST /chat/stream` or `POST /ingestion/process` (about 14 MB: the largest file in base64 plus room for the message), refused from its `Content-Length` before it is read, or as soon as a chunked body passes the cap; no route runs (`BodyLimitMiddleware`, `app/api/request_limits.py:21-33, 38-96`) | `payload_too_large` |
 | **422** | Request validation (Pydantic: a malformed body, a message over 8,000 characters, a file over 10 MB, an unknown `model_mode` or `media_type`) and domain validation (bad base64, a missing `media_type`, a draft modify with a component other than `tasks`, an empty draft edit). An infeasible plan on accept or on `/schedule/generate-schedule`. | `validation_error`, `schedule_infeasible` |
 | **500** | A bug or an uncaught exception, answered with a fixed message; also a task workspace that could not be built | `internal_error` |
 | **503** | A dependency is down: database, embedder, language model | `persistence_unavailable`, `embedding_unavailable`, `llm_unavailable`, `llm_timeout`, `llm_error`, `llm_output_parse`, `llm_refused` |
@@ -206,7 +207,7 @@ Consent is never an error. A step that needs the user's say-so reaches the clien
 
 ## 3. The error envelope
 
-Every error response has one shape, whatever raised it: a `JarvisError`, request validation, an `HTTPException` (only Starlette's own, for an unknown path or method), or an exception nobody caught. The model is `ErrorResponse` (`app/schemas/errors.py:11-21`); the handlers are in `app/api/error_handlers.py:119-197`, and the chat stream sends the same model as its `error` frame.
+Every error response has one shape, whatever raised it: a `JarvisError`, request validation, an `HTTPException` (only Starlette's own, for an unknown path or method), or an exception nobody caught. The model is `ErrorResponse` (`app/schemas/errors.py:11-21`); the handlers are in `app/api/error_handlers.py:124-202`, and the chat stream sends the same model as its `error` frame.
 
 ```json
 {
@@ -296,7 +297,7 @@ Every error response has one shape, whatever raised it: a `JarvisError`, request
            "details": null, "request_id": "…"}}
 ```
 
-The `//` comments are labels only; the bodies are plain JSON. The messages are the literal strings in `app/services/memory/memory_service.py:569-571` (`_get`), `app/services/draft_service.py:59` (`PLAN_CHANGED`, with the latest draft added at `app/api/v1/endpoints/drafts.py:114-119`), `app/infrastructure/persistence/_mapping.py:145-153` (`task_id_clash`), `supabase_repos.py:431-435` (`accept_atomic`) and `app/api/deps.py:31-37` (`require_supabase`).
+The `//` comments are labels only; the bodies are plain JSON. The messages are the literal strings in `app/services/memory/memory_service.py:581-583` (`_get`), `app/services/draft_service.py:59` (`PLAN_CHANGED`, with the latest draft added at `app/api/v1/endpoints/drafts.py:114-119`), `app/infrastructure/persistence/_mapping.py:145-153` (`task_id_clash`), `supabase_repos.py:431-435` (`accept_atomic`) and `app/api/deps.py:31-37` (`require_supabase`).
 
 Every body a client receives on an error is this envelope; `tests/test_api_contract.py::test_endpoints__no_ad_hoc_error_bodies` checks that no route builds an error body of its own.
 
@@ -449,7 +450,7 @@ Generated from the live `/openapi.json` (48 operations) and the Pydantic models.
 | `file_name` | string \| null | |
 | `model_mode` | `auto` \| `cloud` \| `gemini` \| `4b`, default `auto` | `cloud`, `gemini` and `4b` put every model call of the turn on the cloud providers (`CLOUD_MODEL_MODES`, `app/services/chat_turn/service.py:45`); `auto` is local first. Any other value, `"27b"` included, is a 422. |
 
-**Response:** `200 text/event-stream` (`EventStreamResponse`, `app/api/sse.py:31-38`) with headers `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `Connection: keep-alive` and `X-Request-ID`. The frames are in §6. The last frame is one `complete` (`ChatCompletePayload`) or one `error` (the envelope). The router is routing and parsing only (`app/api/v1/endpoints/chat.py:24-61`): it opens the turn with `ChatTurnService.for_app(app.state).open_turn(...)` and streams `turn.frames()`; `turn.finish` runs as the response's background task.
+**Response:** `200 text/event-stream` (`EventStreamResponse`, `app/api/sse.py:31-38`) with headers `Cache-Control: no-cache`, `X-Accel-Buffering: no`, `Connection: keep-alive` and `X-Request-ID`. The frames are in §6. The last frame is one `complete` (`ChatCompletePayload`) or one `error` (the envelope). The router is routing and parsing only (`app/api/v1/endpoints/chat.py:22-56`): it opens the turn with `ChatTurnService.for_app(app.state).open_turn(...)` and streams `turn.frames()`; `turn.finish` runs as the response's background task.
 
 **Errors:**
 - Before the stream starts, as a JSON envelope: 422 `validation_error` for a malformed body, a message over 8,000 characters, a file over 10 MB decoded, or an unknown `model_mode` or `media_type`. No turn starts and the input is not echoed (`tests/test_chat_turn.py::test_chat_stream__request_over_a_limit__422_envelope_and_no_turn`, `tests/test_api_contract.py::test_chat_stream__unknown_model_mode__422_envelope`, `::test_chat_stream__unknown_media_type__422_envelope`).
@@ -480,7 +481,7 @@ Every task route first requires the database (`require_supabase`, `tasks.py:116,
 | `POST /tasks/{task_id}/complete` | Record **done**, from `pending`, `missed` or `skipped`. One `completed` event carries the quality and actual duration in its metadata. | `TaskCompleteRequest {user_id, quality: 0–5 = 3, actual_duration_minutes? ≥1}` | `TaskResponse` (`status: "completed"`) | 404 `not_found`; 409 `stale_version`; 503 `persistence_unavailable` |
 | `POST /tasks/{task_id}/skip` | **Set aside** a pending task. One `skipped` event carries the reason. The message suggests today's buffer or tomorrow morning; nothing is re-placed. | `TaskSkipRequest {user_id, reason? ≤500}` | `TaskResponse` (`status: "skipped"`, or the current status with "already done / set aside, so nothing changed") | 404; 409; 503 |
 | `GET /tasks/?user_id=&status=` | The user's tasks, newest first, at most 500; `status` filters to one `TaskStatus` | — | `TaskListResponse {tasks: Task[], count}` | 422 (unknown status); 503 |
-| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[]}` (`app/schemas/workspace.py:53`) | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-59`) |
+| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[]}` (`app/schemas/workspace.py:53`) | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-60`) |
 | `DELETE /tasks/{task_id}/workspace?user_id=` | Drop the cached workspace | — | `WorkspaceInvalidated {status: "invalidated"}` (`workspace.py:19`) | — (a failed delete is swallowed) |
 
 **Use case:** UC4 (complete or skip a task). The workspace routes support preparing for a task (no numbered use case).
@@ -554,7 +555,7 @@ Every route first requires the database (`require_supabase`) and goes through th
 
 | Method + path | Purpose | Request | Response | Errors |
 |---|---|---|---|---|
-| `GET /sessions/?user_id=&limit=50` | Non-archived sessions, pinned first | — | `SessionListResponse {sessions: SessionSummary[]}` (`app/api/v1/endpoints/sessions.py:27, 62`) | **none**: without a client, or on a failure, it returns `{"sessions": []}` |
+| `GET /sessions/?user_id=&limit=50` | Non-archived sessions, pinned first | — | `SessionListResponse {sessions: SessionSummary[]}` (`app/api/v1/endpoints/sessions.py:28, 63`) | **none**: without a client, or on a failure, it returns `{"sessions": []}` |
 | `GET /sessions/{session_id}/messages?user_id=&limit=100` | The newest N messages, oldest first | — | `SessionMessagesResponse {messages: SessionMessage[]}` | 503 `persistence_unavailable` without a client; a failed query returns `[]` |
 | `GET /sessions/{session_id}?user_id=` | The session row and its newest 100 messages | — | `SessionDetailResponse {session: SessionRecord, messages: SessionMessage[]}` | 404 `not_found` "Session not found."; 503 |
 | `PUT /sessions/{session_id}` | Rename, archive, pin | `UpdateSessionRequest {user_id, title?, is_archived?, is_pinned?}` (`sessions.py:159`) | `SessionUpdateResponse {status: "updated" \| "no_changes", session_id}` | 503. An unknown session still answers `updated`. |
@@ -576,8 +577,8 @@ Every route first requires the database (`require_supabase`) and goes through th
 
 | Method + path | Response | Errors |
 |---|---|---|
-| `GET /` | `RootResponse {message: "Hello, Jarvis this side."}` (`app/main.py:213`) | — |
-| `GET /health` | `HealthResponse {status: "healthy", database: "connected"}` (`main.py:217`). The probe reads `user_tasks` (`app/db/supabase_py.py:49`). | 503 `persistence_unavailable`, `details: {"database": "disconnected"}` (`main.py:228-242`) |
+| `GET /` | `RootResponse {message: "Hello, Jarvis this side."}` (`app/main.py:217`) | — |
+| `GET /health` | `HealthResponse {status: "healthy", database: "connected"}` (`main.py:221`). The probe reads `user_tasks` (`app/db/supabase_py.py:116`). | 503 `persistence_unavailable`, `details: {"database": "disconnected"}` (`main.py:232-246`) |
 | `GET /api/v1/models/status` | `ModelStatus {primary_model, fast_model, cloud_model, gemini_primary, local_available}` (`app/api/v1/endpoints/models.py:11`) | — |
 
 ---
@@ -586,9 +587,9 @@ Every route first requires the database (`require_supabase`) and goes through th
 
 ### 6.1 Frame format
 
-Each frame is `event: <type>\ndata: <one line of JSON>\n\n`, written by `SseEncoder.frame` (`app/schemas/chat_stream.py:332-336`), whose JSON carries exactly the fields the emitter set (`exclude_unset`). The route sends **ten frame types**, the values of `SseEvent` (`chat_stream.py:190-202`). Each has a model in the catalogue `SSE_EVENTS` (`chat_stream.py:302-313`). Every model except `PhaseFrame` forbids extra keys.
+Each frame is `event: <type>\ndata: <one line of JSON>\n\n`, written by `SseEncoder.frame` (`app/schemas/chat_stream.py:338-342`), whose JSON carries exactly the fields the emitter set (`exclude_unset`). The route sends **ten frame types**, the values of `SseEvent` (`chat_stream.py:196-208`). Each has a model in the catalogue `SSE_EVENTS` (`chat_stream.py:308-319`). Every model except `PhaseFrame` forbids extra keys.
 
-Entries from the progress queue (tool steps, learning moments, streamed tokens, phases a module reports) go through `SseEncoder.render_progress` (`chat_stream.py:339-368`): it picks the channel by `_event_type` (`_PROGRESS_CHANNELS`, `chat_stream.py:318-324`) and validates the entry against that channel's model. An entry that does not fit is logged by its event type and sent as it came, so a frame is never dropped; an entry that is not JSON is sent as a phase frame as it came.
+Entries from the progress queue (tool steps, learning moments, streamed tokens, phases a module reports) go through `SseEncoder.render_progress` (`chat_stream.py:345-374`): it picks the channel by `_event_type` (`_PROGRESS_CHANNELS`, `chat_stream.py:324-330`) and validates the entry against that channel's model. An entry that does not fit is logged by its event type and sent as it came, so a frame is never dropped; an entry that is not JSON is sent as a phase frame as it came.
 
 Sources:
 - `app/services/chat_turn/service.py:123-237`: `ChatTurn.frames`, the turn's stream.
@@ -596,18 +597,18 @@ Sources:
 - `app/services/chat_turn/reply.py:68`: `reply_frames`, the reply's `thinking` and `message` frames when the graph did not stream it.
 - `app/core/observation.py:86` (`_emit_event`), `:321` (`memory_frame`), `:357` (`_pattern_frame`), `:458-491` (the learning phase frames).
 - `app/core/module_framework.py:67-158`: `_emit_tool_use`.
-- `app/orchestrator/graph.py:715`: `make_token_emitter`.
+- `app/orchestrator/graph.py:743`: `make_token_emitter`.
 
 | Frame | Model | `data` payload | Emitted by |
 |---|---|---|---|
-| `phase` | `PhaseFrame` (`chat_stream.py:205`, extra keys allowed) | Three forms. (1) After an orchestrator node: `{phase, verb, detail?}`. `phase` comes from `NODE_TO_PHASE`: `loading_context`, `brain_dump_extraction`, `intent_classified`, `planning`, `researching`, `coaching`, `ingesting`, `responding`, `synthesizing`, `learning`. `verb` is a spinner verb. `detail` is node-specific: `load_context` → `{memories_count, conversation_turns}`; `classify_intent` → `{intent, method: "rule-based"}`; a module → `{module}`; `observation_loop` → `{memories_extracted, patterns_detected}`, the real counts. (2) From the observation loop: `{phase: "learning"}` when it starts; `{phase: "learning", status: "done"}` when it ends, with `timeout: true` when the 0.5 s PEARL cap was hit; `{phase: "learning", skipped: true}` for a trivial message. (3) Any other progress-queue entry with no known `_event_type`, re-dumped without that key. | `frames.node_frames`; `observation.py:458-491`; `render_progress` |
-| `step` | `StepFrame` (`:218`) | `{intent, stage: "intent_classified"}` after intent classification, then once after the graph: `{intent, stage: "pipeline_done", model_mode, synthesis_model, force_cloud}` | `frames.py:64-67`; `service.py:172-175` |
-| `tool_use` | `ToolUseFrame` (`:246`) | `{module, tool, status, detail?}`. `status` is `started` \| `done` \| `error` \| `skipped`. `detail` is the step's `_tool_detail` on `done`, `{error: "timeout"}` or `{error: <public message>}` on `error`, and `{reason}` on `skipped` (feature flag off, or a hook said deny or ask). | `module_framework.py:67-158` |
-| `thinking` | `TokenFrame` (`:238`) | `{token}`: the model's own reasoning, streamed or sent once | `graph.make_token_emitter`; `reply.py` |
+| `phase` | `PhaseFrame` (`chat_stream.py:211`, extra keys allowed) | Three forms. (1) After an orchestrator node: `{phase, verb, detail?}`. `phase` comes from `NODE_TO_PHASE`: `loading_context`, `brain_dump_extraction`, `intent_classified`, `planning`, `researching`, `coaching`, `ingesting`, `responding`, `synthesizing`, `learning`. `verb` is a spinner verb. `detail` is node-specific: `load_context` → `{memories_count, conversation_turns}`; `classify_intent` → `{intent, method: "rule-based"}`; a module → `{module}`; `observation_loop` → `{memories_extracted, patterns_detected}`, the real counts. (2) From the observation loop: `{phase: "learning"}` when it starts; `{phase: "learning", status: "done"}` when it ends, with `timeout: true` when the 0.5 s PEARL cap was hit; `{phase: "learning", skipped: true}` for a trivial message. (3) Any other progress-queue entry with no known `_event_type`, re-dumped without that key. | `frames.node_frames`; `observation.py:458-491`; `render_progress` |
+| `step` | `StepFrame` (`:224`) | `{intent, stage: "intent_classified"}` after intent classification, then once after the graph: `{intent, stage: "pipeline_done", model_mode, synthesis_model, force_cloud}` | `frames.py:64-67`; `service.py:172-175` |
+| `tool_use` | `ToolUseFrame` (`:252`) | `{module, tool, status, detail?}`. `status` is `started` \| `done` \| `error` \| `skipped`. `detail` is the step's `_tool_detail` on `done`, `{error: "timeout"}` or `{error: <public message>}` on `error`, and `{reason}` on `skipped` (feature flag off, or a hook said deny or ask). | `module_framework.py:67-158` |
+| `thinking` | `TokenFrame` (`:244`) | `{token}`: the model's own reasoning, streamed or sent once | `graph.make_token_emitter`; `reply.py` |
 | `message` | `TokenFrame` | `{token}`: a piece of the reply, or the whole reply as one frame when it was not streamed | same |
-| `memory_extracted` | `MemoryExtractedFrame` (`:261`) | `{memory_id, type, content, confidence, provenance: "said", action: "created" \| "reinforced" \| "superseded"}`. One frame per memory the turn wrote. A suppressed fact (one the user forgot or dismissed) sends none. | `observation.memory_frame` |
-| `pattern_detected` | `PatternDetectedFrame` (`:276`) | `{type, content, confidence, occurrence_count, action: "created" \| "strengthened", pattern_key: string \| null, memory_id}`. `type` is the detector and `content` the description. One frame per learning moment held for the user, this turn's and any PEARL learned in the background since the last turn. | `observation._pattern_frame` |
-| `consent_request` | `ConsentRequestFrame` (`:292`) | `{reason, module}`. Sent when a `PreModuleExecution` hook answers ASK and the module did not run. There is no resume path; the UI explains why. | `frames.py:68-71`; `app/orchestrator/module_wrapper.py:34` |
+| `memory_extracted` | `MemoryExtractedFrame` (`:267`) | `{memory_id, type, content, confidence, provenance: "said", action: "created" \| "reinforced" \| "superseded"}`. One frame per memory the turn wrote. A suppressed fact (one the user forgot or dismissed) sends none. | `observation.memory_frame` |
+| `pattern_detected` | `PatternDetectedFrame` (`:282`) | `{type, content, confidence, occurrence_count, action: "created" \| "strengthened", pattern_key: string \| null, memory_id}`. `type` is the detector and `content` the description. One frame per learning moment held for the user, this turn's and any PEARL learned in the background since the last turn. | `observation._pattern_frame` |
+| `consent_request` | `ConsentRequestFrame` (`:298`) | `{reason, module}`. Sent when a `PreModuleExecution` hook answers ASK and the module did not run. There is no resume path; the UI explains why. | `frames.py:68-71`; `app/orchestrator/module_wrapper.py:34` |
 | `complete` | `ChatCompletePayload` (`:129`) | §6.3, validated before it is sent | `service.py:211` |
 | `error` | `ErrorResponse` (`app/schemas/errors.py:20`) | the error envelope (§3) | `frames.error_frame`, from `service.py:212-223` |
 
@@ -650,9 +651,9 @@ sequenceDiagram
     H->>L: release, shielded, also after a disconnect
 ```
 
-### 6.3 The `complete` frame: `ChatCompletePayload` (`app/schemas/chat_stream.py:129-184`)
+### 6.3 The `complete` frame: `ChatCompletePayload` (`app/schemas/chat_stream.py:129-190`)
 
-`model_config = ConfigDict(extra="forbid")`: a frame with an unknown key fails validation and becomes an `error` frame. `tests/test_turn_learning.py` pins the exact field set (`COMPLETE_FIELDS`, line 689). Every field is always present; nullable fields are sent as `null`. The payload is built by `build_complete_payload` (`app/services/chat_turn/reply.py:180-226`).
+`model_config = ConfigDict(extra="forbid")`: a frame with an unknown key fails validation and becomes an `error` frame. `tests/test_turn_learning.py` pins the exact field set (`COMPLETE_FIELDS`, line 689; `draft_version` is the one optional key, `OPTIONAL_COMPLETE_FIELDS`, line 697). Every other field is always present; nullable fields are sent as `null`. The payload is built by `build_complete_payload` (`app/services/chat_turn/reply.py:186-232`).
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -668,6 +669,7 @@ sequenceDiagram
 | `schedule_status` | `"draft"` \| `"infeasible"` \| null | `draft`: a plan awaits accept (`draft_id`); `infeasible`: it did not fit |
 | `conflict_summary` | string \| null | why it did not fit, without blame; only when infeasible |
 | `draft_id` | string \| null | set only on the turn that proposed the draft; accept it at `/drafts/{draft_id}/accept` |
+| `draft_version` | string, only with `draft_id` | that draft's `version` (as `GET /drafts/{id}` reports it); send it as `expected_version` on accept, and a plan changed since is refused (409 `stale_version`). Absent when the turn handed over no draft |
 | `saved_constraints` | string[] \| null | the rules this turn saved, in the user's words |
 | `conversation_id` | string \| null | the session id; send it back next turn |
 | `message_id` | string \| null | the saved reply's id |
@@ -685,7 +687,7 @@ sequenceDiagram
 | `confidence` | number | `memory_id` | string \| null | `ttft_ms` | number \| null |
 | `provenance` | `said` \| `inferred` | | | `model` | string: the model that wrote the reply, or how it was made (`"none (structured response)"`, `"cloud"`, `"local"`) |
 
-All four nested models also forbid extra keys. The frame carries no draft `version`, so an accept made from the chat card cannot send `expected_version` (§7).
+All four nested models also forbid extra keys. The frame carries the proposed draft's version as `draft_version`, so the chat card accepts with it as `expected_version` (§7) (`tests/behaviour/test_chat_turns.py::test_chat__draft_proposed__complete_names_its_version_and_the_card_can_accept_with_it`).
 
 ### 6.4 Errors inside the stream
 
@@ -708,7 +710,7 @@ What a cut-off turn leaves behind:
 
 Usage attribution and the per-turn `force_cloud` flag are reset by `ChatTurn.finish`, the response's background task (`service.py:72-77`).
 
-The frontend separates the two ways a stream can end early (`createStreamControl`, `lib/api.ts:234`):
+The frontend separates the two ways a stream can end early (`createStreamControl`, `lib/api.ts:255`):
 - **Stop** aborts the request.
 - **Leaving the page** (`detach`) only silences the handlers and keeps reading, so the server finishes the turn and the reply lands in history.
 
@@ -720,25 +722,24 @@ The frontend repository is `/Users/madhav/Jarvis-cursor/jarvis-frontend` (branch
 
 | Concern | Where | What it does |
 |---|---|---|
-| Identity | `lib/api.ts:189` `userQuery()` | `?user_id=…` for every `CurrentUser` route; body `user_id` elsewhere |
-| Error envelope | `lib/api.ts:107` `readApiError`, `:122` `readApiErrorCode`, `:144` `ApiError` | Reads a 422's field reason first, then `error.message` and `error.code`, with fallbacks to the legacy `detail`, `message` and `error` strings. `ApiError` carries `status`, `code`, `serverMessage` and `details`. |
-| SSE | `lib/api.ts:293` `consumeSSE`, `:395` `chatStream` | A line parser that dispatches each `event:`/`data:` pair in stream order to typed handlers (`onPhase`, `onStep`, `onThinkingToken`, `onMessageToken`, `onToolUse`, `onMemoryExtracted`, `onPatternDetected`, `onConsentRequest`, `onComplete`, `onError`). A malformed line is skipped. `chatStream` posts to `/api/v1/chat/stream` (`lib/api.ts:23`). |
+| Identity | `lib/api.ts:210` `userQuery()` | `?user_id=…` for every `CurrentUser` route; body `user_id` elsewhere |
+| Error envelope | `lib/api.ts:128` `readApiError`, `:143` `readApiErrorCode`, `:165` `ApiError` | Reads a 422's field reason first, then `error.message` and `error.code`, with fallbacks to the legacy `detail`, `message` and `error` strings. `ApiError` carries `status`, `code`, `serverMessage` and `details`. |
+| SSE | `lib/api.ts:331` `consumeSSE`, `:437` `chatStream` | A line parser that dispatches each `event:`/`data:` pair in stream order to typed handlers (`onPhase`, `onStep`, `onThinkingToken`, `onMessageToken`, `onToolUse`, `onMemoryExtracted`, `onPatternDetected`, `onConsentRequest`, `onComplete`, `onError`). A malformed line is skipped. `chatStream` posts to `/api/v1/chat/stream` (`lib/api.ts:25`). |
 | `complete` | `consumeSSE`, plus `lib/learning.ts:117` `toSinceLastSpoke` | Cast to `ChatResponse` (`lib/types.ts:354`). Only `since_last_spoke` is normalised: a non-string or blank value becomes null. The frame is **not** strictly parsed. |
 | `consent_request` | `lib/learning.ts:105` `toConsentRequest` | Dropped unless `reason` is a non-blank string |
 | Strict REST parsers | `lib/contracts.ts` | `parseMemoryOut` / `parseMemoryList`, `parseYouProfile` / `parseYouResponse` (pattern, rule, 24-hour focus, receipt, optional `streak_days`), `parseSuggestion` / `parseSuggestionList`, `parseAcceptResponse`, `parseRunTriggerResponse`, `parseDraftState` (requires `version`). Each checks field names and types and throws `ContractError` on drift; extra fields are ignored. Pinned by `lib/__tests__/contracts.test.ts`. |
-| Stale accept | `lib/api.ts:628-645` `acceptDraft`, `lib/draftBanner.ts:186` | The dashboard banner sends `expected_version`; a 409 with code `stale_version` shows the latest draft from `details.draft`. |
-| Types | `lib/types.ts` | `ChatResponse`, `ToolUseEvent` (status includes `"skipped"`, `:676`), `MemoryExtractedEvent`, `PatternDetectedEvent`, `ConsentRequestEvent`, `PearlInsight` (`memory_id: string \| null`, `:150`), `DraftState`, `SettingsUpdate`, … |
+| Stale accept | `lib/api.ts:674-691` `acceptDraft`, `lib/draftBanner.ts:191`, `lib/draftCard.ts:134` | The dashboard banner and the chat card (with the `complete` frame's `draft_version`) send `expected_version`; a 409 with code `stale_version` shows the latest draft from `details.draft`. |
+| Types | `lib/types.ts` | `ChatResponse`, `ToolUseEvent` (status includes `"skipped"`, `:682`), `MemoryExtractedEvent`, `PatternDetectedEvent`, `ConsentRequestEvent`, `PearlInsight` (`memory_id: string \| null`, `:150`), `DraftState`, `SettingsUpdate`, … |
 
 **Where the frontend and the backend still disagree** (checked for this document):
 
 | # | Frontend | Backend | Effect |
 |---|---|---|---|
-| F1 | `ChatResponse.saved_constraints?: string[]` (`lib/types.ts:381`) | `list[str] \| None`: sends `null` | Optional versus nullable. Harmless in practice. |
-| F2 | `ModelMode = 'auto' \| '4b'` (`lib/types.ts:455`) | `model_mode` accepts `auto`, `cloud`, `gemini`, `4b` | Narrower than the contract, never wider: everything the frontend sends is accepted. |
+| F1 | `ChatResponse.saved_constraints?: string[]` (`lib/types.ts:387`) | `list[str] \| None`: sends `null` | Optional versus nullable. Harmless in practice. |
+| F2 | `ModelMode = 'auto' \| '4b'` (`lib/types.ts:461`) | `model_mode` accepts `auto`, `cloud`, `gemini`, `4b` | Narrower than the contract, never wider: everything the frontend sends is accepted. |
 | F3 | `TriggerName = "morning_brief" \| "pattern_rule"`, hard-coded (`lib/types.ts:328`) | `GET /anticipation/triggers` lists the registry | Matches today; a new trigger needs a frontend change. |
 | F4 | `parseSuggestion` reads `status` and `consent_kind` as any string (`lib/contracts.ts:254-270`) | both are enums | Looser than the contract, never stricter. |
-| F5 | `acceptDraft` is typed `{status, draft_id?, task_count?}` (`lib/api.ts:628-631`) | `DraftAcceptResponse` also has `moved` and `message` | Fields arrive at runtime but are untyped. |
-| F6 | The chat card accepts with no `expected_version` (`lib/hooks/useJarvisChat.ts:441-443`) | The `complete` frame carries no draft version | An accept from the chat card is not checked against edits made since; the dashboard banner's accept is. |
+| F5 | `acceptDraft` is typed `{status, draft_id?, task_count?}` (`lib/api.ts:674-677`) | `DraftAcceptResponse` also has `moved` and `message` | Fields arrive at runtime but are untyped. |
 
 The earlier mismatches (the `"skipped"` tool status, a nullable insight `memory_id`, the trailing slash on `deleteDocument`, the calls to the retired v1 routes, the dead `updateTask`, and the model-mode labels) were fixed in the restructure.
 
@@ -762,9 +763,9 @@ These are stated plainly so a reviewer does not have to find them.
 
 **Status codes and envelopes.**
 - Every route's own 404 is `not_found`; Starlette's 404 for an unmatched path, and its 405 for an undeclared method, are `http_error`.
-- `GET /sessions/` returns `[]` when the database is down, and `GET /sessions/{id}/messages` returns `[]` when its query fails (`app/services/chat_history.py:263-265, 337-339`); every other list answers 503.
+- `GET /sessions/` and `GET /sessions/{id}/messages` answer 503 `persistence_unavailable` like every other list when the database is down or its query fails, never `[]` (`app/services/chat_history.py:254-255, 271-275, 341-342, 359-361`).
 - `PUT /sessions/{id}` and `DELETE /sessions/{id}` answer success for an unknown id.
-- `DELETE /tasks/{id}/workspace` always answers `invalidated`; a failed delete is swallowed (`app/services/analytical/workspace_builder.py:489-503`).
+- `DELETE /tasks/{id}/workspace` always answers `invalidated`; a failed delete is swallowed (`app/services/analytical/workspace_builder.py:490-504`).
 - OpenAPI's shared 422 description names `schedule_infeasible` on every operation, though only the accept and `/schedule/generate-schedule` raise it (`error_handlers.py:34-41`).
 
 **Semantics.**
@@ -783,11 +784,11 @@ These are stated plainly so a reviewer does not have to find them.
 
 ## 9. OpenAPI vs code
 
-Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated.
+Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone.
 
 What agrees:
 - Every operation declares a typed 2xx response model (`tests/test_api_contract.py::test_openapi__every_json_route__declares_a_typed_response_model`, `::test_openapi__schema__every_operation_has_a_typed_2xx_but_the_stream`).
-- Every operation documents `ErrorResponse` for 422, 4XX and 5XX (`FastAPI(responses=ERROR_RESPONSES)`, `app/main.py:184-189`); FastAPI's default `HTTPValidationError` is not in the schema (`::test_openapi__errors__documented_with_the_envelope_never_the_default_shape`).
+- Every operation documents `ErrorResponse` for 422, 4XX and 5XX (`FastAPI(responses=ERROR_RESPONSES)`, `app/main.py:185-190`); FastAPI's default `HTTPValidationError` is not in the schema (`::test_openapi__errors__documented_with_the_envelope_never_the_default_shape`).
 - `POST /api/v1/chat/stream` documents its 200 as `text/event-stream` whose schema is a `$ref` to `ChatCompletePayload`, and its errors as the JSON envelope (`json_error_responses`, `error_handlers.py:50-61`; `::test_openapi__chat_stream__documents_the_complete_frame`).
 - `ChatStreamRequest.user_prompt` shows `maxLength: 8000`, and `model_mode` and `media_type` show their enums.
 
@@ -795,8 +796,9 @@ What OpenAPI does not show:
 
 | OpenAPI says | The code does |
 |---|---|
-| The stream's 200 schema is `ChatCompletePayload` | That is only the last frame. The other nine frame models of `SSE_EVENTS` (`chat_stream.py:302-313`) are not in `components.schemas`; §6 is their contract. |
-| `file_base64` has no bound | `within_upload_limit` refuses a file over 10 MB decoded (`app/schemas/upload.py:22-27`); a validator does not appear in the schema. The stream route's description states the limit (`chat.py:27-35`). |
+| The stream's 200 schema is `ChatCompletePayload` | That is only the last frame. The other nine frame models of `SSE_EVENTS` (`chat_stream.py:308-319`) are not in `components.schemas`; §6 is their contract. |
+| No operation lists a 413 | `BodyLimitMiddleware` answers 413 `payload_too_large`, in the documented `ErrorResponse` envelope (the 4XX), on the two upload routes before any route runs (`app/api/request_limits.py:38-96`) |
+| `file_base64` has no bound | `within_upload_limit` refuses a file over 10 MB decoded (`app/schemas/upload.py:22-27`); a validator does not appear in the schema. The stream route's description states the limit (`chat.py:25-33`). |
 
 Everything else checked agrees with the Pydantic models: every route, method, parameter, request body and response model in §5.
 
@@ -805,6 +807,8 @@ Everything else checked agrees with the Pydantic models: every route, method, pa
 ## 10. Retired in the restructure
 
 Removed between `5c6ffd3` and `e76bff9`, and absent from both the app's routes and `/openapi.json`: the v1 chat routes `POST /chat/`, the v1 handler of `POST /chat/stream` (the path now serves the turn stream), `/chat/confirm-schedule`, `/chat/accept-schedule` and `/chat/modify-schedule`; `POST /drafts/{id}/chat` (it always answered 501); `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/`; and `DELETE /ingestion/behavioral-constraint/{id}` (rules are deleted at `DELETE /habits/constraints/{id}`).
+The hidden, deprecated `POST /chat/v2/stream` alias of the turn stream was removed after the final live run; the old path answers 404 (`tests/test_routes.py::test_routes__old_chat_path__404_envelope`).
+
 Pinned by `tests/test_routes.py`, `tests/test_tasks_one_path.py::test_task_routes__patch_and_deletes__gone_405_or_404` and `tests/test_drafts_one_path.py::test_draft_routes__no_501_chat_route_and_every_route_typed`.
 
 ---
@@ -820,7 +824,7 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 | §10: `ConsentRequiredError` → "202 / SSE `consent_request`" | There is no such error (it was never raised and was deleted). The `consent_request` frame comes from a hook answering ASK; a suggestion that needs consent is stored PENDING with `consent_behavior: "ask"`. |
 | §10: "List endpoints no longer return `[]` on a DB failure; they return 503" | True everywhere except `GET /sessions/` and a failed query on `GET /sessions/{id}/messages`. |
 | §12 (phase 2b): "remaining repositories (sessions, memories, documents, pending-calendar)" | Sessions, documents and the pending calendar still use raw table calls (Task 6 of the restructure was dropped; §1). |
-| §11 (via `08-database-schema.md`): "point the health check at `user_profiles`" | `/health` probes `user_tasks` (`app/db/supabase_py.py:49`). |
+| §11 (via `08-database-schema.md`): "point the health check at `user_profiles`" | `/health` probes `user_tasks` (`app/db/supabase_py.py:116`). |
 
 ---
 

@@ -83,7 +83,7 @@ This document shows where the four pillars of object-oriented programming (encap
         """Yield (event_type, token) pairs as they arrive; req.response_schema must be None."""
 ```
 
-**Example 2 — one function for every model call.** `route_llm_call` hides roles, the cloud switch, the PRIMARY lock, the PII gate, fallback and metering behind one call; the caller passes a task name and a prompt. `app/core/model_router.py:396-403`:
+**Example 2 — one function for every model call.** `route_llm_call` hides roles, the cloud switch, the PRIMARY lock, the PII gate, fallback and metering behind one call; the caller passes a task name and a prompt. `app/core/model_router.py:405-412`:
 
 ```python
     chain = get_chain()
@@ -232,7 +232,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
 **Here:** each class has one reason to change: the router parses, the turn service runs a turn, the encoder writes frames, each LLM decorator adds one concern.
 
-**Example 1 — the chat router only routes.** The whole endpoint is 61 lines; the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:54-60`:
+**Example 1 — the chat router only routes.** The whole endpoint is 61 lines; the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:49-55`:
 
 ```python
     turn = await ChatTurnService.for_app(http_request.app.state).open_turn(
@@ -244,7 +244,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         background=BackgroundTask(turn.finish),
 ```
 
-**Example 2 — one place writes a frame.** Every SSE frame is a Pydantic model serialised by `SseEncoder.frame`. `app/schemas/chat_stream.py:331-336`:
+**Example 2 — one place writes a frame.** Every SSE frame is a Pydantic model serialised by `SseEncoder.frame`. `app/schemas/chat_stream.py:337-342`:
 
 ```python
     @staticmethod
@@ -317,7 +317,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
 **Would break:** `tests/test_anticipation_design.py::test_pattern_rule__new_detector_that_proposes_rules__offered_without_a_trigger_edit`, `tests/test_patterns.py::test_detector__new_strategy__brings_its_own_insight_and_planning_use`, `tests/test_llm_providers.py::test_factory__extra_cloud_provider__order_is_local_extra_cloud_gemini`, `tests/test_anticipation_design.py::test_anticipation__triggers__the_registered_names_and_descriptions`.
 
-**Where we fall short:** adding a cognitive module is not closed for modification. The intent-to-module table is a hand-written dict (`app/orchestrator/routing.py:12-28`) and the graph's edge map names every module (`app/orchestrator/graph.py:777-790`), so a new module means editing both. The spec's `CognitiveModule` registry, where a module declares its intents and the router is derived, was Plan 3 Task 9 and was dropped by ruling to protect the demo (`.superpowers/sdd/2026-11-14-capstone-plan-3-finish-the-restructure/progress.md`).
+**Where we fall short:** adding a cognitive module is not closed for modification. The intent-to-module table is a hand-written dict (`app/orchestrator/routing.py:12-28`) and the graph's edge map names every module (`app/orchestrator/graph.py:805-818`), so a new module means editing both. The spec's `CognitiveModule` registry, where a module declares its intents and the router is derived, was Plan 3 Task 9 and was dropped by ruling to protect the demo (`.superpowers/sdd/2026-11-14-capstone-plan-3-finish-the-restructure/progress.md`).
 
 ---
 
@@ -335,7 +335,7 @@ def repos(request, memory_store, fake_client) -> Repositories:
     return RepositoryFactory.supabase(fake_client)
 ```
 
-**Example 2 — the null event bus.** `NullEventBus` honours `publish` by doing nothing, so code built without a container (tests, scripts, the lazy default chain in `app/core/model_router.py:160`) runs unchanged. `app/domain/events.py:112-116`:
+**Example 2 — the null event bus.** `NullEventBus` honours `publish` by doing nothing, so code built without a container (tests, scripts, the lazy default chain in `app/core/model_router.py:169`) runs unchanged. `app/domain/events.py:112-116`:
 
 ```python
 class NullEventBus(EventBus):
@@ -349,7 +349,7 @@ class NullEventBus(EventBus):
 
 **Would break:** `tests/test_repository_contracts.py` (97 test functions; those taking the `repos` fixture run once per family), `tests/test_domain.py::test_null_event_bus__publish__no_error`, `tests/test_energy.py::test_history_estimator__no_events__prior_and_source_prior` and `::test_heuristic__matches_user_model_table_for_every_hour`.
 
-**Where we fall short:** the provider chain widens the port it implements. `FallbackChainProvider.complete` and `.stream` take an extra `skip_local` argument and the class adds `has_available` (`app/infrastructure/llm/chain.py:62-64`, `87`, `97-99`), so `route_llm_call` depends on the concrete chain type (`get_chain() -> FallbackChainProvider`, `app/core/model_router.py:151`) rather than on `LLMProvider`. Substituting a plain provider for the chain would lose the cloud switch. Second, the Supabase family is contract-tested against `FakeSupabase` (`tests/fakes.py`), not a live PostgREST; the live end-to-end script (`scripts/live_e2e.py`) covers the real database, but it is not part of the offline suite.
+**Where we fall short:** the provider chain widens the port it implements. `FallbackChainProvider.complete` and `.stream` take an extra `skip_local` argument and the class adds `has_available` (`app/infrastructure/llm/chain.py:62-64`, `87`, `97-99`), so `route_llm_call` depends on the concrete chain type (`get_chain() -> FallbackChainProvider`, `app/core/model_router.py:160`) rather than on `LLMProvider`. Substituting a plain provider for the chain would lose the cloud switch. Second, the Supabase family is contract-tested against `FakeSupabase` (`tests/fakes.py`), not a live PostgREST; the live end-to-end script (`scripts/live_e2e.py`) covers the real database, but it is not part of the offline suite.
 
 ---
 
@@ -399,7 +399,7 @@ class Sweep(ABC):
 
 **Would break:** `tests/test_injection.py::test_planning_nodes__read_planning_services_from_state__none_means_no_slots_no_focus_no_scan`, `tests/test_planning_replan.py::test_planning_state_out__habits_could_not_be_read__the_reply_leads_with_it`, and the interface-completeness check in `tests/test_design_conformance.py` (every abstract method of a port is drawn, and a port has no concrete methods).
 
-**Where we fall short:** the turn state is not segregated. `JarvisState` is one 43-key `TypedDict` that every top-level node receives (`app/orchestrator/state.py:31-115`), and the whole `AppContainer` rides in it under `container` (`app/services/chat_turn/context.py:63`), so any node can reach any service: inside a turn the container works like a service locator. Only the planning module projects its state; research and knowledge receive the full dict. Two ports are also wider than their clients need: `TaskRepository` mixes reads with the status writes (the spec's `TaskReader` / `TaskWriter` split was not made, `app/domain/ports.py:59-123`), and `MemoryRepository` has eight methods (`ports.py:400-501`).
+**Where we fall short:** the turn state is not segregated. `JarvisState` is one 44-key `TypedDict` that every top-level node receives (`app/orchestrator/state.py:31-118`), and the whole `AppContainer` rides in it under `container` (`app/services/chat_turn/context.py:63`), so any node can reach any service: inside a turn the container works like a service locator. Only the planning module projects its state; research and knowledge receive the full dict. Two ports are also wider than their clients need: `TaskRepository` mixes reads with the status writes (the spec's `TaskReader` / `TaskWriter` split was not made, `app/domain/ports.py:59-123`), and `MemoryRepository` has eight methods (`ports.py:400-501`).
 
 ---
 
@@ -450,9 +450,9 @@ class Sweep(ABC):
 
 **Where we fall short:**
 
-- **Eight raw-table leftovers.** Eight files still call Supabase tables directly instead of through a port: `services/chat_history.py`, `api/v1/endpoints/sessions.py`, `api/v1/endpoints/documents.py`, `api/v1/endpoints/ingestion.py`, `services/extraction/orchestrator.py`, `services/extraction/task_material_linker.py` (no repositories yet for sessions, messages, documents, materials and pending calendar rows: Plan 3 Task 6 was dropped), plus `services/analytical/workspace_builder.py` and `services/user_preferences.py`. They are pinned by an allow-list that can only shrink (`tests/test_layering.py:438-453`, `505-524`). Because of them, `ChatTurnService` still takes a raw `db_client` for the chat history (`app/services/chat_turn/service.py:243-252`).
+- **Eight raw-table leftovers.** Eight files still call Supabase tables directly instead of through a port: `services/chat_history.py`, `api/v1/endpoints/sessions.py`, `api/v1/endpoints/documents.py`, `api/v1/endpoints/ingestion.py`, `services/extraction/orchestrator.py`, `services/extraction/task_material_linker.py` (no repositories yet for sessions, messages, documents, materials and pending calendar rows: Plan 3 Task 6 was dropped), plus `services/analytical/workspace_builder.py` and `services/user_preferences.py`. They are pinned by an allow-list that can only shrink (`tests/test_layering.py:451-466`, `505-524`). Because of them, `ChatTurnService` still takes a raw `db_client` for the chat history (`app/services/chat_turn/service.py:243-252`).
 - **One import of infrastructure from core.** `app/core/model_router.py` imports the chain, decorators and factory to install and read the process-wide chain (the one entry on `_INFRASTRUCTURE_IMPORTS_ALLOWED`, `tests/test_layering.py:146-151`).
-- **Process-wide singletons are still looked up.** The container is no longer looked up anywhere (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`), but three collaborators still are: the hook pipeline through `get_hooks()` (`app/core/module_framework.py:120`, `app/orchestrator/module_wrapper.py:21`, `app/services/analytical/workspace_builder.py:51`), the installed LLM chain through `get_chain()` (`app/core/model_router.py:151-162`), and the module registry (`app/modules/__init__.py:9`, read by `build_jarvis_graph`). Each is built once per process and is replaceable in tests (`set_chain`, `reset_chain`), but a caller cannot be handed a different one through its constructor. These are in-process guards and wiring that predate the restructure; moving them into the container is the next step.
+- **Process-wide singletons are still looked up.** The container is no longer looked up anywhere (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`), but three collaborators still are: the hook pipeline through `get_hooks()` (`app/core/module_framework.py:120`, `app/orchestrator/module_wrapper.py:21`, `app/services/analytical/workspace_builder.py:51`), the installed LLM chain through `get_chain()` (`app/core/model_router.py:160-171`), and the module registry (`app/modules/__init__.py:9`, read by `build_jarvis_graph`). Each is built once per process and is replaceable in tests (`set_chain`, `reset_chain`), but a caller cannot be handed a different one through its constructor. These are in-process guards and wiring that predate the restructure; moving them into the container is the next step.
 
 ---
 

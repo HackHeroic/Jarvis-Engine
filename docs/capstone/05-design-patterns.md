@@ -81,7 +81,7 @@ A third family (say, plain Postgres through asyncpg) is a new module with one cl
 
 ### 2.7 Honest notes
 - The Supabase family is tested against `FakeSupabase` (`tests/fakes.py`), a stand-in that mirrors PostgREST and the `accept_draft` SQL function, not against a live database. The live database is exercised by `scripts/live_e2e.py`.
-- Drafts, tasks, rules, goals and habit trackers each have one persistence path. Raw `.table(...)` calls remain in 8 files, for tables that have no repository yet: chat sessions and messages, ingested documents, task materials, pending calendar updates, the workspace cache (and the workspace builder's task reads, which need columns the `Task` entity does not carry), and the learning-style read. Each file is on `_RAW_TABLE_CALLS_ALLOWED` with its reason (`tests/test_layering.py:438-453`); `tests/test_layering.py::test_layering__no_raw_table_calls_outside_the_allow_list` fails on a new call elsewhere, and `::test_layering__allow_lists__are_exactly_the_documented_leftovers` fails when an entry goes stale. The chat turn still carries a database handle for the session and document rows (`app/services/chat_turn/service.py:243-251`).
+- Drafts, tasks, rules, goals and habit trackers each have one persistence path. Raw `.table(...)` calls remain in 8 files, for tables that have no repository yet: chat sessions and messages, ingested documents, task materials, pending calendar updates, the workspace cache (and the workspace builder's task reads, which need columns the `Task` entity does not carry), and the learning-style read. Each file is on `_RAW_TABLE_CALLS_ALLOWED` with its reason (`tests/test_layering.py:451-466`); `tests/test_layering.py::test_layering__no_raw_table_calls_outside_the_allow_list` fails on a new call elsewhere, and `::test_layering__allow_lists__are_exactly_the_documented_leftovers` fails when an entry goes stale. The chat turn still carries a database handle for the session and document rows (`app/services/chat_turn/service.py:243-251`).
 
 ---
 
@@ -492,7 +492,7 @@ Concrete classes (which repository family, which providers in which wrappers, wh
 A composition root builds the object graph once at startup and passes each collaborator in (a constructor, or the turn's state); factories build families and rebuild stored commands.
 
 ### 9.3 Where
-- **Composition root**: `AppContainer.build` (`app/container.py:103-239`), called once from the FastAPI lifespan (`app/main.py:118`), which keeps it on `app.state` only (`app/main.py:119`). It chooses the repository family (`container.py:124-128`), turns the config module into each service's settings once (`Settings.from_config`, `container.py:130`; `app/core/settings.py:78-118`), creates the bus and subscribes listeners, builds the LLM chain and installs it process-wide (`container.py:135-137`), and wires every service:
+- **Composition root**: `AppContainer.build` (`app/container.py:103-239`), called once from the FastAPI lifespan (`app/main.py:119`), which keeps it on `app.state` only (`app/main.py:120`). It chooses the repository family (`container.py:124-128`), turns the config module into each service's settings once (`Settings.from_config`, `container.py:130`; `app/core/settings.py:78-118`), creates the bus and subscribes listeners, builds the LLM chain and installs it process-wide (`container.py:135-137`), and wires every service:
 
 ```python
         if supabase_client is not None:
@@ -502,8 +502,8 @@ A composition root builds the object graph once at startup and passes each colla
             repos = RepositoryFactory.in_memory()
 ```
 
-- **How collaborators travel**: a request reaches the container through the app (`container_of`, `app/api/deps.py:40-43`); a chat turn carries it in its LangGraph state under `container` (`app/services/chat_turn/service.py:285-291`), a transient key that is never checkpointed (`app/orchestrator/checkpoint.py:65`); the planning sub-graph copies `PlanningServices` from it into its own state (`app/modules/planning_graph.py:872`), and the replanner holds `PlanningServices` from its constructor (`app/modules/planning_replan.py:37-38`). There is no registry to look the container up from: `app/core/runtime.py` is gone, and a scan of `app/`, `tests/` and `scripts/` for the old lookup names fails the suite if one comes back (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`).
-- **Settings from the root**: eight services built at startup take a frozen settings record (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `app/core/settings.py:13-67`) and do not import the config module (the list is `tests/test_injection.py:386-395`). The container hands each its record; the lifespan hands the scheduler `container.settings.anticipation` (`app/main.py:154-159`). A service built without one (a test, a script) uses `default_settings()` (`settings.py:121-126`).
+- **How collaborators travel**: a request reaches the container through the app (`container_of`, `app/api/deps.py:40-43`); a chat turn carries it in its LangGraph state under `container` (`app/services/chat_turn/service.py:285-291`), a transient key that is never checkpointed (`app/orchestrator/checkpoint.py:65`); the planning sub-graph copies `PlanningServices` from it into its own state (`app/modules/planning_graph.py:877`), and the replanner holds `PlanningServices` from its constructor (`app/modules/planning_replan.py:37-38`). There is no registry to look the container up from: `app/core/runtime.py` is gone, and a scan of `app/`, `tests/` and `scripts/` for the old lookup names fails the suite if one comes back (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`).
+- **Settings from the root**: eight services built at startup take a frozen settings record (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `app/core/settings.py:13-67`) and do not import the config module (the list is `tests/test_injection.py:631-640`). The container hands each its record; the lifespan hands the scheduler `container.settings.anticipation` (`app/main.py:155-160`). A service built without one (a test, a script) uses `default_settings()` (`settings.py:121-126`).
 - **Abstract Factory**: `RepositoryFactory.supabase` / `.in_memory` build a whole family at once (`app/infrastructure/persistence/factory.py:69-105`), so families cannot be mixed.
 - **Factory**: `LLMProviderFactory.build` (`app/infrastructure/llm/factory.py:30-56`) returns the chain with each provider wrapped for its location; Claude is left out when no credential is configured (`app/infrastructure/llm/factory.py:52-53`).
 - **Factory (rebuild a stored command)**: `ActionFactory` (`app/services/anticipation/service.py:84-102`), filled by `build_action_factory` (`app/services/anticipation/actions.py:290-320`). A suggestion stores its action as a payload; on accept the action is rebuilt from it (`service.py:94-102`):
@@ -530,7 +530,7 @@ A new action kind: a `ProactiveAction` subclass and one `factory.register(kind, 
 ### 9.6 Pinned by, and honest notes
 - `tests/test_container.py::test_container__no_supabase__uses_in_memory_family`, `::test_container__with_fake_supabase__uses_supabase_family`, `::test_container__installs_its_chain_for_route_llm_call`; `tests/test_layering.py::test_layering__only_container_builds_repositories`; `tests/test_anticipation_service.py::test_action_factory__unknown_kind__validation_error`.
 - `tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`, `::test_turn__container_only_in_turn_state__rule_memory_and_pattern_reach_the_turn`, `::test_planning_nodes__read_planning_services_from_state__none_means_no_slots_no_focus_no_scan`, `::test_container__services_get_settings_from_the_composition_root`, `::test_container_built_services__import_no_config_module`.
-- Two process-wide objects remain, both on the model side: the installed LLM chain (`set_chain`/`current_chain`, `app/infrastructure/llm/factory.py:59-79`), which `route_llm_call` reads through `get_chain` (`app/core/model_router.py:151-162`), and the hook registry (`get_hooks`, `app/orchestrator/hooks.py:145`), which the lifespan passes into the container (`app/main.py:118`). With no container (a test, a script) `get_chain` builds a default chain gated by those hooks that publishes usage nowhere.
+- Two process-wide objects remain, both on the model side: the installed LLM chain (`set_chain`/`current_chain`, `app/infrastructure/llm/factory.py:59-79`), which `route_llm_call` reads through `get_chain` (`app/core/model_router.py:160-171`), and the hook registry (`get_hooks`, `app/orchestrator/hooks.py:145`), which the lifespan passes into the container (`app/main.py:119`). With no container (a test, a script) `get_chain` builds a default chain gated by those hooks that publishes usage nowhere.
 - The spec named a `TriggerFactory`; triggers are instead registered directly with the service in the root (`container.py:188-196`).
 
 ---
@@ -560,7 +560,7 @@ The endpoint is one call and a mapping (`app/api/v1/endpoints/you.py:120-130`).
 
 Two more facades:
 - `UserModel` (`app/core/user_model.py:23-50`): the user as a turn or the replanner reads them, over `ProfileRepository`, `ConstraintRepository` and `TaskRepository`, each read once per facade. It holds no database handle.
-- `ChatTurnService` (`app/services/chat_turn/service.py:240-303`): the chat router makes one call and returns the stream (`app/api/v1/endpoints/chat.py:54-61`). The service and `ChatTurn` own the lock, the conversation read, the graph pump, the reply, the `complete` frame and the shielded cleanup (`service.py:123-237`). Every frame is a typed model from one catalogue, `SSE_EVENTS` (`app/schemas/chat_stream.py:302-313`), written by one encoder, `SseEncoder.frame` (`chat_stream.py:328-336`).
+- `ChatTurnService` (`app/services/chat_turn/service.py:240-303`): the chat router makes one call and returns the stream (`app/api/v1/endpoints/chat.py:49-56`). The service and `ChatTurn` own the lock, the conversation read, the graph pump, the reply, the `complete` frame and the shielded cleanup (`service.py:123-237`). Every frame is a typed model from one catalogue, `SSE_EVENTS` (`app/schemas/chat_stream.py:308-319`), written by one encoder, `SseEncoder.frame` (`chat_stream.py:334-342`).
 
 ### 10.4 Adding a variant
 A new section is one more collaborator in the constructor and one more entry in the `gather`; the endpoint maps one more field.
@@ -644,7 +644,7 @@ The action is an object with `describe()`, `to_payload()` and `execute(user_id)`
         """Do it for ``user_id`` and say what happened."""
 ```
 
-Execution is claim-then-execute: the suggestion moves PENDING → ACCEPTED by compare-and-set before `execute` runs, so a double click runs it once; on any failure or cancellation it is released (`app/services/anticipation/service.py:298-353`).
+Execution is claim-then-execute: the suggestion moves PENDING → ACCEPTED by compare-and-set before `execute` runs, so a double click runs it once; on any failure or cancellation it is released (`app/services/anticipation/service.py:300-355`).
 
 ### 12.4 Adding a variant
 A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus one `register` call in `build_action_factory` (`actions.py:290-320`). Consent handles it from its `risk` and `blocked_hours()` without change.
@@ -674,7 +674,7 @@ A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus
 
 | Spec | Code |
 |---|---|
-| `ConsentPolicy.evaluate(action)` (§7) | `ConsentPolicy.evaluate(action, ctx)` (`app/domain/anticipation.py:229`): the user's context (autonomy mode, stated blocks, dismissed keys) is passed in, read lazily only when a run reaches consent (`app/services/anticipation/service.py:455-465`) |
+| `ConsentPolicy.evaluate(action)` (§7) | `ConsentPolicy.evaluate(action, ctx)` (`app/domain/anticipation.py:229`): the user's context (autonomy mode, stated blocks, dismissed keys) is passed in, read lazily only when a run reaches consent (`app/services/anticipation/service.py:457-467`) |
 | Triggers call a `PlanningService` (§7 sequence) | Triggers and actions depend on the `DraftPlanner` port (`app/domain/ports.py:618-640`), implemented by `PlanningGraphReplanner` (`app/modules/planning_replan.py:34`) |
 | ChromaDB archive for memories (§5) | pgvector in Postgres behind `MemoryRepository.nearest` (`app/domain/ports.py:465`) |
 | Hooks aggregate deny > ask > allow regardless of order (§6.3) | `ActionHooks.execute` is first DENY or ASK wins (`app/orchestrator/hooks.py:41-56`) |
