@@ -134,8 +134,14 @@ def _wrap_step(step: ModuleStep) -> Callable:
             return {}
 
         except Exception as e:
-            logger.error(f"Step {module_name}.{step.name} failed: {e}")
-            _emit_tool_use(queue, module_name, step.name, "error", {"error": str(e)})
+            from app.domain.errors import public_message
+
+            logger.error(f"Step {module_name}.{step.name} failed: {e!r}")
+            # The frame reaches the browser: never the exception's own text.
+            _emit_tool_use(
+                queue, module_name, step.name, "error",
+                {"error": public_message(e, "This step failed.")},
+            )
             raise
 
     wrapped.__name__ = f"{step.module_name}__{step.name}"

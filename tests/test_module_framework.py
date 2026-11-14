@@ -157,7 +157,8 @@ async def test_wrap_step__handler_exception_emits_error():
     while not queue.empty():
         events.append(json.loads(queue.get_nowait()))
     assert events[-1]["status"] == "error"
-    assert "something broke" in events[-1]["detail"]["error"]
+    # The frame reaches the browser: a fixed text, never the exception's own.
+    assert events[-1]["detail"]["error"] == "This step failed."
 
 
 @pytest.mark.asyncio

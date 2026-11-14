@@ -89,3 +89,12 @@ class LLMRefusedError(LLMError):
     """The model declined the request. Another provider may answer; asking this one again won't."""
 
     code = "llm_refused"
+
+
+def public_message(exc: BaseException, fallback: str) -> str:
+    """The text a user may see about ``exc``: a ``JarvisError``'s own message, else ``fallback``.
+
+    Anything else's ``str()`` can carry a connection string, a query or a stack
+    detail; log it, and show ``fallback``.
+    """
+    return exc.message if isinstance(exc, JarvisError) else fallback

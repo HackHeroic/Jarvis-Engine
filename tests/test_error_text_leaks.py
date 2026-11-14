@@ -222,3 +222,186 @@ async def test_chat_v2__graph_crashes__error_frame_is_the_envelope_without_excep
     assert set(error) == {"code", "message", "details", "request_id"}
     assert error["code"] == "internal_error"
     assert error["message"] == "Something went wrong on our side."
+
+
+# --- documents and memories ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "message"),
+    [
+        ("get", "/api/v1/documents/", "Could not load your documents."),
+        ("delete", "/api/v1/documents/src-1", "Could not delete the document."),
+    ],
+)
+def test_documents__database_fails__503_fixed_message_secret_only_in_the_log(
+    app, client, monkeypatch, caplog, method, path, message
+):
+    monkeypatch.setattr(
+        app.state, "db_client", FakeDBClient(_BrokenSupabase("ingested_documents"))
+    )
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _broken_chroma)
+
+    resp = getattr(client, method)(path, params={"user_id": "u1"})
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == message
+    _assert_no_leak(resp)
+    assert SECRET in caplog.text
+
+
+def _broken_chroma():
+    raise _planted()
+
+
+def test_document_chunks__store_fails__503_fixed_message_secret_only_in_the_log(
+    client, monkeypatch, caplog
+):
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _broken_chroma)
+
+    resp = client.get("/api/v1/documents/src-1/chunks", params={"user_id": "u1"})
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == "Could not load the document's chunks."
+    _assert_no_leak(resp)
+    assert SECRET in caplog.text
+
+
+def test_edit_memory__database_fails__503_fixed_message_secret_only_in_the_log(
+    app, client, monkeypatch, caplog
+):
+    from types import SimpleNamespace
+
+    store = SimpleNamespace(_supabase=_BrokenSupabase("user_memories"))
+    monkeypatch.setattr(app.state, "memory_store", store, raising=False)
+
+    resp = client.patch("/api/v1/memories/m1", params={"user_id": "u1"}, json={"content": "x"})
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == "Could not update the memory."
+    _assert_no_leak(resp)
+    assert SECRET in caplog.text
+
+
+# --- module steps, module errors and the reply that narrates them ----------------------
+
+
+@pytest.mark.asyncio
+async def test_module_step__handler_raises__tool_use_frame_carries_a_fixed_text(caplog):
+    import asyncio
+    import json
+
+    from app.core.module_framework import ModuleStep, _wrap_step
+
+    async def explode(_state):
+        raise _planted()
+
+    step = ModuleStep(name="ingest_document", handler=explode, module_name="knowledge_module")
+    queue: asyncio.Queue = asyncio.Queue()
+
+    with pytest.raises(RuntimeError):
+        await _wrap_step(step)({"progress_queue": queue})
+
+    frames = [json.loads(queue.get_nowait()) for _ in range(queue.qsize())]
+    (failed,) = [f for f in frames if f["status"] == "error"]
+    assert failed["detail"] == {"error": "This step failed."}
+    assert SECRET not in json.dumps(frames)
+    assert SECRET in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_module_step__jarvis_error__tool_use_frame_carries_its_own_message():
+    import asyncio
+    import json
+
+    from app.core.module_framework import ModuleStep, _wrap_step
+
+    async def refuse(_state):
+        raise errors.PersistenceError("Could not reach the database.")
+
+    step = ModuleStep(name="fetch", handler=refuse, module_name="planning_module")
+    queue: asyncio.Queue = asyncio.Queue()
+
+    with pytest.raises(errors.PersistenceError):
+        await _wrap_step(step)({"progress_queue": queue})
+
+    frames = [json.loads(queue.get_nowait()) for _ in range(queue.qsize())]
+    (failed,) = [f for f in frames if f["status"] == "error"]
+    assert failed["detail"] == {"error": "Could not reach the database."}
+
+
+@pytest.mark.asyncio
+async def test_knowledge_ingest__ingestion_raises__state_error_is_a_fixed_text(
+    monkeypatch, caplog
+):
+    from app.modules.knowledge_graph import ingest_document
+
+    async def failing(**_kwargs):
+        raise _planted()
+
+    monkeypatch.setattr("app.services.extraction.orchestrator.process_ingestion", failing)
+
+    out = await ingest_document({"content": "notes", "user_id": "u1"})
+
+    assert out["error"] == "the document could not be read"
+    assert SECRET in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_research_search__search_raises__state_error_is_a_fixed_text(monkeypatch, caplog):
+    from app.modules.research_graph import execute_search
+
+    async def failing(*_args, **_kwargs):
+        raise _planted()
+
+    monkeypatch.setattr(
+        "app.services.analytical.workspace_builder.perform_learning_style_search", failing
+    )
+
+    out = await execute_search({"query": "graphs", "search_results": [], "iteration_count": 0})
+
+    assert out["error"] == "the search could not run"
+    assert SECRET in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_planning_decompose__chunker_raises__state_error_is_a_fixed_text(
+    monkeypatch, caplog
+):
+    from app.modules.planning_graph import decompose_goal
+
+    async def failing(**_kwargs):
+        raise _planted()
+
+    monkeypatch.setattr("app.core.model_router.route_llm_call", failing)
+
+    out = await decompose_goal({"user_message": "Learn graph algorithms this week", "user_id": "u1"})
+
+    assert out["error"] == "the goal could not be broken into steps"
+    assert out["task_chunks"] == []
+    assert SECRET in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_reply__module_error__narrates_only_the_stored_text(monkeypatch, streamed):
+    """End to end from the module to the words: what the module stores is all the reply says."""
+    from app.modules.research_graph import execute_search
+    from app.services.analytical import voice_of_jarvis as voj
+
+    async def failing(*_args, **_kwargs):
+        raise _planted()
+
+    monkeypatch.setattr(
+        "app.services.analytical.workspace_builder.perform_learning_style_search", failing
+    )
+    out = await execute_search({"query": "graphs", "search_results": [], "iteration_count": 0})
+    summary = {"error": out["error"]}
+
+    if streamed:
+        reply = "".join([tok async for _kind, tok in voj.synthesize_jarvis_response_stream(summary)])
+    else:
+        reply, _thinking = await voj.synthesize_jarvis_response(summary)
+
+    assert reply == "Sir, something hiccupped on my end: the search could not run. Shall we try again?"
+    assert SECRET not in reply
