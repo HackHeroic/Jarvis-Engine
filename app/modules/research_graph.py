@@ -8,8 +8,9 @@ from app.domain.errors import public_message
 class ResearchState(TypedDict):
     user_id: str
     user_model: Any
-    # The turn's composition root (AppContainer), or None: a web search is metered onto
-    # its event bus. Transient, never checkpointed.
+    # The turn's composition root (AppContainer): a web search is metered onto its event
+    # bus, and without one no search is made (metered_web_search refuses it, and the
+    # failure is logged and narrated). Transient, never checkpointed.
     container: Any
     query: str
     search_results: list

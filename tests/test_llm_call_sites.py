@@ -13,6 +13,7 @@ search says so plainly and never surfaces a link.
 
 import json
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -20,10 +21,16 @@ import pytest
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
+from app.domain.events import NullEventBus
 from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.llm.transport import strip_fences, translated_errors
+
+# A web search must be metered onto a bus (``metered_web_search`` refuses one without):
+# these tests check the search itself, so they pass one that meters nowhere.
+_NO_LEDGER = NullEventBus()
+_TURN_CONTAINER = SimpleNamespace(events=_NO_LEDGER)  # the turn's composition root, faked
 
 
 class ScriptedModel(LLMProvider):
@@ -286,7 +293,9 @@ async def test_practice_quiz__routes_through_the_chain__returns_the_quiz_assets(
     }
     model = llm(practice_generation=json.dumps({"assets": [quiz]}))
 
-    assets = await generate_practice_assets(["Dijkstra uses a min-heap."], "Dijkstra", [])
+    assets = await generate_practice_assets(
+        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
+    )
 
     assert model.tasks == ["practice_generation"]
     assert model.calls[0].role == "primary"
@@ -299,7 +308,9 @@ async def test_practice_quiz__model_down__returns_no_assets(llm):
 
     llm(practice_generation=_down())
 
-    assert await generate_practice_assets(["Dijkstra uses a min-heap."], "Dijkstra", []) == []
+    assert await generate_practice_assets(
+        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
+    ) == []
 
 
 # --- documents and ingestion ------------------------------------------------------------
@@ -544,7 +555,7 @@ def offline_workspace(monkeypatch):
 async def test_workspace__web_search_fails__says_web_results_are_unavailable_and_shows_no_links(
     web_search_down, offline_workspace
 ):
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1")
+    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
 
     assert ws.notices == [offline_workspace.WEB_RESULTS_UNAVAILABLE]
     assert "web results are unavailable" in ws.notices[0].lower()
@@ -566,7 +577,7 @@ async def test_workspace__web_search_fails__degraded_workspace_is_not_cached(
     monkeypatch.setattr(offline_workspace, "_read_cached_workspace", no_cache)
     monkeypatch.setattr(offline_workspace, "_write_cached_workspace", record_write)
 
-    ws = await offline_workspace.get_or_build_task_workspace("alice", "graphs_task_1")
+    ws = await offline_workspace.get_or_build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
 
     assert ws.notices and written == []
 
@@ -578,7 +589,7 @@ async def test_workspace__web_search_answers__links_surface_without_a_notice(off
 
     monkeypatch.setattr(offline_workspace, "gemini_web_search", search)
 
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1")
+    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
 
     assert ws.notices == []
     assert "https://www.youtube.com/watch?v=abc" in [a.content_or_url for a in ws.surfaced_assets]
@@ -589,7 +600,8 @@ async def test_research__web_search_fails__result_says_web_results_are_unavailab
     from app.modules.research_graph import execute_search, needs_more
     from app.services.analytical.workspace_builder import WEB_RESULTS_UNAVAILABLE
 
-    state = {"query": "graph algorithms", "search_results": [], "iteration_count": 0, "max_iterations": 3}
+    state = {"query": "graph algorithms", "search_results": [], "iteration_count": 0,
+             "max_iterations": 3, "container": _TURN_CONTAINER}
 
     out = await execute_search(state)
 
@@ -628,7 +640,7 @@ async def test_web_search__email_in_the_query__redacted_before_it_leaves(web_sea
     from app.services.analytical.workspace_builder import perform_learning_style_search
 
     assets = await perform_learning_style_search(
-        "graphs, and mail the notes to madhav@example.com", "reader"
+        "graphs, and mail the notes to madhav@example.com", "reader", bus=_NO_LEDGER
     )
 
     (request,) = web_search_recorded
@@ -654,7 +666,9 @@ async def test_web_search__privacy_gate_refuses__no_search_and_says_results_are_
     monkeypatch.setattr(wb, "get_hooks", lambda: hooks)
 
     with pytest.raises(wb.WebSearchUnavailableError) as raised:
-        await wb.perform_learning_style_search("graphs for madhav@example.com", "reader")
+        await wb.perform_learning_style_search(
+            "graphs for madhav@example.com", "reader", bus=_NO_LEDGER
+        )
 
     assert raised.value.message == wb.WEB_RESULTS_UNAVAILABLE
     assert web_search_recorded == []  # nothing left the machine
@@ -665,7 +679,8 @@ async def test_research__user_message_with_an_email__redacted_before_the_search(
     from app.modules.research_graph import execute_search
 
     out = await execute_search(
-        {"query": "graph algorithms; reply to madhav@example.com", "search_results": [], "iteration_count": 0}
+        {"query": "graph algorithms; reply to madhav@example.com", "search_results": [],
+         "iteration_count": 0, "container": _TURN_CONTAINER}
     )
 
     assert out["search_results"]

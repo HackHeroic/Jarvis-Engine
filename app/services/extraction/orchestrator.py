@@ -4,7 +4,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.domain.entities import GoalDeadlineUpdate
+from app.domain.errors import PersistenceError
 from app.domain.ports import ConstraintRepository, GoalRepository, TaskRepository
 from app.schemas.context import (
     ActionItemProposal,
@@ -37,6 +39,12 @@ SEMANTIC_ROUTER_SYSTEM_PROMPT = (
     "direct goals to be scheduled.\n\n"
     "If multiple intents, choose the dominant one. Return strictly valid JSON."
 )
+
+# What the user is told when a document of theirs cannot be kept: no database for its
+# record (or its pending timetable). Narrated in chat, a 503 envelope on the REST route.
+DOCUMENT_NOT_SAVED = "I couldn't save that document, so nothing from it was kept"
+# The intents whose result is a row in the database: without one they keep nothing.
+_KEPT_IN_THE_DATABASE = frozenset({IntentType.CALENDAR_SYNC, IntentType.KNOWLEDGE_INGESTION})
 
 
 def _extract_text(
@@ -123,6 +131,12 @@ async def process_ingestion(
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
+
+    Raises:
+        PersistenceError (``DOCUMENT_NOT_SAVED``): a user's timetable or document with no
+            database to keep it in (or whose pending timetable could not be stored).
+            Refused before anything is read into the knowledge store, never reported
+            as kept.
     """
     text, provenance_items = _extract_text(payload, file_bytes, media_type)
     if not text:
@@ -145,6 +159,12 @@ async def process_ingestion(
     )
 
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
+    if user_id and supabase is None and classification.intent in _KEPT_IN_THE_DATABASE:
+        logger.warning(
+            "process_ingestion: no database for %s's %s, so nothing is kept",
+            user_id, classification.intent.value,
+        )
+        raise PersistenceError(DOCUMENT_NOT_SAVED)
 
     if classification.intent == IntentType.CALENDAR_SYNC:
         user_context = (
@@ -169,8 +189,10 @@ async def process_ingestion(
                     row["valid_until"] = extracted.valid_until
                 supabase.table("pending_calendar_updates").insert(row).execute()
                 base_result.pending_calendar_id = pending_id
-            except Exception:
-                base_result.pending_calendar_id = str(uuid.uuid4())  # Return ID for client to use
+            except Exception as exc:
+                # An id for a row that was never stored could never be approved.
+                logger.warning(f"Storing a pending timetable failed: {type(exc).__name__}")
+                raise PersistenceError(DOCUMENT_NOT_SAVED) from exc
         else:
             base_result.pending_calendar_id = str(uuid.uuid4())
 

@@ -26,7 +26,7 @@ from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtur
     llm,
     said,
 )
-from tests.fakes import planning_services
+from tests.fakes import FakeDBClient, planning_services
 
 ROOT = Path(__file__).resolve().parent.parent
 IST = ZoneInfo("Asia/Kolkata")
@@ -275,37 +275,281 @@ async def test_user_model__profile_unreadable__none_and_the_default_zone():
 # --- web search is metered onto the bus it is handed --------------------------------------
 
 
+class _UsageRecorder:
+    """Records every LLMCallCompleted published on the bus it listens to."""
+
+    def __init__(self, bus) -> None:
+        from app.domain.events import EventListener, LLMCallCompleted
+
+        recorded = self.recorded = []
+
+        class _Listener(EventListener):
+            async def handle(self, event) -> None:
+                recorded.append(event.usage)
+
+        bus.subscribe(LLMCallCompleted, _Listener())
+
+
+_SEARCH_ANSWER = "https://docs.example.org/graphs | Graphs"
+
+
 @pytest.mark.asyncio
-async def test_metered_web_search__bus_passed__usage_published_and_no_bus_nothing():
+async def test_metered_web_search__bus_passed__usage_published_and_no_bus__refused_before_searching():
+    """No bus is a programming error, never a silent unmetered cloud send: the ledger
+    (the You page's privacy receipt) would under-count. Refused before the search runs."""
     from app.core.model_router import attribute_llm_calls, metered_web_search
-    from app.domain.events import EventBus, EventListener, LLMCallCompleted
-
-    recorded = []
-
-    class _Listener(EventListener):
-        async def handle(self, event) -> None:
-            recorded.append(event.usage)
+    from app.domain.events import EventBus
 
     bus = EventBus()
-    bus.subscribe(LLMCallCompleted, _Listener())
+    usage_seen = _UsageRecorder(bus)
+    searches = []
 
     async def search() -> str:
-        return "https://docs.example.org/graphs | Graphs"
+        searches.append(1)
+        return _SEARCH_ANSWER
 
     end = attribute_llm_calls(U, "sess-1")
     try:
         answered = await metered_web_search(search, bus=bus, pii_redactions=1)
-        unmetered = await metered_web_search(search, bus=None)
+        with pytest.raises(TypeError, match="bus"):
+            await metered_web_search(search, bus=None)
     finally:
         end()
 
-    assert answered == unmetered == "https://docs.example.org/graphs | Graphs"
-    (usage,) = recorded
+    assert answered == _SEARCH_ANSWER
+    assert len(searches) == 1  # the refused call never searched
+    (usage,) = usage_seen.recorded
     assert (usage.provider, usage.task, usage.user_id, usage.session_id) == (
         "gemini", "web_search", U, "sess-1"
     )
     assert usage.pii_redactions == 1
     assert usage.created_at.tzinfo is timezone.utc
+
+
+def _stub_web_search(monkeypatch) -> list[str]:
+    """Gemini's grounded search answers one link; returns the queries it was sent."""
+    import app.services.analytical.workspace_builder as wb
+
+    queries = []
+
+    async def search(*, user_prompt: str, system_prompt: str) -> str:
+        queries.append(user_prompt)
+        return _SEARCH_ANSWER
+
+    monkeypatch.setattr(wb, "gemini_web_search", search)
+    return queries
+
+
+@pytest.mark.asyncio
+async def test_workspace_route__web_search_answered__one_web_search_usage_on_the_containers_bus(
+    monkeypatch,
+):
+    """The route hands the composition root's bus to the search: the usage ledger counts
+    the cloud send. Dropping the hand-off would under-count the privacy receipt."""
+    import httpx
+
+    import app.services.analytical.workspace_builder as wb
+    from app.main import app
+    from tests.fakes import build_test_container
+
+    container = build_test_container()
+    usage_seen = _UsageRecorder(container.events)
+    queries = _stub_web_search(monkeypatch)
+
+    async def nothing(*_args, **_kwargs):
+        return None
+
+    async def no_chunks(*_args, **_kwargs):
+        return []
+
+    async def reader(*_args, **_kwargs):
+        return "reader"
+
+    monkeypatch.setattr(wb, "_get_supabase", lambda: None)
+    monkeypatch.setattr(wb, "_read_cached_workspace", nothing)
+    monkeypatch.setattr(wb, "_write_cached_workspace", nothing)
+    monkeypatch.setattr(wb, "fetch_chunks_for_task", no_chunks)
+    monkeypatch.setattr(wb, "get_learning_style", reader)
+    monkeypatch.setattr(wb, "generate_practice_assets", no_chunks)  # one search: the links
+    monkeypatch.setattr(app.state, "container", container, raising=False)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/v1/tasks/graphs_t1/workspace", params={"user_id": U})
+
+    assert response.status_code == 200
+    assert len(queries) == 1
+    (usage,) = usage_seen.recorded
+    assert (usage.provider, usage.task) == ("gemini", "web_search")
+
+
+def _turn_state(container, db_client=None, **request) -> dict:
+    """The orchestrator's input exactly as ``ChatTurnService`` builds it for a turn."""
+    import asyncio
+
+    from app.schemas.chat_stream import ChatStreamRequest
+    from app.services.chat_turn.context import initial_state
+
+    queue: asyncio.Queue = asyncio.Queue()
+    return initial_state(
+        ChatStreamRequest(user_id=U, **request),
+        session_id="sess-1",
+        user_model=None,
+        progress_callback=lambda phase, **detail: None,
+        progress_queue=queue,
+        container=container,
+        db_client=db_client,
+        force_cloud_request=False,
+    )
+
+
+async def _run_module_in_turn(module_name: str, state: dict) -> dict:
+    """``module_name``'s orchestrator node, run on a graph over the turn's state type
+    (``JarvisState``): a key the state type does not declare never reaches the module."""
+    from langgraph.graph import END, START, StateGraph
+
+    from app.modules import module_registry
+    from app.orchestrator.module_wrapper import create_module_wrapper
+    from app.orchestrator.state import JarvisState
+
+    graph = StateGraph(JarvisState)
+    graph.add_node(module_name, create_module_wrapper(module_name, module_registry))
+    graph.add_edge(START, module_name)
+    graph.add_edge(module_name, END)
+    return await graph.compile().ainvoke(state)
+
+
+@pytest.mark.asyncio
+async def test_research_module__in_a_turn__each_web_search_metered_on_the_containers_bus(
+    monkeypatch,
+):
+    from tests.fakes import build_test_container
+
+    container = build_test_container()
+    usage_seen = _UsageRecorder(container.events)
+    queries = _stub_web_search(monkeypatch)
+
+    result = await _run_module_in_turn(
+        "research_agent", _turn_state(container, user_prompt="latest on CP-SAT")
+    )
+
+    assert "research_agent" in result["modules_invoked"]
+    assert result["error"] is None
+    assert queries  # it searched
+    assert [(u.provider, u.task) for u in usage_seen.recorded] == (
+        [("gemini", "web_search")] * len(queries)
+    )
+
+
+# --- the turn's state hands the knowledge and research modules their collaborators -------
+
+
+def test_state_in__real_turn_state__knowledge_and_research_carry_the_container_and_database():
+    from app.modules.knowledge_graph import knowledge_state_in
+    from app.modules.research_graph import research_state_in
+    from tests.fakes import FakeDBClient, build_test_container
+
+    container, db_client = build_test_container(), FakeDBClient()
+    state = _turn_state(container, db_client, user_prompt="here are my notes")
+
+    knowledge = knowledge_state_in(state)
+    research = research_state_in(state)
+
+    assert knowledge["container"] is container
+    assert knowledge["db_client"] is db_client
+    assert research["container"] is container
+
+
+@pytest.mark.asyncio
+async def test_knowledge_module__upload_in_a_turn__ingestion_gets_the_turns_database_and_repositories(
+    monkeypatch,
+):
+    """A document upload in chat: the document row needs the database, the user's rules
+    and tasks the container's repositories. Lose either and the document is not kept."""
+    import base64
+
+    from app.schemas.context import IngestionPipelineResult, IntentType
+    from tests.fakes import FakeDBClient, build_test_container
+
+    container, db_client = build_test_container(), FakeDBClient()
+    seen = []
+
+    async def ingest(**kwargs):
+        seen.append(kwargs)
+        return IngestionPipelineResult(
+            intent=IntentType.KNOWLEDGE_INGESTION, classification_summary="lecture notes"
+        )
+
+    monkeypatch.setattr("app.services.extraction.orchestrator.process_ingestion", ingest)
+
+    result = await _run_module_in_turn("knowledge_module", _turn_state(
+        container, db_client, user_prompt="here are my notes",
+        file_base64=base64.b64encode(b"lecture notes").decode(), media_type="pdf",
+        file_name="notes.pdf",
+    ))
+
+    assert "knowledge_module" in result["modules_invoked"]
+    (call,) = seen
+    assert call["db_client"] is db_client
+    assert call["user_id"] == U
+    assert call["constraints"] is container.repos.constraints
+    assert call["tasks"] is container.repos.tasks
+    assert call["goals"] is container.repos.goals
+    assert result["ingestion_result"]["intent"] == "KNOWLEDGE_INGESTION"
+
+
+@pytest.mark.asyncio
+async def test_process_ingestion__a_users_document_and_no_database__persistence_error_nothing_ingested(
+    monkeypatch,
+):
+    """No database means no document row: refused before anything is read or stored,
+    never a reply that says the document was kept."""
+    import app.services.extraction.orchestrator as orchestrator
+    from app.domain.errors import PersistenceError
+    from app.schemas.context import IntentType
+
+    ingested = []
+
+    async def ingest(**kwargs):
+        ingested.append(kwargs)
+
+    monkeypatch.setattr(orchestrator, "ingest_knowledge", ingest)
+
+    with pytest.raises(PersistenceError) as raised:
+        await orchestrator.process_ingestion(
+            payload="Graphs problem set", user_id=U,
+            intent_override=IntentType.KNOWLEDGE_INGESTION, db_client=None,
+        )
+
+    assert raised.value.message == orchestrator.DOCUMENT_NOT_SAVED
+    assert ingested == []
+
+
+@pytest.mark.asyncio
+async def test_knowledge_module__no_database_in_the_turn__honest_couldnt_save_reply(
+    monkeypatch, caplog
+):
+    import base64
+
+    import app.services.extraction.orchestrator as orchestrator
+    from app.schemas.context import IntentClassification, IntentType
+    from tests.fakes import build_test_container
+
+    async def classified(_text):
+        return IntentClassification(
+            intent=IntentType.KNOWLEDGE_INGESTION, confidence=0.9, summary="notes"
+        )
+
+    monkeypatch.setattr(orchestrator, "_classify", classified)
+    monkeypatch.setattr(orchestrator, "_extract_text", lambda *a: ("lecture notes", None))
+
+    result = await _run_module_in_turn("knowledge_module", _turn_state(
+        build_test_container(), None, user_prompt="here are my notes",
+        file_base64=base64.b64encode(b"lecture notes").decode(), media_type="pdf",
+    ))
+
+    assert result["error"] == orchestrator.DOCUMENT_NOT_SAVED
+    assert "no database" in caplog.text
 
 
 # --- ingestion reads the user's tasks and stores a goal's deadline through ports ----------
@@ -375,6 +619,7 @@ async def test_process_ingestion__document_names_a_deadline__stored_for_the_matc
     await orchestrator.process_ingestion(
         payload="Graphs problem set, due 15 January 2099", user_id=U,
         intent_override=IntentType.KNOWLEDGE_INGESTION, tasks=repos.tasks, goals=repos.goals,
+        db_client=FakeDBClient(),  # the document row is kept in the database
     )
 
     assert seen_tasks == [repos.tasks]
