@@ -105,6 +105,44 @@ def test_process__preference_cannot_be_stored__result_carries_no_exception_text(
     _assert_no_leak(resp)
 
 
+@pytest.mark.asyncio
+async def test_ingest_knowledge__vector_store_fails__result_carries_a_fixed_code(
+    monkeypatch, caplog
+):
+    from app.services.extraction.knowledge_ingester import ingest_knowledge
+
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _broken_chroma)
+
+    result = await ingest_knowledge(extracted_text="Chapter 1: graphs. " * 20, user_id="u1")
+
+    assert result.stored_chunk_count == 0
+    assert result.metadata == {"error": "vector_store_unavailable"}
+    assert SECRET not in repr(result)
+    assert SECRET in caplog.text
+
+
+def test_process__vector_store_fails__body_carries_no_exception_text(client, monkeypatch):
+    """The ingester's result reaches the /ingestion/process body (and the v2 complete frame)."""
+    from app.schemas.context import IntentClassification, IntentType
+
+    async def classify(_text):
+        return IntentClassification(
+            intent=IntentType.KNOWLEDGE_INGESTION, confidence=0.9, summary="notes"
+        )
+
+    monkeypatch.setattr("app.services.extraction.orchestrator._classify", classify)
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _broken_chroma)
+
+    resp = client.post(
+        "/api/v1/ingestion/process",
+        json={"payload": "Chapter 1: graphs and trees. " * 20, "user_id": "u1"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["knowledge_result"]["metadata"] == {"error": "vector_store_unavailable"}
+    _assert_no_leak(resp)
+
+
 def test_delete_constraint__database_fails__500_fixed_message_no_exception_text(
     app, client, monkeypatch
 ):

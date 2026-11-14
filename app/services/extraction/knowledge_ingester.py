@@ -5,6 +5,11 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+from app.core.jarvis_logger import JARVIS_LOGGER as logger
+
+# The error code a result carries when the vector store could not take the chunks.
+VECTOR_STORE_UNAVAILABLE = "vector_store_unavailable"
+
 
 class ProactiveExtractionSchema(BaseModel):
     """4B SLM output: actionable content from DPP, syllabus, assignments."""
@@ -219,10 +224,13 @@ async def ingest_knowledge(
             deadlines=proactive.deadlines,
         )
     except Exception as e:
+        # The result reaches the client and the reply's prompt: a fixed code there,
+        # the exception only in the server log.
+        logger.warning(f"Storing knowledge chunks failed: {e!r}")
         return KnowledgeIngestionResult(
             stored_chunk_count=0,
             suggested_actions=[],
-            metadata={"error": str(e)},
+            metadata={"error": VECTOR_STORE_UNAVAILABLE},
         )
 
 
