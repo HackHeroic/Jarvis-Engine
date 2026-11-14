@@ -116,6 +116,11 @@ def _envelope(
     )
 
 
+def jarvis_error_response(request_id: str, exc: errors.JarvisError) -> JSONResponse:
+    """``exc`` as the envelope, for a middleware that answers before any route runs."""
+    return _envelope(request_id, exc.http_status, exc.code, exc.message, exc.details)
+
+
 async def _handle_jarvis_error(request: Request, exc: errors.JarvisError) -> JSONResponse:
     request_id = _request_id(request)
     if exc.http_status >= 500:

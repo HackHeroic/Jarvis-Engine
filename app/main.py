@@ -23,6 +23,7 @@ from app.api.error_handlers import (
     RequestIdMiddleware,
     register_error_handlers,
 )
+from app.api.request_limits import CAPPED_ROUTES, BodyLimitMiddleware
 from app.api.v1.router import api_router
 from app.db.supabase_py import DatabaseClient
 from app.domain.errors import PersistenceError
@@ -188,6 +189,9 @@ app = FastAPI(
     responses=ERROR_RESPONSES,
 )
 
+# Innermost: a body larger than any valid request is refused before it is read, and the
+# 413 still passes back through CORS and the request id.
+app.add_middleware(BodyLimitMiddleware, limits=CAPPED_ROUTES)
 # CORS: allow jarvis-demo (Next.js) to call the API from a different origin
 app.add_middleware(
     CORSMiddleware,
