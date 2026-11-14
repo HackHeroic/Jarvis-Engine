@@ -14,6 +14,7 @@ from types import ModuleType
 from typing import Any
 
 from app.core.model_router import build_chain
+from app.domain.anticipation import ConsentPolicy
 from app.domain.events import EventBus, LLMCallCompleted
 from app.domain.ports import EnergyEstimator, Sweep, TextEmbedder
 from app.infrastructure.embedding import MiniLMEmbedder
@@ -21,6 +22,7 @@ from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
 from app.infrastructure.persistence.factory import Repositories, RepositoryFactory
 from app.orchestrator.hooks import ActionHooks
+from app.services.anticipation.service import ActionFactory, AnticipationService
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
@@ -44,6 +46,9 @@ class AppContainer:
     energy: EnergyEstimator
     embedder: TextEmbedder
     memory_service: MemoryService
+    consent: ConsentPolicy
+    actions: ActionFactory
+    anticipation: AnticipationService
 
     @classmethod
     def build(
@@ -82,6 +87,10 @@ class AppContainer:
         task_service = TaskService(repos.tasks, repos.task_events, events)
         embedder = embedder if embedder is not None else MiniLMEmbedder()
         memory_service = MemoryService(repos.memories, embedder)
+        # Triggers register themselves with the service; each one's action kind with
+        # the factory, so an accepted suggestion can be rebuilt from its payload.
+        consent = ConsentPolicy.default()
+        actions = ActionFactory()
 
         return cls(
             repos=repos,
@@ -94,4 +103,9 @@ class AppContainer:
             energy=HistoryEnergyEstimator(repos.task_events, HeuristicEnergyEstimator()),
             embedder=embedder,
             memory_service=memory_service,
+            consent=consent,
+            actions=actions,
+            anticipation=AnticipationService(
+                {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints
+            ),
         )

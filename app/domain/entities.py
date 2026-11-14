@@ -49,6 +49,18 @@ class SuggestionStatus(str, Enum):
     AUTO_APPLIED = "auto_applied"
 
 
+class ConsentReasonKind(str, Enum):
+    """Which link of the consent chain decided, so a reason can be shown by type.
+
+    Defined here rather than in ``app.domain.anticipation``, which imports this module.
+    """
+
+    RULE_MATCH = "rule_match"
+    MODE_DECISION = "mode_decision"
+    RISK_CHECK = "risk_check"
+    LEARNED_PREFERENCE = "learned_preference"
+
+
 class LLMLocation(str, Enum):
     LOCAL = "local"
     CLOUD = "cloud"
@@ -402,6 +414,10 @@ class Suggestion(BaseModel):
         description="Consent decision: apply without asking, ask first, or never apply."
     )
     consent_reason: str = Field(description="Why that consent decision was made.")
+    consent_kind: ConsentReasonKind | None = Field(
+        default=None,
+        description="Which consent rule made the decision; None on suggestions stored before it.",
+    )
     created_at: datetime = Field(description="When the suggestion was made.")
     expires_at: datetime | None = Field(
         default=None, description="After this instant the suggestion is stale."

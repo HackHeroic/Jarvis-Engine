@@ -175,6 +175,33 @@ def _users_live_in_india(monkeypatch):
     monkeypatch.setattr(config, "DEFAULT_TIMEZONE", "Asia/Kolkata")
 
 
+@pytest.fixture(autouse=True)
+def _no_anticipation_scheduler(monkeypatch):
+    """The lifespan never starts the background scheduler in a test.
+
+    Left on, any test that runs the real lifespan would leave a loop ticking over
+    the app's repositories; a test that wants it turns it back on.
+    """
+    import app.core.config as config
+
+    monkeypatch.setattr(config, "ANTICIPATION_ENABLED", False)
+
+
+@pytest.fixture
+def recording_llm():
+    """Install a ``RecordingModel`` as the only provider; returns it for inspection.
+
+    ``_fresh_llm_chain`` puts the default chain back after the test.
+    """
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+    from tests.anticipation_fakes import RecordingModel
+
+    model = RecordingModel()
+    set_chain(FallbackChainProvider([model]))
+    return model
+
+
 @pytest.fixture
 def mock_supabase():
     """Mock Supabase client that returns empty results by default."""

@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import chat, documents, habits, models, reasoning, schedule, ingestion, tasks, workspace
+from app.api.v1.endpoints.anticipation import router as anticipation_router
 from app.api.v1.endpoints.drafts import router as drafts_router
 from app.api.v1.endpoints.memories import router as memories_router
 from app.api.v1.endpoints.sessions import router as sessions_router
@@ -56,3 +57,4 @@ api_router.include_router(
 api_router.include_router(drafts_router, prefix="/drafts", tags=["drafts"])
 api_router.include_router(memories_router, prefix="/memories", tags=["Memories"])
 api_router.include_router(sessions_router, prefix="/sessions", tags=["Sessions"])
+api_router.include_router(anticipation_router, prefix="/anticipation", tags=["Anticipation"])

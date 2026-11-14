@@ -185,6 +185,12 @@ DEFAULT_TIMEZONE: str = os.getenv("JARVIS_DEFAULT_TIMEZONE", "Asia/Kolkata")
 SLOT_GRACE_MINUTES: int = 30
 SLOT_SWEEP_LOOKBACK_DAYS: int = 7
 
+# Anticipation (app/services/anticipation): the in-process scheduler the lifespan starts.
+# Every ANTICIPATION_TICK_SECONDS it runs each subsystem's sweeps that are due, then each
+# user's proactive triggers. JARVIS_ANTICIPATION=false keeps it from starting.
+ANTICIPATION_ENABLED: bool = os.getenv("JARVIS_ANTICIPATION", "true").lower() != "false"
+ANTICIPATION_TICK_SECONDS: int = 60
+
 # The focus profile (app/services/energy.py) and the solver's energy term. Outcomes of
 # the last FOCUS_WINDOW_DAYS count for the local hour of their slot; each hour's score
 # is smoothed toward the heuristic prior with FOCUS_PRIOR_STRENGTH pseudo-outcomes. The

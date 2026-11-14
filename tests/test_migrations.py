@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from app.domain.entities import (
+    ConsentReasonKind,
     DraftStatus,
     MemorySource,
     MemoryStatus,
@@ -29,6 +30,7 @@ CAPSTONE = MIGRATIONS / "20261114000001_capstone_lld.sql"
 SKIP_WRITES_SKIPPED = MIGRATIONS / "20261115000000_skip_writes_skipped.sql"
 ACCEPT_DRAFT_RESLOTS = MIGRATIONS / "20261115000001_accept_draft_reslots_missed.sql"
 MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
+SUGGESTION_CONSENT_KIND = MIGRATIONS / "20261115000004_suggestion_consent_kind.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
 # Tables a migration creates that need no row-level security: the dead tables the
@@ -493,3 +495,18 @@ def test_migrations__memory_migration__legacy_nullable_columns_filled_then_not_n
         required = re.search(rf"alter column {column} set not null", sql)
         assert filled and required, column
         assert filled.start() < required.start(), f"{column}: fill the NULLs first"
+
+
+# --- Suggestion consent kind (20261115000004) ---------------------------------------
+
+
+def test_migrations__consent_kind__column_and_check_match_the_enum():
+    sql = _sql(SUGGESTION_CONSENT_KIND)
+
+    assert re.search(
+        rf"alter table {_TABLE}proactive_suggestions\s+add column if not exists consent_kind text",
+        sql,
+    )
+    assert _check_values(sql, "proactive_suggestions_consent_kind_check") == {
+        k.value for k in ConsentReasonKind
+    }

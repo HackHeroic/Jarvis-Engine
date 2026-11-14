@@ -61,6 +61,7 @@ from app.infrastructure.persistence._mapping import (
     pattern_key_taken,
     prepare_new,
     prepare_new_memory,
+    suggestion_changed,
     summarize_usage,
     task_from_row,
     task_id_clash,
@@ -389,9 +390,10 @@ class InMemorySuggestionRepository(SuggestionRepository):
         return stored.model_copy(deep=True)
 
     async def list(
-        self, user_id: str, *, status: SuggestionStatus | None = None
+        self, user_id: str, *, status: SuggestionStatus | None = None, limit: int = 100
     ) -> list[Suggestion]:
-        """Return the user's suggestions, newest first."""
+        """Return the user's newest ``limit`` suggestions, newest first."""
+        check_limit(limit)
         found = [
             s
             for s in self._store.suggestions
@@ -399,7 +401,7 @@ class InMemorySuggestionRepository(SuggestionRepository):
         ]
         return [
             s.model_copy(deep=True)
-            for s in sorted(found, key=lambda s: s.created_at, reverse=True)
+            for s in sorted(found, key=lambda s: s.created_at, reverse=True)[:limit]
         ]
 
     async def get(self, user_id: str, suggestion_id: str) -> Suggestion | None:
@@ -407,19 +409,28 @@ class InMemorySuggestionRepository(SuggestionRepository):
         return self._store.suggestions[i].model_copy(deep=True) if i is not None else None
 
     async def set_status(
-        self, user_id: str, suggestion_id: str, to: SuggestionStatus
+        self,
+        user_id: str,
+        suggestion_id: str,
+        to: SuggestionStatus,
+        *,
+        expected: SuggestionStatus | None = None,
     ) -> Suggestion:
+        # No await between the check and the write: the compare-and-set is atomic.
         i = self._index(user_id, suggestion_id)
         if i is None:
             raise not_found("suggestion", suggestion_id)
+        if expected is not None and self._store.suggestions[i].status != expected:
+            raise suggestion_changed(suggestion_id, expected)
         self._store.suggestions[i] = self._store.suggestions[i].model_copy(
             update={"status": SuggestionStatus(to)}
         )
         return self._store.suggestions[i].model_copy(deep=True)
 
-    async def exists_today(self, user_id: str, trigger: str, day: date) -> bool:
-        """``day`` is a UTC calendar day."""
-        start, end = day_bounds(day)
+    async def exists_today(
+        self, user_id: str, trigger: str, day: date, *, tz: str = "UTC"
+    ) -> bool:
+        start, end = day_bounds(day, tz)
         return any(
             s.user_id == user_id and s.trigger == trigger and start <= s.created_at < end
             for s in self._store.suggestions
