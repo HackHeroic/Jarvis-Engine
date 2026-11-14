@@ -158,7 +158,14 @@ async def translate_habits(state: PlanningState) -> dict:
 
 
 async def expand_slots(state: PlanningState) -> dict:
-    """Expand semantic slots to concrete time slots for OR-Tools."""
+    """Expand semantic slots to concrete time slots for OR-Tools.
+
+    Out to MAX_HORIZON_MINUTES, not the first attempt's horizon: this step runs
+    once, and the INFEASIBLE ladder can stretch the plan to 30 days. Expanded to
+    48 h only, a retry's day 3+ had no habit blocks — and because a sleep habit
+    existed, no default night either. ``solve_schedule`` drops the copies that
+    start past each attempt's horizon, as it does the bridge's.
+    """
     semantic_slots = state.get("semantic_slots", [])
     if not semantic_slots:
         return {"time_slots": []}
@@ -168,7 +175,6 @@ async def expand_slots(state: PlanningState) -> dict:
         from app.schemas.context import SemanticTimeSlot
         # Convert dicts back to SemanticTimeSlot objects
         slot_objects = [SemanticTimeSlot.model_validate(s) for s in semantic_slots]
-        horizon = state.get("horizon_minutes", 2880)
         # plan_start is REQUIRED (weekday/validity anchoring). Omitting it raised
         # TypeError into the except below and silently dropped every habit block.
         # It is the horizon's own start — day 0's local date — not "now" in UTC,
@@ -177,7 +183,7 @@ async def expand_slots(state: PlanningState) -> dict:
             await _user_zone(state)
         )
         time_slots = expand_semantic_slots_to_time_slots(
-            slot_objects, horizon_minutes=horizon, plan_start=plan_start
+            slot_objects, horizon_minutes=MAX_HORIZON_MINUTES, plan_start=plan_start
         )
         return {"time_slots": [ts.model_dump() if hasattr(ts, 'model_dump') else ts for ts in time_slots]}
     except Exception as e:
@@ -426,9 +432,10 @@ async def solve_schedule(state: PlanningState) -> dict:
         except (ValidationError, TypeError, ValueError) as exc:
             logger.warning(f"Skipping unparseable time slot {slot}: {exc}")
             continue
-        # Standing rules arrive repeated out to 30 days (_on_every_day). A copy that
-        # starts past this attempt's horizon constrains nothing the solver places,
-        # but it would still be modelled — soft blocks add variables per task.
+        # Habit slots and standing rules arrive repeated out to 30 days (expand_slots,
+        # _on_every_day). A copy that starts past this attempt's horizon constrains
+        # nothing the solver places, but it would still be modelled — soft blocks
+        # add variables per task.
         if parsed.start_min >= horizon:
             continue
         daily_context.append(parsed)

@@ -629,6 +629,53 @@ async def test_biology__own_sleep_habit__replaces_the_default_night(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_biology__sleep_habit__holds_on_every_day_of_a_seven_day_retry(
+    jarvis, llm, clock, monkeypatch
+):
+    """Habit slots used to be expanded for the first attempt's 48 h only. On a retry
+    out to 7 days, days 3+ had no sleep block, and because a sleep habit existed the
+    default night was skipped too."""
+    from fastapi import HTTPException
+
+    clock.freeze(MONDAY_8AM, schedule_endpoint)
+    jarvis.db.table("behavioral_constraints").insert({
+        "user_id": "alice", "constraint_type": "habit", "raw_text": "I sleep from 11 PM to 7 AM",
+    }).execute()
+    llm.script("habit_translation", {"semantic_slots": [
+        {"name": "Sleep", "start_min": 900, "end_min": 1380,  # 23:00-07:00 local
+         "availability": "blocked", "recurrence": "daily"},
+    ]})
+    # Days are taken 08:00-23:00, so only 07:00-08:00 is free on each day before
+    # the sleep habit is honoured.
+    jarvis.memory_store.store_memory(
+        "alice", {"type": "constraint", "content": "No study between 8 AM and 11 PM", "confidence": 0.9}
+    )
+    real_run_schedule = schedule_endpoint.run_schedule
+    horizons: list[int] = []
+
+    def only_a_week_fits(graph, daily_context, horizon_minutes, **kwargs):
+        horizons.append(horizon_minutes)
+        if horizon_minutes < 7 * MINUTES_PER_DAY:
+            raise HTTPException(status_code=422, detail="Schedule infeasible")
+        return real_run_schedule(graph, daily_context, horizon_minutes=horizon_minutes, **kwargs)
+
+    monkeypatch.setattr(schedule_endpoint, "run_schedule", only_a_week_fits)
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+
+    turn = await jarvis.say("Plan my DSA revision")
+
+    assert horizons[-1] == 7 * MINUTES_PER_DAY  # the 7-day retry is the one that solved
+    days = {t["start_min"] // MINUTES_PER_DAY for t in turn.payload["schedule"]["schedule"].values()}
+    assert max(days) >= 2, days  # the plan reaches the days the first horizon did not cover
+    in_sleep = [
+        t for t in turn.payload["schedule"]["schedule"].values()
+        if 900 <= t["start_min"] % MINUTES_PER_DAY < 1380
+        or 900 < t["end_min"] % MINUTES_PER_DAY <= 1380
+    ]
+    assert in_sleep == [], in_sleep
+
+
+@pytest.mark.asyncio
 async def test_late_night__plan_made_at_3am__nothing_before_8am(jarvis, llm, clock):
     clock.freeze(datetime(2026, 11, 16, 3, 0, tzinfo=IST), schedule_endpoint)
     _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
