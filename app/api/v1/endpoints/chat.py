@@ -1077,9 +1077,13 @@ async def accept_schedule(request: AcceptScheduleRequest, http_request: Request)
         logger.error(f"accept-schedule write for plan {plan_id} did not land")
         return _persist_failed()
 
-    # Fire-and-forget: detect behavioral patterns from task history
+    # Fire-and-forget: detect behavioral patterns from task history — only without the
+    # composition root. With it, PEARL runs on task outcomes (PatternService); the
+    # legacy detectors read user_tasks and would bring back a pattern the user dismissed.
+    from app.core.runtime import registered_container
+
     memory_store = getattr(http_request.app.state, "memory_store", None)
-    if memory_store:
+    if memory_store and registered_container() is None:
         from app.services.memory.pearl import detect_patterns
         _sb = getattr(db_client, "supabase", db_client) if db_client else None
         if _sb:

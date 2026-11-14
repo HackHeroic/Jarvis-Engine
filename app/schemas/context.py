@@ -4,9 +4,9 @@ from dataclasses import dataclass, field as dc_field
 from enum import Enum
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from app.schemas.memory import ExtractedMemory
+from app.schemas.memory import ExtractedMemory, valid_memories
 
 
 @dataclass
@@ -111,6 +111,12 @@ class BrainDumpExtraction(BaseModel):
             "never a repeat of inline_habits. contradicts: the [mN] handle of a known memory this replaces."
         ),
     )
+
+    @field_validator("memories", mode="before")
+    @classmethod
+    def _drop_invalid_memories(cls, value: Any) -> list[ExtractedMemory]:
+        """One malformed memory is dropped alone; it never fails the extraction (and its plan)."""
+        return valid_memories(value)
 
 
 class Availability(str, Enum):

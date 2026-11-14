@@ -121,8 +121,12 @@ async def safe_extract_memories(
     A failed extraction means we miss one memory — not that the user's
     request fails. Called via asyncio.create_task() after the response is sent.
 
-    After extraction, chains PEARL pattern detection if a db_client is available.
+    After extraction, chains the legacy PEARL detectors if a db_client is available and
+    no composition root is registered. With one, PEARL runs on task outcomes
+    (PatternService); the legacy detectors would bring back a pattern the user dismissed.
     """
+    from app.core.runtime import registered_container
+
     try:
         await extract_memories_from_turn(
             user_id=user_id,
@@ -131,7 +135,7 @@ async def safe_extract_memories(
             memory_store=memory_store,
         )
         # Chain PEARL detection after extraction
-        if db_client:
+        if db_client and registered_container() is None:
             from app.services.memory.pearl import detect_patterns
             await asyncio.to_thread(detect_patterns, user_id, db_client, memory_store)
     except Exception as e:

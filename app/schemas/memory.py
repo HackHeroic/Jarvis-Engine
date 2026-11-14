@@ -1,9 +1,10 @@
 """Pydantic schemas for the memory system."""
 
+import math
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 MemoryType = Literal[
     "fact", "preference", "behavioral_pattern",
@@ -42,6 +43,31 @@ class ExtractedMemory(BaseModel):
         default=None, description='Handle of the known memory this replaces, such as "m3", or null'
     )
     expires_at: str | None = Field(default=None, description="ISO date if temporal event, or null")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _clamp_confidence(cls, value: Any) -> Any:
+        """A number outside 0-1 is clamped into it; anything else is left to validation."""
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return min(1.0, max(0.0, float(value)))
+        return value
+
+
+def valid_memories(value: Any) -> list[ExtractedMemory]:
+    """The items of ``value`` that are valid memories; anything else is dropped, alone.
+
+    A model's extraction is judged memory by memory: one malformed memory (or a
+    ``memories`` that is not a list at all) never costs the rest of the extraction.
+    """
+    if not isinstance(value, list):
+        return []
+    kept = []
+    for item in value:
+        try:
+            kept.append(ExtractedMemory.model_validate(item))
+        except ValidationError:
+            continue
+    return kept
 
 
 class MemoryExtractionResponse(BaseModel):

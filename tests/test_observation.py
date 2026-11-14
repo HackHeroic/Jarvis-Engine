@@ -10,14 +10,19 @@ import pytest
 
 import app.core.config as config
 from app.container import AppContainer
-from app.core.observation import persist_turn_memories, run_observation_loop
+from app.core.observation import (
+    detect_pearl_patterns,
+    persist_turn_memories,
+    run_observation_loop,
+)
 from app.core.runtime import set_container
+from app.domain.entities import UserProfile
 from app.domain.errors import EmbeddingUnavailableError
 from app.orchestrator.hooks import ActionHooks
 from app.orchestrator.state import ConversationPhase, NegotiationPhase
 from app.schemas.context import BrainDumpExtraction
 from app.schemas.memory import ExtractedMemory
-from tests.fakes import BagOfWordsEmbedder
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 
 def _make_state(**overrides):
@@ -93,7 +98,12 @@ class _SpyEmbedder(BagOfWordsEmbedder):
 
 
 class _DownEmbedder(BagOfWordsEmbedder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
     def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
         raise EmbeddingUnavailableError("model weights missing at /srv/models/minilm")
 
 
@@ -121,6 +131,7 @@ def _turn(*memories: dict, **overrides):
     })
     state["user_model"].user_id = "alice"
     state["user_model"].get_estimated_energy = AsyncMock(return_value=0.8)
+    state["user_model"].get_profile = AsyncMock(return_value=None)  # no profile row
     return state, queue
 
 
@@ -153,12 +164,15 @@ async def test_observation__stated_memory__frame_queued_and_no_task_left_running
 
 @pytest.mark.asyncio
 async def test_observation__embedder_unavailable__turn_goes_on_with_no_memory_frame():
-    _register(_DownEmbedder())
-    state, queue = _turn(MORNINGS)
+    embedder = _DownEmbedder()
+    _register(embedder)
+    marathon = {"type": "goal", "content": "Training for the Mumbai marathon in March"}
+    state, queue = _turn(MORNINGS, marathon)
 
     result = await run_observation_loop(state)
 
     events = _drain(queue)
+    assert embedder.calls == 1  # nothing else will embed either: the rest is not tried
     assert [e for e in events if e["_event_type"] == "memory_extracted"] == []
     assert result["memories_extracted_count"] == 0
     assert "minilm" not in json.dumps(events)  # no exception text reaches a frame
@@ -198,6 +212,55 @@ async def test_persist_turn_memories__date_only_expiry__ends_that_day_on_the_use
     (outcome,) = await persist_turn_memories(state)
 
     assert outcome.memory.expires_at == datetime(2027, 3, 20, 23, 59, 59, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_memories__expiry__read_from_the_profile_without_creating_one():
+    container = _register(_SpyEmbedder())
+    container.repos.profiles.get_or_create = AsyncMock(
+        side_effect=AssertionError("reading a timezone must not create a profile")
+    )
+    exam = {"type": "temporal_event", "content": "Calculus exam on 20 March", "expires_at": "2027-03-20"}
+    state, _queue = _turn(exam)
+    state["user_model"].get_profile = AsyncMock(
+        return_value=UserProfile(user_id="alice", timezone="America/New_York")
+    )
+
+    (outcome,) = await persist_turn_memories(state)
+
+    assert outcome.memory.expires_at == datetime(
+        2027, 3, 20, 23, 59, 59, tzinfo=ZoneInfo("America/New_York")
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_memories__profile_read_fails__stored_without_an_expiry():
+    _register(_SpyEmbedder())
+    exam = {"type": "temporal_event", "content": "Calculus exam on 20 March", "expires_at": "2027-03-20"}
+    state, _queue = _turn(exam)
+    state["user_model"].get_profile = AsyncMock(side_effect=RuntimeError("profiles unreachable"))
+
+    (outcome,) = await persist_turn_memories(state)
+
+    assert outcome.action == "created"
+    assert outcome.memory.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_detect_pearl_patterns__no_composition_root__nothing_and_no_legacy_detector(
+    monkeypatch,
+):
+    ran_for: list[str] = []  # the legacy detector resurrects dismissed patterns
+    monkeypatch.setattr(
+        "app.services.memory.pearl.detect_patterns",
+        lambda user_id, *_args, **_kwargs: ran_for.append(user_id) or [{"pattern": "x"}],
+    )
+    state, _queue = _turn()
+    state["user_model"]._db = FakeDBClient(FakeSupabase())
+    state["user_model"].get_memory_store = AsyncMock(return_value=MagicMock())
+
+    assert await detect_pearl_patterns(state) == []
+    assert ran_for == []
 
 
 @pytest.mark.asyncio
