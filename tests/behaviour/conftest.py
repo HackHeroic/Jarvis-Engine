@@ -8,10 +8,10 @@ list, what Jarvis remembers next time.
 Only the boundaries are faked:
 
 * the database is ``FakeSupabase`` (real filtering, so user isolation has teeth);
-* every language model is one ``ScriptedLLM``: installed as the process-wide
-  provider chain with ``set_chain``, and patched into the two modules that still
-  call the old transport directly (Voice of Jarvis synthesis, memory extraction).
-  An LLM call the test did not script is recorded and fails the test;
+* every language model is one ``ScriptedLLM``, installed as the process-wide
+  provider chain with ``set_chain`` — every LLM call reaches it through
+  ``route_llm_call``. An LLM call the test did not script is recorded and fails
+  the test;
 * ChromaDB returns no documents, and text embeddings are a deterministic
   bag-of-words (the real model would be downloaded, which the socket guard forbids).
 
@@ -52,10 +52,8 @@ Reply = str | dict | BaseModel | Callable[[LLMRequest], Any]
 class ScriptedLLM(LLMProvider):
     """Answers each LLM task from a script and records every call, in order.
 
-    ``calls`` holds one ``LLMRequest`` per call, whichever path made it: the
-    provider chain (``route_llm_call``) or one of the two modules that still call
-    the old transport, recorded under the task names ``voice_of_jarvis_synthesis``
-    and ``memory_extraction``. Structured replies are parsed into the request's
+    ``calls`` holds one ``LLMRequest`` per call, in the order the provider chain
+    (``route_llm_call``) made them. Structured replies are parsed into the request's
     schema with real Pydantic, from JSON text the way a provider parses a model's
     output.
     """
@@ -103,6 +101,10 @@ class ScriptedLLM(LLMProvider):
         return True
 
     async def complete(self, req: LLMRequest) -> str | BaseModel:
+        if req.task == "memory_extraction":
+            # A model takes time to answer. Without this, background extractions
+            # could never overlap in a test the way they do live.
+            await asyncio.sleep(0.05)
         return self.answer(req)
 
     async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
@@ -119,11 +121,6 @@ class ScriptedLLM(LLMProvider):
 def _tokens(text: str) -> list[str]:
     """Split a reply into small streamed chunks, mid-word on purpose."""
     return [text[i : i + 5] for i in range(0, len(text), 5)] or [""]
-
-
-async def _stream_of(text: str) -> AsyncIterator[tuple[str, str]]:
-    for token in _tokens(text):
-        yield ("content", token)
 
 
 def bag_of_words_embedding(text: str, dims: int = 128) -> list[float]:
@@ -146,34 +143,6 @@ def llm(monkeypatch, embeddings) -> ScriptedLLM:
     """The only language model the test can reach. Fails the test on any unscripted call."""
     scripted = ScriptedLLM()
     set_chain(FallbackChainProvider([scripted]))  # conftest's _fresh_llm_chain resets it
-
-    async def synthesis_transport(
-        user_prompt, system_prompt="", response_schema=None, stream=False,
-        conversation_history=None, **_kwargs,
-    ):
-        req = LLMRequest(
-            task="voice_of_jarvis_synthesis", role="fast", prompt=user_prompt,
-            system_prompt=system_prompt, conversation_history=conversation_history,
-        )
-        text = str(scripted.answer(req))
-        return _stream_of(text) if stream else text
-
-    async def extraction_transport(
-        user_prompt, system_prompt="", response_schema=None, **_kwargs
-    ):
-        # A model takes time to answer. Without this, background extractions could
-        # never overlap in a test the way they do live.
-        await asyncio.sleep(0.05)
-        req = LLMRequest(
-            task="memory_extraction", role="fast", prompt=user_prompt,
-            system_prompt=system_prompt, response_schema=response_schema,
-        )
-        return scripted.answer(req)
-
-    monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query", synthesis_transport
-    )
-    monkeypatch.setattr("app.services.memory.extractor.hybrid_route_query", extraction_transport)
     monkeypatch.setattr("app.utils.chroma_client.query_knowledge", lambda *a, **k: [])
 
     yield scripted

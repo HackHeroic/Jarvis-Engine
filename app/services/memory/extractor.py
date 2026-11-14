@@ -1,15 +1,14 @@
 # app/services/memory/extractor.py
 """LLM-based memory extraction from conversation turns.
 
-Runs as a fire-and-forget background task after each /chat response.
-Uses local Gemma (prefer_local=True) since this is a background task
-that doesn't need to be perfect — a missed extraction is fine.
+Runs as a fire-and-forget background task after each /chat response, on the
+FAST model through ``route_llm_call``. A background task that doesn't need to be
+perfect — a missed extraction is fine.
 """
 
 import asyncio
 import logging
 
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.memory import MemoryExtractionResponse
 
 logger = logging.getLogger(__name__)
@@ -75,11 +74,13 @@ async def extract_memories_from_turn(
         assistant_response=assistant_response[:500],
     )
 
-    raw = await hybrid_route_query(
-        user_prompt=prompt,
+    from app.core.model_router import route_llm_call
+
+    raw = await route_llm_call(
+        task="memory_extraction",
+        prompt=prompt,
         system_prompt=EXTRACTION_SYSTEM_PROMPT,
         response_schema=MemoryExtractionResponse,
-        prefer_local=True,
     )
 
     if isinstance(raw, dict):

@@ -39,7 +39,7 @@ async def test_synthesize_response_wraps_module_output(no_llm):
     state["user_model"].get_estimated_energy = AsyncMock(return_value=0.8)
     result = await voice_of_jarvis_synthesis(state)
     assert result["response_message"] == CANNED_LLM_REPLY
-    assert any(name == "hybrid_route_query" for name, _ in no_llm)
+    assert ("route_llm_call", "voice_of_jarvis_synthesis") in no_llm
 
 
 @pytest.mark.asyncio

@@ -125,3 +125,66 @@ def test_layering__only_container_builds_repositories():
 
     assert referencing == []
     assert "RepositoryFactory" in (_APP_DIR / "container.py").read_text()
+
+
+# --- language-model calls ---------------------------------------------------------
+
+# The LiteLLM transport functions. Called directly they skip the provider chain: no
+# Claude fallback, no PII redaction of prompt, system prompt and history, no usage
+# ledger. Everything else reaches a model through ``route_llm_call``.
+_LEGACY_LLM_CALLS = frozenset({"hybrid_route_query", "gemini_primary_route", "local_primary_route"})
+
+# The transport itself, and the provider adapters built on it.
+_LLM_TRANSPORT_FILES = frozenset(
+    {
+        _APP_DIR / "models" / "brain" / "litellm_conf.py",
+        *(_INFRASTRUCTURE_DIR / "llm").rglob("*.py"),
+    }
+)
+
+_V1_ONLY = "v1 control-policy flow, reached only from the deprecated /chat and /chat/stream"
+
+# (file under app/, enclosing top-level function) -> why it may still call the transport.
+_LEGACY_LLM_CALLS_ALLOWED: dict[tuple[str, str], str] = {
+    ("api/v1/endpoints/chat.py", "chat_stream"): "inside the deprecated v1 /chat/stream route",
+    ("api/v1/endpoints/chat.py", "_stream_direct_27b"): "called only by the deprecated /chat/stream",
+    ("services/analytical/control_policy.py", "_extract_and_stage_inline_habits"): _V1_ONLY,
+    ("services/analytical/control_policy.py", "_run_brain_dump_extraction"): _V1_ONLY,
+    ("services/analytical/control_policy.py", "_direct_qa_response"): _V1_ONLY,
+    ("services/analytical/control_policy.py", "_fallback_single_intent"): _V1_ONLY,
+    ("services/analytical/control_policy.py", "_run_plan_day_flow"): _V1_ONLY,
+}
+
+
+def _legacy_llm_calls(path: Path) -> list[tuple[str, int]]:
+    """(enclosing top-level definition, line) of each call to a transport function."""
+    found: list[tuple[str, int]] = []
+    for top in ast.parse(path.read_text(), filename=str(path)).body:
+        owner = getattr(top, "name", "<module>")
+        for node in ast.walk(top):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name in _LEGACY_LLM_CALLS:
+                found.append((owner, node.lineno))
+    return found
+
+
+def test_llm_calls__outside_the_transport__go_through_route_llm_call():
+    calls: dict[tuple[str, str], list[int]] = {}
+    for path in sorted(_APP_DIR.rglob("*.py")):
+        if path in _LLM_TRANSPORT_FILES:
+            continue
+        for owner, line in _legacy_llm_calls(path):
+            calls.setdefault((path.relative_to(_APP_DIR).as_posix(), owner), []).append(line)
+
+    unexpected = [
+        f"{file}:{lines} in {owner}"
+        for (file, owner), lines in sorted(calls.items())
+        if (file, owner) not in _LEGACY_LLM_CALLS_ALLOWED
+    ]
+    stale = [f"{file} {owner}" for file, owner in _LEGACY_LLM_CALLS_ALLOWED if (file, owner) not in calls]
+
+    assert not unexpected, "call route_llm_call instead:\n" + "\n".join(unexpected)
+    assert not stale, "no longer call the transport, drop from the allow-list:\n" + "\n".join(stale)

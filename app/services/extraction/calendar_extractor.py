@@ -1,6 +1,5 @@
 """Calendar pipeline: Extract TimeSlots from timetable text with Truly Understanding."""
 
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import ExtractedTimeSlots, TimeSlot
 
 CALENDAR_EXTRACTION_SYSTEM_PROMPT = """You extract TimeSlots from timetable text.
@@ -28,7 +27,7 @@ async def extract_calendar_slots(
     timetable_text: str,
     user_context: str | None = None,
 ) -> ExtractedTimeSlots:
-    """Extract TimeSlots from timetable text using 27B model.
+    """Extract TimeSlots from timetable text (``calendar_parsing`` task).
 
     Args:
         timetable_text: Raw text from Docling (timetable PDF/image).
@@ -42,13 +41,12 @@ async def extract_calendar_slots(
     if user_context:
         user_prompt = f"User context (apply to matching slots): {user_context}\n\nTimetable:\n{timetable_text}"
 
-    result = await hybrid_route_query(
-        user_prompt=user_prompt,
+    from app.core.model_router import route_llm_call
+
+    result = await route_llm_call(
+        task="calendar_parsing",
+        prompt=user_prompt,
         system_prompt=CALENDAR_EXTRACTION_SYSTEM_PROMPT,
         response_schema=ExtractedTimeSlots,
-        model_override=None,  # Use 27B (LOCAL_LLM_MODEL)
     )
-
-    if isinstance(result, dict):
-        return ExtractedTimeSlots.model_validate(result)
-    return ExtractedTimeSlots.model_validate_json(result)
+    return ExtractedTimeSlots.model_validate(result)

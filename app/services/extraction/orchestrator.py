@@ -4,8 +4,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import (
     ActionItemProposal,
     ExtractedTimeSlots,
@@ -64,16 +62,16 @@ def _extract_text(
 
 
 async def _classify(text: str) -> IntentClassification:
-    """Classify text via SLM."""
-    result = await hybrid_route_query(
-        user_prompt=text,
+    """Classify text on the FAST model."""
+    from app.core.model_router import route_llm_call
+
+    result = await route_llm_call(
+        task="intent_classification",
+        prompt=text,
         system_prompt=SEMANTIC_ROUTER_SYSTEM_PROMPT,
         response_schema=IntentClassification,
-        model_override=_cfg.SLM_ROUTER_MODEL,
     )
-    if isinstance(result, dict):
-        return IntentClassification.model_validate(result)
-    return IntentClassification.model_validate_json(result)
+    return IntentClassification.model_validate(result)
 
 
 async def process_ingestion(

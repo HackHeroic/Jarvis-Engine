@@ -71,14 +71,12 @@ def no_llm(monkeypatch):
     Returns the running call log so tests can assert the mocked path was the
     one actually taken. Patch targets:
 
-    * ``app.core.model_router.route_llm_call`` — modules import it
+    * ``app.core.model_router.route_llm_call`` — its callers import it
       function-locally, so the module attribute is the live target.
-    * ``app.models.brain.litellm_conf.hybrid_route_query`` — the streaming
-      boundary. A turn carrying a ``progress_queue`` streams tokens instead of
-      calling ``route_llm_call``, so patching only the latter leaves a live
-      LM Studio call behind the socket guard's localhost allowance.
-    * ``app.services.analytical.voice_of_jarvis.hybrid_route_query`` — bound at
-      import time inside that module.
+    * ``app.models.brain.litellm_conf.hybrid_route_query`` — the transport under
+      the provider chain, in case a call reaches the real ``route_llm_call``;
+      unpatched it would leave a live LM Studio call behind the socket guard's
+      localhost allowance.
     * ``app.utils.chroma_client.query_knowledge`` — the conversation module's
       RAG lookup, which dials ChromaDB Cloud.
 
@@ -113,10 +111,6 @@ def no_llm(monkeypatch):
     monkeypatch.setattr("app.core.model_router.route_llm_call", fake_route_llm_call)
     monkeypatch.setattr(
         "app.models.brain.litellm_conf.hybrid_route_query", fake_hybrid_route_query
-    )
-    monkeypatch.setattr(
-        "app.services.analytical.voice_of_jarvis.hybrid_route_query",
-        fake_hybrid_route_query,
     )
     monkeypatch.setattr("app.utils.chroma_client.query_knowledge", fake_query_knowledge)
     return calls

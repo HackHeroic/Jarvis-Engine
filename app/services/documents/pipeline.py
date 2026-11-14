@@ -9,7 +9,6 @@ Adding a new document type requires ZERO changes to this function.
 
 import logging
 
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.document import DocumentClassification
 from app.services.documents.registry import document_registry
 
@@ -41,18 +40,15 @@ Document text (first 8000 chars):
 
 Classify this document. Return JSON with: document_type, confidence (0-1), topics_covered (list), problem_count (int or null), deadline_detected (ISO date or null), difficulty_estimate (0-1 or null)."""
 
-    result = await hybrid_route_query(
-        user_prompt=user_prompt,
+    from app.core.model_router import route_llm_call
+
+    result = await route_llm_call(
+        task="document_understanding",
+        prompt=user_prompt,
         system_prompt=CLASSIFICATION_SYSTEM_PROMPT,
         response_schema=DocumentClassification,
-        prefer_local=False,  # Classification needs reliability — use Gemini
     )
-
-    if isinstance(result, dict):
-        return DocumentClassification.model_validate(result)
-    if isinstance(result, DocumentClassification):
-        return result
-    return DocumentClassification.model_validate_json(str(result))
+    return DocumentClassification.model_validate(result)
 
 
 async def document_intelligence_pipeline(

@@ -7,8 +7,6 @@ import re
 import time as _time
 from typing import List, Optional
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import gemini_primary_route, hybrid_route_query
 from app.schemas.context import SemanticTimeSlot, SemanticTimeSlotsResponse
 
 logger = logging.getLogger(__name__)
@@ -254,17 +252,16 @@ async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
         _habit_cache[cache_key] = (_time.time(), slots)
         return slots
 
-    # --- Primary Gemini Flash call (only if Python fallback didn't match) ---
-    result = await gemini_primary_route(
-        user_prompt=habits_text,
+    # --- LLM call (only if Python fallback didn't match) ---
+    from app.core.model_router import route_llm_call
+
+    result = await route_llm_call(
+        task="habit_translation",
+        prompt=habits_text,
         system_prompt=HABIT_TRANSLATOR_PROMPT,
         response_schema=SemanticTimeSlotsResponse,
-        fallback_model=_cfg.SLM_ROUTER_MODEL,
     )
-    if isinstance(result, dict):
-        parsed = SemanticTimeSlotsResponse.model_validate(result)
-    else:
-        parsed = SemanticTimeSlotsResponse.model_validate_json(result)
+    parsed = SemanticTimeSlotsResponse.model_validate(result)
 
     slots = parsed.semantic_slots or []
 
@@ -280,16 +277,13 @@ async def translate_habits_to_slots(habits_text: str) -> List[SemanticTimeSlot]:
             '"end_min": 180, "availability": "blocked", "recurrence": "daily"}}]}}'
         )
         try:
-            strict_result = await hybrid_route_query(
-                user_prompt=strict_prompt,
+            strict_result = await route_llm_call(
+                task="habit_translation",
+                prompt=strict_prompt,
                 system_prompt="Output JSON with semantic_slots array. No other text.",
                 response_schema=SemanticTimeSlotsResponse,
-                model_override=None,
             )
-            if isinstance(strict_result, dict):
-                strict_parsed = SemanticTimeSlotsResponse.model_validate(strict_result)
-            else:
-                strict_parsed = SemanticTimeSlotsResponse.model_validate_json(strict_result)
+            strict_parsed = SemanticTimeSlotsResponse.model_validate(strict_result)
             if strict_parsed.semantic_slots:
                 slots = strict_parsed.semantic_slots
                 logger.info("Habit translator: LLM strict fallback produced slots for time anchor")

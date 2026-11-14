@@ -5,9 +5,6 @@ import re
 from collections.abc import AsyncGenerator
 from typing import Any
 
-import app.core.config as _cfg
-from app.models.brain.litellm_conf import hybrid_route_query
-
 # ContextVar used by /stream endpoint to capture execution_summary without calling VoJ.
 # When set to a dict, synthesize_jarvis_response writes the summary into it and returns
 # empty placeholders instead of calling the LLM.
@@ -143,44 +140,6 @@ def build_summary_from_state(state: dict, intent: str = "") -> dict[str, Any]:
     }
 
 
-def _will_route_cloud() -> bool:
-    """The same predicate route_llm_call uses to decide a cloud send.
-
-    Both synthesis twins call hybrid_route_query directly with a model_override,
-    which silently redirects to Gemini under GEMINI_PRIMARY (litellm_conf.py:103)
-    — so they bypass route_llm_call's PreCloudLLM gate entirely. This lets them
-    run it themselves on exactly the turns that leave the machine.
-    """
-    try:
-        from app.core.model_router import force_cloud_var
-        if force_cloud_var.get():
-            return True
-    except Exception:
-        pass
-    return bool(_cfg.GEMINI_PRIMARY)
-
-
-async def _gate_cloud_text(text: str) -> str:
-    """Run the PreCloudLLM (L8 PII) hook over one outbound string."""
-    if not text:
-        return text
-    try:
-        from app.orchestrator.hooks import HookDecision, get_hooks
-
-        hooks = get_hooks()
-        if hooks is None:
-            return text
-        result = await hooks.execute("PreCloudLLM", prompt=text)
-        if result.decision == HookDecision.MODIFY and result.modified_input:
-            return result.modified_input.get("prompt", text)
-    except Exception as e:
-        # A gate that crashes must not become a gate that leaks: the caller
-        # keeps the original text only because failing the turn outright would
-        # be worse, and the failure is loud.
-        print(f"[Voice of Jarvis] PreCloudLLM gate failed: {e}")
-    return text
-
-
 def _build_voj_parts(execution_summary: dict[str, Any]) -> list[str]:
     """Build the summary text parts passed to Voice of Jarvis LLM."""
     parts = []
@@ -260,20 +219,18 @@ async def synthesize_jarvis_response(
 
     summary_text = "\n".join(parts)
     try:
+        from app.core.model_router import route_llm_call
+
         # Include memory context in system prompt for personalization
         voj_prompt = VOICE_OF_JARVIS_PROMPT
         mem_ctx = execution_summary.get("memory_context", "")
-        if _will_route_cloud():
-            summary_text = await _gate_cloud_text(summary_text)
-            mem_ctx = await _gate_cloud_text(mem_ctx)
         if mem_ctx:
             voj_prompt += f"\n\nUser context:\n{mem_ctx}"
 
-        result = await hybrid_route_query(
-            user_prompt=summary_text,
+        result = await route_llm_call(
+            task="voice_of_jarvis_synthesis",
+            prompt=summary_text,
             system_prompt=voj_prompt,
-            response_schema=None,
-            model_override=_cfg.SLM_ROUTER_MODEL,
             conversation_history=conversation_history,
         )
         msg = result if isinstance(result, str) else str(result)
@@ -337,23 +294,21 @@ async def synthesize_jarvis_response_stream(
 
     summary_text = "\n".join(parts)
     try:
+        from app.core.model_router import route_llm_call
+
         # Same memory personalization the non-streaming twin applies — without
         # this the streamed voice quietly loses what it knows about the user.
         voj_prompt = VOICE_OF_JARVIS_PROMPT
         mem_ctx = execution_summary.get("memory_context", "")
-        if _will_route_cloud():
-            summary_text = await _gate_cloud_text(summary_text)
-            mem_ctx = await _gate_cloud_text(mem_ctx)
         if mem_ctx:
             voj_prompt += f"\n\nUser context:\n{mem_ctx}"
 
-        token_gen = await hybrid_route_query(
-            user_prompt=summary_text,
+        token_gen = await route_llm_call(
+            task="voice_of_jarvis_synthesis",
+            prompt=summary_text,
             system_prompt=voj_prompt,
-            response_schema=None,
-            model_override=_cfg.SLM_ROUTER_MODEL,
-            stream=True,
             conversation_history=conversation_history,
+            stream=True,
         )
 
         # Stream tokens in real-time with <think> tag parsing state machine.

@@ -9,17 +9,40 @@ task_material_linker links a new document to this task.
 import asyncio
 import json
 import re
+from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from app.models.brain.litellm_conf import gemini_web_search, hybrid_route_query
+from app.domain.errors import LLMUnavailableError
+from app.models.brain.litellm_conf import gemini_web_search
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
 from app.services.user_preferences import get_learning_style
 from supabase import create_client
 
 WORKSPACE_TTL_HOURS = 24
+
+WEB_RESULTS_UNAVAILABLE = "Web results are unavailable right now, so no links are shown"
+
+
+class WebSearchUnavailableError(LLMUnavailableError):
+    """Gemini's grounded web search did not answer; there are no web results to show."""
+
+    code = "web_search_unavailable"
+
+
+async def _search_web(user_prompt: str, system_prompt: str) -> str:
+    """Run the grounded web search, raising ``WebSearchUnavailableError`` when it fails.
+
+    Still Gemini-only: no other provider in the LLM chain has search grounding, so a
+    fallback model would only invent links. ``gemini_web_search`` answers an empty
+    string when the key is missing or the call fails.
+    """
+    raw = await gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt)
+    if not raw or not raw.strip():
+        raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
+    return raw
 
 
 def _get_supabase():
@@ -85,7 +108,10 @@ async def fetch_chunks_for_task(
 
 
 async def perform_learning_style_search(task_title: str, learning_style: str) -> list[StudyAsset]:
-    """Use Gemini + Google Search to find learning-style-curated links (YouTube or articles)."""
+    """Use Gemini + Google Search to find learning-style-curated links (YouTube or articles).
+
+    Raises ``WebSearchUnavailableError`` when the search could not run.
+    """
     assets: list[StudyAsset] = []
     if not task_title.strip():
         return assets
@@ -109,9 +135,7 @@ async def perform_learning_style_search(task_title: str, learning_style: str) ->
         )
         sys = "You are a tutor. Return YouTube and Article lines with URL | Title"
 
-    raw = await gemini_web_search(user_prompt=prompt, system_prompt=sys)
-    if not raw:
-        return assets
+    raw = await _search_web(prompt, sys)
 
     # Parse URL | Title lines
     url_re = re.compile(r"https?://[^\s|]+")
@@ -154,8 +178,9 @@ async def generate_practice_assets(
 ) -> list[StudyAsset]:
     """Generate context-aware practice assets.
 
-    If RAG chunks exist: local 27B creates 3-5 question quiz from materials.
-    If no chunks: Gemini searches for 2 LeetCode/Codeforces links + 1 YouTube.
+    If RAG chunks exist: the PRIMARY model creates a 3-5 question quiz from materials.
+    If no chunks: Gemini searches for 2 LeetCode/Codeforces links + 1 YouTube, and
+    ``WebSearchUnavailableError`` is raised when that search could not run.
     If user_prompt provided: incorporate into the generation.
     """
     assets: list[StudyAsset] = []
@@ -172,11 +197,12 @@ Materials:
 
 Return a JSON object: {{"assets": [{{"asset_type": "generated_quiz", "title": "Quiz: ...", "content_or_url": "<markdown>", "rationale": "From your syllabus"}}]}}"""
         try:
-            result = await hybrid_route_query(
-                user_prompt=prompt,
+            from app.core.model_router import route_llm_call
+
+            result = await route_llm_call(
+                task="practice_generation",
+                prompt=prompt,
                 system_prompt="You are a tutor. Generate practice questions from the materials. Return valid JSON only.",
-                response_schema=None,
-                force_cloud=False,
             )
             if isinstance(result, str):
                 import json
@@ -208,9 +234,9 @@ Return a JSON object: {{"assets": [{{"asset_type": "generated_quiz", "title": "Q
             "(2) 1 YouTube tutorial URL with title. "
             "Format each as: URL | Title. Use real URLs from leetcode.com, codeforces.com, youtube.com."
         )
-        raw = await gemini_web_search(
-            user_prompt=prompt,
-            system_prompt="You are a tutor. Find real LeetCode, Codeforces, and YouTube URLs. Return URL | Title per line.",
+        raw = await _search_web(
+            prompt,
+            "You are a tutor. Find real LeetCode, Codeforces, and YouTube URLs. Return URL | Title per line.",
         )
         if raw:
             url_re = re.compile(r"https?://[^\s|]+")
@@ -285,7 +311,10 @@ async def build_task_workspace(
         chunks, task_title, topic_keywords, learning_style, user_prompt
     )
 
-    web_assets, practice_assets = await asyncio.gather(web_task, practice_task)
+    web_assets, practice_assets = await asyncio.gather(
+        _unless_search_failed(web_task), _unless_search_failed(practice_task)
+    )
+    notices = [WEB_RESULTS_UNAVAILABLE] if web_assets is None or practice_assets is None else []
 
     surfaced: list[StudyAsset] = []
 
@@ -299,8 +328,8 @@ async def build_task_workspace(
             )
         )
 
-    surfaced.extend(web_assets)
-    surfaced.extend(practice_assets)
+    surfaced.extend(web_assets or [])
+    surfaced.extend(practice_assets or [])
 
     # Build WOOP card from task's implementation_intention + goal metadata
     woop_card = None
@@ -356,7 +385,16 @@ async def build_task_workspace(
         primary_objective=primary_objective,
         surfaced_assets=surfaced,
         woop_card=woop_card,
+        notices=notices,
     )
+
+
+async def _unless_search_failed(assets: Awaitable[list[StudyAsset]]) -> list[StudyAsset] | None:
+    """The assets, or None when the web search behind them could not run."""
+    try:
+        return await assets
+    except WebSearchUnavailableError:
+        return None
 
 
 # ─── Workspace persistence ────────────────────────────────────────────
@@ -450,5 +488,8 @@ async def get_or_build_task_workspace(
             return cached
 
     ws = await build_task_workspace(user_id=user_id, task_id=task_id, user_prompt=user_prompt)
-    await _write_cached_workspace(user_id, task_id, ws)
+    if not ws.notices:
+        # A workspace missing its web results is not cached: once search is back,
+        # the next open rebuilds it instead of repeating the notice for a day.
+        await _write_cached_workspace(user_id, task_id, ws)
     return ws

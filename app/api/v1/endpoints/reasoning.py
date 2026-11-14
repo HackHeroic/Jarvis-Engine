@@ -15,8 +15,8 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel, Field, ValidationError
 
-from app.core.config import GEMINI_API_KEY
-from app.models.brain.litellm_conf import hybrid_route_query
+from app.domain.entities import LLMLocation
+from app.domain.errors import LLMOutputParseError, LLMUnavailableError
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas — the JSON contract
@@ -277,32 +277,28 @@ async def decompose_goal(
     """Decompose a monolithic goal into an ExecutionGraph of atomic,
     sub-25-minute micro-tasks with WOOP Implementation Intentions."""
 
-    async def _call_and_get_data(force_cloud: bool = False) -> dict:
-        result = await hybrid_route_query(
-            user_prompt=user_prompt,
+    from app.core.model_router import get_chain, route_llm_call
+
+    async def _decompose(force_cloud: bool) -> ExecutionGraph:
+        result = await route_llm_call(
+            task="socratic_chunker",
+            prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT,
             response_schema=ExecutionGraph,
             force_cloud=force_cloud,
-            lenient_validation=True,
         )
-        if isinstance(result, dict):
-            return result
-        sanitized = _sanitize_llm_json(result)
-        return json.loads(sanitized)
+        return ExecutionGraph.model_validate(result)
 
     try:
-        # Local-First: always try local Gemma first (academic topics like SARIMAX
-        # are handled locally—the model is capable; formatting constraints were
-        # the prior bottleneck, now mitigated by sanitization and max_tokens).
-        data = await _call_and_get_data(force_cloud=False)
+        # Local-First: the PRIMARY model first. A reply that fails ExecutionGraph
+        # validation falls over to the cloud inside the provider chain.
+        graph = await _decompose(force_cloud=False)
 
-        # Last-resort fallback: only when local model fails (undersized decomposition
-        # or Pydantic validation). Cloud Gemini reserved for L9 Real-Time Research
-        # and this fallback only—never for proactive routing of decomposition.
-        if len(data.get("decomposition", [])) < 5 and GEMINI_API_KEY:
-            data = await _call_and_get_data(force_cloud=True)
+        # Last-resort fallback for a valid but undersized decomposition: one more
+        # try on the cloud, when a cloud model is configured.
+        if len(graph.decomposition) < 5 and get_chain().has_available(LLMLocation.CLOUD):
+            graph = await _decompose(force_cloud=True)
 
-        graph = ExecutionGraph(**data)
         if len(graph.decomposition) < 5:
             raise HTTPException(
                 status_code=502,
@@ -314,6 +310,16 @@ async def decompose_goal(
         return graph
     except HTTPException:
         raise
+    except (LLMUnavailableError, RuntimeError) as exc:
+        if not _unparseable(exc):
+            raise
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "LLM Reasoning Error: the model returned content that "
+                "could not be parsed into a valid ExecutionGraph."
+            ),
+        ) from exc
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
         raise HTTPException(
             status_code=502,
@@ -322,3 +328,12 @@ async def decompose_goal(
                 f"could not be parsed into a valid ExecutionGraph. {exc}"
             ),
         ) from exc
+
+
+def _unparseable(exc: BaseException | None) -> bool:
+    """True when the last model asked did answer, but not with a valid ExecutionGraph."""
+    while exc is not None:
+        if isinstance(exc, LLMOutputParseError):
+            return True
+        exc = exc.__cause__
+    return False

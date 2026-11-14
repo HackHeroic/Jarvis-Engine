@@ -1,7 +1,7 @@
 """Task editor — parses an edit request via LLM and applies it to a pending task.
 
-Uses hybrid_route_query (prefer_local=True) to extract the edit intent,
-then applies the change directly in Supabase.
+Asks the FAST model (``route_llm_call``, task ``task_edit_parsing``) for the edit
+intent, then applies the change directly in Supabase.
 """
 
 from __future__ import annotations
@@ -11,8 +11,6 @@ import json
 import logging
 import re
 from typing import Any
-
-from app.models.brain.litellm_conf import hybrid_route_query
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +47,12 @@ async def handle_edit_task(
     # 1. Ask the LLM to parse the edit request
     # ------------------------------------------------------------------
     try:
-        raw_response = await hybrid_route_query(
-            user_prompt=user_prompt,
+        from app.core.model_router import route_llm_call
+
+        raw_response = await route_llm_call(
+            task="task_edit_parsing",
+            prompt=user_prompt,
             system_prompt=_EDIT_PARSE_SYSTEM_PROMPT,
-            prefer_local=True,
         )
         # raw_response may be a string or an object with a text attribute
         raw_text = raw_response if isinstance(raw_response, str) else str(raw_response)

@@ -6,10 +6,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-import app.core.config as _cfg
 from app.api.deps import CurrentUser, require_supabase
 from app.domain import errors
-from app.models.brain.litellm_conf import hybrid_route_query
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
 from app.services.extraction.behavioral_store import delete_behavioral_constraint
 from app.services.extraction.orchestrator import process_ingestion
@@ -95,15 +93,15 @@ async def ingest(request: IngestionRequest) -> IntentClassification:
         )
     text = _get_text_for_classification(request)
     try:
-        result = await hybrid_route_query(
-            user_prompt=text,
+        from app.core.model_router import route_llm_call
+
+        result = await route_llm_call(
+            task="intent_classification",
+            prompt=text,
             system_prompt=SEMANTIC_ROUTER_SYSTEM_PROMPT,
             response_schema=IntentClassification,
-            model_override=_cfg.SLM_ROUTER_MODEL,
         )
-        if isinstance(result, dict):
-            return IntentClassification.model_validate(result)
-        return IntentClassification.model_validate_json(result)
+        return IntentClassification.model_validate(result)
     except HTTPException:
         raise
     except Exception as exc:

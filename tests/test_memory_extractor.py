@@ -2,12 +2,46 @@
 """Tests for LLM-based memory extraction from conversation turns."""
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import MagicMock
+
+from app.domain.entities import LLMLocation
+from app.domain.ports import LLMProvider, LLMRequest
+from app.infrastructure.llm.chain import FallbackChainProvider
+from app.infrastructure.llm.factory import set_chain
+from app.schemas.memory import MemoryExtractionResponse
 from app.services.memory.extractor import (
     extract_memories_from_turn,
     safe_extract_memories,
     EXTRACTION_PROMPT,
 )
+
+
+class _ExtractionModel(LLMProvider):
+    """The only model in the provider chain: answers every request with ``reply``."""
+
+    name = "extraction"
+    location = LLMLocation.CLOUD
+
+    def __init__(self, reply: dict) -> None:
+        self.reply = reply
+        self.calls: list[LLMRequest] = []
+
+    def is_available(self) -> bool:
+        return True
+
+    async def complete(self, req: LLMRequest) -> MemoryExtractionResponse:
+        self.calls.append(req)
+        return MemoryExtractionResponse.model_validate(self.reply)
+
+    async def stream(self, req: LLMRequest):  # pragma: no cover - extraction never streams
+        raise NotImplementedError
+        yield
+
+
+def _extraction_returns(reply: dict) -> _ExtractionModel:
+    model = _ExtractionModel(reply)
+    set_chain(FallbackChainProvider([model]))  # conftest's _fresh_llm_chain resets it
+    return model
 
 
 def test_extraction_prompt_has_placeholders():
@@ -25,20 +59,17 @@ async def test_extract_memories_returns_list():
     mock_store.find_similar_memory.return_value = None
     mock_store.store_memory.return_value = {"id": "new-1"}
 
-    with patch(
-        "app.services.memory.extractor.hybrid_route_query",
-        new_callable=AsyncMock,
-        return_value={"memories": [
-            {"type": "fact", "content": "User is a CS student", "confidence": 0.8, "contradicts": None, "expires_at": None}
-        ]},
-    ):
-        result = await extract_memories_from_turn(
-            user_id="u1",
-            user_message="I'm a CS student at VIT",
-            assistant_response="Great! I'll keep that in mind.",
-            memory_store=mock_store,
-        )
+    model = _extraction_returns({"memories": [
+        {"type": "fact", "content": "User is a CS student", "confidence": 0.8, "contradicts": None, "expires_at": None}
+    ]})
+    result = await extract_memories_from_turn(
+        user_id="u1",
+        user_message="I'm a CS student at VIT",
+        assistant_response="Great! I'll keep that in mind.",
+        memory_store=mock_store,
+    )
 
+    assert [c.task for c in model.calls] == ["memory_extraction"]
     assert len(result) == 1
     assert result[0]["type"] == "fact"
     mock_store.store_memory.assert_called_once()
@@ -53,19 +84,15 @@ async def test_extract_handles_contradiction():
     ]
     mock_store.supersede_memory.return_value = {"id": "new-1"}
 
-    with patch(
-        "app.services.memory.extractor.hybrid_route_query",
-        new_callable=AsyncMock,
-        return_value={"memories": [
-            {"type": "preference", "content": "User prefers evenings", "confidence": 0.7, "contradicts": "old-1", "expires_at": None}
-        ]},
-    ):
-        result = await extract_memories_from_turn(
-            user_id="u1",
-            user_message="Actually I work best in the evenings",
-            assistant_response="Noted — I'll adjust your schedule.",
-            memory_store=mock_store,
-        )
+    _extraction_returns({"memories": [
+        {"type": "preference", "content": "User prefers evenings", "confidence": 0.7, "contradicts": "old-1", "expires_at": None}
+    ]})
+    result = await extract_memories_from_turn(
+        user_id="u1",
+        user_message="Actually I work best in the evenings",
+        assistant_response="Noted — I'll adjust your schedule.",
+        memory_store=mock_store,
+    )
 
     assert len(result) == 1
     mock_store.supersede_memory.assert_called_once_with("old-1", "u1", "User prefers evenings")
@@ -79,19 +106,15 @@ async def test_extract_handles_duplicate():
     mock_store.find_similar_memory.return_value = {"id": "existing-1"}
     mock_store.reinforce_memory.return_value = True
 
-    with patch(
-        "app.services.memory.extractor.hybrid_route_query",
-        new_callable=AsyncMock,
-        return_value={"memories": [
-            {"type": "fact", "content": "User is a CS student", "confidence": 0.8, "contradicts": None, "expires_at": None}
-        ]},
-    ):
-        result = await extract_memories_from_turn(
-            user_id="u1",
-            user_message="As a CS student, I need...",
-            assistant_response="Sure!",
-            memory_store=mock_store,
-        )
+    _extraction_returns({"memories": [
+        {"type": "fact", "content": "User is a CS student", "confidence": 0.8, "contradicts": None, "expires_at": None}
+    ]})
+    await extract_memories_from_turn(
+        user_id="u1",
+        user_message="As a CS student, I need...",
+        assistant_response="Sure!",
+        memory_store=mock_store,
+    )
 
     mock_store.reinforce_memory.assert_called_once_with("existing-1", user_id="u1")
     mock_store.store_memory.assert_not_called()
@@ -103,17 +126,13 @@ async def test_extract_returns_empty_when_nothing_new():
     mock_store = MagicMock()
     mock_store.get_active_memories.return_value = []
 
-    with patch(
-        "app.services.memory.extractor.hybrid_route_query",
-        new_callable=AsyncMock,
-        return_value={"memories": []},
-    ):
-        result = await extract_memories_from_turn(
-            user_id="u1",
-            user_message="Hello",
-            assistant_response="Hi there!",
-            memory_store=mock_store,
-        )
+    _extraction_returns({"memories": []})
+    result = await extract_memories_from_turn(
+        user_id="u1",
+        user_message="Hello",
+        assistant_response="Hi there!",
+        memory_store=mock_store,
+    )
 
     assert result == []
     mock_store.store_memory.assert_not_called()
