@@ -25,6 +25,7 @@ from app.domain.entities import (
     LLMLocation,
     LLMUsageEvent,
     Memory,
+    MemoryStatus,
     OPEN_DRAFT_STATUSES,  # noqa: F401  (re-exported to the repositories)
     SuggestionStatus,
     Task,
@@ -349,6 +350,14 @@ def memory_id_taken(memory_id: str | None) -> errors.ConflictError:
     """Storing the memory would break user_memories' primary key: the id is in use."""
     return errors.ConflictError(
         "A memory with this id already exists.", details={"memory_id": memory_id}
+    )
+
+
+def memory_changed(memory_id: str, status: MemoryStatus | str) -> errors.StaleVersionError:
+    """A guarded memory update lost: the memory's status is no longer one it allows."""
+    return errors.StaleVersionError(
+        "That memory changed in the meantime, so nothing was changed.",
+        details={"memory_id": memory_id, "status": MemoryStatus(status).value},
     )
 
 

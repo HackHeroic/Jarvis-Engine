@@ -17,12 +17,15 @@ from app.domain import errors
 from app.domain.entities import Memory, MemorySource, MemoryStatus, SUPPRESSING_STATUSES
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.infrastructure.persistence.in_memory import InMemoryMemoryRepository, InMemoryStore
+from app.services.memory import store as legacy_store_module
 from app.services.memory.memory_service import (
     MemoryCandidate,
     MemoryDecaySweep,
     MemoryService,
 )
-from tests.fakes import BagOfWordsEmbedder
+from app.services.memory.retriever import compute_memory_strength
+from app.services.memory.store import MemoryStore
+from tests.fakes import BagOfWordsEmbedder, FakeSupabase
 
 NOW = datetime(2026, 11, 16, 9, 0, tzinfo=timezone.utc)
 MARATHON = "Training for the Mumbai marathon in March"
@@ -354,3 +357,184 @@ async def test_memory_decay_sweep__one_users_failure__others_faded(store, clock,
     assert (MemoryDecaySweep.name, MemoryDecaySweep.interval) == ("memory_decay", timedelta(hours=24))
     (warning,) = [r for r in caplog.records if r.name == "app.services.memory.memory_service"]
     assert "PersistenceError" in warning.getMessage()
+
+
+# --- forget and dismiss are terminal ------------------------------------------------------
+
+
+class _ForgottenRightAfterRead(InMemoryMemoryRepository):
+    """While armed, another request forgets every memory a read hands back, just after
+    the read: the window between a service's read and its write."""
+
+    armed = False
+
+    def _forget(self, found: list[Memory]) -> None:
+        if not self.armed:
+            return
+        for memory in found:
+            i = self._index(memory.user_id, memory.id)
+            self._store.memories[i] = self._store.memories[i].model_copy(
+                update={"status": MemoryStatus.FORGOTTEN, "content": ""}
+            )
+
+    async def get(self, user_id, memory_id):
+        found = await super().get(user_id, memory_id)
+        self._forget([found] if found else [])
+        return found
+
+    async def list(self, user_id, **kwargs):
+        found = await super().list(user_id, **kwargs)
+        self._forget(found)
+        return found
+
+    async def nearest(self, user_id, embedding, **kwargs):
+        found = await super().nearest(user_id, embedding, **kwargs)
+        self._forget([match.memory for match in found])
+        return found
+
+
+@pytest.mark.asyncio
+async def test_forget__lands_between_a_read_and_its_write__memory_stays_forgotten(store, clock):
+    memories = _ForgottenRightAfterRead(store)
+    service = MemoryService(memories, BagOfWordsEmbedder(), clock=clock)
+    mentioned = (await service.remember("alice", _candidate(MARATHON, "goal"))).memory
+    confirmed = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+    decayed = (await service.remember("alice", _candidate(SKIPS_AT_NINE, "behavioral_pattern"))).memory
+    memories.armed = True
+
+    again = await service.remember("alice", _candidate(MARATHON_AGAIN, "goal"))  # reinforce
+    with pytest.raises(errors.ConflictError):
+        await service.confirm("alice", confirmed.id)
+    faded = await service.fade_stale("alice", NOW + timedelta(days=30))
+
+    memories.armed = False
+    assert (again.action, again.memory, faded) == ("suppressed", None, 0)
+    for memory in (mentioned, confirmed, decayed):
+        stored = await memories.get("alice", memory.id)
+        assert (stored.status, stored.content) == (MemoryStatus.FORGOTTEN, "")
+
+
+@pytest.mark.asyncio
+async def test_confirm_or_edit__dismissed_or_forgotten__conflict_and_unchanged(service, memories):
+    dismissed = (await service.remember("alice", _candidate(SKIPS_AT_NINE, "behavioral_pattern"))).memory
+    forgotten = (await service.remember("alice", _candidate(MARATHON, "goal"))).memory
+    await service.dismiss("alice", dismissed.id)
+    await service.forget("alice", forgotten.id)
+    before = await _every_row(memories)
+
+    for memory in (dismissed, forgotten):
+        with pytest.raises(errors.ConflictError):
+            await service.confirm("alice", memory.id)
+        with pytest.raises(errors.ConflictError):
+            await service.edit("alice", memory.id, content="Something else")
+    with pytest.raises(errors.ConflictError):
+        await service.dismiss("alice", forgotten.id)
+
+    assert await _every_row(memories) == before
+    await service.forget("alice", dismissed.id)  # the one way out of dismissed: erase it
+    assert (await memories.get("alice", dismissed.id)).status is MemoryStatus.FORGOTTEN
+
+
+@pytest.mark.asyncio
+async def test_remember__forgotten_goal_offered_as_another_type__still_suppressed(service, memories):
+    goal = (await service.remember("alice", _candidate(MARATHON, "goal"))).memory
+    await service.forget("alice", goal.id)
+
+    outcome = await service.remember("alice", _candidate(MARATHON_AGAIN, "temporal_event"))
+
+    assert (outcome.action, outcome.memory) == ("suppressed", None)
+    assert [m.id for m in await _every_row(memories)] == [goal.id]
+
+
+@pytest.mark.asyncio
+async def test_remember__supersede_retried_after_the_link_failed__one_new_memory(store, clock):
+    class _LinkFailsOnce(InMemoryMemoryRepository):
+        failed = False
+
+        async def update(self, user_id, memory_id, **fields):
+            if "superseded_by" in fields and not self.failed:
+                self.failed = True
+                raise errors.PersistenceError("Could not reach the database.")
+            return await super().update(user_id, memory_id, **fields)
+
+    memories = _LinkFailsOnce(store)
+    service = MemoryService(memories, BagOfWordsEmbedder(), clock=clock)
+    old = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+    replacement = _candidate(NIGHTS, "preference", contradicts=old.id)
+    with pytest.raises(errors.PersistenceError):
+        await service.remember("alice", replacement)
+
+    outcome = await service.remember("alice", replacement)
+
+    assert outcome.action == "superseded"
+    stored = [m.id for m in store.memories]  # superseded rows included
+    assert sorted(stored) == sorted([old.id, outcome.memory.id])
+    assert (await memories.get("alice", old.id)).superseded_by == outcome.memory.id
+    assert [m.id for m in await service.list_active("alice")] == [outcome.memory.id]
+
+
+# --- the legacy store and retriever read the same decay --------------------------------
+
+
+def _freeze_legacy_clock(monkeypatch, when: datetime) -> None:
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when.astimezone(tz) if tz is not None else when.replace(tzinfo=None)
+
+    monkeypatch.setattr(legacy_store_module, "datetime", _Frozen)
+
+
+@pytest.fixture
+def legacy(monkeypatch):
+    """The v1 MemoryStore and the Supabase MemoryRepository over one database."""
+    supabase = FakeSupabase()
+    monkeypatch.setattr(legacy_store_module, "embed_text", lambda text: None)
+    return supabase, MemoryStore(supabase_client=supabase), RepositoryFactory.supabase(supabase).memories
+
+
+@pytest.mark.asyncio
+async def test_legacy_retriever__after_the_decay_sweep__reads_the_strength_the_service_reports(
+    legacy, monkeypatch
+):
+    supabase, store, memories = legacy
+    _freeze_legacy_clock(monkeypatch, NOW)
+    row = store.store_memory("alice", {"type": "goal", "content": MARATHON})
+    service = MemoryService(memories, BagOfWordsEmbedder(), clock=_Clock(NOW))
+
+    assert await service.fade_stale("alice", NOW + timedelta(days=10)) == 0
+
+    swept = await memories.get("alice", row["id"])
+    later = NOW + timedelta(days=12)
+    (stored,) = supabase.rows["user_memories"]
+    assert compute_memory_strength(stored, later) == pytest.approx(swept.strength_at(later))
+
+
+@pytest.mark.asyncio
+async def test_legacy_reinforce__then_the_decay_sweep__memory_not_faded(legacy, monkeypatch):
+    supabase, store, memories = legacy
+    _freeze_legacy_clock(monkeypatch, NOW)
+    row = store.store_memory("alice", {"type": "goal", "content": MARATHON})
+    _freeze_legacy_clock(monkeypatch, NOW + timedelta(days=21))
+    assert store.reinforce_memory(row["id"], user_id="alice")
+    service = MemoryService(memories, BagOfWordsEmbedder(), clock=_Clock(NOW))
+    forty_days_on = NOW + timedelta(days=40)
+
+    assert await service.fade_stale("alice", forty_days_on) == 0
+
+    assert (await memories.get("alice", row["id"])).status is MemoryStatus.ACTIVE
+    (stored,) = supabase.rows["user_memories"]
+    assert compute_memory_strength(stored, forty_days_on) >= 0.1
+
+
+@pytest.mark.asyncio
+async def test_legacy_store__memory_noticed_from_behaviour__stored_as_inferred(legacy):
+    _, store, memories = legacy
+
+    noticed = store.store_memory(
+        "alice", {"type": "behavioral_pattern", "content": SKIPS_AT_NINE, "source": "behavior"}
+    )
+    said = store.store_memory("alice", {"type": "goal", "content": MARATHON})
+
+    assert (await memories.get("alice", noticed["id"])).provenance is MemorySource.INFERRED
+    assert (await memories.get("alice", said["id"])).provenance is MemorySource.SAID

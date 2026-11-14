@@ -58,6 +58,7 @@ from app.infrastructure.persistence._mapping import (
     is_uuid,
     iso,
     memory_from_row,
+    memory_changed,
     memory_id_taken,
     memory_to_row,
     new_draft,
@@ -602,10 +603,19 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
         except (KeyError, TypeError, ValueError) as exc:
             raise errors.PersistenceError(_UNREADABLE) from exc
 
-    async def update(self, user_id: str, memory_id: str, **fields: Any) -> Memory:
+    async def update(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        only_if_status: frozenset[MemoryStatus] | None = None,
+        **fields: Any,
+    ) -> Memory:
         current = await self.get(user_id, memory_id)
         if current is None:
             raise not_found("memory", memory_id)
+        if only_if_status is not None and current.status not in only_if_status:
+            raise memory_changed(memory_id, current.status)
         updated = apply_memory_update(current, fields)
         changed = [name for name in fields if name != EMBEDDING]
         payload = memory_to_row(updated, changed)
@@ -613,12 +623,22 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
             payload[EMBEDDING] = embedding_values(fields[EMBEDDING])
         if not payload:
             return current
-        rows = await self._write(
-            lambda q: q.update(payload).eq("id", memory_id).eq("user_id", user_id), updated
-        )
-        if not rows:  # deleted since it was read
+
+        def build(q: Any) -> Any:
+            q = q.update(payload).eq("id", memory_id).eq("user_id", user_id)
+            if only_if_status is not None:
+                # The guard is part of the UPDATE itself: a status changed since the
+                # read above makes it match no row, so nothing is overwritten.
+                q = q.in_("status", sorted(MemoryStatus(s).value for s in only_if_status))
+            return q
+
+        rows = await self._write(build, updated)
+        if rows:
+            return _read_memory(rows[0])
+        now = await self.get(user_id, memory_id)
+        if now is None:  # deleted since it was read
             raise not_found("memory", memory_id)
-        return _read_memory(rows[0])
+        raise memory_changed(memory_id, now.status)
 
 
 class SupabaseUsageRepository(_SupabaseRepository, UsageRepository):

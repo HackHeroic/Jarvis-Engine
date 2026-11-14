@@ -68,6 +68,13 @@ class PersistenceError(InfrastructureError):
     http_status = 503
 
 
+class EmbeddingUnavailableError(InfrastructureError):
+    """The text embedder could not run (model missing, failed to load or answer)."""
+
+    code = "embedding_unavailable"
+    http_status = 503
+
+
 class LLMError(InfrastructureError):
     code = "llm_error"
     http_status = 503

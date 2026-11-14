@@ -2,7 +2,12 @@
 
 Routing and parsing only. Every route is a ``MemoryService`` move, taken from the
 composition root (``get_container``). Another user's memory reads as absent and
-answers 404, never 403, which would confirm it exists. Errors use the one envelope.
+answers 404, never 403, which would confirm it exists. A dismissed or forgotten memory
+cannot be confirmed or edited (409). Errors use the one envelope.
+
+Every route first requires the database (``require_supabase``): without it the
+container runs on in-memory repositories, where the user's memories would read as
+an empty list and every one as unknown. An outage answers 503, never "no memories".
 """
 
 from datetime import datetime, timezone
@@ -11,7 +16,7 @@ from typing import Literal
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, get_container
+from app.api.deps import CurrentUser, get_container, require_supabase
 from app.domain.entities import Memory, MemorySource, MemoryType
 from app.services.memory.memory_service import MemoryService
 
@@ -79,6 +84,8 @@ class MemoryEdit(BaseModel):
 
 
 def _memories(request: Request) -> MemoryService:
+    """The memory service, once the database is known to be there (else 503)."""
+    require_supabase(request)
     return get_container(request).memory_service
 
 
@@ -100,9 +107,12 @@ async def list_memories(
     user: CurrentUser,
     memory_type: MemoryType | None = Query(default=None, description="Only this type."),
 ) -> MemoryListResponse:
+    memories = _memories(request)
     types = frozenset({memory_type}) if memory_type is not None else None
     now = _now()
-    shown = [MemoryOut.of(m, now) for m in await _memories(request).list_active(user, types=types)]
+    shown = [
+        MemoryOut.of(m, now) for m in await memories.list_active(user, types=types, now=now)
+    ]
     return MemoryListResponse(memories=shown, count=len(shown))
 
 
@@ -110,7 +120,10 @@ async def list_memories(
     "/{memory_id}",
     response_model=MemoryOut,
     summary="Edit a memory",
-    description="Change a memory's words or type. Unknown, forgotten or another user's: 404.",
+    description=(
+        "Change a memory's words or type. Unknown or another user's: 404; dismissed or "
+        "forgotten: 409."
+    ),
 )
 async def edit_memory(
     memory_id: str, edit: MemoryEdit, request: Request, user: CurrentUser
@@ -128,8 +141,8 @@ async def edit_memory(
     description=(
         "Erases the memory's words at once and removes it from every list. A tombstone "
         "stays: its embedding and pattern key are kept, so when the same fact is said or "
-        "noticed again Jarvis recognises it and does not store it again. Another user's "
-        "memory: 404."
+        "noticed again Jarvis recognises it and does not store it again. A dismissed memory "
+        "can be forgotten too. Another user's memory: 404."
     ),
 )
 async def forget_memory(memory_id: str, request: Request, user: CurrentUser) -> ForgetResponse:
@@ -141,7 +154,10 @@ async def forget_memory(memory_id: str, request: Request, user: CurrentUser) -> 
     "/{memory_id}/confirm",
     response_model=MemoryOut,
     summary="Confirm a memory",
-    description="The user says it holds: it is reinforced and Jarvis is at least 0.9 sure of it.",
+    description=(
+        "The user says it holds: it is reinforced and Jarvis is at least 0.9 sure of it. "
+        "A dismissed or forgotten memory stays let go of: 409."
+    ),
 )
 async def confirm_memory(memory_id: str, request: Request, user: CurrentUser) -> MemoryOut:
     return MemoryOut.of(await _memories(request).confirm(user, memory_id), _now())
@@ -153,7 +169,7 @@ async def confirm_memory(memory_id: str, request: Request, user: CurrentUser) ->
     summary="Dismiss a memory",
     description=(
         "The user says it does not hold: it is hidden for good, and the same fact said or "
-        "noticed again is not stored."
+        "noticed again is not stored. A forgotten memory: 409."
     ),
 )
 async def dismiss_memory(memory_id: str, request: Request, user: CurrentUser) -> MemoryOut:

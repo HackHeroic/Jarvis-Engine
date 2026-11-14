@@ -6,13 +6,14 @@ error is the one envelope.
 """
 
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from app.domain.entities import MemorySource
 from app.services.memory.memory_service import MemoryCandidate
-from tests.fakes import BagOfWordsEmbedder, FakeSupabase
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 MARATHON = "Training for the Mumbai marathon in March"
 SKIPS_AT_NINE = "Skips work around 9 AM"
@@ -32,7 +33,7 @@ _MEMORY_OUT_FIELDS = {
 }
 
 
-def _container(supabase):
+def _container(supabase, embedder=None):
     import app.core.config as cfg
     from app.container import AppContainer
     from app.orchestrator.hooks import ActionHooks
@@ -41,16 +42,19 @@ def _container(supabase):
         supabase_client=supabase,
         cfg=cfg,
         hooks=ActionHooks(),
-        embedder=BagOfWordsEmbedder(),
+        embedder=embedder or BagOfWordsEmbedder(),
         install_chain=False,
     )
 
 
 @asynccontextmanager
-async def _api(monkeypatch, container):
+async def _api(monkeypatch, container, supabase):
+    """The app over ``container``, its database client over ``supabase`` (None: no database)."""
     from app.main import app
 
+    db_client = FakeDBClient(supabase) if supabase is not None else SimpleNamespace(supabase=None)
     monkeypatch.setattr(app.state, "container", container, raising=False)
+    monkeypatch.setattr(app.state, "db_client", db_client, raising=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
@@ -86,7 +90,7 @@ async def test_memories_api__forget_then_list__gone(monkeypatch, supabase, conta
         provenance=MemorySource.INFERRED, origin="behavior",
     )
 
-    async with _api(monkeypatch, container) as api:
+    async with _api(monkeypatch, container, supabase) as api:
         forgot = await api.delete(f"/api/v1/memories/{marathon.id}", params={"user_id": "alice"})
         panel = await api.get("/api/v1/memories/", params={"user_id": "alice"})
 
@@ -111,7 +115,7 @@ async def test_memories_api__other_users_memory__404(monkeypatch, supabase, cont
     before = dict(_row(supabase, memory.id))
     path = f"/api/v1/memories/{memory.id}"
 
-    async with _api(monkeypatch, container) as api:
+    async with _api(monkeypatch, container, supabase) as api:
         responses = [
             await api.patch(path, params={"user_id": "bob"}, json={"content": "Hijacked"}),
             await api.delete(path, params={"user_id": "bob"}),
@@ -143,9 +147,10 @@ class _MemoriesDown(FakeSupabase):
 
 @pytest.mark.asyncio
 async def test_memories_api__store_down__503_envelope(monkeypatch):
-    container = _container(_MemoriesDown())
+    supabase = _MemoriesDown()
+    container = _container(supabase)
 
-    async with _api(monkeypatch, container) as api:
+    async with _api(monkeypatch, container, supabase) as api:
         resp = await api.get("/api/v1/memories/", params={"user_id": "alice"})
 
     assert resp.status_code == 503
@@ -162,7 +167,7 @@ async def test_memories_api__dismiss__status_dismissed(monkeypatch, supabase, co
         provenance=MemorySource.INFERRED, origin="behavior",
     )
 
-    async with _api(monkeypatch, container) as api:
+    async with _api(monkeypatch, container, supabase) as api:
         dismissed = await api.post(
             f"/api/v1/memories/{memory.id}/dismiss", params={"user_id": "alice"}
         )
@@ -174,3 +179,58 @@ async def test_memories_api__dismiss__status_dismissed(monkeypatch, supabase, co
     row = _row(supabase, memory.id)
     assert (row["status"], row["content"]) == ("dismissed", SKIPS_AT_NINE)  # hidden, kept
     assert panel.json() == {"memories": [], "count": 0}
+
+
+@pytest.mark.asyncio
+async def test_memories_api__no_database__503_on_every_route_never_empty_or_404(monkeypatch):
+    container = _container(None)  # what the lifespan builds with Supabase unreachable
+    memory = await _remember(container, MARATHON)
+    path = f"/api/v1/memories/{memory.id}"
+    params = {"user_id": "alice"}
+
+    async with _api(monkeypatch, container, None) as api:
+        responses = [
+            await api.get("/api/v1/memories/", params=params),
+            await api.patch(path, params=params, json={"content": "Edited"}),
+            await api.delete(path, params=params),
+            await api.post(f"{path}/confirm", params=params),
+            await api.post(f"{path}/dismiss", params=params),
+        ]
+
+    assert [r.status_code for r in responses] == [503] * 5
+    assert {r.json()["error"]["code"] for r in responses} == {"persistence_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_memories_api__embedder_unavailable_on_edit__503_envelope(monkeypatch, supabase):
+    from app.infrastructure.embedding import MiniLMEmbedder
+
+    memory = await _remember(_container(supabase), MARATHON)
+    monkeypatch.setattr(
+        "app.infrastructure.embedding.embed_texts", lambda texts: [None] * len(texts)
+    )
+    container = _container(supabase, embedder=MiniLMEmbedder())
+
+    async with _api(monkeypatch, container, supabase) as api:
+        resp = await api.patch(
+            f"/api/v1/memories/{memory.id}",
+            params={"user_id": "alice"},
+            json={"content": "Training for the Pune half marathon"},
+        )
+
+    assert resp.status_code == 503
+    assert set(resp.json()["error"]) == {"code", "message", "details", "request_id"}
+    assert _row(supabase, memory.id)["content"] == MARATHON
+
+
+@pytest.mark.asyncio
+async def test_memories_api__confirm_after_dismiss__409_envelope(monkeypatch, supabase, container):
+    memory = await _remember(container, SKIPS_AT_NINE, "behavioral_pattern")
+
+    async with _api(monkeypatch, container, supabase) as api:
+        await api.post(f"/api/v1/memories/{memory.id}/dismiss", params={"user_id": "alice"})
+        resp = await api.post(f"/api/v1/memories/{memory.id}/confirm", params={"user_id": "alice"})
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "conflict"
+    assert _row(supabase, memory.id)["status"] == "dismissed"

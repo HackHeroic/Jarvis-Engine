@@ -6,11 +6,18 @@ keeps its embedding and pattern key), so the same fact, said or noticed again, i
 recognised and not stored. Every memory carries its provenance: the user said it, or
 Jarvis inferred it from what happened. Strength decays with time unused; a daily sweep
 persists the decay and fades what has dropped below the retention floor.
+
+DISMISSED and FORGOTTEN are terminal. Nothing automatic (a mention, a contradiction,
+the decay sweep) ever moves a memory out of them, and every write that could is a
+compare-and-set on the status, so a forget that lands between a read and its write
+still wins. The one way out of DISMISSED is the user's own forget, which erases it; a
+forgotten memory never changes again. Confirming or editing either is a conflict.
 """
 
 import asyncio
 import logging
 import re
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import ClassVar, Literal
@@ -35,8 +42,15 @@ logger = logging.getLogger(__name__)
 _MAX_STABILITY = 20.0
 # Confirming a memory makes Jarvis at least this sure of it.
 _CONFIRMED_CONFIDENCE = 0.9
-# Memories a mention can reinforce: a faded one comes back, a dismissed or forgotten one never.
-_REINFORCEABLE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+# Memories still in use: a mention reinforces one (a faded one comes back), the user may
+# confirm or edit one. A dismissed or forgotten memory is never among them again.
+_IN_USE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED})
+# What the user's forget may erase: anything not already forgotten.
+_FORGETTABLE = frozenset({MemoryStatus.ACTIVE, MemoryStatus.FADED, MemoryStatus.DISMISSED})
+_ACTIVE = frozenset({MemoryStatus.ACTIVE})
+# The memory that replaces memory X has an id derived from (user, X), so a supersede
+# retried after a partial failure finds the replacement it already stored.
+_SUPERSEDE_IDS = uuid.UUID("6f1d3c2a-6b0e-4f6a-9a51-2f0c8e7d4b19")
 # A letter or digit in any script: text without one has nothing in it to remember.
 _WORD = re.compile(r"[^\W_]")
 
@@ -115,9 +129,10 @@ class MemoryService:
     ) -> RememberOutcome:
         """Store, reinforce or supersede a memory, or recognise one the user let go of.
 
-        In order: a fact close to one the user forgot or dismissed is suppressed and
-        nothing is written; one that ``contradicts`` the user's active memory is added
-        and the old one superseded; one close to an active or faded memory of the same
+        In order: a fact close to one the user forgot or dismissed, of any type, is
+        suppressed and nothing is written; one that ``contradicts`` the user's active
+        memory is added and the old one superseded (safe to retry); one close to an
+        active or faded memory of the same
         type reinforces it (and confirms it when the user said it); anything else is
         created. Text with no words is never embedded: there is nothing to remember.
         """
@@ -125,13 +140,12 @@ class MemoryService:
             return RememberOutcome(action="suppressed", memory=None)
         embedding = await self._embed(candidate.content)
         now = self._clock()
-        same_type = frozenset({candidate.memory_type})
 
+        # Any type: a fact the user let go of stays gone whatever it is offered as.
         if await self._memories.nearest(
             user_id,
             embedding,
             statuses=SUPPRESSING_STATUSES,
-            types=same_type,
             limit=1,
             min_similarity=config.MEMORY_SUPPRESS_SIMILARITY,
         ):
@@ -154,15 +168,13 @@ class MemoryService:
         if candidate.contradicts is not None:
             old = await self._memories.get(user_id, candidate.contradicts)
             if old is not None and old.status is MemoryStatus.ACTIVE and old.superseded_by is None:
-                stored = await self._memories.add(user_id, new, embedding=embedding)
-                await self._memories.update(user_id, old.id, superseded_by=stored.id)
-                return RememberOutcome(action="superseded", memory=stored)
+                return await self._supersede(user_id, old, new, embedding)
 
         matches = await self._memories.nearest(
             user_id,
             embedding,
-            statuses=_REINFORCEABLE,
-            types=same_type,
+            statuses=_IN_USE,
+            types=frozenset({candidate.memory_type}),
             limit=1,
             min_similarity=config.MEMORY_DEDUPE_SIMILARITY,
         )
@@ -171,43 +183,63 @@ class MemoryService:
             fields = _reinforcement(existing, now)
             if provenance is MemorySource.SAID:  # saying it again confirms it
                 fields["last_confirmed_at"] = now
-            reinforced = await self._memories.update(user_id, existing.id, **fields)
+            try:
+                reinforced = await self._memories.update(
+                    user_id, existing.id, only_if_status=_IN_USE, **fields
+                )
+            except errors.StaleVersionError:  # dismissed or forgotten since it was found
+                return RememberOutcome(action="suppressed", memory=None)
             return RememberOutcome(action="reinforced", memory=reinforced)
 
         stored = await self._memories.add(user_id, new, embedding=embedding)
         return RememberOutcome(action="created", memory=stored)
 
     async def confirm(self, user_id: str, memory_id: str) -> Memory:
-        """The user says it holds: reinforce it, at least 0.9 sure, confirmed now."""
-        memory = await self._visible(user_id, memory_id)
+        """The user says it holds: reinforce it, at least 0.9 sure, confirmed now.
+
+        A dismissed or forgotten memory is a ConflictError: it stays let go of.
+        """
+        memory = await self._in_use(user_id, memory_id, "confirmed")
         now = self._clock()
         fields = _reinforcement(memory, now)
         fields["confidence"] = max(fields["confidence"], _CONFIRMED_CONFIDENCE)
         fields["last_confirmed_at"] = now
-        return await self._memories.update(user_id, memory_id, **fields)
+        return await self._memories.update(user_id, memory_id, only_if_status=_IN_USE, **fields)
 
     async def dismiss(self, user_id: str, memory_id: str) -> Memory:
-        """The user says it does not hold: hide it, keeping its words. It never comes back."""
-        memory = await self._visible(user_id, memory_id)
-        if memory.status is MemoryStatus.DISMISSED:
-            return memory
-        return await self._memories.update(user_id, memory_id, status=MemoryStatus.DISMISSED)
+        """The user says it does not hold: hide it, keeping its words. It never comes back.
+
+        Dismissing it again changes nothing; a forgotten memory is a ConflictError.
+        """
+        memory = await self._get(user_id, memory_id)
+        if memory.status is not MemoryStatus.DISMISSED:
+            try:
+                return await self._memories.update(
+                    user_id, memory_id, only_if_status=_IN_USE, status=MemoryStatus.DISMISSED
+                )
+            except errors.StaleVersionError:  # dismissed or forgotten meanwhile
+                memory = await self._get(user_id, memory_id)
+        if memory.status is MemoryStatus.FORGOTTEN:
+            raise _let_go(memory, "dismissed")
+        return memory
 
     async def forget(self, user_id: str, memory_id: str) -> None:
-        """Erase the memory's words for good.
+        """Erase the memory's words for good; a dismissed memory may be forgotten too.
 
         The row stays as a tombstone: its embedding and pattern key are kept, so the
         same fact said or noticed again is recognised and not stored. Forgetting a
         forgotten memory changes nothing; another user's memory is NotFoundError.
         """
-        memory = await self._memories.get(user_id, memory_id)
-        if memory is None:
-            raise errors.NotFoundError(
-                "That memory does not exist.", details={"memory_id": memory_id}
-            )
+        memory = await self._get(user_id, memory_id)
         if memory.status is MemoryStatus.FORGOTTEN:
             return
-        await self._memories.update(user_id, memory_id, status=MemoryStatus.FORGOTTEN, content="")
+        try:
+            await self._memories.update(
+                user_id, memory_id, only_if_status=_FORGETTABLE,
+                status=MemoryStatus.FORGOTTEN, content="",
+            )
+        except errors.StaleVersionError:  # forgotten meanwhile: the same end
+            return
 
     async def edit(
         self,
@@ -221,7 +253,7 @@ class MemoryService:
         mention is matched against what it says now."""
         if content is None and memory_type is None:
             raise errors.ValidationError("Nothing to change: give new words or a new type.")
-        await self._visible(user_id, memory_id)
+        await self._in_use(user_id, memory_id, "edited")
         fields: dict = {}
         if memory_type is not None:
             fields["memory_type"] = memory_type
@@ -230,7 +262,7 @@ class MemoryService:
                 raise errors.ValidationError("A memory needs at least one word.")
             fields["content"] = content
             fields["embedding"] = await self._embed(content)
-        return await self._memories.update(user_id, memory_id, **fields)
+        return await self._memories.update(user_id, memory_id, only_if_status=_IN_USE, **fields)
 
     async def list_active(
         self, user_id: str, *, types: frozenset[str] | None = None, now: datetime | None = None
@@ -261,25 +293,71 @@ class MemoryService:
                 continue
             strength = memory.strength_at(now)
             fields: dict = {"strength": strength, "strength_as_of": now}
-            if strength < config.MEMORY_RETENTION_FLOOR and memory.memory_type != "constraint":
+            fades = strength < config.MEMORY_RETENTION_FLOOR and memory.memory_type != "constraint"
+            if fades:
                 fields["status"] = MemoryStatus.FADED
+            try:
+                await self._memories.update(user_id, memory.id, only_if_status=_ACTIVE, **fields)
+            except errors.StaleVersionError:  # dismissed, forgotten or faded meanwhile
+                continue
+            if fades:
                 faded += 1
-            await self._memories.update(user_id, memory.id, **fields)
         return faded
 
-    async def _visible(self, user_id: str, memory_id: str) -> Memory:
-        """The user's memory, or NotFoundError: absent, another user's, or forgotten."""
+    async def _supersede(
+        self, user_id: str, old: Memory, new: Memory, embedding: list[float]
+    ) -> RememberOutcome:
+        """Store ``new`` and point ``old`` at it; safe to retry after a partial failure.
+
+        ``new`` gets an id derived from (user, old), so a retry finds the replacement
+        it already stored instead of adding a second. The link is guarded: if ``old``
+        stopped being active meanwhile, ``new`` simply stands as a created memory.
+        """
+        replacement_id = str(uuid.uuid5(_SUPERSEDE_IDS, f"{user_id}:{old.id}"))
+        try:
+            stored = await self._memories.add(
+                user_id, new.model_copy(update={"id": replacement_id}), embedding=embedding
+            )
+        except errors.ConflictError:  # stored by an earlier attempt
+            stored = await self._memories.get(user_id, replacement_id)
+            if stored is None:
+                raise
+        try:
+            await self._memories.update(
+                user_id, old.id, only_if_status=_ACTIVE, superseded_by=stored.id
+            )
+        except errors.StaleVersionError:
+            return RememberOutcome(action="created", memory=stored)
+        return RememberOutcome(action="superseded", memory=stored)
+
+    async def _get(self, user_id: str, memory_id: str) -> Memory:
+        """The user's memory, whatever its status; NotFoundError if absent or another user's."""
         memory = await self._memories.get(user_id, memory_id)
-        if memory is None or memory.status is MemoryStatus.FORGOTTEN:
+        if memory is None:
             raise errors.NotFoundError(
                 "That memory does not exist.", details={"memory_id": memory_id}
             )
+        return memory
+
+    async def _in_use(self, user_id: str, memory_id: str, verb: str) -> Memory:
+        """The user's memory if it is still in use; ConflictError if dismissed or forgotten."""
+        memory = await self._get(user_id, memory_id)
+        if memory.status not in _IN_USE:
+            raise _let_go(memory, verb)
         return memory
 
     async def _embed(self, text: str) -> list[float]:
         """Embed ``text`` off the event loop (the model is CPU work)."""
         (vector,) = await asyncio.to_thread(self._embedder.embed, [text])
         return vector
+
+
+def _let_go(memory: Memory, verb: str) -> errors.ConflictError:
+    """The user let go of ``memory`` (dismissed or forgotten); it cannot be ``verb`` now."""
+    return errors.ConflictError(
+        f"This memory was {memory.status.value}, so it can't be {verb}.",
+        details={"memory_id": memory.id, "status": memory.status.value},
+    )
 
 
 class MemoryDecaySweep(Sweep):
