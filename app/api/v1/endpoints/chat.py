@@ -8,6 +8,7 @@ import time as time_mod
 from collections.abc import AsyncGenerator
 from typing import Optional
 
+import anyio
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -1666,13 +1667,19 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             )
             yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
         finally:
-            # The graph no longer runs inline, so a client disconnect (GeneratorExit)
-            # would otherwise leave it churning through LLM calls nobody reads.
-            if pump_task is not None and not pump_task.done():
-                pump_task.cancel()
-                # Release the conversation only once this run has stopped writing it.
-                await asyncio.wait([pump_task])
-            await turn_lock.aclose()
+            # Shielded: under uvicorn, Starlette streams inside an anyio task group
+            # and a client disconnect cancels that scope — anyio then re-cancels
+            # every await made inside it, so an unshielded wait below would itself
+            # be cancelled, the lock would be left to the garbage collector, and a
+            # queued turn could start while this run was still unwinding.
+            with anyio.CancelScope(shield=True):
+                # The graph no longer runs inline, so a client disconnect would
+                # otherwise leave it churning through LLM calls nobody reads.
+                if pump_task is not None and not pump_task.done():
+                    pump_task.cancel()
+                    # Release the conversation only once this run has stopped writing it.
+                    await asyncio.wait([pump_task])
+                await turn_lock.aclose()
 
     # Usage attribution, like force_cloud_var: every LLM call of this turn — the
     # graph pump and every task it starts copy this context — is metered to this

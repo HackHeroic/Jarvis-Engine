@@ -221,18 +221,90 @@ async def test_chat_v2__queued_turn__sees_the_checkpoint_the_first_turn_left(no_
     assert "negotiation_state" not in graph.states["second"]  # resumed: inherited
 
 
+class _SlowUnwindGraph:
+    """The run for "first" blocks; cancelled, it takes a while to unwind, as a graph
+    with a checkpoint write in flight does."""
+
+    def __init__(self) -> None:
+        self.log: list[str] = []
+        self.first_running = asyncio.Event()
+
+    async def aget_state(self, config):
+        return _Snapshot({})
+
+    async def astream(self, state, config=None, **kwargs):
+        prompt = state["user_message"]
+        self.log.append(f"{prompt} starts")
+        if prompt == "first":
+            self.first_running.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                self.log.append("first cleanup done")
+                raise
+        self.log.append(f"{prompt} ends")
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+
+async def _serve_over_asgi(graph, prompt: str, disconnect: asyncio.Event) -> None:
+    """One request as uvicorn serves it: the handler, then its response called with
+    ASGI spec 2.3 — Starlette then streams inside an anyio task group and cancels the
+    stream when ``http.disconnect`` arrives. Handler and response share one task, as
+    under Starlette's ``request_response``."""
+    from app.api.v1.endpoints.chat import ChatRequest, chat_stream_v2
+
+    app_state = SimpleNamespace(jarvis_graph=graph, db_client=None, memory_store=None)
+    http_request = SimpleNamespace(app=SimpleNamespace(state=app_state))
+    response = await chat_stream_v2(ChatRequest(user_prompt=prompt, user_id="u1"), http_request)
+
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        pass
+
+    await response({"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send)
+
+
 @pytest.mark.asyncio
-async def test_chat_v2__client_disconnects_mid_turn__next_turn_runs(no_llm, monkeypatch):
+async def test_chat_v2__client_disconnects_mid_turn__lock_released_once_the_run_unwound(
+    no_llm, monkeypatch
+):
+    """anyio re-delivers the cancellation at every await of the stream's cleanup; an
+    unshielded cleanup is cancelled again and the lock is left to the garbage collector."""
     _stub_chat_io(monkeypatch)
-    graph = _TwoTabGraph()
-    first = asyncio.create_task(_drain(await _open_turn(graph, "first")))
+    graph = _SlowUnwindGraph()
+    gone = asyncio.Event()
+    first = asyncio.create_task(_serve_over_asgi(graph, "first", gone))
     await graph.first_running.wait()
 
-    first.cancel()  # the tab closed; the graph run is cancelled with it
-    await asyncio.gather(first, return_exceptions=True)
+    gone.set()  # the tab closed
+    await asyncio.wait_for(first, timeout=2)
 
-    await asyncio.wait_for(_drain(await _open_turn(graph, "second")), timeout=2)
-    assert graph.log[-2:] == ["second starts", "second ends"]
+    assert graph.log == ["first starts", "first cleanup done"]
+    assert turn_locks._locks == {}
+
+
+@pytest.mark.asyncio
+async def test_chat_v2__client_disconnects_mid_turn__queued_turn_starts_after_the_cleanup(
+    no_llm, monkeypatch
+):
+    _stub_chat_io(monkeypatch)
+    graph = _SlowUnwindGraph()
+    gone = asyncio.Event()
+    first = asyncio.create_task(_serve_over_asgi(graph, "first", gone))
+    await graph.first_running.wait()
+
+    gone.set()
+    await _settle()  # the cancellation has landed; the first run is unwinding
+    second = asyncio.create_task(_serve_over_asgi(graph, "second", asyncio.Event()))
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=2)
+
+    assert graph.log == ["first starts", "first cleanup done", "second starts", "second ends"]
+    assert turn_locks._locks == {}
 
 
 class _AttributionGraph:
