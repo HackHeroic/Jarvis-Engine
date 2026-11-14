@@ -251,6 +251,87 @@ async def test_bridge__dismissed_pattern__hands_the_hour_back(jarvis, llm, monke
     assert any(_touches(slot, 9, 10) for slot in _wall_clock(again))
 
 
+# --- forgetting a rule holds: said again, it is not stored again ---------------------
+
+MORNING_RULE = "Never put study before 11 AM"
+GYM_RULE = "Gym from 6 to 7 pm"
+
+
+def _script_rules(llm) -> None:
+    """The extraction hears each rule said in the message (verbatim, as inline habits).
+    Both translate deterministically (08:00-11:00 and 18:00-19:00 blocked): no model."""
+
+    def extract(req) -> str:
+        message = said(req)
+        habits = [
+            rule for trigger, rule in (("before 11", MORNING_RULE), ("Gym", GYM_RULE))
+            if trigger in message
+        ]
+        if habits:
+            return brain_dump(inline_habits=habits)
+        return brain_dump(planning_goal="Revise DSA") if "plan" in message.lower() else "{}"
+
+    llm.script("brain_dump_extraction", extract)
+    llm.script("socratic_chunker", decomposition(FIVE_TOPICS))
+
+
+async def _taught_then_forgotten(jarvis, monkeypatch) -> None:
+    """The morning rule stated, then its memory forgotten from the Memory panel."""
+    await jarvis.say("Please never put study before 11 AM, I'm useless then")
+    (memory,) = [
+        m for m in jarvis.rows("user_memories", user_id="alice") if m["content"] == MORNING_RULE
+    ]
+    async with _memory_api(jarvis, monkeypatch) as api:
+        forgot = await api.delete(f"/api/v1/memories/{memory['id']}", params={"user_id": "alice"})
+    assert forgot.status_code == 200
+    assert jarvis.rows("behavioral_constraints", user_id="alice") == []  # the rule went with it
+
+
+def _rules(jarvis) -> list[str]:
+    return [r["raw_text"] for r in jarvis.rows("behavioral_constraints", user_id="alice")]
+
+
+@pytest.mark.asyncio
+async def test_forgotten_rule__said_again_with_a_new_rule__only_the_new_rule_is_kept(
+    jarvis, llm, monkeypatch
+):
+    _script_rules(llm)
+    await _taught_then_forgotten(jarvis, monkeypatch)
+
+    turn = await jarvis.say("Never put study before 11 AM. Gym from 6 to 7 pm, too")
+
+    assert _rules(jarvis) == [GYM_RULE]  # a different rule in the same message is kept
+    assert turn.payload["saved_constraints"] == [GYM_RULE]
+    assert MORNING_RULE not in turn.reply
+    assert [m["content"] for m in jarvis.rows("user_memories", user_id="alice")
+            if m["content"] == MORNING_RULE] == []  # no memory of it either
+    learned = [data for event, data in turn.events if event == "memory_extracted"]
+    assert MORNING_RULE not in [frame["content"] for frame in learned]
+
+    plan = await jarvis.say("Plan my DSA revision")
+
+    slots = _wall_clock(plan)
+    assert any(_touches(slot, 8, 11) for slot in slots), slots  # the morning is free again
+    assert not [slot for slot in slots if _touches(slot, 18, 19)], slots
+
+
+@pytest.mark.asyncio
+async def test_forgotten_rule__said_again_alone__nothing_stored_and_no_failure_claimed(
+    jarvis, llm, monkeypatch
+):
+    _script_rules(llm)
+    await _taught_then_forgotten(jarvis, monkeypatch)
+
+    turn = await jarvis.say("Never put study before 11 AM")
+
+    assert _rules(jarvis) == []
+    assert turn.payload["saved_constraints"] == []
+    assert turn.payload["suggested_action"] is None  # nothing new to re-plan around
+    assert "locked in" not in turn.reply.lower()
+    assert "couldn't save" not in turn.reply.lower()  # nothing failed: it was let go
+    assert [event for event, _data in turn.events if event == "memory_extracted"] == []
+
+
 # --- the focus profile: learned hours lean the plan, stated rules still win ---------
 
 

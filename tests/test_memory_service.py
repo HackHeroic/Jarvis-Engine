@@ -506,3 +506,23 @@ async def test_snapshot__bounded_active_memories_and_only_the_ids_of_let_go_ones
     assert await service.drop_suppressed(
         "alice", ["hates early starts", "likes tea"], let_go_ids=snapshot.let_go_ids
     ) == ["likes tea"]  # suppression still works from the ids alone
+
+
+@pytest.mark.asyncio
+async def test_drop_let_go__forgotten_rule__dropped_by_the_test_remember_uses(service):
+    """A rule stored outside the memories is held to the same suppression as a memory:
+    said again in the same words it is dropped; anything else is kept."""
+    forgotten = (await service.remember("alice", _candidate("Never study before 11 AM"))).memory
+    await service.forget("alice", forgotten.id)
+
+    kept = await service.drop_let_go(
+        "alice", ["Never study before 11 AM", "Gym from 6 to 7 pm"]
+    )
+
+    assert kept == ["Gym from 6 to 7 pm"]
+    assert (await service.remember("alice", _candidate("Never study before 11 AM"))).action == (
+        "suppressed"
+    )  # the same fact, the same verdict
+    assert await service.drop_let_go("bob", ["Never study before 11 AM"]) == [
+        "Never study before 11 AM"
+    ]  # another user's forgetting is not bob's
