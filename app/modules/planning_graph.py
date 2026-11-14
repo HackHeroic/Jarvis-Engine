@@ -110,17 +110,19 @@ async def mark_missed(state: PlanningState) -> dict:
     if md.asks_to_bring_back_missed(state.get("user_message")):
         # The overdue message's offer ("say the word and I'll work it into this
         # plan"), kept: the set-aside tasks are pending again before fusion reads
-        # pending tasks, so this plan schedules them. Nothing is marked this turn.
+        # pending tasks, so this plan schedules them. Nothing is marked this turn,
+        # even when nothing was set aside (a second ask must not undo the first).
         restored = await md.restore_missed(state.get("user_id", "demo"), supabase)
-        if restored:
-            if user_model is not None and hasattr(user_model, "invalidate"):
-                user_model.invalidate("pending_tasks")
-            return {
-                "missed_deadlines": [],
-                "anti_guilt_message": md.build_restored_message(restored),
-                "restored_task_ids": [r["task_id"] for r in restored],
-                "_tool_detail": {"restored": len(restored)},
-            }
+        if not restored:
+            return {"missed_deadlines": [], "anti_guilt_message": None}
+        if user_model is not None and hasattr(user_model, "invalidate"):
+            user_model.invalidate("pending_tasks")
+        return {
+            "missed_deadlines": [],
+            "anti_guilt_message": md.build_restored_message(restored),
+            "restored_task_ids": [r["task_id"] for r in restored],
+            "_tool_detail": {"restored": len(restored)},
+        }
     try:
         overdue = await md.detect_and_mark_missed(
             state.get("user_id", "demo"), supabase, zone=await _user_zone(state)

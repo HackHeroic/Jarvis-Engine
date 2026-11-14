@@ -371,6 +371,44 @@ async def test_anti_guilt__user_asks_for_the_missed_tasks__they_come_back_into_t
     assert blame_phrases_in(framing) == []
 
 
+@pytest.mark.asyncio
+async def test_anti_guilt__user_asks_for_the_missed_tasks_twice__they_stay_in_the_plan(
+    jarvis, llm, monday_morning
+):
+    """The second ask finds nothing set aside; it must not set the restored tasks aside again."""
+    _seed_overdue(jarvis)
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    planned = await jarvis.say("Plan my DSA revision")
+    await jarvis.say("Yes please, add the missed tasks back in", session=planned.conversation_id)
+
+    turn = await jarvis.say("And add the missed tasks back in, please", session=planned.conversation_id)
+
+    assert {r["status"] for r in jarvis.rows("user_tasks", goal_id="old")} == {"pending"}
+    scheduled_titles = {t["title"] for t in turn.payload["schedule"]["schedule"].values()}
+    assert {"Problem set 3", "Read chapter 2"} <= scheduled_titles
+
+
+@pytest.mark.parametrize("accept_first", [True, False], ids=["accepted", "not_yet_accepted"])
+@pytest.mark.asyncio
+async def test_anti_guilt__restored_tasks__next_plan_does_not_set_them_aside_again(
+    jarvis, llm, monday_morning, accept_first
+):
+    """Bringing a task back is durable: its passed deadline no longer sets it aside."""
+    _seed_overdue(jarvis)
+    _script_plan(llm, decomposition(["Graphs", "DP", "Trees", "Heaps", "Mocks"]))
+    planned = await jarvis.say("Plan my DSA revision")
+    await jarvis.say("Yes please, add the missed tasks back in", session=planned.conversation_id)
+    if accept_first:
+        await jarvis.say("looks good", session=planned.conversation_id)
+
+    turn = await jarvis.say("Plan my DSA revision")
+
+    restored = [r for r in jarvis.rows("user_tasks") if r["title"] in ("Problem set 3", "Read chapter 2")]
+    assert {r["status"] for r in restored} == {"pending"}
+    scheduled_titles = {t["title"] for t in turn.payload["schedule"]["schedule"].values()}
+    assert {"Problem set 3", "Read chapter 2"} <= scheduled_titles
+
+
 @pytest.mark.parametrize(
     "message",
     ["Plan my DSA revision", "Don't add the missed tasks, just plan DSA"],
@@ -399,7 +437,11 @@ async def test_anti_guilt__replan_without_asking__missed_tasks_stay_set_aside(
         ("bring back what I missed", True),
         ("ok, work them in — the missed ones", True),
         ("bring the set-aside tasks back", True),
+        ("reschedule my missed tasks", True),
+        ("add the tasks I missed back", True),
+        ("Yes please, add the missed tasks back in", True),
         ("I missed the bus", False),
+        ("I missed the lecture, add a review session", False),
         ("add graphs to the plan", False),
         ("don't add the missed tasks", False),
         ("", False),
