@@ -4,7 +4,7 @@ from datetime import datetime, time
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.domain.errors import InvalidStateTransition
 
@@ -229,6 +229,45 @@ class Pattern(BaseModel):
     evidence: list[str] = Field(
         default_factory=list, description="References to the observations behind it."
     )
+
+
+class HourFocus(BaseModel):
+    """How well the user gets things done in one local hour of their day."""
+
+    hour: int = Field(ge=0, le=23, description="Local hour of the day, 0 to 23.")
+    score: float = Field(
+        ge=0.0, le=1.0, description="Focus at this hour, from 0 (none) to 1 (peak)."
+    )
+    done: int = Field(ge=0, description="Slots at this hour that were completed.")
+    not_done: int = Field(
+        ge=0, description="Slots at this hour that were set aside or didn't happen."
+    )
+
+
+class FocusProfile(BaseModel):
+    """The user's focus across the 24 hours of their day, learned or assumed."""
+
+    source: Literal["prior", "learned"] = Field(
+        description=(
+            "'learned' once there are enough outcomes to trust; 'prior' is the default"
+            " table, which never steers the solver."
+        )
+    )
+    observations: int = Field(ge=0, description="Outcomes with a slot the profile was built from.")
+    hours: list[HourFocus] = Field(
+        min_length=24, max_length=24, description="One entry per local hour; index == hour."
+    )
+
+    @field_validator("hours")
+    @classmethod
+    def _index_is_hour(cls, hours: list[HourFocus]) -> list[HourFocus]:
+        if any(h.hour != i for i, h in enumerate(hours)):
+            raise ValueError("hours must run 0 to 23 in order, one entry per hour")
+        return hours
+
+    def scores(self) -> list[float]:
+        """The 24 focus scores; index == local hour."""
+        return [h.score for h in self.hours]
 
 
 class Suggestion(BaseModel):

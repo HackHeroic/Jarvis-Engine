@@ -336,3 +336,149 @@ def test_run_schedule__memory_block_overlapping_habit_block__feasible(before_the
     assert len(resp.schedule) == 5
     for task in resp.schedule.values():
         assert task.start_min >= 180, "task placed inside the blocked morning"
+
+
+# --- the energy term: a learned focus profile leans hard tasks toward the best hours ---
+
+# Minute 0 is 08:00 local: 09:00 is minute 60, 19:00 is minute 660.
+NINE_AND_SEVEN_PM = [(60, 90), (660, 690)]
+TODAY = "2026-11-16"  # the day before_the_horizon freezes
+IN_3_DAYS = "2026-11-19"
+
+
+def _blocked_except(free: list[tuple[int, int]], horizon: int = 1440) -> list:
+    """Hard blocks over the whole horizon except the ``free`` windows."""
+    from app.schemas.context import Availability, TimeSlot
+
+    slots, cursor = [], 0
+    for i, (start, end) in enumerate(sorted(free)):
+        if start > cursor:
+            slots.append(TimeSlot(name=f"busy_{i}", start_min=cursor, end_min=start,
+                                  availability=Availability.BLOCKED))
+        cursor = end
+    if cursor < horizon:
+        slots.append(TimeSlot(name="busy_rest", start_min=cursor, end_min=horizon,
+                              availability=Availability.BLOCKED))
+    return slots
+
+
+def _graph(*tasks: tuple[str, int, float, str | None]):
+    """An ExecutionGraph of (task_id, minutes, difficulty, deadline_hint) tasks."""
+    from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata, TaskChunk
+
+    chunks = [TaskChunk(task_id=tid, title=tid, duration_minutes=minutes,
+                        difficulty_weight=difficulty, dependencies=[],
+                        completion_criteria="done", deadline_hint=deadline)
+              for tid, minutes, difficulty, deadline in tasks]
+    return ExecutionGraph(goal_metadata=GoalMetadata(), decomposition=chunks,
+                          cognitive_load_estimate={"intrinsic_load": 0.5})
+
+
+def _peak_at(hour: int, *, rest: float = 0.2) -> list[float]:
+    """A focus profile: full focus at ``hour``, ``rest`` everywhere else."""
+    return [1.0 if h == hour else rest for h in range(24)]
+
+
+def _overlaps(task, start: int, end: int) -> bool:
+    return task.start_min < end and task.end_min > start
+
+
+def test_energy_term__two_free_slots__hard_task_takes_high_focus_slot(before_the_horizon):
+    from app.api.v1.endpoints import schedule as sep
+
+    # Listed B first: on TMT alone the two are tied and this order puts A at 09:00.
+    graph = _graph(("B", 25, 0.1, IN_3_DAYS), ("A", 25, 0.9, IN_3_DAYS))
+
+    resp = sep.run_schedule(graph, _blocked_except(NINE_AND_SEVEN_PM), horizon_minutes=1440,
+                            focus_by_hour=_peak_at(19))
+
+    assert resp.schedule["A"].start_min == 660
+    assert resp.schedule["B"].start_min == 60
+
+
+def test_energy_term__flag_off__identical_to_no_profile(before_the_horizon, monkeypatch):
+    import app.core.config as config
+    from app.api.v1.endpoints import schedule as sep
+
+    def plan(focus):
+        # B is shorter, so without a profile the hard task takes 09:00 (a smaller makespan).
+        graph = _graph(("A", 25, 0.9, IN_3_DAYS), ("B", 10, 0.1, IN_3_DAYS))
+        return sep.run_schedule(graph, _blocked_except(NINE_AND_SEVEN_PM), horizon_minutes=1440,
+                                focus_by_hour=focus).schedule
+
+    without_profile = plan(None)
+    with_profile = plan(_peak_at(19))
+    monkeypatch.setattr(config, "ENERGY_OBJECTIVE_ENABLED", False)
+    flag_off = plan(_peak_at(19))
+
+    assert flag_off == without_profile
+    assert with_profile != without_profile  # the profile would have moved it; the flag held it
+
+
+def test_energy_term__task_due_today__tmt_order_kept(before_the_horizon, monkeypatch):
+    from app.api.v1.endpoints import schedule as sep
+
+    weights: dict[str, int] = {}
+
+    class _Recording(JarvisScheduler):
+        def add_task(self, task_id, *args, energy_weight=0, **kwargs):
+            weights[task_id] = energy_weight
+            super().add_task(task_id, *args, energy_weight=energy_weight, **kwargs)
+
+    monkeypatch.setattr(sep, "JarvisScheduler", _Recording)
+    # Free 09:00-09:25 and 10:00-10:25; the profile peaks at 10:00, where the hard,
+    # due-today task would go if the energy term could outweigh its urgency.
+    graph = _graph(("later", 25, 0.1, IN_3_DAYS), ("today", 25, 0.9, TODAY))
+
+    resp = sep.run_schedule(graph, _blocked_except([(60, 85), (120, 145)]), horizon_minutes=1440,
+                            focus_by_hour=_peak_at(10, rest=0.0))
+
+    assert resp.schedule["today"].start_min < resp.schedule["later"].start_min
+    assert weights == {"later": 4, "today": 0}
+
+
+@pytest.mark.parametrize(
+    "focus",
+    [_peak_at(9), _peak_at(18), _peak_at(2), _peak_at(13, rest=0.6), [0.0] * 24],
+    ids=["peak_in_lecture", "peak_in_gym", "peak_in_the_night", "mild_peak", "flat_zero"],
+)
+def test_energy_term__hard_blocks_never_violated(before_the_horizon, focus):
+    from app.api.v1.endpoints import schedule as sep
+    from app.schemas.context import Availability, TimeSlot
+
+    blocked = Availability.BLOCKED
+    ctx = [
+        TimeSlot(name="lecture_d0", start_min=60, end_min=180, availability=blocked),
+        TimeSlot(name="gym_d0", start_min=600, end_min=690, availability=blocked),
+        TimeSlot(name="lecture_d1", start_min=1500, end_min=1620, availability=blocked),
+        TimeSlot(name="gym_d1", start_min=2040, end_min=2130, availability=blocked),
+    ]
+    graph = _graph(*[(f"t{i}", 25, d, None) for i, d in enumerate([0.9, 0.8, 0.5, 0.3, 0.9, 0.1])])
+
+    resp = sep.run_schedule(graph, ctx, horizon_minutes=2880, focus_by_hour=focus)
+
+    # run_schedule appended the default night to ctx: every block it solved against.
+    blocks = [(s.start_min, s.end_min) for s in ctx if s.availability == blocked]
+    assert len(blocks) > 4
+    assert len(resp.schedule) == 6
+    for tid, task in resp.schedule.items():
+        for start, end in blocks:
+            assert not _overlaps(task, start, end), (tid, task, (start, end))
+
+
+def test_energy_term__minimal_work_window_at_peak__hard_task_still_kept_out(before_the_horizon):
+    from app.api.v1.endpoints import schedule as sep
+    from app.schemas.context import Availability, TimeSlot
+
+    # 19:00-19:30 is the peak hour, but a minimal-work window (a commute): only short,
+    # easy tasks may sit in it. Without it the energy term puts the hard task there.
+    ctx = _blocked_except(NINE_AND_SEVEN_PM) + [
+        TimeSlot(name="commute", start_min=660, end_min=690, availability=Availability.MINIMAL_WORK)
+    ]
+    graph = _graph(("hard", 25, 0.9, IN_3_DAYS), ("easy", 10, 0.1, IN_3_DAYS))
+
+    resp = sep.run_schedule(graph, ctx, horizon_minutes=1440, focus_by_hour=_peak_at(19))
+
+    assert not _overlaps(resp.schedule["hard"], 660, 690)
+    assert resp.schedule["hard"].start_min == 60
+    assert resp.schedule["easy"].start_min == 660

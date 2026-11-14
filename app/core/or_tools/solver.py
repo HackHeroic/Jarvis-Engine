@@ -17,9 +17,10 @@ from typing import Optional
 
 from ortools.sat.python import cp_model
 
-from app.core.or_tools.constraints import merge_time_windows
+from app.core.or_tools.constraints import energy_objective_terms, merge_time_windows
 
 MINUTES_PER_DAY = 1440
+HOURS_PER_DAY = 24
 
 
 class JarvisScheduler:
@@ -53,6 +54,10 @@ class JarvisScheduler:
         self.hard_blocks: list[tuple[int, int, str]] = []
         self.soft_blocks: list[tuple] = []  # (interval_var, max_duration, max_difficulty)
         self._load_d_vars: list = []  # for spread objective
+        # The energy term: per-local-hour penalties and the local hour of minute 0.
+        # None (the default) leaves the objective without it.
+        self._focus_penalties: list[int] | None = None
+        self._day_start_hour: int = 0
 
     def add_hard_block(self, start_min: int, end_min: int, name: str) -> None:
         """Add a non-negotiable block (e.g., sleep 23:00–07:00).
@@ -115,6 +120,21 @@ class JarvisScheduler:
         )
         self.soft_blocks.append((iv, max_task_duration, max_difficulty))
 
+    def set_focus_penalties(self, penalty_by_hour: list[int], day_start_hour: int) -> None:
+        """Turn on the energy term: tasks with an energy weight lean toward low-penalty hours.
+
+        Args:
+            penalty_by_hour: 24 integers, index == local hour; 0 is the best hour.
+            day_start_hour: Local hour of minute 0 (DAY_START_HOUR).
+        """
+        if len(penalty_by_hour) != HOURS_PER_DAY:
+            # A shorter table would quietly forbid every hour past its end.
+            raise ValueError(
+                f"penalty_by_hour needs {HOURS_PER_DAY} entries, got {len(penalty_by_hour)}"
+            )
+        self._focus_penalties = list(penalty_by_hour)
+        self._day_start_hour = day_start_hour
+
     def add_task(
         self,
         task_id: str,
@@ -122,6 +142,7 @@ class JarvisScheduler:
         priority_score: int,
         dependencies: list[str],
         difficulty_weight: float = 1.0,
+        energy_weight: int = 0,
     ) -> None:
         """Add a schedulable task with variable start/end.
 
@@ -131,6 +152,8 @@ class JarvisScheduler:
             priority_score: TMT-derived integer for objective weighting.
             dependencies: List of task_ids that must finish before this one.
             difficulty_weight: Cognitive load 0–1; used for soft-block qualification.
+            energy_weight: How strongly the task leans toward high-focus hours once
+                ``set_focus_penalties`` is called; 0 (the default) never leans.
         """
         start_var = self.model.new_int_var(
             0, self.horizon, f"start_{task_id}"
@@ -147,6 +170,7 @@ class JarvisScheduler:
             "dependencies": dependencies,
             "duration": duration,
             "difficulty_weight": difficulty_weight,
+            "energy_weight": energy_weight,
         }
 
     def build_dependencies(self) -> None:
@@ -204,7 +228,9 @@ class JarvisScheduler:
         Applies AddNoOverlap to all intervals (tasks + hard blocks),
         builds dependencies, and minimizes a weighted objective:
         makespan + Σ(priority_i × start_i) so high-priority tasks
-        are scheduled earlier.
+        are scheduled earlier. With focus penalties set, Σ(energy_weight_i ×
+        penalty[local hour of start_i]) leans weighted tasks toward the user's
+        high-focus hours.
 
         The search is capped at ``SOLVER_MAX_TIME_SECONDS``; see config for why.
         An expired cap yields FEASIBLE (best schedule found so far, returned as
@@ -255,6 +281,14 @@ class JarvisScheduler:
             for load_d in self._load_d_vars:
                 self.model.add(max_load >= load_d)
             obj_expr += weight_spread * max_load
+
+        # Energy term: only after set_focus_penalties (a learned focus profile).
+        if self._focus_penalties is not None:
+            obj_expr += sum(
+                energy_objective_terms(
+                    self.model, self.tasks, self._focus_penalties, self._day_start_hour
+                )
+            )
 
         self.model.minimize(obj_expr)
 

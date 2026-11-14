@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+import app.core.config as config
 from app.api.v1.endpoints.reasoning import ExecutionGraph, GoalMetadata
 from app.core.config import DEFAULT_HORIZON_MINUTES
 from app.services.planning.local_time import day_start_on, logical_day_start, user_zone
@@ -84,6 +85,29 @@ def _compute_tmt_priority(
     motivation = (expectancy * value) / (1.0 + IMPULSIVENESS * delay)
     priority_score = max(1, int(motivation * 100))
     return (motivation, priority_score)
+
+
+# ---------------------------------------------------------------------------
+# The energy term (a learned focus profile; see energy_objective_terms)
+# ---------------------------------------------------------------------------
+
+# Tasks due within this many hours (today's, and overdue ones) keep their TMT place.
+ENERGY_MIN_DELAY_HOURS = 24
+
+
+def _focus_penalties(focus_by_hour: List[float]) -> List[int]:
+    """Per local hour: round(10 × (1 − score)), 0 at full focus and 10 at none."""
+    return [round(10 * (1 - score)) for score in focus_by_hour]
+
+
+def _energy_weight(difficulty_weight: float, delay_hours: float) -> int:
+    """How strongly a task leans toward high-focus hours: ENERGY_OBJECTIVE_WEIGHT × difficulty.
+
+    0 for a task due today or overdue, so the energy term never competes with urgency.
+    """
+    if delay_hours < ENERGY_MIN_DELAY_HOURS:
+        return 0
+    return round(config.ENERGY_OBJECTIVE_WEIGHT * difficulty_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -244,9 +268,14 @@ def run_schedule(
     db_client: object = None,
     zone: Optional[ZoneInfo] = None,
     block_past: Optional[bool] = None,
+    focus_by_hour: list[float] | None = None,
 ) -> GenerateScheduleResponse:
     """Reusable schedule generation from ExecutionGraph and daily context.
     Raises HTTPException on INFEASIBLE.
+
+    ``focus_by_hour`` is a learned focus profile (24 scores, index == local hour).
+    With it, and with ``ENERGY_OBJECTIVE_ENABLED``, each task not due today leans
+    toward the user's high-focus hours. Without it the objective is TMT alone.
 
     Minute 0 is 08:00 in the user's ``zone`` (default: ``user_zone()``). Without an
     explicit ``horizon_start`` it is 08:00 on the user's logical day — yesterday's
@@ -323,6 +352,11 @@ def run_schedule(
     if already_past:
         scheduler.add_hard_block(0, already_past, "past")
 
+    # Minute 0 is DAY_START_HOUR local, so the penalties are indexed by local hour.
+    energy_on = focus_by_hour is not None and config.ENERGY_OBJECTIVE_ENABLED
+    if energy_on:
+        scheduler.set_focus_penalties(_focus_penalties(focus_by_hour), config.DAY_START_HOUR)
+
     # Enforce dynamic calendar blocks from daily_context
     for slot in daily_context:
         if slot.availability == Availability.BLOCKED:
@@ -367,6 +401,7 @@ def run_schedule(
             priority_score,
             chunk.dependencies,
             difficulty_weight=chunk.difficulty_weight,
+            energy_weight=_energy_weight(chunk.difficulty_weight, delay_h) if energy_on else 0,
         )
 
     result, status_or_empty = scheduler.solve()

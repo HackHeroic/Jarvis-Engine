@@ -185,6 +185,18 @@ DEFAULT_TIMEZONE: str = os.getenv("JARVIS_DEFAULT_TIMEZONE", "Asia/Kolkata")
 SLOT_GRACE_MINUTES: int = 30
 SLOT_SWEEP_LOOKBACK_DAYS: int = 7
 
+# The focus profile (app/services/energy.py) and the solver's energy term. Outcomes of
+# the last FOCUS_WINDOW_DAYS count for the local hour of their slot; each hour's score
+# is smoothed toward the heuristic prior with FOCUS_PRIOR_STRENGTH pseudo-outcomes. The
+# profile is "learned" from MIN_FOCUS_OBSERVATIONS outcomes, and only a learned profile
+# steers the solver: each task not due today leans toward high-focus hours with weight
+# ENERGY_OBJECTIVE_WEIGHT x difficulty. JARVIS_ENERGY_OBJECTIVE=false turns the term off.
+ENERGY_OBJECTIVE_ENABLED: bool = os.getenv("JARVIS_ENERGY_OBJECTIVE", "true").lower() != "false"
+ENERGY_OBJECTIVE_WEIGHT: int = 40
+FOCUS_WINDOW_DAYS: int = 28
+FOCUS_PRIOR_STRENGTH: float = 3.0
+MIN_FOCUS_OBSERVATIONS: int = 10
+
 # CP-SAT wall-clock cap. An uncapped solve has no upper bound, and it sits on
 # the request path — on the streaming plan flow that is an unbounded stall with
 # every queued SSE frame stuck behind it. Capped, CP-SAT returns the best

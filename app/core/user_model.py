@@ -135,22 +135,12 @@ class UserModel:
         self._cache["pearl_patterns"] = patterns
 
     async def get_estimated_energy(self) -> float:
+        from app.services.energy import HeuristicEnergyEstimator
         from app.services.planning.local_time import user_zone
 
         # The user's hour, not the server's: energy follows their day.
         hour = datetime.now(user_zone(self._cache.get("profile"))).hour
-        if 9 <= hour <= 12:
-            return 0.9
-        elif 15 <= hour <= 17:
-            return 0.85
-        elif 13 <= hour <= 14:
-            return 0.5
-        elif 7 <= hour <= 9:
-            return 0.7
-        elif 17 < hour <= 21:
-            return 0.6
-        else:
-            return 0.3
+        return HeuristicEnergyEstimator().score(hour)
 
     def invalidate(self, key: str) -> None:
         self._cache.pop(key, None)

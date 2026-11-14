@@ -1559,3 +1559,61 @@ async def test_expand_slots__daily_blocked_habit__recurs_across_horizon():
     assert len(slots) >= 3, f"expected daily recurrence over 3 days, got {len(slots)}"
     day_starts = sorted(s["start_min"] for s in slots)
     assert day_starts[:3] == [0, 1440, 2880]
+
+
+# ---------------------------------------------------------------------------
+# fetch_constraints — the learned focus profile, read once per turn
+# ---------------------------------------------------------------------------
+
+_IST = ZoneInfo("Asia/Kolkata")
+_PLAN_NOW = datetime(2026, 11, 16, 8, 0, tzinfo=_IST)
+
+
+async def _container_with_evening_completions(count: int):
+    """A registered composition root whose history holds ``count`` 19:00 completions for u1."""
+    from datetime import timedelta
+
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.core import runtime
+    from app.domain.entities import TaskEvent, TaskEventType
+    from app.orchestrator.hooks import ActionHooks
+
+    container = AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks())
+    runtime.set_container(container)  # conftest resets the registry afterwards
+    for day in range(1, count + 1):
+        slot = (_PLAN_NOW - timedelta(days=day)).replace(hour=19)
+        await container.repos.task_events.append("u1", TaskEvent(
+            user_id="u1", task_id=f"past_{day}", event_type=TaskEventType.COMPLETED,
+            occurred_at=slot + timedelta(minutes=25), scheduled_start=slot,
+            scheduled_end=slot + timedelta(minutes=25),
+        ))
+    return container
+
+
+@pytest.mark.asyncio
+async def test_fetch_constraints__learned_profile__focus_on_state(clock):
+    import app.modules.planning_graph as pg
+    from app.services.energy import HeuristicEnergyEstimator
+
+    clock.freeze(_PLAN_NOW, pg)
+    container = await _container_with_evening_completions(12)
+
+    result = await pg.fetch_constraints({"user_id": "u1", "user_model": None})
+
+    learned = await container.energy.estimate("u1", _IST, now=_PLAN_NOW)
+    assert learned.source == "learned"
+    assert result["focus_by_hour"] == learned.scores()
+    assert result["focus_by_hour"][19] > HeuristicEnergyEstimator().score(19)
+
+
+@pytest.mark.asyncio
+async def test_fetch_constraints__prior_profile__no_focus(clock):
+    import app.modules.planning_graph as pg
+
+    clock.freeze(_PLAN_NOW, pg)
+    await _container_with_evening_completions(9)  # one outcome short of a learned profile
+
+    result = await pg.fetch_constraints({"user_id": "u1", "user_model": None})
+
+    assert result["focus_by_hour"] is None
