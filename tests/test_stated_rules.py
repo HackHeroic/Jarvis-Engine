@@ -243,3 +243,81 @@ async def test_replan__after_deleting_the_rule__morning_free_again(wired):
 
     assert await _morning_blocks(container, fake) == ("", [])
     assert await container.memory_service.list_active("alice") == []
+
+
+# --- one memory, differently worded rules: deleting one rule never removes another -----
+
+STUDY = "Never study before 11 AM"
+WORK = "Never work after 10 PM"
+COMPOUND = "Never study before 11 AM and never work after 10 PM"
+
+
+async def _compound(repos, rules, memory):
+    """One memory of saying two rules at once, each rule linked to it."""
+    study = await repos.constraints.add("alice", _rule(text=STUDY))
+    work = await repos.constraints.add("alice", _rule(text=WORK))
+    remembered = await _said(memory, text=COMPOUND)
+    for rule in (study, work):
+        assert await rules.link("alice", rule.id, remembered.id)
+    return study, work, remembered
+
+
+@pytest.mark.asyncio
+async def test_delete_rule__compound_memory__the_other_rule_and_the_memory_stay(
+    repos, rules, memory
+):
+    study, work, remembered = await _compound(repos, rules, memory)
+
+    assert await rules.delete_rule("alice", study.id) is True
+
+    assert [r.raw_text for r in await repos.constraints.list_active("alice")] == [WORK]
+    assert (await repos.memories.get("alice", remembered.id)).status is MemoryStatus.ACTIVE
+
+    assert await rules.delete_rule("alice", work.id) is True  # the last rule saying it
+    assert await repos.constraints.list_active("alice") == []
+    assert (await repos.memories.get("alice", remembered.id)).status is MemoryStatus.FORGOTTEN
+
+
+@pytest.mark.asyncio
+async def test_forget_memory__compound_memory__every_rule_it_holds_goes_and_is_named(
+    repos, rules, memory
+):
+    study, work, remembered = await _compound(repos, rules, memory)
+
+    gone = await rules.forget_memory("alice", remembered.id)
+
+    assert sorted(gone) == sorted([study.id, work.id])
+    assert await repos.constraints.list_active("alice") == []
+    assert await rules.forget_memory("alice", remembered.id) == []  # again: nothing left
+
+
+@pytest.mark.asyncio
+async def test_delete_rule__a_later_rule_merged_into_the_same_memory__the_first_stays(
+    repos, rules, memory
+):
+    first = await repos.constraints.add("alice", _rule(text="Never schedule before 11 AM"))
+    remembered = await _said(memory)
+    await rules.link("alice", first.id, remembered.id)
+    later = await repos.constraints.add("alice", _rule(text="No meetings before 11 AM, please"))
+    await rules.link("alice", later.id, remembered.id)  # reinforced into the same memory
+
+    assert await rules.delete_rule("alice", later.id) is True
+
+    assert [r.id for r in await repos.constraints.list_active("alice")] == [first.id]
+    assert (await repos.memories.get("alice", remembered.id)).status is MemoryStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_delete_rule__same_words_said_twice__both_copies_go_whatever_the_spacing(
+    repos, rules, memory
+):
+    rule = await repos.constraints.add("alice", _rule(text="Never schedule before 11 AM"))
+    copy = await repos.constraints.add("alice", _rule(text="  never schedule before 11 am. "))
+    remembered = await _said(memory)
+    for each in (rule, copy):
+        await rules.link("alice", each.id, remembered.id)
+
+    assert await rules.delete_rule("alice", rule.id) is True
+
+    assert await repos.constraints.list_active("alice") == []
+    assert (await repos.memories.get("alice", remembered.id)).status is MemoryStatus.FORGOTTEN
