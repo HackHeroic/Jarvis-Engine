@@ -189,6 +189,16 @@ class ConstraintRepository(ABC):
     async def delete(self, user_id: str, constraint_id: str) -> bool:
         """Delete the user's constraint; return whether one was deleted."""
 
+    @abstractmethod
+    async def set_semantics(
+        self, user_id: str, constraint_id: str, structured_semantics: dict
+    ) -> BehavioralConstraint | None:
+        """Replace the constraint's ``structured_semantics``; return it as stored now.
+
+        None when the user has no such constraint (another user's, or an id that is
+        not one), and nothing is written.
+        """
+
 
 class ProfileRepository(ABC):
     """Storage for user profiles."""

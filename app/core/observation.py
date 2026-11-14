@@ -217,6 +217,9 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
         "source_message_id": _uuid_or_none(state.get("user_message_id")),
     }
     landed: list[RememberOutcome] = []
+    # (what was extracted, the id of the memory it landed on): for linking the rules
+    # store_constraint saved this turn to the memories of stating them.
+    stored: list[tuple[ExtractedMemory, str]] = []
     loop = asyncio.get_running_loop()
     deadline = loop.time() + MEMORY_PERSIST_TIMEOUT_S
 
@@ -257,7 +260,47 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
             logger.warning(f"A memory from this turn was not learned ({type(e).__name__})")
             continue
         landed.append(outcome)
+        if outcome.memory is not None and outcome.memory.id:
+            stored.append((memory, outcome.memory.id))
+    await _link_rules(container, user_id, state.get("saved_rule_ids") or {}, stored)
     return landed
+
+
+def _states(memory: ExtractedMemory, habit: str) -> bool:
+    """Whether ``memory`` is the memory of stating ``habit``: its words, or a memory that
+    covers them (``turn_memories`` stored no separate memory for the habit then)."""
+    habit = habit.strip()
+    return (memory.content or "").strip() == habit or _covered(habit, [memory])
+
+
+async def _link_rules(
+    container: Any,
+    user_id: str,
+    rule_ids: dict[str, str],
+    stored: list[tuple[ExtractedMemory, str]],
+) -> None:
+    """Link each rule saved this turn to the memory of stating it (``StatedRules.link``).
+
+    A rule left unlinked (its memory not stored, a failed or slow write) is still a rule
+    and still planned; only the memory of stating it then also blocks its hours.
+    """
+    links = [
+        (rule_id, memory_id)
+        for habit, rule_id in rule_ids.items()
+        for memory_id in [next((mid for m, mid in stored if _states(m, habit)), None)]
+        if memory_id is not None
+    ]
+    if not links:
+        return
+
+    async def link_all() -> None:
+        for rule_id, memory_id in links:
+            await container.stated_rules.link(user_id, rule_id, memory_id)
+
+    try:
+        await asyncio.wait_for(link_all(), timeout=MEMORY_WRITE_TIMEOUT_S)
+    except Exception as e:  # asyncio.TimeoutError included
+        logger.warning(f"A stated rule was not linked to its memory ({type(e).__name__})")
 
 
 def memory_frames(outcomes: list[RememberOutcome]) -> list[dict]:

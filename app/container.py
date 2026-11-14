@@ -45,6 +45,7 @@ from app.services.memory.conversation_memory import (
 )
 from app.services.memory.memory_service import MemoryDecaySweep, MemoryService
 from app.services.memory.patterns import PatternObserver, PatternService
+from app.services.memory.stated_rules import StatedRules
 from app.services.task_service import SlotPassedSweep, TaskService
 from app.services.usage_ledger import UsageLedger
 from app.services.user_model_service import UserModelService
@@ -75,6 +76,7 @@ class AppContainer:
     anticipation_listener: AnticipationListener
     user_model_service: UserModelService
     conversation_memory: ConversationMemoryService
+    stated_rules: StatedRules
 
     @classmethod
     def build(
@@ -180,6 +182,8 @@ class AppContainer:
                 repos.profiles, memory_service, patterns, repos.constraints, energy, usage_ledger
             ),
             conversation_memory=conversation_memory,
+            # A stated rule and the memory of stating it: letting go of one lets go of both.
+            stated_rules=StatedRules(repos.constraints, memory_service),
         )
 
     async def shutdown(self) -> None:

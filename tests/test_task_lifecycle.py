@@ -199,30 +199,44 @@ def test_list_constraints__degraded_db__503_not_an_empty_list():
 
 
 def test_delete_constraint__removes_own_row_only():
-    from fastapi.testclient import TestClient
-    from app.main import app
-    from tests.fakes import FakeSupabase
+    from uuid import uuid4
 
+    from fastapi.testclient import TestClient
+
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.main import app
+    from app.orchestrator.hooks import ActionHooks
+    from tests.fakes import BagOfWordsEmbedder, FakeSupabase
+
+    mine, theirs = str(uuid4()), str(uuid4())
     fake = FakeSupabase()
     fake.rows.setdefault("behavioral_constraints", []).extend([
-        {"id": "c1", "user_id": "u1", "raw_text": "no study before 11am"},
-        {"id": "c2", "user_id": "OTHER", "raw_text": "leak"},
+        {"id": mine, "user_id": "u1", "raw_text": "no study before 11am",
+         "constraint_type": "habit"},
+        {"id": theirs, "user_id": "OTHER", "raw_text": "leak", "constraint_type": "habit"},
     ])
 
     class _DB:
         supabase = fake
 
     original = getattr(app.state, "db_client", None)
+    original_container = getattr(app.state, "container", None)
     app.state.db_client = _DB()
+    app.state.container = AppContainer.build(
+        supabase_client=fake, cfg=cfg, hooks=ActionHooks(), embedder=BagOfWordsEmbedder(),
+        install_chain=False,
+    )
     try:
         client = TestClient(app)
-        assert client.delete("/api/v1/habits/constraints/c1?user_id=u1").status_code == 200
-        assert [r["id"] for r in fake.rows["behavioral_constraints"]] == ["c2"]
+        assert client.delete(f"/api/v1/habits/constraints/{mine}?user_id=u1").status_code == 200
+        assert [r["id"] for r in fake.rows["behavioral_constraints"]] == [theirs]
         # wrong user: 404, row untouched
-        assert client.delete("/api/v1/habits/constraints/c2?user_id=u1").status_code == 404
+        assert client.delete(f"/api/v1/habits/constraints/{theirs}?user_id=u1").status_code == 404
         assert len(fake.rows["behavioral_constraints"]) == 1
     finally:
         app.state.db_client = original
+        app.state.container = original_container
 
 
 # ---------------------------------------------------------------------------

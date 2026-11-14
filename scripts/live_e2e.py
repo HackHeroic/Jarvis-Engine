@@ -11,14 +11,17 @@ does, as a throwaway user, and prints a pass/fail/skip table:
     5. teach a rule ("never before 11 AM") -> stored as a rule or a memory
     6. re-plan     -> the new draft keeps every task out of 08:00-11:00
     7. new session -> the remembered rule is loaded into the new conversation
-    8. forget      -> DELETE /memories/{id} removes it from the Memory panel
+    8. forget      -> DELETE /memories/{id} removes it from the Memory panel, and the
+                      rule stored with it goes too (a rule and the memory of stating it
+                      are linked: letting go of one lets go of both)
     9. usage receipt -> the user's ledger shows cloud calls
   10a. a stated fact -> its memory_extracted frame arrives before the complete frame
   10b. forget sticks -> forgotten, then said again in a new conversation: no frame,
                        not listed, no active row in user_memories
    11. new session  -> complete.since_last_spoke starts "Since we last spoke"
   11a. cached prompt -> the second reply of a conversation read cached prompt tokens
-  11b. You page     -> focus is the prior, the rule from step 5 is a rule, and the
+  11b. You page     -> focus is the prior, the rule whose memory step 8 forgot is no
+                       longer under rules (a re-plan may use the morning again), and the
                        privacy receipt counts cloud calls over a stated window
    12. morning brief on demand -> a morning_brief suggestion holding a draft
    13. accept the brief -> its tasks are written in its slots; a second accept is 409
@@ -138,6 +141,29 @@ def poll_until(
         if value or time.monotonic() >= deadline:
             return value
         time.sleep(interval_s)
+
+
+def linked_memory_id(rule_row: dict) -> str | None:
+    """The memory a behavioral_constraints row is linked to (the memory of stating it)."""
+    semantics = rule_row.get("structured_semantics")
+    linked = semantics.get("memory_id") if isinstance(semantics, dict) else None
+    return linked if isinstance(linked, str) and linked else None
+
+
+def rule_memory(memories: list[dict], rule_rows: list[dict]) -> dict | None:
+    """The Memory panel entry that is the taught rule: the memory a rule reading as the
+    rule is linked to, else the first memory that reads as the rule; None if neither."""
+    linked = {
+        linked_memory_id(row) for row in rule_rows if RULE_TEXT.search(row.get("raw_text") or "")
+    }
+    by_link = [m for m in memories if m["memory_id"] in linked]
+    by_text = [m for m in memories if RULE_TEXT.search(m["content"])]
+    return (by_link or by_text or [None])[0]
+
+
+def rules_linked_to(rule_rows: list[dict], memory_id: str) -> list[str]:
+    """The ids of the rules linked to ``memory_id``: forgetting it deletes them."""
+    return [str(row["id"]) for row in rule_rows if linked_memory_id(row) == memory_id]
 
 
 def matches_fact(text: str | None) -> bool:
@@ -514,19 +540,26 @@ def _core_loop(run: Run, client: Client, db: Any, user_id: str, state: dict) -> 
         assert not after, f"still in 08:00-11:00 {zone.key}: {after}"
         return f"08:00-11:00 {zone.key} tasks: {len(before)} before, 0 after"
 
+    def _rule_rows() -> list[dict]:
+        return rows(db, "behavioral_constraints", user_id, "id,raw_text,structured_semantics")
+
     def recall() -> str:
         payload = client.say("Good morning")  # a new conversation: one model call
         loaded = [m["content"] for m in payload.get("memories") or [] if RULE_TEXT.search(m["content"])]
         assert loaded, "the rule was not loaded into the new conversation"
-        state["rule_memory"] = next(m for m in client.memories() if RULE_TEXT.search(m["content"]))
+        state["rule_memory"] = rule_memory(client.memories(), _rule_rows())
+        assert state["rule_memory"], "the rule is not in the Memory panel"
         return f"loaded {loaded}; reply {payload['message'][:60]!r}"
 
     def forget() -> str:
         memory = state["rule_memory"]
+        state["forgotten_rule_ids"] = rules_linked_to(_rule_rows(), memory["memory_id"])
         response = client.forget(memory["memory_id"])
         assert response.status_code == 200, said(response)
         assert memory["memory_id"] not in [m["memory_id"] for m in client.memories()], "still in the panel"
-        return f"forgot {memory['content']!r}"
+        left = [r["id"] for r in _rule_rows() if str(r["id"]) in state["forgotten_rule_ids"]]
+        assert not left, f"the rule stored with the forgotten memory is still a rule: {left}"
+        return f"forgot {memory['content']!r} and {len(state['forgotten_rule_ids'])} rule(s) with it"
 
     def usage() -> str:
         last: dict = {}
@@ -657,16 +690,19 @@ def _vision_core(run: Run, client: Client, db: Any, user_id: str, state: dict) -
             f"focus is {focus['source']} from {focus['observations']} outcomes; "
             "a new user has the prior"
         )
-        taught = [r for r in rules if RULE_TEXT.search(r["text"])]
-        assert taught, f"the rule from step 5 is not under rules: {[r['text'] for r in rules]}"
+        # Step 8 forgot the rule's memory, which takes the rule with it: plans stop
+        # applying it, and the page stops listing it.
+        gone = state.get("forgotten_rule_ids") or []
+        still = [r["text"] for r in rules if r["id"] in gone]
+        assert not still, f"step 8 forgot the rule's memory, yet it is under rules: {still}"
         assert receipt["cloud_calls"] > 0, f"no cloud calls in the receipt: {receipt}"
         now = datetime.now(timezone.utc)
         since = datetime.fromisoformat(receipt["since"])
         assert since < now, f"the receipt's window opens in the future: {receipt['since']}"
         days = round((now - since).total_seconds() / 86400)
         return (
-            f"focus prior ({focus['observations']} outcomes); rule {taught[0]['text']!r}"
-            f" ({taught[0]['provenance']}); receipt {receipt['cloud_calls']} cloud /"
+            f"focus prior ({focus['observations']} outcomes); {len(gone)} forgotten rule(s)"
+            f" not listed; receipt {receipt['cloud_calls']} cloud /"
             f" {receipt['on_device_calls']} on-device calls over {days} days"
             f" since {since:%Y-%m-%d}"
         )

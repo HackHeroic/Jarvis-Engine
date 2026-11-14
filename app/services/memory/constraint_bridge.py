@@ -237,10 +237,19 @@ def _claimed_window(text: str) -> tuple[int, int] | None:
     return window
 
 
-def memory_slots(memories: list[Memory], *, habits: Iterable[str] = ()) -> list[TimeSlot]:
+def memory_slots(
+    memories: list[Memory],
+    *,
+    habits: Iterable[str] = (),
+    covered: frozenset[str] = frozenset(),
+) -> list[TimeSlot]:
     """Turn the user's memories in use into solver constraints.
 
-    A ``constraint`` memory that names a clock range becomes a hard block. A learned
+    A ``constraint`` memory that names a clock range becomes a hard block, unless a
+    stored rule already covers it (its id is in ``covered``: the rule the user stated
+    carries the id of the memory of stating it). Planning has that rule from the
+    rules, so the memory never blocks the same hours a second time, and letting go of
+    either one frees them. A learned
     skip window (pattern key ``skip_time_window:{h}``) at least 0.6 sure becomes a
     minimal-work hour. Nothing else blocks time: not a goal or a fact, and not any
     other pattern. A peak hour is where demanding work belongs, and reading "hour N"
@@ -259,6 +268,8 @@ def memory_slots(memories: list[Memory], *, habits: Iterable[str] = ()) -> list[
     slots: list[TimeSlot] = []
     for memory in memories:
         if memory.memory_type == "constraint":
+            if memory.id in covered:
+                continue
             time_range = _parse_time_range(memory.content)
             if time_range and _claimed_window(memory.content) is None:
                 slots.append(TimeSlot(

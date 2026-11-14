@@ -234,3 +234,62 @@ async def test_memories_api__confirm_after_dismiss__409_envelope(monkeypatch, su
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "conflict"
     assert _row(supabase, memory.id)["status"] == "dismissed"
+
+
+# --- a stated rule and its memory: letting go of one lets go of both ------------------
+
+
+async def _taught_rule(container, user: str = "alice"):
+    """A rule row and the memory of stating it, linked as the chat turn links them."""
+    from uuid import uuid4
+
+    from app.domain.entities import BehavioralConstraint
+
+    rule = await container.repos.constraints.add(user, BehavioralConstraint(
+        id=str(uuid4()), user_id=user, raw_text="Never schedule before 11 AM",
+        constraint_type="habit", recurrence="daily",
+    ))
+    memory = await _remember(
+        container, "Never schedule before 11 AM", memory_type="constraint", user=user,
+        provenance=MemorySource.SAID,
+    )
+    await container.stated_rules.link(user, rule.id, memory.id)
+    return rule, memory
+
+
+@pytest.mark.asyncio
+async def test_memories_api__forget_a_stated_rules_memory__the_rule_is_gone_too(
+    monkeypatch, supabase, container
+):
+    rule, memory = await _taught_rule(container)
+
+    async with _api(monkeypatch, container, supabase) as client:
+        forgotten = await client.delete(f"/api/v1/memories/{memory.id}?user_id=alice")
+        rules = await client.get("/api/v1/habits/constraints?user_id=alice")
+
+    assert forgotten.status_code == 200
+    assert rules.json()["constraints"] == []
+    assert await container.repos.constraints.list_active("alice") == []
+
+
+@pytest.mark.asyncio
+async def test_habits_api__delete_a_stated_rule__its_memory_is_forgotten(
+    monkeypatch, supabase, container
+):
+    rule, memory = await _taught_rule(container)
+    await _taught_rule(container, user="bob")
+
+    async with _api(monkeypatch, container, supabase) as client:
+        stranger = await client.delete(f"/api/v1/habits/constraints/{rule.id}?user_id=bob")
+        deleted = await client.delete(f"/api/v1/habits/constraints/{rule.id}?user_id=alice")
+        again = await client.delete(f"/api/v1/habits/constraints/{rule.id}?user_id=alice")
+        listed = await client.get("/api/v1/memories/?user_id=alice")
+
+    assert stranger.status_code == 404 and again.status_code == 404
+    assert stranger.json()["error"]["code"] == "not_found"
+    assert deleted.status_code == 200 and deleted.json() == {"status": "deleted", "id": rule.id}
+    assert listed.json()["memories"] == []
+    assert _row(supabase, memory.id)["status"] == "forgotten"
+    assert [m.content for m in await container.memory_service.list_active("bob")] == [
+        "Never schedule before 11 AM"
+    ]

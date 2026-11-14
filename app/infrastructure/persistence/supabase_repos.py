@@ -418,6 +418,18 @@ class SupabaseConstraintRepository(_SupabaseRepository, ConstraintRepository):
         )
         return bool(rows)
 
+    async def set_semantics(
+        self, user_id: str, constraint_id: str, structured_semantics: dict
+    ) -> BehavioralConstraint | None:
+        if not is_uuid(constraint_id):
+            return None
+        rows = await self._run(
+            lambda q: q.update({"structured_semantics": dict(structured_semantics)})
+            .eq("id", constraint_id)
+            .eq("user_id", user_id)
+        )
+        return _read(BehavioralConstraint, rows[0]) if rows else None
+
 
 def _applies_at(row: dict, now: datetime) -> bool:
     """Whether a behavioral_constraints row's validity window (both ends optional) holds now."""

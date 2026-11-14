@@ -70,6 +70,9 @@ class JarvisState(TypedDict):
     thinking_process: Optional[str]
     response_message: Optional[str]
     saved_constraints: Optional[list[str]]  # habits persisted by store_constraint
+    # Per turn: each habit store_constraint saved -> its rule's id, for the observation
+    # loop to link the rule to the memory of stating it.
+    saved_rule_ids: Optional[dict[str, str]]
 
     # Orchestrator control
     conversation_phase: ConversationPhase
