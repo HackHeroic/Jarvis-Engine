@@ -1,97 +1,91 @@
 # Jarvis Engine
 
-An AI-powered proactive preparation engine that transforms brain dumps into optimized, psychologically-informed schedules — so students and professionals can focus on execution instead of planning.
+Jarvis is a hyper-personalized personal intelligence. It builds a model of one person (when they focus, what they avoid, how they respond when a plan slips) and uses it to have things ready before they are asked. It is not a calendar or a planner: the scheduler is a muscle, the user model and the observation loop are the brain.
 
-## What It Does
+This repository is the backend. The frontend is [jarvis-frontend](https://github.com/HackHeroic/jarvis-frontend).
 
-You brain-dump everything — goals, deadlines, habits, preferences — and Jarvis handles the rest:
+## Where is what
 
-1. **Extracts** structured intents from natural language (goals, habits, deadlines, calendar events, action items)
-2. **Decomposes** goals into micro-tasks using a Socratic chunking pipeline
-3. **Schedules** optimally using OR-Tools CP-SAT constraint solver with adaptive daily caps
-4. **Links** relevant study materials from your uploaded documents via RAG
-5. **Recalibrates** automatically when plans break — no guilt, just data
+| You want | Open |
+|---|---|
+| The capstone design documents (start here for the evaluation) | [`docs/capstone/`](docs/capstone/) |
+| What is built and what is not, right now | [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) |
+| The demo script, viva questions and who owns what | [`docs/capstone/10-demo-and-contributions.md`](docs/capstone/10-demo-and-contributions.md) |
+| The design spec and its three plans | [`docs/superpowers/specs/`](docs/superpowers/specs/), [`docs/superpowers/plans/`](docs/superpowers/plans/) |
+| Rules for working in this code | [`.claude/CLAUDE.md`](.claude/CLAUDE.md), [`.claude/rules/`](.claude/rules/) |
+| Older documents | [`docs/INDEX.md`](docs/INDEX.md) |
 
-## Tech Stack
+### The ten capstone documents
 
-| Layer | Technology |
-|-------|-----------|
-| AI Routing | LiteLLM Hybrid Router (local Qwen-27B/4B + Gemini cloud fallback) |
-| Scheduling | Google OR-Tools CP-SAT Solver |
-| Document Intelligence | IBM Docling + ChromaDB + MLX-Embed |
-| Task Decomposition | Socratic Chunker (multi-phase goal breakdown) |
-| Habit Tracking | SM-2 Spaced Repetition |
-| Psychology | WOOP, CLT, TMT, Anti-guilt architecture |
-| Backend | FastAPI + Supabase (PostgreSQL) |
-| Frontend | Next.js 14 (see [jarvis-demo](../jarvis-demo)) |
+| # | Document | Evaluation criterion |
+|---|---|---|
+| 01 | [Requirements](docs/capstone/01-requirements.md) | Functional and non-functional requirements |
+| 02 | [Architecture](docs/capstone/02-architecture.md) | Layers and how a request moves through them |
+| 03 | [Class diagrams](docs/capstone/03-class-diagrams.md) | Class diagram |
+| 04 | [OOP and SOLID](docs/capstone/04-oop-and-solid.md) | OOP principles, SOLID |
+| 05 | [Design patterns](docs/capstone/05-design-patterns.md) | Design patterns, each with its code location |
+| 06 | [Sequence and activity diagrams](docs/capstone/06-sequence-and-activity.md) | Sequence and activity diagrams |
+| 07 | [API design](docs/capstone/07-api-design.md) | API design |
+| 08 | [Database schema](docs/capstone/08-database-schema.md) | Database schema |
+| 09 | [Error handling](docs/capstone/09-error-handling.md) | Error handling, edge cases, concurrency |
+| 10 | [Demo and contributions](docs/capstone/10-demo-and-contributions.md) | Working implementation, each member's part |
 
-## Project Structure
+`tests/test_design_conformance.py` checks that the code matches what these documents claim.
+
+### The code
 
 ```
-Jarvis-Engine/
-├── app/
-│   ├── api/v1/endpoints/     # FastAPI route handlers
-│   ├── core/
-│   │   └── or_tools/         # CP-SAT constraint solver
-│   ├── db/
-│   │   ├── migrations/       # Supabase SQL migrations
-│   │   └── supabase_py.py    # Database client
-│   ├── schemas/              # Pydantic models
-│   ├── services/
-│   │   ├── analytical/       # Voice of Jarvis, workspace, schedule modifier
-│   │   ├── extraction/       # Brain dump parsing, action items, knowledge ingestion
-│   │   └── scheduling/       # Socratic chunker, habit translation, fusion
-│   └── utils/                # LLM routing, deadline parsing, ChromaDB, pacing
-├── docs/
-│   ├── POLICY_ENGINE_ARCHITECTURE.md
-│   ├── PROJECT_STATUS.md
-│   ├── NST-Startup-Foundry-2026-Application.md
-│   └── superpowers/plans/    # 25 implementation plans
-├── tests/                    # pytest + pytest-asyncio
-├── main.py                   # FastAPI app entry point
-└── pyproject.toml            # Dependencies
+app/api/v1/endpoints/   routers only: parse, call a service, return a typed model
+app/services/           application services
+  chat_turn/              one chat turn, start to finish
+  planning/               scheduling, rule windows, the user's clock
+  memory/                 long-term memory: remember, recall, forget, decay
+  anticipation/           the scheduler, triggers, suggestions, consent
+app/orchestrator/       the LangGraph turn graph, state, checkpointer
+app/modules/            module sub-graphs (planning, research, knowledge, conversation, coach)
+app/domain/             entities, ports (ABCs), events, errors; imports no outer layer
+app/infrastructure/     Supabase and in-memory repositories, model providers, embedder
+app/container.py        the composition root: the one place that wires everything
+app/core/or_tools/      the CP-SAT solver and its constraints
+supabase/migrations/    the database schema (source of truth)
+tests/                  the offline suite; tests/behaviour/ drives whole chat turns
+scripts/                seed_demo_user.py, live_e2e.py, smoke_claude.py
 ```
 
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/chat` | Main brain-dump endpoint — extracts intents, schedules, responds |
-| GET | `/api/v1/schedule/today` | Today's optimized schedule |
-| POST | `/api/v1/schedule/replan` | Trigger manual recalibration |
-| GET | `/api/v1/workspace/{task_id}` | RAG-powered study materials for a task |
-| POST | `/api/v1/documents/ingest` | Upload and process documents (PDF, DOCX) |
-| GET | `/api/v1/tasks` | List tasks with filters |
-
-## Quick Start
+## Running it
 
 ```bash
-# Clone and setup
-git clone git@github.com:HackHeroic/Jarvis-Engine.git
-cd Jarvis-Engine
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# Configure environment
-cp .env.example .env  # Add your Supabase, Gemini, and other API keys
-
-# Run
-uvicorn main:app --reload --port 8000
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# create .env with the keys listed under "Environment" in .claude/CLAUDE.md (ask the repo owner for the values)
+.venv/bin/uvicorn app.main:app --port 8000
 ```
 
-## Key Design Decisions
+A local model in LM Studio on port 1234 is optional. Without it every model call goes to Claude.
 
-- **Local-first AI**: Core intelligence runs on Apple Silicon via Qwen models. Cloud (Gemini) is a fallback, not a dependency.
-- **Anti-guilt architecture**: Missed tasks trigger recalibration, not shame. No red "overdue" badges.
-- **Psychological science**: Every schedule embeds WOOP implementation intentions, Temporal Motivation Theory urgency weighting, and spaced repetition.
-- **Constraint programming over heuristics**: OR-Tools CP-SAT guarantees mathematically optimal schedules within bounds, with automatic horizon expansion when infeasible.
+Then start the frontend (`npm install && npm run dev` in jarvis-frontend) and open:
 
-## Documentation
+- `http://localhost:3000/dashboard`: the morning brief and today
+- `http://localhost:3000/chat`: talk to Jarvis
+- `http://localhost:3000/you`: what Jarvis has learned about you, and the forget button
+- `http://localhost:3000/schedule`: the plan
 
-- [Architecture Deep Dive](docs/POLICY_ENGINE_ARCHITECTURE.md) — 9-layer stack, request flow, Mermaid diagrams
-- [Project Status](docs/PROJECT_STATUS.md) — Implementation matrix, roadmap, decision log
-- [Implementation Plans](docs/superpowers/plans/) — 25 dated design documents
+## Tests
 
-## License
+```bash
+.venv/bin/python -m pytest tests/ -q        # offline: never touches the network
+.venv/bin/python scripts/live_e2e.py        # 18 live checks against real Supabase and Claude (backend must be running)
+```
 
-Proprietary. All rights reserved.
+## Demo data
+
+With the backend stopped:
+
+```bash
+.venv/bin/python scripts/seed_demo_user.py --reset
+```
+
+This seeds about three weeks of history for the user `demo`. Start the backend again afterwards.
+
+## Not built
+
+Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. `docs/PROJECT_STATUS.md` has the full list.
