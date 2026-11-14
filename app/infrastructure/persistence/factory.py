@@ -11,6 +11,8 @@ from app.domain.ports import (
     ConstraintRepository,
     ConversationRepository,
     DraftRepository,
+    GoalRepository,
+    HabitTrackerRepository,
     MemoryRepository,
     ProfileRepository,
     SuggestionRepository,
@@ -22,6 +24,8 @@ from app.infrastructure.persistence.in_memory import (
     InMemoryConstraintRepository,
     InMemoryConversationRepository,
     InMemoryDraftRepository,
+    InMemoryGoalRepository,
+    InMemoryHabitTrackerRepository,
     InMemoryMemoryRepository,
     InMemoryProfileRepository,
     InMemoryStore,
@@ -34,6 +38,8 @@ from app.infrastructure.persistence.supabase_repos import (
     SupabaseConstraintRepository,
     SupabaseConversationRepository,
     SupabaseDraftRepository,
+    SupabaseGoalRepository,
+    SupabaseHabitTrackerRepository,
     SupabaseMemoryRepository,
     SupabaseProfileRepository,
     SupabaseSuggestionRepository,
@@ -56,6 +62,8 @@ class Repositories:
     usage: UsageRepository
     memories: MemoryRepository
     conversations: ConversationRepository
+    goals: GoalRepository
+    habit_trackers: HabitTrackerRepository
 
 
 class RepositoryFactory:
@@ -74,6 +82,8 @@ class RepositoryFactory:
             usage=SupabaseUsageRepository(client),
             memories=SupabaseMemoryRepository(client),
             conversations=SupabaseConversationRepository(client),
+            goals=SupabaseGoalRepository(client),
+            habit_trackers=SupabaseHabitTrackerRepository(client),
         )
 
     @staticmethod
@@ -90,4 +100,6 @@ class RepositoryFactory:
             usage=InMemoryUsageRepository(store),
             memories=InMemoryMemoryRepository(store),
             conversations=InMemoryConversationRepository(store),
+            goals=InMemoryGoalRepository(store),
+            habit_trackers=InMemoryHabitTrackerRepository(store),
         )

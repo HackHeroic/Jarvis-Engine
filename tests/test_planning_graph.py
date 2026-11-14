@@ -1458,25 +1458,33 @@ def test_belongs_to_goal__own_goal_id_decides__prefix_only_for_legacy_rows(
 # ---------------------------------------------------------------------------
 
 
+def _registered_container():
+    """A composition root registered process-wide (until Task 7 moves it into the state);
+    conftest resets the registry afterwards."""
+    from app.core import runtime
+    from tests.fakes import build_test_container
+
+    container = build_test_container()
+    runtime.set_container(container)
+    return container
+
+
 @pytest.mark.asyncio
 async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    async def fake_detect(user_id, supabase, zone=None):
+    container = _registered_container()
+
+    async def fake_detect(user_id, tasks, task_service, zone=None):
         assert user_id == "u1"
+        assert (tasks, task_service) == (container.repos.tasks, container.task_service)
         return [{"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}]
 
     monkeypatch.setattr(
         "app.services.analytical.missed_deadlines.detect_and_mark_missed", fake_detect
     )
 
-    class _DB:
-        supabase = object()
-
-    class _UM:
-        _db = _DB()
-
-    state = {"user_id": "u1", "user_model": _UM()}
+    state = {"user_id": "u1", "user_model": None}
     result = await mark_missed(state)
     assert result["missed_deadlines"] == [
         {"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}
@@ -1489,7 +1497,9 @@ async def test_mark_missed__overdue_tasks_marked_and_anti_guilt_set(monkeypatch)
 async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
     from app.modules.planning_graph import mark_missed
 
-    async def fake_detect(user_id, supabase, zone=None):
+    _registered_container()
+
+    async def fake_detect(user_id, tasks, task_service, zone=None):
         return []
 
     monkeypatch.setattr(
@@ -1500,16 +1510,43 @@ async def test_mark_missed__no_overdue__empty_and_silent(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["plan my week", "add the missed tasks back"])
+async def test_mark_missed__no_container__nothing_scanned_or_restored(monkeypatch, caplog, message):
+    """Without a composition root the feature is off (Null behaviour): no second path."""
+    import logging
+
+    from app.modules.planning_graph import mark_missed
+
+    calls: list[str] = []
+
+    async def fake(*args, **kwargs):
+        calls.append("called")
+        return [{"task_id": "t9", "title": "old thing", "deadline": "2026-08-01"}]
+
+    monkeypatch.setattr("app.services.analytical.missed_deadlines.detect_and_mark_missed", fake)
+    monkeypatch.setattr("app.services.analytical.missed_deadlines.restore_missed", fake)
+    caplog.set_level(logging.DEBUG, logger="jarvis.flow")  # the planning module's logger
+
+    result = await mark_missed({"user_id": "u1", "user_model": None, "user_message": message})
+
+    assert result == {"missed_deadlines": [], "anti_guilt_message": None}
+    assert calls == []
+    assert any(r.levelno == logging.DEBUG and "container" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_mark_missed__asks_back_with_nothing_set_aside__skips_the_scan(monkeypatch):
     """Asking for the missed tasks never sets anything aside that turn, restored or not."""
     from app.modules.planning_graph import mark_missed
 
-    async def fake_restore(user_id, supabase):
+    _registered_container()
+
+    async def fake_restore(user_id, tasks, task_service):
         return []
 
     scans: list[str] = []
 
-    async def fake_detect(user_id, supabase, zone=None):
+    async def fake_detect(user_id, tasks, task_service, zone=None):
         scans.append(user_id)
         return [{"task_id": "t9", "title": "just restored", "deadline": "2026-08-01"}]
 

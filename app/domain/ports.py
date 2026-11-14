@@ -25,6 +25,9 @@ from app.domain.entities import (
     DraftSchedule,
     DraftStatus,
     FocusProfile,
+    Goal,
+    GoalDeadlineUpdate,
+    HabitTracker,
     LLMLocation,
     LLMUsageEvent,
     Memory,
@@ -41,9 +44,11 @@ from app.domain.entities import (
 
 # --- Repositories -----------------------------------------------------------
 
-# The most tasks one read by status returns: the newest, so a bound (or PostgREST's
+# The most tasks one list read returns: the newest, so a bound (or PostgREST's
 # 1000-row cap) only ever leaves out the oldest.
 TASK_LIST_LIMIT = 500
+# The most habit trackers one list read returns: the newest, as above.
+TRACKER_LIST_LIMIT = 500
 # The most sessions one ``ConversationRepository.recent_sessions`` read returns: the
 # most recently active, so the bound only ever leaves out the oldest.
 RECENT_SESSIONS_LIMIT = 100
@@ -54,8 +59,9 @@ SESSION_SUMMARY_MAX_CHARS = 4000
 class TaskRepository(ABC):
     """Storage for the user's committed tasks.
 
-    It writes only a task's status. A task's row, slot included, is written by
-    accepting a draft (``DraftRepository.accept_atomic``) and by nothing else.
+    It writes only a task's status (and, bringing a set-aside task back, its passed
+    deadline). A task's row, slot included, is written by accepting a draft
+    (``DraftRepository.accept_atomic``) and by nothing else.
     """
 
     @abstractmethod
@@ -63,10 +69,20 @@ class TaskRepository(ABC):
         """Return the user's tasks whose status is PENDING."""
 
     @abstractmethod
-    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
-        """Return the user's newest TASK_LIST_LIMIT tasks in ``statuses``, newest first.
+    async def list_for_user(
+        self, user_id: str, *, statuses: frozenset[TaskStatus] | None = None
+    ) -> list[Task]:
+        """Return the user's newest TASK_LIST_LIMIT tasks, newest first.
 
-        A legacy stored status counts as the status it reads as. No statuses, no tasks.
+        Only those in ``statuses``, when given: a legacy stored status counts as the
+        status it reads as, and an empty ``statuses`` matches nothing. Newest first, so
+        the bound (or a store's row cap) only ever leaves out the oldest.
+        """
+
+    @abstractmethod
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        """``list_for_user(user_id, statuses=statuses)``: the newest TASK_LIST_LIMIT tasks
+        in ``statuses``, newest first. No statuses, no tasks.
         """
 
     @abstractmethod
@@ -94,6 +110,16 @@ class TaskRepository(ABC):
         With ``expected_start`` the compare-and-set also holds the slot: the write
         happens only while the task still starts at that instant (compared as instants,
         whatever offset it is stored with), so a task re-slotted meanwhile is left alone.
+        """
+
+    @abstractmethod
+    async def bring_back(self, user_id: str, task_id: str) -> Task:
+        """Move a MISSED task back to PENDING and clear its passed ``deadline_hint``.
+
+        One write, a compare-and-set from MISSED: the status and the deadline change
+        together or not at all. Without the cleared deadline the next deadline scan
+        would set the task straight aside again. Raises NotFoundError if the user has
+        no such task, and StaleVersionError if it is no longer MISSED (nothing changes).
         """
 
 
@@ -201,7 +227,13 @@ class ConstraintRepository(ABC):
 
     @abstractmethod
     async def list_active(self, user_id: str) -> list[BehavioralConstraint]:
-        """Return the user's constraints that currently apply."""
+        """Return the user's constraints that currently apply (inside their validity
+        window), oldest first.
+
+        A store may cap one read (PostgREST answers at most 1000 rows and says nothing):
+        the read is made newest first and handed back oldest first, so a cap leaves out
+        only the oldest rules.
+        """
 
     @abstractmethod
     async def add(self, user_id: str, c: BehavioralConstraint) -> BehavioralConstraint:
@@ -219,6 +251,58 @@ class ConstraintRepository(ABC):
 
         None when the user has no such constraint (another user's, or an id that is
         not one), and nothing is written.
+        """
+
+
+class GoalRepository(ABC):
+    """The user's goals, and the deadline updates learned for them (``user_plan_updates``)."""
+
+    @abstractmethod
+    async def get(self, user_id: str, goal_id: str) -> Goal | None:
+        """Return the user's goal with this id, or None."""
+
+    @abstractmethod
+    async def latest_context(self, user_id: str, goal_id: str) -> str | None:
+        """The context snippet of the goal's newest deadline update; None when the goal
+        has no update, or its newest has no context."""
+
+    @abstractmethod
+    async def add_deadline_update(self, user_id: str, update: GoalDeadlineUpdate) -> None:
+        """Store a deadline update for the user's goal.
+
+        Raises ValidationError, before anything is written, if the update is another
+        user's. An unset ``created_at`` is stamped by the store.
+        """
+
+
+class HabitTrackerRepository(ABC):
+    """The SM-2 state of the user's habit trackers."""
+
+    @abstractmethod
+    async def get(self, user_id: str, tracker_id: str) -> HabitTracker | None:
+        """Return the user's tracker with this id, or None (an id that is no UUID too)."""
+
+    @abstractmethod
+    async def list_for_user(self, user_id: str) -> list[HabitTracker]:
+        """Return the user's newest TRACKER_LIST_LIMIT trackers, newest first."""
+
+    @abstractmethod
+    async def record_review(
+        self,
+        user_id: str,
+        tracker_id: str,
+        *,
+        repetitions: int,
+        ef: float,
+        next_interval_days: int,
+        quality: int,
+        done_at: datetime,
+    ) -> HabitTracker:
+        """Store one review's SM-2 outcome (``quality`` as the last rating, ``done_at``
+        as when it was done) and return the tracker as stored now.
+
+        Raises NotFoundError if the user has no such tracker (another user's included),
+        and ValidationError, writing nothing, for a value the tracker rejects.
         """
 
 

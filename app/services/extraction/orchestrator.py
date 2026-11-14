@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from app.domain.ports import ConstraintRepository
 from app.schemas.context import (
     ActionItemProposal,
     ExtractedTimeSlots,
@@ -82,6 +83,7 @@ async def process_ingestion(
     db_client=None,
     intent_override: Optional[IntentType] = None,
     file_name: Optional[str] = None,
+    constraints: Optional[ConstraintRepository] = None,
 ) -> IngestionPipelineResult:
     """Run the full autonomous extraction pipeline.
 
@@ -90,8 +92,10 @@ async def process_ingestion(
         file_bytes: Optional raw PDF/image bytes.
         media_type: Optional "pdf" or "image" when file_bytes provided.
         user_id: Optional user identifier for behavioral context and storage.
-        db_client: Optional Supabase client for pending_calendar and behavioral_constraints.
+        db_client: Optional Supabase client for pending_calendar and documents.
         intent_override: When provided, skip SLM classification and use this intent (for Control Policy).
+        constraints: The user's rules (the container's repository): read as calendar
+            context, written for a stated preference. None (no database): neither.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -119,7 +123,11 @@ async def process_ingestion(
     supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
 
     if classification.intent == IntentType.CALENDAR_SYNC:
-        user_context = await get_behavioral_context_for_calendar(user_id, supabase)
+        user_context = (
+            await get_behavioral_context_for_calendar(constraints, user_id)
+            if constraints is not None and user_id
+            else ""
+        )
         extracted = await extract_calendar_slots(text, user_context=user_context or None)
         base_result.calendar_result = extracted
         if db_client and supabase:
@@ -281,12 +289,12 @@ async def process_ingestion(
                         print(f"[Orchestrator] Insert user_plan_updates failed: {e}")
 
     elif classification.intent == IntentType.BEHAVIORAL_CONSTRAINT:
-        br = await store_behavioral_constraint(
-            raw_text=text,
-            constraint_type="preference",
-            user_id=user_id,
-            supabase_client=supabase,
-        )
+        if constraints is not None and user_id:
+            br = await store_behavioral_constraint(
+                constraints, text, user_id=user_id, constraint_type="preference"
+            )
+        else:
+            br = {"status": "skipped", "reason": "No database to keep it in."}
         base_result.behavioral_result = br
 
     elif classification.intent == IntentType.ACTION_ITEM:

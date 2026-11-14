@@ -371,16 +371,9 @@ def run_schedule(
             )
         # FULL_FOCUS: no block added
 
-    # Fetch success rate for TMT Expectancy (reuse existing db_client)
-    _sr = 0.5  # neutral prior
-    if user_id and db_client and hasattr(db_client, "supabase"):
-        try:
-            from app.services.analytical.mastery_tracker import calculate_success_ratio
-
-            goal_id = getattr(graph.goal_metadata, "goal_id", None)
-            _sr = calculate_success_ratio(user_id, goal_id, db_client.supabase)
-        except Exception:
-            pass
+    # TMT Expectancy: the neutral prior. No caller passes a database here, and the
+    # success ratio is read from the outcome history (mastery_tracker), not user_tasks.
+    _sr = 0.5
 
     # TMT scores and task mapping (per-chunk delay from deadline_hint)
     tmt_scores: dict[str, float] = {}

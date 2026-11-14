@@ -7,9 +7,7 @@ CRITICAL CONSTRAINTS (from research):
 - Credible encouragement grounded in actual mastery data
 """
 
-import asyncio
 import json
-from datetime import timedelta
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.core.runtime import registered_container
@@ -54,28 +52,18 @@ def _identify_sources_used(mastery: dict, trend: str, streak: int, energy: float
     return sources
 
 
-async def _completion_streak(user_id: str) -> int:
+async def _completion_streak(container, user_id: str) -> int:
     """Consecutive days, ending today on the user's clock, with a completed task.
 
-    Read from the outcome history (``task_events``) of the last STREAK_WINDOW_DAYS, never
-    from task statuses. Without a composition root (tests, scripts) there is no history
-    to read: 0.
+    ``mastery_tracker.completion_streak``: the outcome history (``task_events``) of the
+    last STREAK_WINDOW_DAYS, never task statuses (``GET /you`` shows the same number).
     """
-    from app.services.analytical.mastery_tracker import (
-        OUTCOME_TYPES, STREAK_WINDOW_DAYS, compute_streak_from_events,
-    )
-    from app.services.planning.local_time import user_zone
     from app.domain.clock import utc_now
+    from app.services.analytical.mastery_tracker import completion_streak
+    from app.services.planning.local_time import user_zone
 
-    container = registered_container()
-    if container is None:
-        return 0
-    now = utc_now()
     zone = user_zone(await container.repos.profiles.get_or_create(user_id))
-    events = await container.repos.task_events.list_for_user(
-        user_id, since=now - timedelta(days=STREAK_WINDOW_DAYS), types=set(OUTCOME_TYPES)
-    )
-    return compute_streak_from_events(events, zone, now.astimezone(zone).date())
+    return await completion_streak(user_id, container.repos.task_events, zone, now=utc_now())
 
 
 async def run_coaching_response(state: dict) -> dict:
@@ -105,17 +93,27 @@ async def run_coaching_response(state: dict) -> dict:
 
     try:
         from app.services.analytical.mastery_tracker import (
-            get_mastery_summary, calculate_success_ratio, compute_quality_trend,
+            NEUTRAL_SUCCESS_RATIO,
+            calculate_success_ratio,
+            compute_quality_trend,
+            get_mastery_summary,
         )
 
-        db = user_model._db.supabase  # explicit path — avoids wiring bug
+        user_id = user_model.user_id
+        # The mastery numbers come from the composition root's repositories. Without
+        # one (tests, scripts) there is no history to read: neutral numbers.
         container = registered_container()
-        task_events = container.repos.task_events if container is not None else None
-
-        mastery = await get_mastery_summary(user_model.user_id, db, task_events)
-        sr = await asyncio.to_thread(calculate_success_ratio, user_model.user_id, None, db)
-        trend = await asyncio.to_thread(compute_quality_trend, user_model.user_id, db)
-        streak = await _completion_streak(user_model.user_id)
+        if container is not None:
+            repos = container.repos
+            mastery = await get_mastery_summary(
+                user_id, repos.tasks, repos.task_events, repos.goals
+            )
+            sr = await calculate_success_ratio(user_id, None, repos.task_events)
+            trend = await compute_quality_trend(user_id, repos.task_events)
+            streak = await _completion_streak(container, user_id)
+        else:
+            logger.debug("Coach: no container registered, so no mastery history to read")
+            mastery, sr, trend, streak = {}, NEUTRAL_SUCCESS_RATIO, "stable", 0
         energy = await user_model.get_estimated_energy()
 
         all_tasks = await user_model.get_all_tasks()

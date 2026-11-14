@@ -25,6 +25,9 @@ from app.domain.entities import (
     ConversationSession,
     DraftSchedule,
     DraftStatus,
+    Goal,
+    GoalDeadlineUpdate,
+    HabitTracker,
     LLMUsageEvent,
     Memory,
     MemoryStatus,
@@ -41,9 +44,12 @@ from app.domain.entities import (
 from app.domain.ports import (
     RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
+    TRACKER_LIST_LIMIT,
     ConstraintRepository,
     ConversationRepository,
     DraftRepository,
+    GoalRepository,
+    HabitTrackerRepository,
     MemoryMatch,
     MemoryRepository,
     ProfileRepository,
@@ -59,10 +65,12 @@ from app.infrastructure.persistence._mapping import (
     apply_memory_update,
     apply_profile_update,
     check_limit,
+    checked_review,
     checked_summary,
     day_bounds,
     draft_closed,
     embedding_values,
+    is_uuid,
     new_draft,
     normalized,
     not_found,
@@ -70,11 +78,13 @@ from app.infrastructure.persistence._mapping import (
     memory_changed,
     memory_id_taken,
     pattern_key_taken,
+    prepare_deadline_update,
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
     summarize_usage,
     summary_coverage,
+    task_changed,
     task_from_row,
     task_id_clash,
     utc,
@@ -94,6 +104,11 @@ class InMemoryStore:
     suggestions: list[Suggestion] = field(default_factory=list)
     usage: list[LLMUsageEvent] = field(default_factory=list)
     memories: list[Memory] = field(default_factory=list)
+    # Goals (the database's ensure_goal trigger creates them; no port does) and the
+    # deadline updates learned for them.
+    goals: list[Goal] = field(default_factory=list)
+    plan_updates: list[GoalDeadlineUpdate] = field(default_factory=list)
+    habit_trackers: list[HabitTracker] = field(default_factory=list)
     # Conversations, as the chat endpoint writes them (no port writes these two).
     chat_sessions: list[ConversationSession] = field(default_factory=list)
     chat_messages: list[ChatMessage] = field(default_factory=list)
@@ -101,10 +116,6 @@ class InMemoryStore:
     memory_embeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
     # Serialises draft status changes, as the row lock does in the database.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-def _value_of(status: TaskStatus | None) -> str | None:
-    return TaskStatus(status).value if status is not None else None
 
 
 class InMemoryTaskRepository(TaskRepository):
@@ -125,12 +136,20 @@ class InMemoryTaskRepository(TaskRepository):
             if t.user_id == user_id and t.status == TaskStatus.PENDING
         ]
 
-    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
-        wanted = {TaskStatus(status) for status in statuses}
+    async def list_for_user(
+        self, user_id: str, *, statuses: frozenset[TaskStatus] | None = None
+    ) -> list[Task]:
+        wanted = None if statuses is None else {TaskStatus(status) for status in statuses}
+        # The store is in creation order, so reversed is newest first.
         newest_first = [
-            t for t in reversed(self._store.tasks) if t.user_id == user_id and t.status in wanted
+            t
+            for t in reversed(self._store.tasks)
+            if t.user_id == user_id and (wanted is None or t.status in wanted)
         ]
         return [t.model_copy(deep=True) for t in newest_first[:TASK_LIST_LIMIT]]
+
+    async def list_by_status(self, user_id: str, statuses: frozenset[TaskStatus]) -> list[Task]:
+        return await self.list_for_user(user_id, statuses=frozenset(statuses))
 
     async def get(self, user_id: str, task_id: str) -> Task | None:
         indexes = self._indexes(user_id, task_id)
@@ -170,15 +189,25 @@ class InMemoryTaskRepository(TaskRepository):
                 and (start is None or self._store.tasks[i].scheduled_start == start)
             ]
             if not indexes:
-                raise errors.StaleVersionError(
-                    "That task changed before this update; reload and try again.",
-                    details={"task_id": task_id, "expected": _value_of(expected)},
-                )
+                raise task_changed(task_id, expected)
         for i in indexes:
             self._store.tasks[i] = self._store.tasks[i].model_copy(
                 update={"status": TaskStatus(status)}
             )
         return self._store.tasks[indexes[0]].model_copy(deep=True)
+
+    async def bring_back(self, user_id: str, task_id: str) -> Task:
+        indexes = self._indexes(user_id, task_id)
+        if not indexes:
+            raise not_found("task", task_id)
+        missed = [i for i in indexes if self._store.tasks[i].status == TaskStatus.MISSED]
+        if not missed:
+            raise task_changed(task_id, TaskStatus.MISSED)
+        for i in missed:
+            self._store.tasks[i] = self._store.tasks[i].model_copy(
+                update={"status": TaskStatus.PENDING, "deadline_hint": None}
+            )
+        return self._store.tasks[missed[0]].model_copy(deep=True)
 
 
 class InMemoryTaskEventRepository(TaskEventRepository):
@@ -396,6 +425,84 @@ class InMemoryConstraintRepository(ConstraintRepository):
                 self._store.constraints[i] = updated
                 return updated.model_copy(deep=True)
         return None
+
+
+class InMemoryGoalRepository(GoalRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    async def get(self, user_id: str, goal_id: str) -> Goal | None:
+        return next(
+            (
+                g.model_copy(deep=True)
+                for g in self._store.goals
+                if g.user_id == user_id and g.id == goal_id
+            ),
+            None,
+        )
+
+    async def latest_context(self, user_id: str, goal_id: str) -> str | None:
+        updates = [
+            u for u in self._store.plan_updates if u.user_id == user_id and u.goal_id == goal_id
+        ]
+        if not updates:
+            return None
+        # The newest by created_at; of equal stamps, the later stored.
+        newest = max(enumerate(updates), key=lambda pair: (pair[1].created_at, pair[0]))[1]
+        return newest.context_snippet or None
+
+    async def add_deadline_update(self, user_id: str, update: GoalDeadlineUpdate) -> None:
+        stored = prepare_deadline_update(user_id, update)
+        if stored.created_at is None:  # the column default: stamped when stored
+            stored = stored.model_copy(update={"created_at": now_utc()})
+        self._store.plan_updates.append(stored)
+
+
+class InMemoryHabitTrackerRepository(HabitTrackerRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, tracker_id: str) -> int | None:
+        if not is_uuid(tracker_id):  # as the uuid column: anything else matches nothing
+            return None
+        return next(
+            (
+                i
+                for i, t in enumerate(self._store.habit_trackers)
+                if t.id == tracker_id and t.user_id == user_id
+            ),
+            None,
+        )
+
+    async def get(self, user_id: str, tracker_id: str) -> HabitTracker | None:
+        i = self._index(user_id, tracker_id)
+        return self._store.habit_trackers[i].model_copy(deep=True) if i is not None else None
+
+    async def list_for_user(self, user_id: str) -> list[HabitTracker]:
+        # The store is in creation order, so reversed is newest first.
+        newest_first = [t for t in reversed(self._store.habit_trackers) if t.user_id == user_id]
+        return [t.model_copy(deep=True) for t in newest_first[:TRACKER_LIST_LIMIT]]
+
+    async def record_review(
+        self,
+        user_id: str,
+        tracker_id: str,
+        *,
+        repetitions: int,
+        ef: float,
+        next_interval_days: int,
+        quality: int,
+        done_at: datetime,
+    ) -> HabitTracker:
+        fields = checked_review(
+            user_id, tracker_id, repetitions=repetitions, ef=ef,
+            next_interval_days=next_interval_days, quality=quality, done_at=done_at,
+        )
+        i = self._index(user_id, tracker_id)
+        if i is None:
+            raise not_found("tracker", tracker_id)
+        self._store.habit_trackers[i] = self._store.habit_trackers[i].model_copy(update=fields)
+        return self._store.habit_trackers[i].model_copy(deep=True)
 
 
 class InMemoryProfileRepository(ProfileRepository):

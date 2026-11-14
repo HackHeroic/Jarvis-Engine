@@ -27,7 +27,7 @@ from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 SECRET = "postgres://admin:hunter2@db.internal"
 MARATHON = "Training for the Mumbai marathon in March"
 
-_TOP_LEVEL = {"profile", "patterns", "rules", "memories", "focus", "receipt"}
+_TOP_LEVEL = {"profile", "patterns", "rules", "memories", "focus", "receipt", "streak_days"}
 _PROFILE = {"display_name", "timezone", "wake_time", "autonomy_mode"}
 _PATTERN = {
     "memory_id", "pattern_key", "detector", "description", "confidence", "occurrences",
@@ -152,6 +152,38 @@ async def test_you_api__get__matches_response_model(monkeypatch, recording_llm):
     window = datetime.now(timezone.utc) - datetime.fromisoformat(receipt["since"])
     assert timedelta(days=30) <= window < timedelta(days=30, minutes=5)
     assert recording_llm.calls == []  # one read of what Jarvis knows: no model is asked
+
+
+@pytest.mark.asyncio
+async def test_you_api__streak_days__the_coachs_streak_on_the_users_days(monkeypatch):
+    """The streak the coach counts (completions, on the user's clock) is on the page the
+    dashboard already reads, so the frontend need not count it itself."""
+    from zoneinfo import ZoneInfo
+
+    from app.services.analytical.mastery_tracker import streak_as_of
+
+    ist = ZoneInfo("Asia/Kolkata")
+    supabase = FakeSupabase()
+    container = _container(supabase)
+    today = datetime.now(ist).date()
+    # 00:30 IST: still the previous day in UTC, so only a local count sees three in a row.
+    for days_ago in (0, 1, 2, 4):  # a run of three ending today, then a gap
+        at = datetime.combine(today - timedelta(days=days_ago), time(0, 30), ist)
+        await container.repos.task_events.append("alice", TaskEvent(
+            user_id="alice", task_id=f"t{days_ago}", event_type=TaskEventType.COMPLETED,
+            occurred_at=at, scheduled_start=at, scheduled_end=at + timedelta(minutes=25),
+        ))
+
+    async with _api(monkeypatch, container, supabase) as api:
+        alice = await api.get("/api/v1/you", params={"user_id": "alice"})
+        bob = await api.get("/api/v1/you", params={"user_id": "bob"})
+
+    assert alice.status_code == bob.status_code == 200
+    assert alice.json()["streak_days"] == 3
+    assert bob.json()["streak_days"] == 0
+    # The coach's own count over the same history agrees.
+    events = await container.repos.task_events.list_for_user("alice")
+    assert streak_as_of(events, ist, datetime.now(timezone.utc)) == 3
 
 
 @pytest.mark.asyncio

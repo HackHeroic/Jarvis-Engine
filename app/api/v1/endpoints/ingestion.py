@@ -4,13 +4,12 @@ import base64
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, require_supabase
+from app.api.deps import CurrentUser, container_of, require_supabase
 from app.domain import errors
 from app.schemas.context import IngestionPipelineResult, IntentClassification, TimeSlot
-from app.services.extraction.behavioral_store import delete_behavioral_constraint
 from app.services.extraction.orchestrator import process_ingestion
 from app.utils.docling_helper import extract_document
 
@@ -147,12 +146,17 @@ async def process_full_pipeline(
         except Exception as e:
             raise HTTPException(status_code=400, detail=_BAD_BASE64) from e
     db_client = getattr(http_request.app.state, "db_client", None)
+    # Rules are stored and read through the container's repository, and only with a
+    # database: without one the container is in-memory and nothing would last.
+    container = container_of(http_request)
+    has_db = getattr(db_client, "supabase", None) is not None
     return await process_ingestion(
         payload=request.payload or None,
         file_bytes=file_bytes,
         media_type=request.media_type,
         user_id=request.user_id,
         db_client=db_client,
+        constraints=container.repos.constraints if container is not None and has_db else None,
     )
 
 
@@ -232,34 +236,3 @@ async def reject_pending_calendar(
     supabase = require_supabase(http_request)
     _resolve_pending_calendar(supabase, pending_id, user, "rejected")
     return {"status": "rejected"}
-
-
-@router.delete(
-    "/behavioral-constraint/{constraint_id}",
-    summary="Delete a behavioral constraint",
-)
-async def delete_behavioral_constraint_endpoint(
-    constraint_id: str,
-    http_request: Request,
-    user_id: str = Query(..., description="User ID (required for IDOR protection)"),
-) -> dict:
-    """Delete a behavioral constraint (habit/preference) by ID. Requires user_id for IDOR protection."""
-    if not user_id:
-        raise HTTPException(status_code=401, detail="user_id is required for deletion")
-    db_client = getattr(http_request.app.state, "db_client", None)
-    supabase = db_client.supabase if db_client and hasattr(db_client, "supabase") else None
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
-    result = await delete_behavioral_constraint(
-        constraint_id=constraint_id,
-        user_id=user_id,
-        supabase_client=supabase,
-    )
-    if result.get("status") == "error":
-        reason = result.get("reason", "")
-        if "not found" in reason.lower():
-            raise HTTPException(status_code=404, detail="Constraint not found")
-        if "not configured" in reason.lower():
-            raise HTTPException(status_code=503, detail="Database not available")
-        raise HTTPException(status_code=500, detail="Could not delete the constraint.")
-    return result

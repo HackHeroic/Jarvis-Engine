@@ -1,17 +1,18 @@
-"""SuperMemo-2 spaced repetition engine for habit persistence."""
+"""SuperMemo-2 spaced repetition engine for habit persistence.
 
-import logging
+Trackers are read and written through the ``HabitTrackerRepository`` port: an outage
+raises ``PersistenceError`` (503), never "nothing due", and another user's tracker is
+``NotFoundError``, exactly like a missing one, so its existence does not leak.
+"""
+
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from app.domain.errors import PersistenceError
-from app.services.planning.local_time import user_zone
-from app.db.supabase_py import build_supabase_client
-
-logger = logging.getLogger(__name__)
+from app.domain.entities import SM2_EF_FLOOR
+from app.domain.errors import NotFoundError
+from app.domain.ports import HabitTrackerRepository
 
 
 def calculate_sm2(
@@ -42,7 +43,7 @@ def calculate_sm2(
             interval = math.ceil(previous_interval * previous_ef)
 
     new_ef = previous_ef + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-    new_ef = max(1.3, new_ef)  # EF floor 1.3
+    new_ef = max(SM2_EF_FLOOR, new_ef)  # EF floor 1.3
 
     return {
         "repetitions": repetitions,
@@ -52,63 +53,34 @@ def calculate_sm2(
     }
 
 
-def _get_supabase():
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return None
-    return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-
 async def record_completion(
-    tracker_id: str,
-    quality: int,
-    user_id: str,
-    supabase_client: Any = None,
+    trackers: HabitTrackerRepository, user_id: str, tracker_id: str, quality: int
 ) -> dict[str, Any]:
-    """Record a completion and update tracker. Returns next_review_date and next_interval_days.
+    """Record a review of the user's tracker; return next_review_date and next_interval_days.
 
-    Scoped to ``user_id``: another user's tracker is reported as ``"not found"``,
-    exactly like a missing one, so its existence does not leak.
+    Raises NotFoundError for a tracker the user does not have (another user's
+    included) and PersistenceError when the store cannot be reached.
     """
-    client = supabase_client or _get_supabase()
-    if not client:
-        return {"status": "error", "reason": "Supabase not configured"}
+    tracker = await trackers.get(user_id, tracker_id)
+    if tracker is None:
+        raise NotFoundError("That tracker does not exist.", details={"tracker_id": tracker_id})
 
-    try:
-        result = (
-            client.table("habit_trackers")
-            .select("*")
-            .eq("id", tracker_id)
-            .eq("user_id", user_id)
-            .execute()
-        )
-        if not result.data or len(result.data) == 0:
-            return {"status": "error", "reason": "not found"}
-
-        row = result.data[0]
-        reps = row.get("repetitions") or 0
-        ef = float(row.get("ef") or 2.5)
-        interval = int(row.get("next_interval_days") or 1)
-
-        sm2_result = calculate_sm2(quality, reps, ef, interval)
-
-        client.table("habit_trackers").update(
-            {
-                "repetitions": sm2_result["repetitions"],
-                "quality_last": quality,
-                "ef": sm2_result["ef"],
-                "next_interval_days": sm2_result["next_interval_days"],
-                "last_done_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ).eq("id", tracker_id).eq("user_id", user_id).execute()
-
-        return {
-            "status": "ok",
-            "next_review_date": sm2_result["next_review_date"].isoformat(),
-            "next_interval_days": sm2_result["next_interval_days"],
-        }
-    except Exception:
-        logger.warning("record_completion failed for tracker %s", tracker_id, exc_info=True)
-        return {"status": "error", "reason": "database error"}
+    sm2_result = calculate_sm2(
+        quality, tracker.repetitions, tracker.ef, tracker.next_interval_days or 1
+    )
+    await trackers.record_review(
+        user_id,
+        tracker_id,
+        repetitions=sm2_result["repetitions"],
+        ef=sm2_result["ef"],
+        next_interval_days=sm2_result["next_interval_days"],
+        quality=quality,
+        done_at=datetime.now(timezone.utc),
+    )
+    return {
+        "next_review_date": sm2_result["next_review_date"].isoformat(),
+        "next_interval_days": sm2_result["next_interval_days"],
+    }
 
 
 def _local_date(moment: datetime | date, zone: ZoneInfo) -> date:
@@ -122,49 +94,25 @@ def _local_date(moment: datetime | date, zone: ZoneInfo) -> date:
 
 
 async def get_due_trackers(
+    trackers: HabitTrackerRepository,
     user_id: str,
-    supabase_client: Any = None,
-    as_of_date: datetime | None = None,
-    zone: ZoneInfo | None = None,
+    zone: ZoneInfo,
+    *,
+    as_of_date: datetime | date | None = None,
 ) -> list[dict[str, Any]]:
-    """Return the user's habit trackers due for review on or before ``as_of_date``'s local date.
+    """The user's trackers due for review on or before today (or ``as_of_date``), as rows.
 
-    Both sides of the comparison are dates on the user's clock (``zone``, default
-    ``user_zone()``): the day the habit was last done plus its interval, against the
-    day it is now (or ``as_of_date``) there. A tracker never done is due.
+    Both sides of the comparison are dates on the user's clock (``zone``): the day the
+    habit was last done plus its interval, against the day it is now there. A tracker
+    never done is due. Newest tracker first, as the repository lists them; an outage
+    raises PersistenceError, never "nothing due".
     """
-    client = supabase_client or _get_supabase()
-    if not client:
-        return []
-
-    zone = zone or user_zone()
     today = _local_date(as_of_date or datetime.now(timezone.utc), zone)
-
-    try:
-        result = (
-            client.table("habit_trackers")
-            .select("*")
-            .eq("user_id", user_id)
-            .execute()
-        )
-    except Exception as exc:
-        # Not []: "nothing is due" would be a false answer to a database outage.
-        raise PersistenceError("Could not reach the database.") from exc
     due = []
-    for row in result.data or []:
-        last = row.get("last_done_at")
-        if not last:
-            # Never done: treat as due
-            due.append(row)
-            continue
-        try:
-            interval = int(row.get("next_interval_days") or 1)
-            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-            if last_dt.tzinfo is None:  # stored instants are UTC
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            next_due = last_dt.astimezone(zone).date() + timedelta(days=interval)
-            if next_due <= today:
-                due.append(row)
-        except (ValueError, TypeError):
-            due.append(row)
+    for tracker in await trackers.list_for_user(user_id):
+        if tracker.last_done_at is not None:
+            interval = tracker.next_interval_days or 1
+            if tracker.last_done_at.astimezone(zone).date() + timedelta(days=interval) > today:
+                continue
+        due.append(tracker.model_dump(mode="json"))
     return due

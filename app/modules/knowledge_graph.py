@@ -43,7 +43,12 @@ async def extract_calendar(state: KnowledgeState) -> dict:
 
 async def ingest_document(state: KnowledgeState) -> dict:
     try:
+        from app.core.runtime import registered_container
         from app.services.extraction.orchestrator import process_ingestion
+
+        # The user's rules through the composition root's repository; without one
+        # (tests, scripts) no rule is read or stored.
+        container = registered_container()
         result = await process_ingestion(
             payload=state.get("content"),
             file_bytes=state.get("file_bytes"),
@@ -51,6 +56,7 @@ async def ingest_document(state: KnowledgeState) -> dict:
             user_id=state.get("user_id"),
             file_name=state.get("file_name"),
             db_client=state.get("db_client"),
+            constraints=container.repos.constraints if container is not None else None,
         )
         return {"ingestion_result": result.model_dump() if hasattr(result, "model_dump") else {"status": "ok"}}
     except Exception as e:

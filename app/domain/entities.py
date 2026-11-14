@@ -1,7 +1,7 @@
 """Domain entities: the things Jarvis reasons about, free of any framework or storage detail."""
 
 import math
-from datetime import datetime, time
+from datetime import date, datetime, time
 from enum import Enum
 from typing import Literal
 
@@ -252,6 +252,24 @@ class Goal(BaseModel):
     status: str = Field(default="active", description="Lifecycle state of the goal.")
 
 
+class GoalDeadlineUpdate(BaseModel):
+    """A deadline learned for a goal (from a document, or the user), with its context."""
+
+    user_id: str = Field(description="Owner of the goal.")
+    goal_id: str | None = Field(default=None, description="Goal the deadline is for, if known.")
+    source: str = Field(description="Where the deadline came from (e.g. ingestion).")
+    deadline_date: date | None = Field(default=None, description="The deadline's date, if parsed.")
+    deadline_raw: str | None = Field(
+        default=None, description="The deadline as it was written, before parsing."
+    )
+    context_snippet: str | None = Field(
+        default=None, description="Text around the deadline: what it is about."
+    )
+    created_at: datetime | None = Field(
+        default=None, description="When it was stored; set by the store, None until then."
+    )
+
+
 class Task(BaseModel):
     """One schedulable unit of work the user has committed to."""
 
@@ -265,7 +283,11 @@ class Task(BaseModel):
     )
     goal_id: str | None = Field(default=None, description="Goal this task belongs to.")
     plan_id: str | None = Field(
-        default=None, description="Plan (accepted draft) that wrote this task."
+        default=None,
+        description=(
+            "Id shared by the rows one draft acceptance wrote: a fresh UUID minted per"
+            " accept, not the draft's id."
+        ),
     )
     title: str = Field(description="What to do.")
     duration_minutes: int = Field(gt=0, description="Planned length in minutes; always positive.")
@@ -364,6 +386,36 @@ class BehavioralConstraint(BaseModel):
     )
     created_at: datetime | None = Field(
         default=None, description="When it was stored; set by the store, None until then."
+    )
+
+
+# SuperMemo-2's easiness-factor floor: a habit harder than this is broken down instead.
+SM2_EF_FLOOR = 1.3
+
+
+class HabitTracker(BaseModel):
+    """The spaced-repetition (SM-2) state of one habit the user reviews."""
+
+    id: str = Field(description="Tracker identifier (a UUID).")
+    user_id: str = Field(description="Owner of the tracker.")
+    habit_id: str | None = Field(default=None, description="The habit it tracks, if named.")
+    constraint_id: str | None = Field(
+        default=None, description="The behavioural constraint it tracks, if any."
+    )
+    repetitions: int = Field(
+        default=0, ge=0, description="Reviews in a row rated 3 or better (0 after a lapse)."
+    )
+    quality_last: int | None = Field(
+        default=None, ge=0, le=5, description="The last review's rating, 0 to 5; None before one."
+    )
+    ef: float = Field(
+        default=2.5, ge=SM2_EF_FLOOR, description="SM-2 easiness factor, never below 1.3."
+    )
+    next_interval_days: int = Field(
+        default=1, ge=0, description="Days after the last review that the next one is due."
+    )
+    last_done_at: datetime | None = Field(
+        default=None, description="When it was last reviewed; None if never."
     )
 
 

@@ -184,8 +184,10 @@ async def test_due_trackers__ist_morning__uses_local_date():
     # 03:00 IST on Mon 16 Nov is 21:30 UTC on Sun 15 Nov.
     morning = datetime(2026, 11, 16, 3, 0, tzinfo=IST)
 
-    due = await get_due_trackers("alice", supabase, as_of_date=morning, zone=IST)
-    on_utc = await get_due_trackers("alice", supabase, as_of_date=morning, zone=ZoneInfo("UTC"))
+    trackers = _container(supabase).repos.habit_trackers
+
+    due = await get_due_trackers(trackers, "alice", IST, as_of_date=morning)
+    on_utc = await get_due_trackers(trackers, "alice", ZoneInfo("UTC"), as_of_date=morning)
 
     assert [t["id"] for t in due] == ["daytime"]
     assert on_utc == []  # on UTC dates it is still the 15th: nothing would be due yet
@@ -202,8 +204,8 @@ async def test_due_trackers_api__zone_from_the_profile(monkeypatch):
     await container.repos.profiles.update("alice", timezone="America/New_York")
     seen: dict = {}
 
-    async def fake_due(user_id, supabase_client=None, as_of_date=None, zone=None):
-        seen.update(user_id=user_id, zone=zone)
+    async def fake_due(trackers, user_id, zone, *, as_of_date=None):
+        seen.update(trackers=trackers, user_id=user_id, zone=zone)
         return []
 
     monkeypatch.setattr("app.api.v1.endpoints.habits.get_due_trackers", fake_due)
@@ -215,4 +217,8 @@ async def test_due_trackers_api__zone_from_the_profile(monkeypatch):
         resp = await api.get("/api/v1/habits/tracker/due", params={"user_id": "alice"})
 
     assert resp.status_code == 200
-    assert seen == {"user_id": "alice", "zone": ZoneInfo("America/New_York")}
+    assert seen == {
+        "trackers": container.repos.habit_trackers,
+        "user_id": "alice",
+        "zone": ZoneInfo("America/New_York"),
+    }

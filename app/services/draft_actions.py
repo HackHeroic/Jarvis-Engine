@@ -201,20 +201,6 @@ async def reject_draft(
         )
 
 
-def task_repository(supabase: Any) -> Any:
-    """The composition root's ``TaskRepository``; without a container, one over ``supabase``.
-
-    The same no-container fallback as ``_draft_service`` (tests, scripts), kept in
-    this one shim: nothing else outside the composition root builds a repository.
-    """
-    container = registered_container()
-    if container is not None:
-        return container.repos.tasks
-    from app.infrastructure.persistence.supabase_repos import SupabaseTaskRepository
-
-    return SupabaseTaskRepository(supabase)
-
-
 def _draft_service(supabase: Any) -> Optional[DraftService]:
     """The composition root's ``DraftService``, whose bus delivers ``DraftAccepted``.
 

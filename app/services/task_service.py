@@ -149,6 +149,22 @@ class TaskService:
             DeadlineMissed(occurred_at=now, user_id=user_id, task_id=task_id),
         )
 
+    async def bring_back(self, user_id: str, task_id: str) -> Task | None:
+        """Bring a set-aside (MISSED) task back to PENDING, its passed deadline cleared.
+
+        Returns the task as it is now, or None when it is not missed any more (an
+        accept re-slotted it, or the user completed it meanwhile): one compare-and-set
+        write, so nothing changes then. NotFoundError if the user has no such task.
+
+        Bringing a task back is not an outcome, so no event is recorded: the slot it
+        lost keeps its ``missed``, and the plan that takes it in records its new slot
+        (``scheduled`` / ``rescheduled``, written on accept).
+        """
+        try:
+            return await self._tasks.bring_back(user_id, task_id)
+        except errors.StaleVersionError:
+            return None
+
     async def sweep_passed_slots(self, user_id: str, now: datetime) -> list[TaskEvent]:
         """Mark missed each pending task whose slot passed with no outcome; return the events.
 
