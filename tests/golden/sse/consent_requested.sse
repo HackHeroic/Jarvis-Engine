@@ -1,0 +1,21 @@
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "KNOWLEDGE_INGESTION", "method": "rule-based"}}
+
+event: step
+data: {"intent": "KNOWLEDGE_INGESTION", "stage": "intent_classified"}
+
+event: phase
+data: {"phase": "ingesting", "verb": "<ingesting>", "detail": {"module": "knowledge_module"}}
+
+event: consent_request
+data: {"reason": "May I read that file, sir?", "module": "knowledge_module"}
+
+event: step
+data: {"intent": "KNOWLEDGE_INGESTION", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}
+
+event: message
+data: {"token": "May I read that file, sir?"}
+
+event: complete
+data: {"intent": "KNOWLEDGE_INGESTION", "message": "May I read that file, sir?", "schedule": null, "execution_graph": null, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": null, "thinking_process": null, "schedule_status": null, "conflict_summary": null, "draft_id": null, "saved_constraints": null, "conversation_id": "sess-1", "message_id": "msg-reply", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": null, "generation_metrics": {"total_tokens": 1, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": null, "model": "local"}}
+

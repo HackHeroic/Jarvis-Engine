@@ -435,7 +435,7 @@ async def update_cognitive_state(state: dict) -> None:
 async def run_observation_loop(state: dict) -> dict:
     """Learn from the turn, inline, before the stream completes.
 
-    - Emits phase_start + phase_end SSE so frontend timing is accurate.
+    - Emits phase_start + phase_end (``status: done``) SSE so frontend timing is accurate.
     - Skips entirely on trivial inputs (greetings/emotional) — no memories from "hi".
     - Remembers the turn's memories (no write starts after MEMORY_PERSIST_TIMEOUT_S;
       the one in flight is never cut short), then emits their frames.
@@ -482,7 +482,11 @@ async def run_observation_loop(state: dict) -> dict:
     patterns = drain_pattern_frames(state)
     for frame in patterns:
         _emit_event(state, "pattern_detected", frame)
-    _emit_event(state, "phase_end", {"phase": "learning", **({"timeout": True} if timed_out else {})})
+    # "status": "done", as a tool step's last frame says: else the end reads as the start.
+    _emit_event(
+        state, "phase_end",
+        {"phase": "learning", "status": "done", **({"timeout": True} if timed_out else {})},
+    )
     container = registered_container()
     return {
         "needs_followup": False,

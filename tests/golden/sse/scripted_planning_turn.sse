@@ -1,0 +1,66 @@
+event: phase
+data: {"phase": "loading_context", "verb": "<loading_context>", "detail": {"memories_count": 0, "conversation_turns": 0}}
+
+event: phase
+data: {"phase": "brain_dump_extraction", "verb": "<brain_dump_extraction>"}
+
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "PLAN_DAY", "method": "rule-based"}}
+
+event: step
+data: {"intent": "PLAN_DAY", "stage": "intent_classified"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "validate_goal", "status": "started"}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "validate_goal", "status": "done", "detail": {"task_count": 3, "duration_ms": "<n>"}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "translate_habits", "status": "skipped", "detail": {"reason": "feature 'habits' disabled"}}
+
+event: tool_use
+data: {"module": "planning_module", "tool": "fuse_tasks", "status": "exploded"}
+
+event: phase
+data: {"phase": "decomposing", "task_count": 3}
+
+event: phase
+data: {"phase": "planning"}
+
+event: phase
+data: not json at all
+
+event: phase
+data: {"phase": "planning", "verb": "<planning>", "detail": {"module": "planning_module"}}
+
+event: phase
+data: {"phase": "synthesizing", "verb": "<synthesizing>"}
+
+event: phase
+data: {"phase": "learning"}
+
+event: memory_extracted
+data: {"memory_id": "mem-1", "type": "preference", "content": "Prefers studying in the mornings", "confidence": 0.8, "provenance": "said", "action": "created"}
+
+event: pattern_detected
+data: {"type": "skip_time_window", "content": "Tends to set aside 9 AM slots", "confidence": 0.75, "occurrence_count": 3, "action": "created", "pattern_key": "skip_time_window:9", "memory_id": "mem-2"}
+
+event: phase
+data: {"phase": "learning", "status": "done"}
+
+event: phase
+data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 1, "patterns_detected": 1}}
+
+event: step
+data: {"intent": "PLAN_DAY", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}
+
+event: thinking
+data: {"token": "Three tasks fit before noon."}
+
+event: message
+data: {"token": "Here's the plan, sir."}
+
+event: complete
+data: {"intent": "PLAN_DAY", "message": "Here's the plan, sir.", "schedule": {"horizon_start": "2026-11-16T08:00:00+05:30", "schedule": {"t1": {"start_min": 0, "end_min": 25}}}, "execution_graph": {"decomposition": [{"task_id": "t1", "title": "Graphs"}]}, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": "replan", "thinking_process": "Three tasks fit before noon.", "schedule_status": "draft", "conflict_summary": null, "draft_id": "draft-1", "saved_constraints": ["never before 11 AM"], "conversation_id": "sess-1", "message_id": "msg-reply", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": null, "generation_metrics": {"total_tokens": 1, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": null, "model": "none (structured response)"}}
+

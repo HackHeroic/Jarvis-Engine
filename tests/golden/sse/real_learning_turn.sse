@@ -1,0 +1,45 @@
+event: phase
+data: {"phase": "loading_context", "verb": "<loading_context>", "detail": {"memories_count": 0, "conversation_turns": 0}}
+
+event: phase
+data: {"phase": "brain_dump_extraction", "verb": "<brain_dump_extraction>"}
+
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "CHAT", "method": "rule-based"}}
+
+event: step
+data: {"intent": "CHAT", "stage": "intent_classified"}
+
+event: message
+data: {"token": "Very "}
+
+event: message
+data: {"token": "good,"}
+
+event: message
+data: {"token": " sir."}
+
+event: phase
+data: {"phase": "responding", "verb": "<responding>", "detail": {"module": "conversation_module"}}
+
+event: phase
+data: {"phase": "learning"}
+
+event: memory_extracted
+data: {"memory_id": "<uuid>", "type": "preference", "content": "Prefers studying in the mornings", "confidence": 0.8, "provenance": "said", "action": "created"}
+
+event: pattern_detected
+data: {"type": "skip_time_window", "content": "You tend to set work aside around 9 AM", "confidence": 1.0, "occurrence_count": 3, "action": "created", "pattern_key": "skip_time_window:9", "memory_id": "<uuid>"}
+
+event: phase
+data: {"phase": "learning", "status": "done"}
+
+event: phase
+data: {"phase": "learning", "verb": "<learning>", "detail": {"memories_extracted": 0, "patterns_detected": 0}}
+
+event: step
+data: {"intent": "CHAT", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}
+
+event: complete
+data: {"intent": "CHAT", "message": "Very good, sir.", "schedule": null, "execution_graph": null, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": null, "thinking_process": null, "schedule_status": null, "conflict_summary": null, "draft_id": null, "saved_constraints": null, "conversation_id": "<uuid>", "message_id": "<uuid>", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": [{"insight": "I keep demanding work out of the 9 AM hour \u2014 you've set aside 3 of 3 there.", "confidence": 1.0, "occurrences": 3, "memory_id": "<uuid>"}], "generation_metrics": {"total_tokens": 3, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": "<n>", "model": "local"}}
+

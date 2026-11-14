@@ -1,0 +1,21 @@
+event: phase
+data: {"phase": "intent_classified", "verb": "<intent_classified>", "detail": {"intent": "CHAT", "method": "rule-based"}}
+
+event: step
+data: {"intent": "CHAT", "stage": "intent_classified"}
+
+event: phase
+data: {"phase": "responding", "verb": "<responding>", "detail": {"module": "conversation_module"}}
+
+event: step
+data: {"intent": "CHAT", "stage": "pipeline_done", "model_mode": "auto", "synthesis_model": "local", "force_cloud": false}
+
+event: thinking
+data: {"token": "They want a reply."}
+
+event: message
+data: {"token": "Good evening, sir."}
+
+event: complete
+data: {"intent": "CHAT", "message": "Good evening, sir.", "schedule": null, "execution_graph": null, "ingestion_result": null, "action_proposals": null, "search_result": null, "suggested_action": null, "thinking_process": "They want a reply.", "schedule_status": null, "conflict_summary": null, "draft_id": null, "saved_constraints": null, "conversation_id": "sess-1", "message_id": "msg-reply", "clarification_options": null, "memories": null, "since_last_spoke": null, "pearl_insights": null, "generation_metrics": {"total_tokens": 1, "total_time_s": "<n>", "tok_per_sec": "<n>", "ttft_ms": null, "model": "local"}}
+

@@ -7,7 +7,6 @@ restarted in either order keep talking.
 """
 
 import asyncio
-import json
 import json as json_mod
 import re
 import time as time_mod
@@ -20,6 +19,16 @@ from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
+from app.schemas.chat_stream import (
+    ChatCompletePayload,
+    ConsentRequestFrame,
+    PhaseFrame,
+    SseEncoder,
+    SseEvent,
+    StepFrame,
+    TokenFrame,
+)
+from app.schemas.errors import ErrorBody, ErrorResponse
 from app.services.analytical.voice_of_jarvis import (
     extract_thinking_process,
     synthesize_jarvis_response_stream,
@@ -27,43 +36,16 @@ from app.services.analytical.voice_of_jarvis import (
 
 router = APIRouter()
 
-# Progress-queue `_event_type` → SSE frame name. Token events land on the
-# `message` and `thinking` channels, so a streamed reply is just many
-# `event: message` frames instead of one.
-_PROGRESS_EVENT_CHANNEL = {
-    "tool_use": "tool_use",
-    "memory_extracted": "memory_extracted",
-    "pattern_detected": "pattern_detected",
-    "token": "message",
-    "thinking_token": "thinking",
-}
+
+def _text_frame(event: SseEvent, text: str) -> str:
+    """A ``thinking`` or ``message`` frame carrying ``text``."""
+    return SseEncoder.frame(event, TokenFrame(token=text))
 
 
-def render_progress_event(raw) -> tuple[str, str, str]:
-    """Map one progress-queue entry to (sse_frame, event_type, token).
-
-    `token` is "" for anything that is not a token event. Unknown/absent
-    `_event_type` falls through to `event: phase`, re-dumped from the parsed
-    dict — yielding the raw string there would leak the internal `_event_type`
-    key into the phase payload.
-    """
-    try:
-        parsed = json_mod.loads(raw)
-        evt_type = parsed.pop("_event_type", "phase")
-    except (json_mod.JSONDecodeError, TypeError):
-        return f"event: phase\ndata: {raw}\n\n", "phase", ""
-
-    channel = _PROGRESS_EVENT_CHANNEL.get(evt_type)
-    if channel is None:
-        return f"event: phase\ndata: {json_mod.dumps(parsed)}\n\n", "phase", ""
-    if evt_type in ("token", "thinking_token"):
-        token = parsed.get("token", "")
-        return (
-            f"event: {channel}\ndata: {json_mod.dumps({'token': token})}\n\n",
-            evt_type,
-            token,
-        )
-    return f"event: {channel}\ndata: {json_mod.dumps(parsed)}\n\n", evt_type, ""
+def _error_frame(request_id: str, code: str, message: str, details: dict | None = None) -> str:
+    """The error envelope as the stream's ``error`` frame: the 200 has already gone out."""
+    body = ErrorBody(code=code, message=message, details=details, request_id=request_id)
+    return SseEncoder.frame(SseEvent.ERROR, ErrorResponse(error=body))
 
 
 NODE_TO_PHASE = {
@@ -142,9 +124,8 @@ async def chat_stream(request: ChatRequest, http_request: Request):
     from contextlib import AsyncExitStack
 
     from app.api.deps import container_of
-    from app.api.error_handlers import error_envelope, request_id_of
+    from app.api.error_handlers import request_id_of
     from app.domain.errors import JarvisError
-    from app.schemas.chat_stream import ChatCompletePayload
     from app.orchestrator.graph import is_trivial_input
     from app.services.memory.context import Recall, note_line, render_context_note
     from app.services.planning.local_time import user_zone
@@ -530,19 +511,25 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                                 "memories_extracted": node_state.get("memories_extracted_count", 0),
                                 "patterns_detected": node_state.get("patterns_detected_count", 0),
                             }
-                        yield f"event: phase\ndata: {json_mod.dumps(phase_detail)}\n\n"
+                        yield SseEncoder.frame(
+                            SseEvent.PHASE, PhaseFrame.model_validate(phase_detail)
+                        )
 
                     if node_name == "classify_intent" and node_state.get("intent"):
-                        yield f"event: step\ndata: {json_mod.dumps({'intent': _intent_str(node_state['intent']), 'stage': 'intent_classified'})}\n\n"
+                        yield SseEncoder.frame(SseEvent.STEP, StepFrame(
+                            intent=_intent_str(node_state["intent"]), stage="intent_classified"
+                        ))
 
                     # Emit consent_request if a hook asked for consent
                     if node_state.get("needs_consent"):
-                        yield f"event: consent_request\ndata: {json_mod.dumps({'reason': node_state.get('response_message', ''), 'module': node_name})}\n\n"
+                        yield SseEncoder.frame(SseEvent.CONSENT_REQUEST, ConsentRequestFrame(
+                            reason=node_state.get("response_message") or "", module=node_name
+                        ))
 
                     continue
 
                 # Sub-graph / synthesis bridge event (JSON string)
-                frame, evt_type, _tok = render_progress_event(raw)
+                frame, evt_type, _tok = SseEncoder.render_progress(raw)
                 if evt_type in ("token", "thinking_token"):
                     if _gen_start is None:
                         _gen_start = time_mod.monotonic()
@@ -567,7 +554,10 @@ async def chat_stream(request: ChatRequest, http_request: Request):
             from app.core.model_router import force_cloud_var
 
             _force_cloud_now = force_cloud_var.get()
-            yield f"event: step\ndata: {json_mod.dumps({'intent': _intent, 'stage': 'pipeline_done', 'model_mode': model_mode, 'synthesis_model': _answering_model(), 'force_cloud': _force_cloud_now})}\n\n"
+            yield SseEncoder.frame(SseEvent.STEP, StepFrame(
+                intent=_intent, stage="pipeline_done", model_mode=model_mode,
+                synthesis_model=_answering_model(), force_cloud=_force_cloud_now,
+            ))
 
             # --- Token streaming ---
             # Credited once the reply exists (below); a template reply keeps its label.
@@ -588,9 +578,9 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                 _pre_msg = final_state.get("response_message") or "Here's your schedule."
                 _pre_think = final_state.get("thinking_process")
                 if _pre_think and not thinking_streamed:
-                    yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                    yield _text_frame(SseEvent.THINKING, _pre_think)
                     thinking_full = _pre_think
-                yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                yield _text_frame(SseEvent.MESSAGE, _pre_msg)
                 message_full = _pre_msg
                 _token_count = 1
                 _stream_model = "none (structured response)"
@@ -603,9 +593,9 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                 if _pre_msg:
                     # Graph already computed the response — stream it word-by-word for UX
                     if _pre_think and not thinking_streamed:
-                        yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                        yield _text_frame(SseEvent.THINKING, _pre_think)
                         thinking_full = _pre_think
-                    yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                    yield _text_frame(SseEvent.MESSAGE, _pre_msg)
                     message_full = _pre_msg
                     _token_count = 1
                 else:
@@ -623,9 +613,9 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                     _llm_msg = _gc_out.get("response_message") or "Standing by, sir."
                     _llm_think = _gc_out.get("thinking_process")
                     if _llm_think:
-                        yield f"event: thinking\ndata: {json.dumps({'token': _llm_think})}\n\n"
+                        yield _text_frame(SseEvent.THINKING, _llm_think)
                         thinking_full = _llm_think
-                    yield f"event: message\ndata: {json.dumps({'token': _llm_msg})}\n\n"
+                    yield _text_frame(SseEvent.MESSAGE, _llm_msg)
                     message_full = _llm_msg
                     _token_count = 1
 
@@ -637,10 +627,10 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                 if _pre_msg and _pre_msg not in ("", "Standing by, sir."):
                     # VoJ already computed in synthesize_response node — emit it
                     if _pre_think and not thinking_streamed:
-                        yield f"event: thinking\ndata: {json.dumps({'token': _pre_think})}\n\n"
+                        yield _text_frame(SseEvent.THINKING, _pre_think)
                         thinking_full = _pre_think
                     # Stream message word-by-word for typing effect
-                    yield f"event: message\ndata: {json.dumps({'token': _pre_msg})}\n\n"
+                    yield _text_frame(SseEvent.MESSAGE, _pre_msg)
                     message_full = _pre_msg
                     _token_count = 1
                 else:
@@ -666,11 +656,11 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                                 thinking_full += tok
                             else:
                                 message_full += tok
-                            yield f"event: {event_type}\ndata: {json.dumps({'token': tok})}\n\n"
+                            yield _text_frame(SseEvent(event_type), tok)
                     except Exception as voj_exc:
                         print(f"[chat/stream] VoJ streaming failed: {voj_exc}")
                         _fallback = final_state.get("response_message") or "Standing by, sir."
-                        yield f"event: message\ndata: {json.dumps({'token': _fallback})}\n\n"
+                        yield _text_frame(SseEvent.MESSAGE, _fallback)
                         message_full = _fallback
                         _token_count = 1
 
@@ -769,17 +759,13 @@ async def chat_stream(request: ChatRequest, http_request: Request):
             # The frame's contract, checked before it is sent (fields exactly as the
             # frontend reads them): a frame off the contract is a failed turn, not a
             # silently different payload.
-            complete_payload = ChatCompletePayload.model_validate(complete_payload).model_dump(
-                mode="json"
+            yield SseEncoder.frame(
+                SseEvent.COMPLETE, ChatCompletePayload.model_validate(complete_payload)
             )
-            yield f"event: complete\ndata: {json_mod.dumps(complete_payload)}\n\n"
         except JarvisError as exc:
             # Raised on purpose, with a user-facing message (a turn that waited too
             # long for the one before it is a conflict): the standard envelope.
-            envelope = error_envelope(
-                request_id_of(http_request), exc.code, exc.message, exc.details
-            )
-            yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
+            yield _error_frame(request_id_of(http_request), exc.code, exc.message, exc.details)
         except Exception as exc:
             # The cause is logged with the request id; its text never goes to the client.
             request_id = request_id_of(http_request)
@@ -787,10 +773,7 @@ async def chat_stream(request: ChatRequest, http_request: Request):
                 f"chat stream failed [request_id={request_id}]: {type(exc).__name__}",
                 exc_info=exc,
             )
-            envelope = error_envelope(
-                request_id, "internal_error", "Something went wrong on our side."
-            )
-            yield f"event: error\ndata: {json_mod.dumps(envelope)}\n\n"
+            yield _error_frame(request_id, "internal_error", "Something went wrong on our side.")
         finally:
             # Shielded: under uvicorn, Starlette streams inside an anyio task group
             # and a client disconnect cancels that scope — anyio then re-cancels

@@ -1,0 +1,3 @@
+event: error
+data: {"error": {"code": "conflict", "message": "Your previous message is still being answered.", "details": null, "request_id": "<request_id>"}}
+
