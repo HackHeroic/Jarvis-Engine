@@ -26,7 +26,10 @@ router = APIRouter()
 class MemoryOut(BaseModel):
     """One memory as the Memory panel shows it."""
 
-    memory_id: str = Field(description="The memory's id.")
+    memory_id: str = Field(
+        description="The memory's id: `memory_id` wherever a memory is referred to (chat "
+        "frames, PEARL insights, the You page)."
+    )
     memory_type: MemoryType = Field(description="What kind of thing is remembered.")
     content: str = Field(description="The memory in words.")
     confidence: float = Field(description="How sure Jarvis is that it holds, 0 to 1.")

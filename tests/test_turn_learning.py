@@ -681,3 +681,45 @@ async def test_turn__store_reads__memories_listed_once_pearl_looks_once_profile_
     assert detections == ["alice"]
     (insight,) = second.payload["pearl_insights"]
     assert "9 AM" in insight["insight"]
+
+
+# --- the complete frame: one typed contract ---------------------------------------------
+
+
+COMPLETE_FIELDS = {  # exactly what the frontend reads today
+    "intent", "message", "schedule", "execution_graph", "ingestion_result",
+    "action_proposals", "search_result", "suggested_action", "thinking_process",
+    "awaiting_task_confirmation", "schedule_status", "conflict_summary", "draft_id",
+    "saved_constraints", "conversation_id", "message_id", "clarification_options",
+    "memories", "since_last_spoke", "pearl_insights", "generation_metrics",
+}
+
+
+@pytest.mark.asyncio
+async def test_complete__payload__validated_by_its_model_fields_exactly_as_before(jarvis, llm):
+    from app.schemas.chat_stream import ChatCompletePayload
+
+    await _seed_skips_at_nine(jarvis)
+    _remember_on(llm, {"marathon": MARATHON})
+    await jarvis.say("I'm training for the Mumbai marathon in March")
+
+    turn = await jarvis.say("Anything I should know about my week?")
+
+    assert set(turn.payload) == set(ChatCompletePayload.model_fields) == COMPLETE_FIELDS
+    assert ChatCompletePayload.model_validate(turn.payload).model_dump(mode="json") == turn.payload
+    assert set(turn.payload["generation_metrics"]) == {
+        "total_tokens", "total_time_s", "tok_per_sec", "ttft_ms", "model",
+    }
+    (memory,) = [m for m in turn.payload["memories"] if "marathon" in m["content"]]
+    assert set(memory) == {"memory_id", "memory_type", "content", "confidence", "provenance"}
+    for name, field in ChatCompletePayload.model_fields.items():
+        assert field.description, f"{name} has no description"
+
+
+def test_complete__payload_model__rejects_a_frame_off_the_contract():
+    from pydantic import ValidationError
+
+    from app.schemas.chat_stream import ChatCompletePayload
+
+    with pytest.raises(ValidationError):
+        ChatCompletePayload.model_validate({"intent": "CHAT", "message": "hi", "surprise": 1})

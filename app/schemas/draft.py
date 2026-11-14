@@ -44,7 +44,10 @@ class DraftStateResponse(BaseModel):
     accepted or rejected whole.
     """
 
-    draft_id: str = Field(description="Primary key of the draft (draft_schedules.id)")
+    draft_id: str = Field(
+        description="The draft's id (draft_schedules.id): `draft_id` wherever a draft is "
+        "referred to, as in the chat complete frame."
+    )
     user_id: str
     goal_id: Optional[str] = None
     tasks: List[dict] = Field(default_factory=list, description="TaskChunk dicts under review")

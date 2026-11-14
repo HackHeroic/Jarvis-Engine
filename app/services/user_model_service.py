@@ -105,7 +105,10 @@ class PatternShown(BaseModel):
 class RuleShown(BaseModel):
     """A rule the user's plans respect."""
 
-    id: str = Field(description="The rule's id.")
+    id: str = Field(
+        description="The rule's id (`id`: the item is the rule itself); delete it at "
+        "/habits/constraints/{id}."
+    )
     text: str = Field(description="The rule as said, or as inferred.")
     provenance: MemorySource = Field(
         description="'said': the user stated it. 'inferred': Jarvis noticed it."
