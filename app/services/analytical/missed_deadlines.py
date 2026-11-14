@@ -99,8 +99,8 @@ async def detect_and_mark_missed(
             try:
                 if await task_service.mark_deadline_missed(user_id, o["task_id"]) is not None:
                     marked.append(o)
-            except errors.JarvisError as e:
-                logger.warning(f"Could not set task {o['task_id']} aside: {e.code}")
+            except Exception as e:  # one task's failure never stops the others
+                logger.warning(f"Could not set task {o['task_id']} aside: {type(e).__name__}")
         overdue = marked
     else:
         # Mark missed in DB

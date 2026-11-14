@@ -5,7 +5,7 @@ each one as a single append-only task event.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -48,11 +48,11 @@ class TaskUpdateRequest(BaseModel):
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=120)
     difficulty_weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     deadline_hint: Optional[str] = None
-    status: Optional[Literal["pending", "completed", "skipped", "missed"]] = Field(
+    status: Optional[str] = Field(
         default=None,
         description=(
-            "New status: pending, completed, skipped or missed, the statuses "
-            "user_tasks accepts. Anything else is rejected with a 422."
+            "Not accepted here: any value is a 422. Status changes go through "
+            "POST /tasks/{task_id}/complete or /skip, which record each outcome once."
         ),
     )
 
@@ -87,6 +87,19 @@ def _get_supabase(request: Request) -> Any:
     return None
 
 
+def _require_supabase(request: Request) -> Any:
+    """The Supabase client, or the one 503 every task route answers without it.
+
+    Complete and Skip check it too: with Supabase unreachable the container runs on
+    in-memory repositories, where every task is unknown, and a 404 would tell the
+    user their task is gone.
+    """
+    supabase = _get_supabase(request)
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database not available")
+    return supabase
+
+
 # What a task that is no longer pending already is, in the user's words.
 _ALREADY = {TaskStatus.COMPLETED: "done", TaskStatus.MISSED: "set aside"}
 
@@ -111,6 +124,7 @@ async def complete_task(
     request: Request,
 ) -> TaskResponse:
     """Complete a task and record its quality signal."""
+    supabase = _require_supabase(request)
     event = await get_container(request).task_service.complete(
         body.user_id,
         task_id,
@@ -119,8 +133,7 @@ async def complete_task(
     )
     if event is not None:  # a repeat click recorded nothing, so it adds no signal either
         _record_completion_signal(
-            _get_supabase(request), task_id, body.user_id, body.quality,
-            body.actual_duration_minutes,
+            supabase, task_id, body.user_id, body.quality, body.actual_duration_minutes,
         )
 
     return TaskResponse(
@@ -149,6 +162,7 @@ async def skip_task(
     Never says 'overdue' or 'failed'. A repeat skip, or a skip of a task that is
     already done, records nothing.
     """
+    _require_supabase(request)
     container = get_container(request)
     await container.task_service.skip(body.user_id, task_id)
     task = await container.repos.tasks.get(body.user_id, task_id)
@@ -192,8 +206,8 @@ async def skip_task(
     response_model=TaskResponse,
     summary="Update a task",
     description=(
-        "Update task fields (title, duration, difficulty, deadline, status). Status must "
-        "be one of pending, completed, skipped, missed; anything else is a 422."
+        "Update task fields (title, duration, difficulty, deadline). A status is a 422: "
+        "status changes go through POST /tasks/{task_id}/complete or /skip."
     ),
 )
 async def update_task(
@@ -203,13 +217,17 @@ async def update_task(
 ) -> TaskResponse:
     """Update mutable fields on a task.
 
-    ``status`` is limited to the statuses the user_tasks CHECK constraint accepts
-    (pending, completed, skipped, missed). Request validation rejects anything
-    else with a 422 before the database is touched.
+    ``status`` is rejected with a 422 before the database is touched. An outcome is
+    recorded by Complete or Skip, through TaskService (a compare-and-set plus one
+    outcome event); a PATCH would move the status with no event.
     """
-    supabase = _get_supabase(request)
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
+    if body.status is not None:
+        raise errors.ValidationError(
+            "A task's status changes through POST /api/v1/tasks/{task_id}/complete "
+            "or /skip, not through an update.",
+            details={"field": "status"},
+        )
+    supabase = _require_supabase(request)
 
     # Verify task exists and belongs to user
     result = (
@@ -232,8 +250,6 @@ async def update_task(
         update_payload["difficulty_weight"] = body.difficulty_weight
     if body.deadline_hint is not None:
         update_payload["deadline_hint"] = body.deadline_hint
-    if body.status is not None:
-        update_payload["status"] = body.status
 
     if len(update_payload) == 0:
         return TaskResponse(
@@ -247,7 +263,7 @@ async def update_task(
     # No replan runs: the background replan is off.
     return TaskResponse(
         task_id=task_id,
-        status=body.status or "updated",
+        status="updated",
         message="Task updated.",
         replan_triggered=False,
     )
@@ -265,9 +281,7 @@ async def delete_task(
     request: Request = None,
 ) -> TaskResponse:
     """Delete a task."""
-    supabase = _get_supabase(request)
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
+    supabase = _require_supabase(request)
 
     # Verify exists
     result = (
@@ -307,9 +321,7 @@ async def clear_all_tasks(
     request: Request = None,
 ) -> dict:
     """Clear all tasks for a user, optionally filtered by status."""
-    supabase = _get_supabase(request)
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
+    supabase = _require_supabase(request)
 
     query = supabase.table("user_tasks").delete().eq("user_id", user_id)
     if status_filter:
@@ -334,9 +346,7 @@ async def list_tasks(
     request: Request = None,
 ) -> dict:
     """List all tasks for a user, optionally filtered by status."""
-    supabase = _get_supabase(request)
-    if not supabase:
-        raise HTTPException(status_code=503, detail="Database not available")
+    supabase = _require_supabase(request)
 
     query = (
         supabase.table("user_tasks")

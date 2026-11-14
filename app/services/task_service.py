@@ -179,18 +179,20 @@ class TaskService:
             raise errors.NotFoundError("That task does not exist.", details={"task_id": task_id})
         return task
 
-    async def _move(self, task: Task, move: _Move) -> Task | None:
-        """Compare-and-set ``task`` to ``move.target``; the moved task, or None if nothing changed.
+    async def _move(self, task: Task, move: _Move) -> tuple[Task, TaskStatus] | None:
+        """Compare-and-set ``task`` to ``move.target``.
 
-        A lost race re-reads the task and tries again from the status that won, while
-        the move is still legal from it.
+        Returns the moved task and the status it moved from, or None if nothing
+        changed. A lost race re-reads the task and tries again from the status that
+        won, while the move is still legal from it.
         """
         attempts = 0
         while task.status != move.target and task.status in move.allowed_from:
             try:
-                return await self._tasks.update_status(
+                moved = await self._tasks.update_status(
                     task.user_id, task.task_id, move.target, expected=task.status
                 )
+                return moved, task.status
             except errors.StaleVersionError:
                 attempts += 1
                 if attempts >= _CAS_ATTEMPTS:
@@ -206,29 +208,51 @@ class TaskService:
         details: dict,
         announcement: DomainEvent,
     ) -> TaskEvent | None:
-        """Make the move; if it happened, store its event, then publish ``announcement``."""
-        moved = await self._move(task, move)
-        if moved is None:
+        """Make the move; if it happened, store its event, then publish ``announcement``.
+
+        The status and the event are two writes. If the event cannot be stored the
+        status is set back before the error is re-raised, so the outcome is not lost:
+        a retry finds the task where it was and records it.
+        """
+        result = await self._move(task, move)
+        if result is None:
             return None
-        event = await self._events.append(
-            moved.user_id,
-            TaskEvent(
-                user_id=moved.user_id,
-                task_id=moved.task_id,
-                event_type=move.event_type,
-                occurred_at=now,
-                scheduled_start=moved.scheduled_start,
-                scheduled_end=moved.scheduled_end,
-                metadata={
-                    "title": moved.title,
-                    "goal_id": moved.goal_id,
-                    "deadline_hint": moved.deadline_hint,
-                    **details,
-                },
-            ),
+        moved, previous = result
+        event = TaskEvent(
+            user_id=moved.user_id,
+            task_id=moved.task_id,
+            event_type=move.event_type,
+            occurred_at=now,
+            scheduled_start=moved.scheduled_start,
+            scheduled_end=moved.scheduled_end,
+            metadata={
+                "title": moved.title,
+                "goal_id": moved.goal_id,
+                "deadline_hint": moved.deadline_hint,
+                **details,
+            },
         )
+        try:
+            stored = await self._events.append(moved.user_id, event)
+        except errors.PersistenceError:
+            await self._set_back(moved, previous, move.target)
+            raise
         await self._bus.publish(announcement)
-        return event
+        return stored
+
+    async def _set_back(self, moved: Task, previous: TaskStatus, target: TaskStatus) -> None:
+        """Undo a move whose event was not stored (compare-and-set from ``target``).
+
+        Best effort: if the undo fails too, it is logged and the caller re-raises the
+        event write's error.
+        """
+        try:
+            await self._tasks.update_status(moved.user_id, moved.task_id, previous, expected=target)
+        except errors.JarvisError as exc:
+            logger.warning(
+                "Could not set task %s back to %s after its event was lost: %s",
+                moved.task_id, previous.value, exc.code,
+            )
 
 
 class SlotPassedSweep(Sweep):
@@ -241,11 +265,25 @@ class SlotPassedSweep(Sweep):
         self._tasks = tasks
 
     async def run(self, user_ids: list[str], now: datetime) -> int:
-        """Sweep each user's passed slots; return how many tasks were marked missed."""
+        """Sweep each user's passed slots; return how many tasks were marked missed.
+
+        Failures are counted and logged once per run, as one warning: while the
+        database is down this runs every minute for every user, and a traceback each
+        time would bury everything else in the log.
+        """
         changed = 0
+        failures: dict[str, int] = {}
         for user_id in user_ids:
             try:
                 changed += len(await self._tasks.sweep_passed_slots(user_id, now))
-            except Exception:  # one user's failure never stops the others
-                logger.exception("Slot sweep failed for user %s", user_id)
+            except Exception as exc:  # one user's failure never stops the others
+                kind = type(exc).__name__
+                failures[kind] = failures.get(kind, 0) + 1
+        if failures:
+            logger.warning(
+                "Slot sweep could not finish for %d of %d users (%s)",
+                sum(failures.values()),
+                len(user_ids),
+                ", ".join(f"{kind} x{count}" for kind, count in sorted(failures.items())),
+            )
         return changed

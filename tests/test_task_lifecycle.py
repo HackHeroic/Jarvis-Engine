@@ -256,27 +256,19 @@ def test_patch_task__unknown_status__422():
         app.state.db_client = original
 
 
-def test_patch_task__missed__accepted_and_written():
-    from fastapi.testclient import TestClient
-    from app.main import app
-    from tests.fakes import FakeSupabase
+def test_patch_task__status__422_points_to_complete_and_skip(monkeypatch):
+    """An outcome is recorded by Complete or Skip (one event each), never by PATCH."""
+    fake = FakeSupabase({"user_tasks": [_task_row("t1")]})
+    client = _client_over(fake, monkeypatch)
 
-    fake = FakeSupabase({"user_tasks": [
-        {"user_id": "u1", "task_id": "t1", "title": "Study CNNs", "status": "pending"},
-    ]})
+    resp = client.patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "completed"})
 
-    class _DB:
-        supabase = fake
-
-    original = getattr(app.state, "db_client", None)
-    app.state.db_client = _DB()
-    try:
-        resp = TestClient(app).patch("/api/v1/tasks/t1", json={"user_id": "u1", "status": "missed"})
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "missed"
-        assert fake.rows["user_tasks"][0]["status"] == "missed"
-    finally:
-        app.state.db_client = original
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    assert error["code"] == "validation_error"
+    assert "/complete" in error["message"] and "/skip" in error["message"]
+    assert fake.rows["user_tasks"][0]["status"] == "pending"
+    assert fake.rows.get("task_events", []) == []
 
 
 def test_patch_task__pacing_pushed__422(monkeypatch):
@@ -303,6 +295,52 @@ def test_complete_endpoint__unknown_task__404_envelope(monkeypatch):
     assert error["code"] == "not_found"
     assert fake.rows.get("task_events", []) == []
     assert fake.rows["user_tasks"][0]["status"] == "pending"
+
+
+def test_skip_endpoint__unknown_task__404_envelope(monkeypatch):
+    fake = FakeSupabase({"user_tasks": [_task_row("t1", user_id="someone_else")]})
+    client = _client_over(fake, monkeypatch)
+
+    resp = client.post("/api/v1/tasks/t1/skip", json={"user_id": "u1"})
+
+    assert resp.status_code == 404
+    error = resp.json()["error"]
+    assert set(error) == {"code", "message", "details", "request_id"}
+    assert error["code"] == "not_found"
+    assert fake.rows.get("task_events", []) == []
+    assert fake.rows["user_tasks"][0]["status"] == "pending"
+
+
+def test_complete_and_skip__no_database__same_503_envelope_as_list(monkeypatch):
+    """With Supabase unreachable the container runs in memory, where every task is
+    unknown: answering 404 would tell the user their task is gone."""
+    from fastapi.testclient import TestClient
+
+    import app.core.config as cfg
+    from app.container import AppContainer
+    from app.main import app
+    from app.orchestrator.hooks import ActionHooks
+
+    monkeypatch.setattr(app.state, "db_client", None, raising=False)
+    monkeypatch.setattr(
+        app.state,
+        "container",
+        AppContainer.build(supabase_client=None, cfg=cfg, hooks=ActionHooks()),
+        raising=False,
+    )
+    client = TestClient(app)
+
+    listed = client.get("/api/v1/tasks/?user_id=u1")
+    completed = client.post("/api/v1/tasks/t1/complete", json={"user_id": "u1", "quality": 4})
+    skipped = client.post("/api/v1/tasks/t1/skip", json={"user_id": "u1"})
+
+    def shape(resp):
+        error = resp.json()["error"]
+        return resp.status_code, error["code"], error["message"]
+
+    assert shape(listed)[0] == 503
+    assert shape(completed) == shape(listed)
+    assert shape(skipped) == shape(listed)
 
 
 # The background replan (control_policy.trigger_replan) has never run to completion
