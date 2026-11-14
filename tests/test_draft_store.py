@@ -57,27 +57,6 @@ def test_legacy_add_component_with_four_args(mock_supabase):
     assert result is True
 
 
-def test_legacy_accept_component_with_three_args(mock_supabase):
-    """drafts.py:115 calls store.accept_component(draft_id, user_id, key)"""
-    store = DraftStore(supabase_client=mock_supabase)
-    result = store.accept_component("draft-id", "user-id", "tasks")
-    assert result is True
-
-
-def test_legacy_reject_component_with_three_args(mock_supabase):
-    """drafts.py:136 calls store.reject_component(draft_id, user_id, key)"""
-    store = DraftStore(supabase_client=mock_supabase)
-    result = store.reject_component("draft-id", "user-id", "tasks")
-    assert result is True
-
-
-def test_legacy_update_component_data_with_four_args(mock_supabase):
-    """drafts.py:151 calls store.update_component_data(draft_id, user_id, component, data)"""
-    store = DraftStore(supabase_client=mock_supabase)
-    result = store.update_component_data("draft-id", "user-id", "tasks", {"key": "val"})
-    assert result is True
-
-
 def test_legacy_create_returns_draft_with_id(mock_supabase):
     """control_policy.py:1230 calls draft = draft_store.create(user_id, metadata={...}) then draft.draft_id"""
     store = DraftStore(supabase_client=mock_supabase)

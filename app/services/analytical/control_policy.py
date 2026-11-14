@@ -360,7 +360,7 @@ def _persist_fused_tasks(
     Deletes existing pending rows, then inserts fresh rows for each chunk. The
     rows come from ``build_task_rows``, the same builder draft acceptance uses.
     Chunks must have prefixed task_ids (goal_id_orig_id). Full TaskChunk fields
-    are persisted for retrieval by get_all_pending_tasks.
+    are persisted for retrieval by get_all_pending_tasks_with_goals.
 
     The delete and the insert are two calls, not one transaction. Draft
     acceptance does not come through here: it uses ``DraftService.accept``,

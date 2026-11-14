@@ -24,7 +24,6 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3.1.0",
     "aiosqlite>=0.20.0",
     "langchain-core>=0.3.0",
-    "pytest>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +40,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 vector = [
-    "chromadb>=0.4.0",
+    "chromadb>=0.5.0",
     "qdrant-client>=1.7.0",
 ]
 eval = [

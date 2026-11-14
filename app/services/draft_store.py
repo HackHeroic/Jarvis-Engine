@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
-from app.domain.entities import DraftStatus
+from app.domain.entities import OPEN_DRAFT_STATUSES
 
 
 # ── Legacy stubs (used by control_policy.py pending Task 8 rewrite) ─────────
@@ -44,8 +44,9 @@ def _get_supabase():
 
 _UNSET = object()  # sentinel: distinguish "arg not passed" from "explicitly None"
 
-# Statuses a draft is still under review in; every other status is final.
-_OPEN_STATUSES = [DraftStatus.PENDING.value, DraftStatus.MODIFIED.value]
+# Statuses a draft is still under review in (the domain's one definition), as the
+# column values this Supabase client filters on; every other status is final.
+_OPEN_STATUSES = [s.value for s in OPEN_DRAFT_STATUSES]
 
 
 def is_open_draft(draft: dict | None) -> bool:
@@ -161,12 +162,12 @@ class DraftStore:
         return True
 
     # ── Backward-compatible aliases ──────────────────────────
-    # The old in-memory DraftStore had: create(), get(), delete(), add_component(),
-    # accept_component(), reject_component(), accept_all(), cleanup_expired().
-    # drafts.py no longer calls any of them (Task 10 rewrote it onto the real
-    # API above); control_policy.py's v1 flow still calls add_component(), so
-    # the shims stay until that flow is retired. tests/test_draft_store.py pins
-    # their no-op contract so nobody mistakes them for working code.
+    # What is left of the old in-memory DraftStore's API: create(), get(),
+    # delete(), add_component(), cleanup_expired(). control_policy.py's v1 flow
+    # still calls create() and add_component(), so these stay until that flow is
+    # retired; tests/test_draft_store.py pins their contract so nobody mistakes
+    # the no-ops for working code. The component accept/reject/update shims had
+    # no caller left and are gone.
 
     def create(self, user_id: str, **kwargs) -> "Draft":
         """Legacy alias. Returns a Draft stub with a generated draft_id."""
@@ -185,22 +186,6 @@ class DraftStore:
 
     def add_component(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
         """Legacy no-op. Still called by control_policy.py:897,907,1260,1354 (v1 flow)."""
-        return True
-
-    def update_component_data(self, draft_id: str, user_id: str = None, component_type: str = None, data=None, **kwargs) -> bool:
-        """Legacy no-op. No caller remains — drafts.py now uses replace_tasks()."""
-        return True
-
-    def accept_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
-        """Legacy no-op. No caller remains — drafts.py accepts via draft_actions.accept_draft_and_persist()."""
-        return True
-
-    def reject_component(self, draft_id: str, user_id: str = None, component_type: str = None, **kwargs) -> bool:
-        """Legacy no-op. No caller remains — drafts.py now uses reject_draft()."""
-        return True
-
-    def accept_all(self, draft_id: str, **kwargs) -> bool:
-        """Legacy no-op."""
         return True
 
     def cleanup_expired(self) -> int:
