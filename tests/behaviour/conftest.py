@@ -23,7 +23,6 @@ PEARL, the constraint bridge and the draft service.
 import asyncio
 import copy
 import json
-import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -33,6 +32,7 @@ import pytest
 import pytest_asyncio
 from pydantic import BaseModel
 
+from app.domain.anti_guilt import BLAME_PHRASES, blame_phrases_in  # noqa: F401  (re-export)
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
 from app.domain.ports import LLMProvider, LLMRequest
@@ -331,23 +331,5 @@ async def jarvis(tmp_path) -> Jarvis:
 
 
 # --- anti-guilt ----------------------------------------------------------------
-
-BLAME_PHRASES = (
-    "failed",
-    "you didn't",
-    "you did not",
-    "you missed",
-    "behind schedule",
-    "falling behind",
-    "lazy",
-    "should have",
-    "your fault",
-)
-
-
-def blame_phrases_in(text: str) -> list[str]:
-    """Every blame phrase ``text`` contains, matched case-insensitively as whole phrases."""
-    return [
-        phrase for phrase in BLAME_PHRASES
-        if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text, flags=re.IGNORECASE)
-    ]
+# BLAME_PHRASES and blame_phrases_in come from app.domain.anti_guilt (imported above):
+# the one list, shared with the production code that vets model-written text.

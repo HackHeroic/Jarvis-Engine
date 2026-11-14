@@ -281,22 +281,25 @@ MEMORY_RECALL_TOKENS: int = 300
 MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
 
 # Conversations (ConversationMemoryService). The model sees the newest
-# HISTORY_MAX_MESSAGES messages after the conversation's summary, each cut to
-# HISTORY_MAX_CHARS_PER_MESSAGE characters. Once more than COMPACT_AFTER_MESSAGES are
-# unsummarized, one FAST call folds all but the newest COMPACT_KEEP_RECENT into the
-# summary; so between compactions the window only grows (8 to 18 messages), and the
-# prefix it sends changes only when a compaction rewrites it. A conversation idle for
-# SESSION_IDLE_MINUTES gets the rest summarised too, by the session-summary sweep, for
-# "since we last spoke".
+# HISTORY_MAX_MESSAGES messages after the conversation's summary_through (its verbatim
+# window), each cut to HISTORY_MAX_CHARS_PER_MESSAGE characters. Once more than
+# COMPACT_AFTER_MESSAGES are past it, one FAST call folds all but the newest
+# COMPACT_KEEP_RECENT into the summary; so between compactions the window only grows
+# (8 to 18 messages), and the prefix it sends changes only when a summary moves it. A
+# conversation idle for SESSION_IDLE_MINUTES gets the rest summarised too, by the
+# session-summary sweep, for "since we last spoke"; its newest COMPACT_KEEP_RECENT
+# messages stay in the window, word for word, for when the user comes back.
 HISTORY_MAX_MESSAGES: int = 24
 HISTORY_MAX_CHARS_PER_MESSAGE: int = 1500
 COMPACT_AFTER_MESSAGES: int = 16
 COMPACT_KEEP_RECENT: int = 8
 SESSION_IDLE_MINUTES: int = 30
-# The most unsummarized messages one summary call reads: a bound on its prompt. More
-# can pile up only while summary calls keep failing, or on a conversation older than
-# summaries; the older ones were already out of the window, and stay out of the summary.
-SUMMARY_MAX_INPUT_MESSAGES: int = 40
+# One summary call reads the oldest unsummarized messages first, at most
+# SUMMARY_PAGE_MESSAGES of them, and sends as many as fit SUMMARY_INPUT_MAX_CHARS of
+# transcript. A backlog (a chat older than summaries, a long outage) is worked through
+# a page per run, so every message eventually reaches a summary.
+SUMMARY_PAGE_MESSAGES: int = 40
+SUMMARY_INPUT_MAX_CHARS: int = 24_000
 # After a summary call fails (or is refused), that conversation's next try waits this
 # long: the turns stay as they were, and no turn pays for a call that keeps failing.
 SUMMARY_RETRY_MINUTES: int = 15
@@ -311,12 +314,16 @@ SESSION_SUMMARY_LOOKBACK_DAYS: int = 7
 # does not fit is left out, never cut mid-sentence.
 CONVERSATION_SUMMARY_TOKENS: int = 450
 SINCE_LAST_SPOKE_TOKENS: int = 250
-# A summary sentence at least this close (cosine similarity, memory embedder) to a memory
-# the user forgot or dismissed is never shown or fed to the next summary. Lower than
-# MEMORY_SUPPRESS_SIMILARITY on purpose: a sentence carries more words than the fact, and
-# dropping an innocent sentence costs little, while showing a forgotten fact breaks a
-# promise.
-SUMMARY_SUPPRESS_SIMILARITY: float = 0.5
+# A summary sentence is never shown, stored or fed to the next summary when it, or any of
+# its clauses, is at least this close (cosine similarity, memory embedder) to a memory
+# the user forgot or dismissed. Calibrated on all-MiniLM-L6-v2 with clause splitting
+# (10 forgotten facts, each repeated inside a run-on summary sentence, against 25
+# summary sentences): the weakest true match scored 0.497, the next 0.719. Of the 240
+# non-matching pairs, 5 scored 0.45 or more (top 0.497, a sister visiting against a
+# girlfriend moving away) and none 0.50. Dropping an innocent sentence costs little and
+# showing a forgotten fact breaks a promise, so the cut sits below the weakest true
+# match. Unsplit, the same run-on sentences scored as low as 0.42.
+SUMMARY_SUPPRESS_SIMILARITY: float = 0.45
 
 # AWS S3 (document storage)
 AWS_ACCESS_KEY_ID: str | None = os.getenv("AWS_ACCESS_KEY_ID")

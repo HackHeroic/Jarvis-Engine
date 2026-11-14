@@ -1349,7 +1349,11 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         ``ConversationMemoryService.build_history``: the messages after the
         conversation's summary, the summary itself going in the note (``<earlier>``).
         A conversation with no messages yet, opened after an earlier one, gets "since
-        we last spoke" (``<since>``, no model call), read before this message is saved.
+        we last spoke" (``<since>``, no model call).
+
+        Two stages of reads: the window with the profile; then, at once, "since we last
+        spoke" (only for an empty window), recall, the plate and the save of this
+        message, none of which reads this conversation's messages.
 
         Then the turn's context note (``memory_context``): what ``MemoryService.recall``
         finds for this message within its token budgets (a trivial message gets the
@@ -1370,49 +1374,76 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
             )
             return
         conversations = container.conversation_memory
-        window = None
-        try:
-            window = await conversations.build_history(request.user_id, session_id)
+
+        async def _window():
+            try:
+                return await conversations.build_history(request.user_id, session_id)
+            except Exception as exc:  # the plain newest-ten window, never a failed turn
+                logger.warning(
+                    f"Conversation history unavailable this turn ({type(exc).__name__})"
+                )
+                return None
+
+        # Stage 1, before this message is saved: the window, and the profile with it.
+        window, profile = await asyncio.gather(_window(), user_model.get_profile())
+        if window is not None:
             initial_state["conversation_history"] = window.history
-        except Exception as exc:  # the plain newest-ten window, never a failed turn
-            logger.warning(f"Conversation history unavailable this turn ({type(exc).__name__})")
+        else:
             initial_state["conversation_history"] = await build_context_messages(
                 session_id, request.user_id, max_messages=10, max_chars_per_message=500,
                 supabase=supabase,
             )
-        zone = user_zone(await user_model.get_profile())
-        since = None
-        if window is not None and window.message_count == 0 and not window.summarized:
-            try:
-                since = await conversations.since_last_spoke(request.user_id, session_id, zone=zone)
+        zone = user_zone(profile)
+        now = utc_now()
+
+        async def _since() -> str | None:
+            if window is None or window.message_count or window.summarized:
+                return None
+            try:  # the window found no messages: "since" need not read them again
+                return await conversations.since_last_spoke(
+                    request.user_id, session_id, zone=zone, known_empty=True
+                )
             except Exception as exc:  # nothing to pick up this turn, never a failed turn
                 logger.warning(f"'Since we last spoke' unavailable ({type(exc).__name__})")
-        initial_state["user_message_id"] = await save_user_message(
-            session_id, request.user_id, request.user_prompt, supabase
-        )
-        now = utc_now()
-        recall = Recall(profile=[], relevant=[], tokens=0)
-        try:
-            recall = await container.memory_service.recall(
-                request.user_id,
-                request.user_prompt,
-                trivial=_is_trivial_input(request.user_prompt),
-                now=now,
-            )
-        except Exception as exc:  # no memories this turn, never a failed turn
-            logger.warning(f"Recall unavailable this turn ({type(exc).__name__})")
-        plate: list[str] = []
-        try:
-            pending = await container.repos.tasks.list_pending(request.user_id)
+                return None
+
+        async def _recall() -> Recall:
+            try:
+                return await container.memory_service.recall(
+                    request.user_id,
+                    request.user_prompt,
+                    trivial=_is_trivial_input(request.user_prompt),
+                    now=now,
+                )
+            except Exception as exc:  # no memories this turn, never a failed turn
+                logger.warning(f"Recall unavailable this turn ({type(exc).__name__})")
+                return Recall(profile=[], relevant=[], tokens=0)
+
+        async def _plate() -> list[str]:
+            try:
+                pending = await container.repos.tasks.list_pending(request.user_id)
+            except Exception as exc:  # no plate this turn, never a failed turn
+                logger.warning(
+                    f"Pending tasks unavailable for the context note ({type(exc).__name__})"
+                )
+                return []
             pending.sort(  # soonest first; task_id breaks ties, so the note is stable
                 key=lambda t: (t.scheduled_start is None, t.scheduled_start or now, t.task_id)
             )
-            plate = [
+            return [
                 f"{t.title} (due {t.deadline_hint})" if t.deadline_hint else t.title
                 for t in pending
             ]
-        except Exception as exc:  # no plate this turn, never a failed turn
-            logger.warning(f"Pending tasks unavailable for the context note ({type(exc).__name__})")
+
+        # Stage 2, all at once: none of these reads this conversation's own messages, so
+        # saving the message alongside them is safe.
+        since, recall, plate, user_message_id = await asyncio.gather(
+            _since(),
+            _recall(),
+            _plate(),
+            save_user_message(session_id, request.user_id, request.user_prompt, supabase),
+        )
+        initial_state["user_message_id"] = user_message_id
         initial_state["memory_context"] = (
             render_context_note(
                 recall,
