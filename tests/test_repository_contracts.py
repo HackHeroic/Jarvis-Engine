@@ -1292,6 +1292,41 @@ async def test_memories__list__never_returns_embeddings(repos, fake_client):
 
 
 @pytest.mark.asyncio
+async def test_memories__list__newest_first_with_a_limit(repos, fake_client):
+    old = await repos.memories.add(U1, _memory(U1, "Old", created_at=T0))
+    mid = await repos.memories.add(U1, _memory(U1, "Mid", created_at=T0 + timedelta(hours=1)))
+    new = await repos.memories.add(U1, _memory(U1, "New", created_at=T0 + timedelta(hours=2)))
+
+    assert await repos.memories.list(U1, newest_first=True, limit=2) == [new, mid]
+    assert await repos.memories.list(U1) == [old, mid, new]  # default: oldest first, all
+    with pytest.raises(errors.ValidationError):
+        await repos.memories.list(U1, limit=-1)
+
+
+@pytest.mark.asyncio
+async def test_memories__list_ids__ids_only_newest_first_bounded_and_the_users(
+    repos, fake_client
+):
+    forgotten = await repos.memories.add(
+        U1, _memory(U1, "", status=MemoryStatus.FORGOTTEN, created_at=T0)
+    )
+    dismissed = await repos.memories.add(U1, _memory(
+        U1, "Hates mornings", status=MemoryStatus.DISMISSED, created_at=T0 + timedelta(hours=1)
+    ))
+    await repos.memories.add(U1, _memory(U1, "Likes tea"))  # active: not asked for
+    await repos.memories.add(U2, _memory(U2, "", status=MemoryStatus.FORGOTTEN))
+    let_go = frozenset({MemoryStatus.DISMISSED, MemoryStatus.FORGOTTEN})
+    before = len(fake_client.selects)
+
+    ids = await repos.memories.list_ids(U1, statuses=let_go, limit=10)
+
+    assert ids == [dismissed.id, forgotten.id]
+    assert await repos.memories.list_ids(U1, statuses=let_go, limit=1) == [dismissed.id]
+    if isinstance(repos.memories, SupabaseMemoryRepository):
+        assert fake_client.selects[before] == ("user_memories", ("id",)), "no words read"
+
+
+@pytest.mark.asyncio
 async def test_memories__find_by_pattern_key__returns_dismissed_row(repos):
     dismissed = await repos.memories.add(
         U1, _memory(U1, "Skips 9 AM", status=MemoryStatus.DISMISSED, pattern_key="skip_hour:9")

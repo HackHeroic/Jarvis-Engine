@@ -655,7 +655,8 @@ async def test_turn__store_reads__memories_listed_once_pearl_looks_once_profile_
     jarvis, llm, monkeypatch
 ):
     """A turn reads the user's memories once (recall, the extraction's known memories and
-    the suppression check share it), and PEARL looks once (the learning moments and the
+    the suppression check share it: its active memories and the ids of the let-go ones,
+    two bounded reads made at once), and PEARL looks once (the learning moments and the
     complete frame's insights share it), on the profile the turn already read."""
     from collections import Counter
 
@@ -675,7 +676,7 @@ async def test_turn__store_reads__memories_listed_once_pearl_looks_once_profile_
     second = await jarvis.say("And how is next week looking?", session=first.conversation_id)
 
     reads = Counter(table for table, _ in jarvis.db.selects)
-    assert reads["user_memories"] == 2, "the turn's one read, and PEARL's pattern memories"
+    assert reads["user_memories"] == 3, "the turn's snapshot (2 reads), PEARL's pattern memories"
     assert reads["user_profiles"] == 1
     assert reads["task_events"] == 1
     assert detections == ["alice"]

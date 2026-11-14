@@ -344,10 +344,23 @@ class MemoryRepository(ABC):
         *,
         statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
         types: frozenset[str] | None = None,
+        newest_first: bool = False,
+        limit: int | None = None,
     ) -> list[Memory]:
         """Return the user's memories in ``statuses`` (and ``types``), oldest first.
 
-        A superseded memory is never returned.
+        With ``newest_first`` the newest come first; with ``limit``, at most that many
+        (the newest, when newest first). A superseded memory is never returned. A
+        negative ``limit`` raises ValidationError.
+        """
+
+    @abstractmethod
+    async def list_ids(
+        self, user_id: str, *, statuses: frozenset[MemoryStatus], limit: int
+    ) -> list[str]:
+        """Return the ids of the user's newest ``limit`` memories in ``statuses``, newest
+        first: no words, no embeddings (what the forget check needs of let-go memories).
+        A negative ``limit`` raises ValidationError.
         """
 
     @abstractmethod

@@ -655,7 +655,12 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
         *,
         statuses: frozenset[MemoryStatus] = frozenset({MemoryStatus.ACTIVE}),
         types: frozenset[str] | None = None,
+        newest_first: bool = False,
+        limit: int | None = None,
     ) -> list[Memory]:
+        if limit is not None:
+            check_limit(limit)
+
         def build(q: Any) -> Any:
             q = (
                 q.select(_MEMORY_SELECT)
@@ -665,9 +670,24 @@ class SupabaseMemoryRepository(_SupabaseRepository, MemoryRepository):
             )
             if types is not None:
                 q = q.in_("memory_type", sorted(types))
-            return q.order("created_at")
+            q = q.order("created_at", desc=newest_first)
+            return q.limit(limit) if limit is not None else q
 
         return [_read_memory(r) for r in await self._run(build)]
+
+    async def list_ids(
+        self, user_id: str, *, statuses: frozenset[MemoryStatus], limit: int
+    ) -> list[str]:
+        check_limit(limit)
+        rows = await self._run(
+            lambda q: q.select("id")
+            .eq("user_id", user_id)
+            .in_("status", sorted(MemoryStatus(s).value for s in statuses))
+            .is_("superseded_by", "null")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        return [str(r["id"]) for r in rows]
 
     async def find_by_pattern_key(self, user_id: str, pattern_key: str) -> Memory | None:
         rows = await self._run(

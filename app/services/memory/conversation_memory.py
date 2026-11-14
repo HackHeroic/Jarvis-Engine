@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field
 import app.core.config as config
 from app.core.model_router import attribute_llm_calls, route_llm_call
 from app.domain.clock import utc_now
-from app.domain.entities import ChatMessage, ConversationSession, Memory
+from app.domain.entities import ChatMessage, ConversationSession
 from app.domain.ports import (
     ConversationRepository,
     SuggestionRepository,
@@ -227,14 +227,14 @@ class ConversationMemoryService:
         user_id: str,
         session_id: str,
         *,
-        let_go: Callable[[], Awaitable[list[Memory] | None]] | None = None,
+        let_go_ids: Callable[[], Awaitable[frozenset[str] | None]] | None = None,
     ) -> HistoryWindow:
         """The turns to send before the new message, and the note's <earlier> line.
 
         Messages after ``summary_through``, the newest HISTORY_MAX_MESSAGES; a summary
-        that lags only makes the window longer. Two reads. ``let_go`` gives the user's
-        forgotten and dismissed memories for the summary's forget check, when the
-        caller is reading them anyway (awaited only if there is a summary to check).
+        that lags only makes the window longer. Two reads. ``let_go_ids`` gives the ids
+        of the user's forgotten and dismissed memories for the summary's forget check,
+        when the caller is reading them anyway (awaited only if there is a summary).
         """
         session = await self._conversations.get_session(user_id, session_id)
         through = session.summary_through if session is not None else None
@@ -249,7 +249,7 @@ class ConversationMemoryService:
         ]
         summarized = bool(session is not None and session.summary and through is not None)
         earlier = (
-            await self._earlier(user_id, session, overflow, let_go) if summarized else None
+            await self._earlier(user_id, session, overflow, let_go_ids) if summarized else None
         )
         if earlier is None and overflow:
             earlier = NOT_SHOWN
@@ -262,7 +262,7 @@ class ConversationMemoryService:
         user_id: str,
         session: ConversationSession,
         overflow: bool,
-        let_go: Callable[[], Awaitable[list[Memory] | None]] | None,
+        let_go_ids: Callable[[], Awaitable[frozenset[str] | None]] | None,
     ) -> str:
         """The summary line, within CONVERSATION_SUMMARY_TOKENS; NOT_SHOWN if none survives."""
         tail = f" {NOT_SHOWN_AFTER_SUMMARY}" if overflow else ""
@@ -270,8 +270,8 @@ class ConversationMemoryService:
         def frame(body: str) -> str:
             return f"{EARLIER_PREFIX}{body}{tail}"
 
-        known = await let_go() if let_go is not None else None
-        clean = await self._filter.clean(user_id, session.summary or "", let_go=known)
+        known = await let_go_ids() if let_go_ids is not None else None
+        clean = await self._filter.clean(user_id, session.summary or "", let_go_ids=known)
         body = (
             fit(clean.sentences, clean.threads, frame, config.CONVERSATION_SUMMARY_TOKENS)
             if clean is not None

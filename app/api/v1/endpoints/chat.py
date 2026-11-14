@@ -1465,14 +1465,14 @@ async def chat_stream_v2(request: ChatRequest, http_request: Request):
         # known memories and every forget check share this one read.
         snapshot_read = asyncio.ensure_future(_snapshot())
 
-        async def _let_go():
+        async def _let_go_ids():
             snapshot = await snapshot_read
-            return snapshot.let_go if snapshot is not None else None
+            return snapshot.let_go_ids if snapshot is not None else None
 
         async def _window():
             try:
                 return await conversations.build_history(
-                    request.user_id, session_id, let_go=_let_go
+                    request.user_id, session_id, let_go_ids=_let_go_ids
                 )
             except Exception as exc:  # the plain newest-ten window, never a failed turn
                 logger.warning(
