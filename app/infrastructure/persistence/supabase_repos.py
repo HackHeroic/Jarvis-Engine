@@ -78,6 +78,7 @@ from app.infrastructure.persistence._mapping import (
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
+    summary_coverage,
     USAGE_SUMMARY_COLUMNS,
     summarize_usage_rows,
     task_from_row,
@@ -844,16 +845,19 @@ class SupabaseConversationRepository(_SupabaseRepository, ConversationRepository
         through: datetime,
         *,
         written_at: datetime | None = None,
+        covered_through: datetime | None = None,
     ) -> bool:
         """A compare-and-set in the UPDATE's own filter: one statement for a session whose
         summary reaches no further than ``through``, a second for one with none yet."""
         summary, through = checked_summary(summary, through)
+        covered = summary_coverage(through, covered_through)
         if not is_uuid(session_id):
             raise not_found("session", session_id)
         payload = {
             "summary": summary,
             "summary_through": through.isoformat(),
             "summary_updated_at": iso(written_at or now_utc()),
+            "summary_covered_through": covered.isoformat(),
         }
 
         def update(q: Any) -> Any:

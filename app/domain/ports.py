@@ -449,9 +449,14 @@ class ConversationRepository(ABC):
         through: datetime,
         *,
         written_at: datetime | None = None,
+        covered_through: datetime | None = None,
     ) -> bool:
         """Store the session's summary, where its verbatim window starts, and when it was
         written (``written_at``, default the store's clock); True when it was stored.
+
+        ``covered_through`` is the newest message the summary covers (default
+        ``through``; never stored before it): an idle summary covers the turns the
+        window still shows, and the next summary starts after them.
 
         A compare-and-set: it writes only while the stored ``summary_through`` is null or
         no later than ``through``, checked in the same step as the write, so a slower
