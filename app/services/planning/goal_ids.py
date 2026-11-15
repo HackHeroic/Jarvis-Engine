@@ -57,15 +57,11 @@ def namespace_chunk(chunk: TaskChunk, goal_id: str, run: str) -> TaskChunk:
     build_dependencies() receives consistent IDs for precedence constraints.
     """
     prefix = f"{goal_id}_{run}_"
-    prefixed_id = f"{prefix}{chunk.task_id}"
-    prefixed_deps = [f"{prefix}{d}" for d in chunk.dependencies]
-    return TaskChunk(
-        task_id=prefixed_id,
-        title=chunk.title,
-        duration_minutes=chunk.duration_minutes,
-        difficulty_weight=chunk.difficulty_weight,
-        dependencies=prefixed_deps,
-        completion_criteria=chunk.completion_criteria,
-        implementation_intention=chunk.implementation_intention,
-        deadline_hint=chunk.deadline_hint,
+    # Every other field (the deadline, the not_before, the if-then plan) is kept as is.
+    return chunk.model_copy(
+        update={
+            "task_id": f"{prefix}{chunk.task_id}",
+            "dependencies": [f"{prefix}{d}" for d in chunk.dependencies],
+        },
+        deep=True,
     )

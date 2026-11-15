@@ -32,11 +32,15 @@ def compute_adaptive_daily_cap(
     min_daily_override: int | None = None,
     daily_context: list["TimeSlot"] | None = None,
     longest_task_minutes: int | None = None,
+    held_work: list[tuple[int, int]] | None = None,
 ) -> int:
     """Compute daily deep-work cap from horizon, work, and cognitive load.
 
     Research: 3-4h optimal; distributed practice favors spread when we have slack.
     User override takes precedence. min_daily_override limits over-spreading.
+    ``held_work`` is (earliest start minute, duration) for each task held to a
+    not-before: the cap is raised, if need be, so that work fits in the days left to
+    it (``held_work_minimum_cap``).
     """
     if user_override is not None:
         return user_override
@@ -96,7 +100,39 @@ def compute_adaptive_daily_cap(
             if longest_task_minutes:
                 cap = max(cap, longest_task_minutes)
 
+    # Work the user asked for at a set time ("one hour tomorrow evening") spreads over
+    # fewer days than the horizon has: a cap worked out for the whole horizon would split
+    # it, or leave it no room at all. Raised to fit, in whole task atoms, up to the
+    # deep-work ceiling; past that the horizon ladder gives it more days.
+    need = held_work_minimum_cap(held_work or [], horizon_minutes)
+    if need > cap:
+        if longest_task_minutes:
+            need = math.ceil(need / longest_task_minutes) * longest_task_minutes
+        cap = max(cap, min(need, max(longest_task_minutes or 0, PACING_MAX_DEEP_WORK_PER_DAY)))
+
     return max(1, cap)
+
+
+def held_work_minimum_cap(held_work: list[tuple[int, int]], horizon_minutes: int) -> int:
+    """The least daily cap that lets work held to a not-before fit in the days left to it.
+
+    ``held_work`` is (earliest start minute, duration) per held task. For each earliest
+    start ``e``, every task held to ``e`` or later must sit in the whole days from ``e``'s
+    day to the horizon's end, so the cap is at least their minutes over those days. 0
+    when nothing is held, or the horizon is one day or less (no daily cap then). A task
+    held past the horizon adds nothing: that solve is infeasible whatever the cap.
+    """
+    days = horizon_minutes // MINUTES_PER_DAY
+    if days <= 1:
+        return 0
+    need = 0
+    for earliest, _ in held_work:
+        days_left = days - earliest // MINUTES_PER_DAY
+        if days_left <= 0:
+            continue
+        minutes = sum(duration for start, duration in held_work if start >= earliest)
+        need = max(need, math.ceil(minutes / days_left))
+    return need
 
 
 def compute_free_minutes_per_day(

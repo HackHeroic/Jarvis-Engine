@@ -237,3 +237,66 @@ async def test_local_day__profile_timezone__the_plan_runs_on_that_zones_clock(ja
     slots = _local_slots(turn, new_york)
     assert slots[0][0] == now  # the first task at 09:00 New York time
     assert not [s for s in slots if _in_the_night(s)], slots
+
+
+# --- "tomorrow evening": work the user times is never placed earlier ---------------------
+
+SQL_ASK = "Plan one hour tomorrow evening to practise SQL joins and nested queries"
+SQL_TOPICS = ["Write three inner joins", "Write two outer joins", "Nest a subquery in WHERE"]
+TOMORROW_6PM = datetime.combine(MONDAY + timedelta(days=1), time(18, 0), tzinfo=IST)
+
+
+def _script_sql_plan(llm) -> None:
+    """The model hears "tomorrow evening" against the note's <now> and answers each task's
+    not_before in the user's wall time; asking for DSA revision plans that, untimed."""
+
+    def extract(req) -> str:
+        message = said(req)
+        if "SQL" in message:
+            return brain_dump(planning_goal=SQL_ASK)
+        return brain_dump(planning_goal="Revise DSA") if "plan" in message.lower() else "{}"
+
+    def chunk(req) -> str:
+        if "SQL" in req.prompt:
+            return decomposition(SQL_TOPICS, duration=20, not_before="2026-11-17T18:00")
+        return decomposition(TOPICS[:5])
+
+    llm.script("brain_dump_extraction", extract)
+    llm.script("socratic_chunker", chunk)
+
+
+def _slots_by_title(turn) -> dict[str, datetime]:
+    schedule = turn.payload["schedule"]
+    start = datetime.fromisoformat(schedule["horizon_start"])
+    titles = {t["task_id"]: t["title"] for t in turn.payload["execution_graph"]["decomposition"]}
+    return {
+        titles[task_id]: (start + timedelta(minutes=slot["start_min"])).astimezone(IST)
+        for task_id, slot in schedule["schedule"].items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_day__tomorrow_evening_asked_at_7_45_pm__drafted_tomorrow_from_6_pm(
+    jarvis, llm, clock
+):
+    """The reported bug: asked at 19:45 for "one hour tomorrow evening", the draft put
+    the SQL work today at 19:45. The decomposition is told the time on the user's clock,
+    and the solver holds every task to the not_before it answered."""
+    import app.domain.clock as utc_clock
+
+    clock.freeze(datetime.combine(MONDAY, time(19, 45), tzinfo=IST), scheduling, utc_clock)
+    _script_sql_plan(llm)
+
+    turn = await jarvis.say(SQL_ASK)
+
+    [decompose] = llm.calls_for("socratic_chunker")
+    assert decompose.conversation_history[-1]["content"].endswith(
+        "<now>Mon 16 Nov 2026, 19:45 (Asia/Kolkata)</now>"
+    )
+    starts = _slots_by_title(turn)
+    assert set(starts) == set(SQL_TOPICS)
+    midnight = TOMORROW_6PM.replace(hour=0) + timedelta(days=1)
+    assert all(TOMORROW_6PM <= start < midnight for start in starts.values()), starts
+    # The draft keeps the instant, which accepting it writes to the task.
+    tasks = jarvis.draft(turn.draft_id)["tasks"]
+    assert {t["not_before"] for t in tasks} == {"2026-11-17T18:00:00+05:30"}

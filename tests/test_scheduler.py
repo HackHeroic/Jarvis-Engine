@@ -803,3 +803,55 @@ def test_run_schedule__unreadable_not_before__ignored_and_logged(before_the_hori
 
     assert resp.schedule["vague"].start_min == 0
     assert "not_before" in caplog.text
+
+
+def test_adaptive_cap__work_held_to_the_horizons_last_day__raised_to_fit_it():
+    from app.utils.pacing import compute_adaptive_daily_cap
+
+    friday_6pm = 4 * 1440 + 600  # the fifth and last day of a 5-day horizon
+    held = [(friday_6pm, 25)] * 3
+
+    plain = compute_adaptive_daily_cap(
+        horizon_minutes=7200, total_task_minutes=75, longest_task_minutes=25,
+    )
+    raised = compute_adaptive_daily_cap(
+        horizon_minutes=7200, total_task_minutes=75, longest_task_minutes=25, held_work=held,
+    )
+
+    assert plain == 50  # spread over two days: never all three on Friday
+    assert raised == 75
+
+
+def test_held_work_minimum_cap__work_held_later__counts_against_earlier_holds_too():
+    from app.utils.pacing import held_work_minimum_cap
+
+    # Day 1 and day 2 of a 3-day horizon: 50 held from day 1 on (two days left) and
+    # 60 from day 2 on (one day left), so day 2 alone must take 60.
+    held = [(1440 + 600, 25), (1440 + 600, 25), (2880 + 60, 30), (2880 + 60, 30)]
+
+    assert held_work_minimum_cap(held, 4320) == 60
+    assert held_work_minimum_cap([], 4320) == 0
+    assert held_work_minimum_cap(held, 1440) == 0  # one day: no daily cap at all
+    assert held_work_minimum_cap([(5000, 25)], 4320) == 0  # past the horizon: infeasible anyway
+
+
+def test_run_schedule__one_hour_held_to_tomorrow_evening__all_of_it_that_evening(
+    before_the_horizon,
+):
+    """The bug's request, at the solver: three 20-minute tasks for tomorrow evening are
+    placed tomorrow evening, none today and none split off to another day."""
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
+    from app.services.planning import scheduling as sep
+
+    chunks = [TaskChunk(task_id=f"sql_{i}", title=f"SQL {i}", duration_minutes=20,
+                        difficulty_weight=0.5, dependencies=[], completion_criteria="done",
+                        not_before="2026-11-17T18:00")
+              for i in range(3)]
+    graph = ExecutionGraph(goal_metadata=GoalMetadata(), decomposition=chunks,
+                           cognitive_load_estimate={"intrinsic_load": 0.5})
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880)
+
+    midnight = 1440 + 960
+    assert all(TOMORROW_6PM_MINUTE <= t.start_min and t.end_min <= midnight
+               for t in resp.schedule.values())

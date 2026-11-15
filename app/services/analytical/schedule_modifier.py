@@ -52,6 +52,7 @@ def resolve_from_now(
                 completion_criteria=t.get("completion_criteria"),
                 implementation_intention=t.get("implementation_intention"),
                 deadline_hint=t.get("deadline_hint"),
+                not_before=t.get("not_before"),
             )
             for t in tasks
         ]

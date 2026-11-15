@@ -158,10 +158,13 @@ def decomposition(
     with_intentions: bool = True,
     chained: bool = False,
     objective: str = "",
+    not_before: str | None = None,
 ) -> str:
     """An ``ExecutionGraph`` as the socratic chunker returns it, positional ids and all.
 
     ``deadline`` is one deadline hint for every task, or a list with one per task.
+    ``not_before`` is one earliest start for every task, in the user's wall time as the
+    model gives it; left out of the JSON when None.
     """
     deadlines = deadline if isinstance(deadline, list) else [deadline] * len(titles)
     tasks = []
@@ -175,6 +178,8 @@ def decomposition(
             "completion_criteria": f"Explain {title.lower()} from memory in two minutes",
             "deadline_hint": task_deadline,
         }
+        if not_before is not None:
+            task["not_before"] = not_before
         if with_intentions:
             task["implementation_intention"] = {
                 "obstacle_trigger": f"If I stall on {title.lower()}",

@@ -246,6 +246,15 @@ def run_schedule(
         clamped_durations[chunk.task_id] = d
     total_task_minutes = sum(clamped_durations.values())
 
+    # Each task's earliest start (its not_before), in minutes from the horizon's start.
+    clock_zone = zone or user_zone()
+    earliest_starts = {
+        chunk.task_id: _not_before_minute(
+            chunk.not_before, resolved_horizon_start, clock_zone, now
+        )
+        for chunk in graph.decomposition
+    }
+
     # Dynamic Biological Fallback: inject default sleep block for cold-start users
     has_sleep_habit = any(
         "sleep" in slot.name.lower() or "night" in slot.name.lower()
@@ -281,6 +290,11 @@ def run_schedule(
             (clamped_durations.get(t.task_id, t.duration_minutes) for t in graph.decomposition),
             default=None,
         ),
+        held_work=[
+            (earliest, clamped_durations[task_id])
+            for task_id, earliest in earliest_starts.items()
+            if earliest > 0
+        ],
     )
     scheduler = JarvisScheduler(
         horizon_minutes=horizon_minutes,
@@ -314,10 +328,8 @@ def run_schedule(
         # FULL_FOCUS: no block added
 
 
-    # TMT scores and task mapping (per-chunk delay from deadline_hint), and each
-    # task's earliest start (its not_before)
+    # TMT scores and task mapping (per-chunk delay from deadline_hint)
     tmt_scores: dict[str, float] = {}
-    clock_zone = zone or user_zone()
     for chunk in graph.decomposition:
         duration = clamped_durations[chunk.task_id]
         delay_h = _delay_hours_for_chunk(chunk, resolved_horizon_start)
@@ -336,9 +348,7 @@ def run_schedule(
             chunk.dependencies,
             difficulty_weight=chunk.difficulty_weight,
             energy_weight=_energy_weight(chunk.difficulty_weight, delay_h) if energy_on else 0,
-            earliest_start=_not_before_minute(
-                chunk.not_before, resolved_horizon_start, clock_zone, now
-            ),
+            earliest_start=earliest_starts[chunk.task_id],
         )
 
     result, status_or_empty = scheduler.solve()

@@ -1680,3 +1680,82 @@ async def test_fetch_constraints__prior_profile__no_focus(clock):
     )
 
     assert result["focus_by_hour"] is None
+
+
+# --- not before: "tomorrow evening" holds the work until then --------------------------
+
+
+@pytest.mark.asyncio
+async def test_decompose_goal__not_before__an_instant_on_the_users_clock(monkeypatch):
+    """The model answers in the user's wall time; the chunks carry the instant from then
+    on (the draft stores it, accepting it writes it). An unreadable one is dropped."""
+    from app.modules.planning_graph import decompose_goal
+
+    _patch_decompose_transport(monkeypatch, _decompose_transport([
+        _chunk("task_1", not_before="2026-11-17T18:00"),
+        _chunk("task_2", not_before="tomorrow evening"),
+        _chunk("task_3"),
+    ]))
+
+    out = await decompose_goal(
+        {"planning_goal": "Practise SQL joins tomorrow evening", "user_id": "u1"}
+    )
+
+    assert out.get("error") is None, out.get("error")
+    assert [c["not_before"] for c in out["task_chunks"]] == [
+        "2026-11-17T18:00:00+05:30", None, None,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fuse_tasks__carried_pending_task__keeps_its_not_before():
+    """A pending task re-solved with a new plan keeps its not_before, so the new plan
+    cannot pull it earlier than the user asked."""
+    from app.modules.planning_graph import fuse_tasks
+
+    stored = {
+        "task_id": "sql_abc123_task_1", "goal_id": "sql", "title": "Joins",
+        "duration_minutes": 25, "difficulty_weight": 0.5, "dependencies": [],
+        "deadline_hint": None, "not_before": "2026-11-17T12:30:00Z",
+    }
+    out = await fuse_tasks({
+        "user_model": _PendingUserModel([stored]),
+        "goal_id": "dsa",
+        "task_chunks": [_chunk("dsa_def456_task_1", goal_id="dsa")],
+    })
+
+    carried = next(c for c in out["task_chunks"] if c["task_id"] == "sql_abc123_task_1")
+    assert carried["not_before"] == "2026-11-17T12:30:00Z"
+
+
+@pytest.mark.asyncio
+async def test_planning_subgraph__not_before_past_the_first_horizon__ladder_widens_to_a_plan(
+    monkeypatch, before_the_horizon
+):
+    """Friday evening, asked on Monday morning, lies past the first two-day horizon: the
+    real solver finds that infeasible, the ladder widens, and the user gets a plan."""
+    from app.modules.planning_graph import planning_state_in
+    from app.services.planning import scheduling
+
+    friday_6pm = "2026-11-20T18:00"
+    _patch_decompose_transport(monkeypatch, _decompose_transport(
+        [_chunk(f"task_{i}", not_before=friday_6pm) for i in range(1, 4)]
+    ))
+    solve = scheduling.run_schedule
+    horizons = []
+
+    def recording_run_schedule(*args, **kwargs):
+        horizons.append(kwargs["horizon_minutes"])
+        return solve(*args, **kwargs)
+
+    monkeypatch.setattr(scheduling, "run_schedule", recording_run_schedule)
+
+    result = await build_module_graph(planning_module).ainvoke(planning_state_in(
+        {"user_model": None, "user_message": "practise SQL on Friday evening", "container": None}
+    ))
+
+    assert horizons == [2880, 4320, 7200]  # 2 days, 3 days: infeasible; 5 days fits
+    assert result["error"] is None and result["clarification_request"] is None
+    slots = result["schedule"]["schedule"]
+    assert len(slots) == 3
+    assert min(slot["start_min"] for slot in slots.values()) >= 4 * 1440 + 600
