@@ -28,8 +28,8 @@ from app.services.analytical.workspace.materials import (
     MaterialChunk,
     excerpt_assets,
     fetch_chunks_for_task,
-    sources_phrase,
 )
+from app.services.analytical.workspace.quiz import generate_quiz
 from app.services.documents.service import DocumentService
 from app.services.user_preferences import get_learning_style
 from app.db.supabase_py import build_supabase_client
@@ -195,55 +195,17 @@ async def generate_practice_assets(
 ) -> list[StudyAsset]:
     """Generate context-aware practice assets.
 
-    If the task has material: the PRIMARY model creates a 3-5 question quiz from it,
-    named after the documents it came from, or none when the model finds the material
-    is not about the task. If no material: Gemini searches for 2 LeetCode/Codeforces
-    links + 1 YouTube, and ``WebSearchUnavailableError`` is raised when that search
-    could not run. If user_prompt provided: incorporate into the generation.
+    If the task has material: the PRIMARY model creates a 3-5 question quiz from it
+    (``generate_quiz``: structured, named after its documents, none when the model finds
+    the material is not about the task or the reply is not a quiz). If no material:
+    Gemini searches for 2 LeetCode/Codeforces links + 1 YouTube, and
+    ``WebSearchUnavailableError`` is raised when that search could not run. If
+    user_prompt provided: incorporate into the generation.
     """
     assets: list[StudyAsset] = []
 
     if chunks:
-        context = "\n\n".join(f"[From {c.file_name}]\n{c.text}" for c in chunks[:8])[:8000]
-        user_hint = f"\n\nUser request: {user_prompt}" if user_prompt else ""
-        prompt = f"""Based on the following material, create a short practice quiz (3-5 questions) testing "{task_title}".{user_hint}
-Use the content heavily - pick or adapt questions from the material. Cover multiple topics if present.
-Format as markdown with numbered questions and brief expected answers.
-If the material is not about "{task_title}", return {{"assets": []}} and nothing else.
-
-Materials:
-{context}
-
-Return a JSON object: {{"assets": [{{"asset_type": "generated_quiz", "title": "Quiz: ...", "content_or_url": "<markdown>"}}]}}"""
-        rationale = f"From {sources_phrase(chunks)}"
-        try:
-            from app.core.model_router import route_llm_call
-
-            result = await route_llm_call(
-                task="practice_generation",
-                prompt=prompt,
-                system_prompt="You are a tutor. Generate practice questions from the materials. Return valid JSON only.",
-            )
-            if isinstance(result, str):
-                import json
-                try:
-                    parsed = json.loads(result)
-                    for a in parsed.get("assets", [])[:3]:
-                        assets.append(StudyAsset(
-                            asset_type=a.get("asset_type", "generated_quiz"),
-                            title=a.get("title", "Practice Quiz"),
-                            content_or_url=a.get("content_or_url", ""),
-                            rationale=rationale,
-                        ))
-                except json.JSONDecodeError:
-                    assets.append(StudyAsset(
-                        asset_type="generated_quiz",
-                        title=f"Quiz: {task_title}",
-                        content_or_url=result[:4000],
-                        rationale=rationale,
-                    ))
-        except Exception as exc:
-            logger.warning("The practice quiz could not be generated (%s)", type(exc).__name__)
+        return await generate_quiz(chunks, task_title, user_prompt)
 
     else:
         topic = task_title or " ".join(topic_keywords) or "programming"

@@ -240,30 +240,33 @@ _DIJKSTRA = [MaterialChunk(text="Dijkstra uses a min-heap.", source_id="src-1", 
 
 @pytest.mark.asyncio
 async def test_practice_quiz__routes_through_the_chain__returns_the_quiz_assets(llm):
-    from app.services.analytical.workspace_builder import generate_practice_assets
+    from app.services.analytical.workspace.quiz import generate_quiz
 
-    quiz = {
-        "asset_type": "generated_quiz", "title": "Quiz: Dijkstra",
-        "content_or_url": "1. Why a heap?",
-    }
-    model = llm(practice_generation=json.dumps({"assets": [quiz]}))
+    questions = [
+        {"question": f"Why a heap ({i})?", "answer": "To pop the nearest vertex.", "hint": ""}
+        for i in range(3)
+    ]
+    model = llm(practice_generation=json.dumps(
+        {"assets": [{"title": "Dijkstra", "questions": questions}]}
+    ))
 
-    assets = await generate_practice_assets(_DIJKSTRA, "Dijkstra", [], bus=_NO_LEDGER)
+    assets = await generate_quiz(_DIJKSTRA, "Dijkstra")
 
     assert model.tasks == ["practice_generation"]
     assert model.calls[0].role == "primary"
-    assert [a.model_dump(exclude={"metadata"}) for a in assets] == [
-        {**quiz, "rationale": "From Graphs.pdf"}
+    assert [(a.asset_type, a.title, a.rationale) for a in assets] == [
+        ("generated_quiz", "Quiz: Dijkstra", "From Graphs.pdf")
     ]
+    assert assets[0].metadata == {"quiz": {"title": "Dijkstra", "questions": questions}}
 
 
 @pytest.mark.asyncio
 async def test_practice_quiz__model_down__returns_no_assets(llm):
-    from app.services.analytical.workspace_builder import generate_practice_assets
+    from app.services.analytical.workspace.quiz import generate_quiz
 
     llm(practice_generation=_down())
 
-    assert await generate_practice_assets(_DIJKSTRA, "Dijkstra", [], bus=_NO_LEDGER) == []
+    assert await generate_quiz(_DIJKSTRA, "Dijkstra") == []
 
 
 # --- documents and ingestion ------------------------------------------------------------

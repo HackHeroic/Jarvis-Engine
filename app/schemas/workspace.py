@@ -2,7 +2,7 @@
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.documents import LinkedDocument
 
@@ -36,6 +36,47 @@ class StudyAsset(BaseModel):
     metadata: Optional[dict] = Field(
         default=None,
         description="Optional metadata, e.g. difficulty, topic for problems",
+    )
+
+
+# How many questions a workspace quiz has.
+QUIZ_MIN_QUESTIONS = 3
+QUIZ_MAX_QUESTIONS = 5
+
+
+class QuizQuestion(BaseModel):
+    """One practice question with its answer, and an optional nudge toward it."""
+
+    question: str = Field(min_length=1, description="The question, one or two sentences.")
+    answer: str = Field(
+        min_length=1, description="The expected answer, brief (one to three sentences)."
+    )
+    hint: str = Field(default="", description="A short nudge toward the answer, or empty.")
+
+    @field_validator("hint", mode="before")
+    @classmethod
+    def _no_hint(cls, value: object) -> object:
+        """A hint left null means there is no hint."""
+        return "" if value is None else value
+
+
+class Quiz(BaseModel):
+    """A short practice quiz drawn from the task's material."""
+
+    title: str = Field(min_length=1, description="A short title naming what the quiz covers.")
+    questions: List[QuizQuestion] = Field(
+        min_length=QUIZ_MIN_QUESTIONS,
+        max_length=QUIZ_MAX_QUESTIONS,
+        description=f"{QUIZ_MIN_QUESTIONS} to {QUIZ_MAX_QUESTIONS} questions, in order.",
+    )
+
+
+class QuizReply(BaseModel):
+    """What the model answers when asked for a quiz: one quiz, or none when the material
+    is not about the task."""
+
+    assets: List[Quiz] = Field(
+        description="The quiz, or empty when the material is not about the task.",
     )
 
 

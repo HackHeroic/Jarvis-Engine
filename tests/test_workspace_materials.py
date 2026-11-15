@@ -12,6 +12,7 @@ from app.domain.entities import IngestedDocument, TaskMaterialLink
 from app.domain.events import NullEventBus
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.services.analytical.workspace import materials
+from app.services.analytical.workspace.quiz import generate_quiz
 from tests.fakes import FakeKnowledgeCollection, install_scripted_model, knowledge_chunk
 
 ALICE, BOB = "alice", "bob"
@@ -229,9 +230,7 @@ async def test_quiz__model_says_material_is_unrelated__no_quiz_asset():
     model = install_scripted_model(practice_generation='{"assets": []}')
     transcript = [materials.MaterialChunk("Semester 5 marks: DBMS 8", "transcript", "Marks.pdf")]
 
-    assets = await wb.generate_practice_assets(
-        transcript, "Course project: write the README", [], bus=NullEventBus()
-    )
+    assets = await generate_quiz(transcript, "Course project: write the README")
 
     assert assets == []
     assert model.tasks == ["practice_generation"]
