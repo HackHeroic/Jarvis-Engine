@@ -15,8 +15,8 @@
 **Spec:** `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md`: §5, §6.2–6.4, §8.5, §10, §12 phase 2b, ADR-9. This is plan 3 of 4. Its inputs are the Plan 2 ledger `.superpowers/sdd/2026-11-14-capstone-plan-2-vision-core/progress.md`, in particular final review B (I2 two persistence paths, I3 global lookups, god files, M3 API naming, M4 skip reason) and the "Carried to Plan 3/4" line, plus the Plan 1 ledger's Plan-2b/Plan-3 items (G1 slow-client lock, `str(exc)` in v1 streams, TaskChunk in the API layer).
 
 **Code base this plan was verified against:**
-- Jarvis-Engine `capstone-lld` at `5c6ffd3`. The suite stands at 1850 passed, 3 xfailed, 2 deselected.
-- jarvis-frontend `capstone-lld` at `744c1cc`.
+- Jarvis-Engine `capstone-lld` at `dca181d`. The suite stands at 1850 passed, 3 xfailed, 2 deselected.
+- jarvis-frontend `capstone-lld` at `a2db469`.
 
 ## Global Constraints
 

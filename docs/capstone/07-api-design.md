@@ -1,6 +1,6 @@
 # 07 — API design
 
-Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 49 operations on 43 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `e76bff9` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
+Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 49 operations on 43 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `d3e9132` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -152,7 +152,7 @@ The places where this vocabulary is not yet followed are listed in §8.
 | `ChatStreamRequest.file_base64`, `IngestionRequest.file_base64` | ≤ 10 MB decoded (`MAX_CHAT_UPLOAD_BYTES`, `config.py:279`), checked by `within_upload_limit` | `app/schemas/upload.py:16-27` |
 | `ChatStreamRequest.media_type`, `IngestionRequest.media_type` | `"pdf"`, `"image"`, `"png"` or `"jpeg"` (`UploadMediaType`) | `upload.py:13` |
 | `ChatStreamRequest.model_mode` | `"auto"`, `"cloud"`, `"gemini"` or `"4b"` (`ModelMode`) | `chat_stream.py:44, 77-85` |
-| `IngestionRequest.file_name` | ≤ 255 chars (added after `e76bff9`) | `app/api/v1/endpoints/ingestion.py` |
+| `IngestionRequest.file_name` | ≤ 255 chars (added after `d3e9132`) | `app/api/v1/endpoints/ingestion.py` |
 | `TaskSkipRequest.reason` | ≤ 500 chars | `app/api/v1/endpoints/tasks.py:44-56` |
 | `TaskCompleteRequest.quality` | 0–5 | `tasks.py:27-41` |
 | `TaskCompleteRequest.actual_duration_minutes` | ≥ 1 | `tasks.py:37-41` |
@@ -253,7 +253,7 @@ Every error response has one shape, whatever raised it: a `JarvisError`, request
 | `schedule_infeasible` | 422 | accepting a partly-past draft whose remaining tasks no longer fit when re-solved from now; `/schedule/generate-schedule` when nothing fits |
 | `persistence_unavailable` | 503 | the database cannot be reached, or the app has no client |
 | `embedding_unavailable` | 503 | the text embedder could not run (for example, while editing a memory's words) |
-| `document_read_timeout` | 503 | the document reader (Docling) did not finish an upload within 120 s, on `POST /ingestion/ingest` or `/ingestion/process` (`DocumentReadTimeoutError`, added after `e76bff9`) |
+| `document_read_timeout` | 503 | the document reader (Docling) did not finish an upload within 120 s, on `POST /ingestion/ingest` or `/ingestion/process` (`DocumentReadTimeoutError`, added after `d3e9132`) |
 | `llm_error`, `llm_timeout`, `llm_unavailable`, `llm_output_parse`, `llm_refused` | 503 | the model chain failed; for example, the ingestion classifier is down (`llm_unavailable`), a goal decomposition is unusable (`llm_output_parse`), or the user's habits could not be read for the re-solve on accept |
 | `http_error` | 404 / 405 | Starlette's own answer for a path or method no route declares |
 | `internal_error` | 500 | anything else |
@@ -726,7 +726,7 @@ The frontend separates the two ways a stream can end early (`createStreamControl
 
 ## 7. How the frontend consumes the API
 
-The frontend repository is `/Users/madhav/Jarvis-cursor/jarvis-frontend` (references at commit `4f72769`, now part of its `main`). Later frontend work that changes how the API is used, uncommitted in the frontend's working tree when this was written: a reopened conversation with a pending plan shows its review card again (`storedPlanOf`, `lib/draftCard.ts`, which finds the newest assistant message with a `draft_id` and a schedule; whether that draft is still open is checked with `GET /drafts/{id}`); Discard asks its reason in the page instead of a native prompt; a dashboard quick brain dump starts a clean conversation; and concurrent workspace requests for one task share one call.
+The frontend repository is `/Users/madhav/Jarvis-cursor/jarvis-frontend` (references at commit `4fa06ef`, now part of its `main`). Later frontend work that changes how the API is used, uncommitted in the frontend's working tree when this was written: a reopened conversation with a pending plan shows its review card again (`storedPlanOf`, `lib/draftCard.ts`, which finds the newest assistant message with a `draft_id` and a schedule; whether that draft is still open is checked with `GET /drafts/{id}`); Discard asks its reason in the page instead of a native prompt; a dashboard quick brain dump starts a clean conversation; and concurrent workspace requests for one task share one call.
 
 | Concern | Where | What it does |
 |---|---|---|
@@ -792,7 +792,7 @@ These are stated plainly so a reviewer does not have to find them.
 
 ## 9. OpenAPI vs code
 
-Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone. Re-checked at `c956a8f` the same way: still 48 operations on 42 paths and 102 component schemas (`file_name` is a new field of an existing request, not a new path). Re-checked in-process after the documents work: 49 operations on 43 paths (the new `GET /documents/{source_id}/file`) and 104 component schemas (`LinkedTask`, `LinkedDocument`).
+Checked against `GET http://localhost:8000/openapi.json` on the running server at `d3e9132`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `de0f285` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone. Re-checked at `cc8d170` the same way: still 48 operations on 42 paths and 102 component schemas (`file_name` is a new field of an existing request, not a new path). Re-checked in-process after the documents work: 49 operations on 43 paths (the new `GET /documents/{source_id}/file`) and 104 component schemas (`LinkedTask`, `LinkedDocument`).
 
 What agrees:
 - Every operation declares a typed 2xx response model (`tests/test_api_contract.py::test_openapi__every_json_route__declares_a_typed_response_model`, `::test_openapi__schema__every_operation_has_a_typed_2xx_but_the_stream`).
@@ -814,7 +814,7 @@ Everything else checked agrees with the Pydantic models: every route, method, pa
 
 ## 10. Retired in the restructure
 
-Removed between `5c6ffd3` and `e76bff9`, and absent from both the app's routes and `/openapi.json`: the v1 chat routes `POST /chat/`, the v1 handler of `POST /chat/stream` (the path now serves the turn stream), `/chat/confirm-schedule`, `/chat/accept-schedule` and `/chat/modify-schedule`; `POST /drafts/{id}/chat` (it always answered 501); `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/`; and `DELETE /ingestion/behavioral-constraint/{id}` (rules are deleted at `DELETE /habits/constraints/{id}`).
+Removed between `dca181d` and `d3e9132`, and absent from both the app's routes and `/openapi.json`: the v1 chat routes `POST /chat/`, the v1 handler of `POST /chat/stream` (the path now serves the turn stream), `/chat/confirm-schedule`, `/chat/accept-schedule` and `/chat/modify-schedule`; `POST /drafts/{id}/chat` (it always answered 501); `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/`; and `DELETE /ingestion/behavioral-constraint/{id}` (rules are deleted at `DELETE /habits/constraints/{id}`).
 The hidden, deprecated `POST /chat/v2/stream` alias of the turn stream was removed after the final live run; the old path answers 404 (`tests/test_routes.py::test_routes__old_chat_path__404_envelope`).
 
 Pinned by `tests/test_routes.py`, `tests/test_tasks_one_path.py::test_task_routes__patch_and_deletes__gone_405_or_404` and `tests/test_drafts_one_path.py::test_draft_routes__no_501_chat_route_and_every_route_typed`.

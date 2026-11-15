@@ -1266,7 +1266,7 @@ async function s19c() {
     text(s, [mono(px, { fontSize: 12 }), { text: "  " + lab, options: { fontSize: 12, color: C.text2 } }], { x: x - 0.09, y: bottom + 0.2, w: Math.max(w + 0.18, 2.2), h: 0.26 });
   }
   s.addNotes(
-    "The frontend had a responsive pass (frontend commit 861069e, layout at phone, tablet and desktop sizes) on top of the same theme tokens the rest of the app uses. " +
+    "The frontend had a responsive pass (frontend commit 336f2b6, layout at phone, tablet and desktop sizes) on top of the same theme tokens the rest of the app uses. " +
       "At 390 px wide the navigation becomes a bottom tab bar, at 768 px it is a side rail, and at 1440 px the Jarvis chat panel sits beside the page. " +
       "The tablet and desktop renders are of the seeded demo user today; the phone render comes from the responsive pass's own capture set, taken before the demo user was reseeded, so its pattern shows as confirmed. " +
       "Nothing here is a mock-up: each is a headless-Chrome render of the running app in its dark theme."
@@ -1307,9 +1307,9 @@ async function s20() {
     text(s, [mono(g, { fontSize: 12 }), { text: "   " + d, options: { fontSize: 13, color: C.text2 } }], { x: x + 0.2, y, w: CW / 2 - 0.5, h: 0.54, valign: "middle" });
   });
   s.addNotes(
-    "The offline suite at backend commit 8759bf0: 2,203 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 91 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
-      "The frontend has 381 vitest tests in 20 files at frontend commit 073644b. " +
-      "scripts/live_e2e.py drives the running backend against real Supabase and Claude in 18 steps as a throwaway user and deletes its rows; it was re-run on 8759bf0 and every step passed with no traceback in the server log, and its cached-prompt step read 1,398 tokens. Run it again on demo day. " +
+    "The offline suite at backend commit 670e2d5: 2,203 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 91 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
+      "The frontend has 381 vitest tests in 20 files at frontend commit c600e44. " +
+      "scripts/live_e2e.py drives the running backend against real Supabase and Claude in 18 steps as a throwaway user and deletes its rows; it was re-run on 670e2d5 and every step passed with no traceback in the server log, and its cached-prompt step read 1,398 tokens. Run it again on demo day. " +
       "The guards that keep the design honest are the layering test, the design-conformance test over the class diagrams, the SSE golden files and the repository contract suite."
   );
 }

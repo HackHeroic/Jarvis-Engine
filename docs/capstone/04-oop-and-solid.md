@@ -1,6 +1,6 @@
 # 04 — OOP and SOLID
 
-This document shows where the four pillars of object-oriented programming (encapsulation, abstraction, inheritance, polymorphism) and the five SOLID principles are applied in the Jarvis backend, at commit `e76bff9`, now part of `main`. For each one it gives what it means in this code base in one sentence, two or three concrete examples with `file:line` and a short excerpt copied from the code, the test that would fail if the principle were broken, and one honest place where the code falls short and why. The class-level picture is in `03-class-diagrams.md`, and the patterns these principles produce (Strategy, Decorator, Chain of Responsibility, Template Method and others) are in `05-design-patterns.md`. The last section lists the ten largest source files and what would be split next.
+This document shows where the four pillars of object-oriented programming (encapsulation, abstraction, inheritance, polymorphism) and the five SOLID principles are applied in the Jarvis backend, at commit `d3e9132`, now part of `main`. For each one it gives what it means in this code base in one sentence, two or three concrete examples with `file:line` and a short excerpt copied from the code, the test that would fail if the principle were broken, and one honest place where the code falls short and why. The class-level picture is in `03-class-diagrams.md`, and the patterns these principles produce (Strategy, Decorator, Chain of Responsibility, Template Method and others) are in `05-design-patterns.md`. The last section lists the ten largest source files and what would be split next.
 
 **Owner: ______**
 
@@ -232,7 +232,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
 **Here:** each class has one reason to change: the router parses, the turn service runs a turn, the encoder writes frames, each LLM decorator adds one concern.
 
-**Example 1 — the chat router only routes.** The whole endpoint is 56 lines at `c956a8f` (61 at `e76bff9`, before a hidden alias was removed); the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:49-55`:
+**Example 1 — the chat router only routes.** The whole endpoint is 56 lines at `cc8d170` (61 at `d3e9132`, before a hidden alias was removed); the handler opens a turn and returns the stream. `app/api/v1/endpoints/chat.py:49-55`:
 
 ```python
     turn = await ChatTurnService.for_app(http_request.app.state).open_turn(
@@ -458,7 +458,7 @@ class Sweep(ABC):
 
 ## 10. The ten largest source files
 
-Line counts at `c956a8f` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tail`); `planning_graph.py`, `graph.py`, `memory_service.py` and `workspace_builder.py` grew after `e76bff9` (1,008, 810, 627 and 531 lines there). `supabase_repos.py`, `in_memory.py` and `ports.py` are counted after the documents repositories were added. The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
+Line counts at `cc8d170` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tail`); `planning_graph.py`, `graph.py`, `memory_service.py` and `workspace_builder.py` grew after `d3e9132` (1,008, 810, 627 and 531 lines there). `supabase_repos.py`, `in_memory.py` and `ports.py` are counted after the documents repositories were added. The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
 
 | # | File | Lines | What it holds | What would be split next |
 |---|---|---|---|---|

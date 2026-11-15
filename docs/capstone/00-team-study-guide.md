@@ -2,7 +2,7 @@
 
 This guide is for a teammate who has never opened this codebase. After reading it you should be able to explain the system design in the viva, and say **why** each decision was made, what was rejected, and what it costs. It is the teaching layer. The ten numbered documents (`01-requirements.md` to `10-demo-and-contributions.md`) are the formal versions, with every `path:line` citation. When this guide and the code disagree, the code is right.
 
-Everything here was checked against the code on branch `main` (commit `c956a8f`). File paths and test names are real; open them.
+Everything here was checked against the code on branch `main` (commit `cc8d170`). File paths and test names are real; open them.
 
 ---
 
@@ -19,16 +19,16 @@ Everything here was checked against the code on branch `main` (commit `c956a8f`)
 
 **Tips.**
 - Keep the code open next to this guide. When a section names a file, open it and find the class.
-- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 91 seconds; at `8759bf0` the result is `2203 passed, 2 xfailed, 2 deselected`).
+- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 91 seconds; at `670e2d5` the result is `2203 passed, 2 xfailed, 2 deselected`).
 - Section 11 defines every term. When a word is new, look it up there.
 - Do not claim anything listed in section 9 as working.
 
-**Numbers to quote** (measured at `c956a8f`):
+**Numbers to quote** (measured at `cc8d170`):
 - Tests: **2203 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2203 passed, 2 xfailed, 2 deselected**, in 94 test files.
 - The chat router `app/api/v1/endpoints/chat.py` is **56 lines**.
 - PEARL reads the last **28 days** (`FOCUS_WINDOW_DAYS`).
-- The API has **43 paths and 49 operations** (42 and 48 at `c956a8f`; the documents work added `GET /documents/{source_id}/file`); there are **20 migration files**.
-- The formal documents cite `path:line` at commit `e76bff9`. Four later commits (`e0e154f`, `7a414bb`, `be76c48`, `c956a8f`) fixed problems found by clicking through the app; the documents note each change where it alters a claim, and this guide covers them in D25, D29, D30 and D31. The documents work (D32: kept files, linking by meaning) moved lines in the files it touched, and the citations into those files were moved with them.
+- The API has **43 paths and 49 operations** (42 and 48 at `cc8d170`; the documents work added `GET /documents/{source_id}/file`); there are **20 migration files**.
+- The formal documents cite `path:line` at commit `d3e9132`. Four later commits (`102fc8b`, `975b0c6`, `0e40e5f`, `cc8d170`) fixed problems found by clicking through the app; the documents note each change where it alters a claim, and this guide covers them in D25, D29, D30 and D31. The documents work (D32: kept files, linking by meaning) moved lines in the files it touched, and the citations into those files were moved with them.
 
 ---
 
@@ -478,7 +478,7 @@ sequenceDiagram
 - **The test that pins it.** `tests/behaviour/test_psychology.py::test_anti_guilt__skipping_tasks__every_reply_is_blame_free`; `tests/test_patterns.py::test_copy__every_detector__speaks_to_the_user_plainly_and_without_blame`; `tests/test_triggers.py::test_brief__copy__no_blame_phrases_and_peak_claim_only_when_learned`.
 
 ### D29. Reading an uploaded document never blocks the server
-- **The problem.** Docling (the PDF and image reader) is synchronous and can take tens of seconds on its first use, while its models load. It ran inside the request, on the event loop, so every other request waited; once, a parse that never returned froze the whole server (commit `7a414bb`).
+- **The problem.** Docling (the PDF and image reader) is synchronous and can take tens of seconds on its first use, while its models load. It ran inside the request, on the event loop, so every other request waited; once, a parse that never returned froze the whole server (commit `975b0c6`).
 - **What we chose.** Async code reads documents only through `read_document` and `read_document_with_provenance` (`app/utils/docling_helper.py`). They run Docling on a worker thread (`asyncio.to_thread`), one document at a time (a lock, because the reader's models are loaded once and are not built for two parses at once), for at most `DOCUMENT_READ_TIMEOUT_S` = 120 s. Past that, `DocumentReadTimeoutError` answers 503 `document_read_timeout`: "That document took too long to read. Try again, or a smaller file."
 - **What we rejected, and why.** Leaving the parse on the event loop (the freeze above). No other alternative is recorded. What the choice buys in practice: the server keeps answering while a document is read, and a stuck parse costs one request, not the whole server.
 - **What it costs us.** Uploads wait for each other. A Python thread cannot be stopped, so a parse that never returns keeps running on its worker thread after the request has answered at 120 s, and the lock is free again, so the next upload may run beside it. In a chat upload the knowledge module's step limit (60 s) ends the turn's wait first.
@@ -486,7 +486,7 @@ sequenceDiagram
 - **The test that pins it.** `tests/test_document_reading.py::test_read_document__parse_takes_a_while__the_loop_keeps_serving`, `::test_read_document__parse_never_returns__times_out_as_a_503`, `::test_read_document__two_uploads_at_once__parsed_one_at_a_time`.
 
 ### D30. A resumed conversation trusts the draft's status, not its checkpoint
-- **The problem.** The chat card's Accept and Discard buttons call REST (`POST /drafts/{id}/accept`), which never passes through the conversation. The conversation's checkpoint still said "a draft is under review", so the next message, even "thanks" or a question, took the negotiation shortcut and planned again (found in hands-on testing, commit `e0e154f`).
+- **The problem.** The chat card's Accept and Discard buttons call REST (`POST /drafts/{id}/accept`), which never passes through the conversation. The conversation's checkpoint still said "a draft is under review", so the next message, even "thanks" or a question, took the negotiation shortcut and planned again (found in hands-on testing, commit `102fc8b`).
 - **What we chose.** Before the graph runs, `ChatTurn._close_review_of_a_closed_draft` (`app/services/chat_turn/service.py`) reads the draft's real status through `DraftService.get`. Still open: nothing changes. Accepted: the thread moves to the accepted phase, so a second "looks good", or a "scrap it", is answered "already locked in" and writes nothing. Discarded, expired or gone: the review ends. If the database cannot be read, the checkpoint is left as it was.
 - **What we rejected, and why.** Trusting the checkpoint (the bug above). The method's docstring records the rule: "The draft's own status is the truth." No other alternative is recorded. What the choice buys in practice: however a draft was closed (its card, another tab, a newer plan superseding it), the conversation finds out on its next turn.
 - **What it costs us.** One extra database read on each resumed turn that was mid-review.
@@ -494,7 +494,7 @@ sequenceDiagram
 - **The test that pins it.** `tests/behaviour/test_chat_turns.py::test_chat__plan_accepted_from_its_card__next_message_is_a_conversation_not_a_replan`, `::test_chat__plan_discarded_from_its_card__next_message_is_a_conversation_not_a_replan`, `::test_chat__scrap_it_after_accepting_in_the_review_ui__never_claims_a_discard`.
 
 ### D31. A question is answered, not planned or ingested
-- **The problem.** Hands-on testing found three replies that did the wrong thing (commits `be76c48`, `c956a8f`): "What should I do first today?" was extracted as a planning goal and produced a new draft with invented tasks; "According to my uploaded notes, what…?" was sent to ingestion and answered "Standing by"; and the reply about a new plan copied "six tasks" from an example in its prompt.
+- **The problem.** Hands-on testing found three replies that did the wrong thing (commits `0e40e5f`, `cc8d170`): "What should I do first today?" was extracted as a planning goal and produced a new draft with invented tasks; "According to my uploaded notes, what…?" was sent to ingestion and answered "Standing by"; and the reply about a new plan copied "six tasks" from an example in its prompt.
 - **What we chose.** Three small rules. (1) The extraction prompt says a goal needs new work or an explicit request to plan; a question about work already planned is not a goal (`app/services/planning/brain_dump_prompt.py`). (2) A text-only message is ingested as material only from `PASTED_MATERIAL_MIN_CHARS` = 400 characters; a shorter one goes on through the other intent rules, so a question about the user's notes reaches the conversation path, which answers from the stored document chunks (`_classify_intent`, `app/orchestrator/graph.py`). (3) The reply about a drafted plan is given its real facts (`tasks_in_draft`, `new_tasks`, `new_work`, `already_on_the_plate_and_given_a_slot`, from `_drafted_plan_facts` in `app/services/analytical/voice_of_jarvis.py`), and the prompt's example no longer contains a count.
 - **What we rejected, and why.** Not recorded. What the choice buys in practice: no extra model call, since rules (1) and (3) change prompt text the turn already sends and rule (2) is a length check.
 - **What it costs us.** Rule (1) is prompt wording, so it guides the model rather than guarantees the result. Rule (2) is a heuristic: notes shorter than 400 characters pasted as text are treated as a message, not kept.
@@ -577,7 +577,7 @@ sequenceDiagram
 
 **C10. A working implementation that matches the design.**
 - *Looking for:* it runs end to end, and the code is what the diagrams say.
-- *How Jarvis meets it:* 2203 offline tests at `8759bf0` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
+- *How Jarvis meets it:* 2203 offline tests at `670e2d5` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
 - *Best example:* the demo's terminal step (doc 10, minute 8:45): the concurrent-accept test, the SQL lock-order test, `test_layering.py` and `test_design_conformance.py`, all passing.
 - *Detail:* `10-demo-and-contributions.md`.
 
@@ -707,14 +707,14 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 27. **What happens when the network drops?** It depends where. *Database:* a connection that cannot be made is retried once, and so is a read whose kept-alive connection the server dropped; a write is never retried. Otherwise the route answers 503 `persistence_unavailable`, never an empty list. *Model:* a timeout is retried with backoff (cloud only), then the chain falls over to the next provider; a stream that already sent a token is not restarted. *Browser:* the shielded cleanup cancels the graph and frees the turn lock at once; the user's message is saved, the assistant's is not.
 28. **Why not let the language model write to the database directly?** Model output is never trusted: it is parsed through a Pydantic schema and never executed. Plans go through the CP-SAT solver (which guarantees no overlaps), then into a draft the user must accept. Only `DraftService.accept` writes `user_tasks`.
 29. **What is process-local, and what breaks with two workers?** Turn locks, the PRIMARY lock, the anticipation locks and day memo, single-flight runs and the scheduler loop. Two workers could interleave turns, make two briefs, or run two heavy model calls. Data stays correct because the accept transaction, CAS writes and unique keys are in the database.
-30. **What happens when an uploaded document takes forever to read?** The server keeps answering: the reader (Docling) runs on a worker thread, one document at a time. After 120 s the REST ingestion routes answer 503 `document_read_timeout`. Before commit `7a414bb` the parse ran on the event loop, and one stuck parse froze the whole server (D29).
+30. **What happens when an uploaded document takes forever to read?** The server keeps answering: the reader (Docling) runs on a worker thread, one document at a time. After 120 s the REST ingestion routes answer 503 `document_read_timeout`. Before commit `975b0c6` the parse ran on the event loop, and one stuck parse froze the whole server (D29).
 
 ### C10. Working implementation
 31. **Why not microservices?** Our reading, based on the spec's non-goals (no cloud deployment, no multi-user scale) and ADR-3: Jarvis serves one person from one process, next to a local model on the same laptop. Splitting it would add network calls, deployment and distributed failure modes for no gain. The atomic accept relies on one database transaction; across services it would need a distributed transaction.
 32. **Why CP-SAT and not let the model schedule?** A model makes overlaps and ignores constraints. CP-SAT returns a schedule that meets every hard constraint, or proves none exists; it is capped at 10 s and keeps the best schedule found.
 33. **Why the local model first?** Privacy: the prompt never leaves the machine. Claude is the cloud tier for schema-valid structured output in the demo; Gemini is the last resort (ADR-10).
 34. **Is the demo data fake?** The history is seeded, the inference is live. `scripts/seed_demo_user.py` writes three weeks of history through the real services under a simulated clock; patterns, the focus profile and the brief are computed live. A test checks that every seeded row has a shape the live app writes.
-35. **How do you prove it works end to end?** 2203 offline tests at `8759bf0` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
+35. **How do you prove it works end to end?** 2203 offline tests at `670e2d5` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
 36. **If you had another week?** From the build ledgers: repositories for sessions and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
 
 ---

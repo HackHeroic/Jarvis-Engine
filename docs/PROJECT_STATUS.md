@@ -1,7 +1,7 @@
 # Jarvis Engine — Project Status
 
 **Last updated:** 2026-11-15
-**Branch:** `main` (the capstone work is merged) · **Checked against:** `e76bff9` (end of capstone plan 3, "finish the restructure"); the fixes up to `c956a8f` are folded in where they change a claim. `path:line` references are at `e76bff9`.
+**Branch:** `main` (the capstone work is merged) · **Checked against:** `d3e9132` (end of capstone plan 3, "finish the restructure"); the fixes up to `cc8d170` are folded in where they change a claim. `path:line` references are at `d3e9132`.
 **Scope:** what the code does today. Every claim below names the file it was checked in. Where something is a stub or not built, it says so. This is the one current architecture document; the capstone documents (§10) expand each part.
 
 ---
@@ -164,7 +164,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 ## 7. Tests
 
-**2203 passed, 2 xfailed, 2 deselected**, about 91 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `8759bf0`. 94 test files.
+**2203 passed, 2 xfailed, 2 deselected**, about 91 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `670e2d5`. 94 test files.
 
 - **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
 - **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.
@@ -181,7 +181,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 2. Run `.venv/bin/python scripts/live_e2e.py` (default `--base-url http://localhost:8000`). It costs ten chat turns, roughly 25–30 model calls.
 3. Pass means the table ends `ALL PASSED` (exit 0; a SKIP is allowed and means the step had nothing to say) and the server log shows no traceback.
 
-Last run: all 18 steps passed at `8759bf0` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
+Last run: all 18 steps passed at `670e2d5` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
 
 ---
 

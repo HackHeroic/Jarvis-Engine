@@ -11,8 +11,8 @@
 **Spec:** `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md`, sections §7, §8.1, §8.2, §9, §9.1, §9.2, §10, §11, and §12 phase 3a. This is plan 2 of 4. Plan 1's ledger is `.superpowers/sdd/2026-11-14-capstone-plan-1-safety-and-spine/progress.md`; its Plan-2 follow-ups are folded in below.
 
 **Code base this plan was verified against:**
-- Jarvis-Engine `capstone-lld` at `482397e` (includes the `EVENING_CUTOFF_HOUR` evening rule in `app/services/planning/local_time.py`).
-- jarvis-frontend `capstone-lld` at `d38a4d9`.
+- Jarvis-Engine `capstone-lld` at `7550ea9` (includes the `EVENING_CUTOFF_HOUR` evening rule in `app/services/planning/local_time.py`).
+- jarvis-frontend `capstone-lld` at `c2bd9c4`.
 
 ## Global Constraints
 

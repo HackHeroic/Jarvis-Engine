@@ -1,6 +1,6 @@
 # 10 — Demo and contributions
 
-This document is the team's playbook for the evaluation. Jarvis is a personal intelligence for one person: it keeps their work ready before they need it, learns from what actually happened (an append-only outcome history becomes patterns and a focus profile that change the solver's math), remembers what they say and forgets on request for good, and makes the first move each morning only with consent. Section 1 is the demo-day setup, with exact commands, the environment it needs and what to do when the cloud model or the network fails. Section 2 is a ten-minute demo script, minute by minute, with the exact text to type, what appears on screen (quoted from the seeded `demo` user as read from the running backend on 2026-11-14), the point to make and the rubric criterion it shows, plus a three-minute cut. Section 3 is a bank of viva questions with honest answers and the file to open. Section 4 maps every subsystem to its files and documents, with what its owner must be able to explain and a blank owner slot. Section 5 lists the limits we state openly. File references are `path:line` at commit `e76bff9`, now part of `main` (frontend `4f72769`).
+This document is the team's playbook for the evaluation. Jarvis is a personal intelligence for one person: it keeps their work ready before they need it, learns from what actually happened (an append-only outcome history becomes patterns and a focus profile that change the solver's math), remembers what they say and forgets on request for good, and makes the first move each morning only with consent. Section 1 is the demo-day setup, with exact commands, the environment it needs and what to do when the cloud model or the network fails. Section 2 is a ten-minute demo script, minute by minute, with the exact text to type, what appears on screen (quoted from the seeded `demo` user as read from the running backend on 2026-11-14), the point to make and the rubric criterion it shows, plus a three-minute cut. Section 3 is a bank of viva questions with honest answers and the file to open. Section 4 maps every subsystem to its files and documents, with what its owner must be able to explain and a blank owner slot. Section 5 lists the limits we state openly. File references are `path:line` at commit `d3e9132`, now part of `main` (frontend `4fa06ef`).
 
 **Owner: ______**
 
@@ -187,7 +187,7 @@ Answers are short on purpose; open the file named to go deeper.
 | # | Question | Answer | Open |
 |---|---|---|---|
 | 33 | Why one error envelope? | Every error is a `JarvisError` with a stable code and HTTP status, rendered as `{"error": {code, message, details, request_id}}` by global handlers, and the same shape inside the stream's `error` frame; exception text never reaches a client. | `app/domain/errors.py`; `app/api/error_handlers.py`; `tests/test_api_contract.py::test_endpoints__raise_no_http_exception` |
-| 34 | What do the offline tests prove, and what does the live script add? | The offline suite (2203 passed, 2 xfailed, 2 deselected at `8759bf0`) runs the real services, the real CP-SAT and both repository families over fakes and a scripted model, with network blocked. The live script drives the running backend against real Supabase and Claude as a throwaway user. | `tests/`; `scripts/live_e2e.py` |
+| 34 | What do the offline tests prove, and what does the live script add? | The offline suite (2203 passed, 2 xfailed, 2 deselected at `670e2d5`) runs the real services, the real CP-SAT and both repository families over fakes and a scripted model, with network blocked. The live script drives the running backend against real Supabase and Claude as a throwaway user. | `tests/`; `scripts/live_e2e.py` |
 | 35 | Where does the design fall short? | Section 5: ask-back, PreTaskPrep and DeadlineRisk not built; process-local guards; no authentication; regex PII; six legacy raw-table leftovers; two orchestrator branches never taken. | Section 5 |
 | 36 | If you had another week? | From the ledgers' parked items: repositories for sessions and calendar rows (removing the raw-table allow-list), a `local_day` unique index for the once-a-day brief, a version on the chat accept, real authentication, and a real PII gateway. | `.superpowers/sdd/…/progress.md` |
 
@@ -246,8 +246,8 @@ One possible split for four people, for the team to change: (1) Domain, Persiste
 
 ```bash
 cd Jarvis-Engine
-git log -1 --oneline                                   # e76bff9
-git -C ../jarvis-frontend log -1 --oneline             # 4f72769
+git log -1 --oneline                                   # d3e9132
+git -C ../jarvis-frontend log -1 --oneline             # 4fa06ef
 
 # Setup commands exist and say what section 1 says.
 sed -n 1,48p scripts/seed_demo_user.py                 # what the seed does, refusal, exit codes
@@ -266,7 +266,7 @@ curl -s "localhost:8000/api/v1/tasks/?user_id=demo&status=pending"
 .venv/bin/python -m pytest -q tests/test_layering.py tests/test_design_conformance.py tests/test_draft_service.py tests/test_migrations.py \
   tests/test_triggers.py tests/test_consent.py tests/test_memory_service.py tests/test_patterns.py \
   tests/test_claude_provider.py tests/test_prompt_layout.py tests/test_seed_demo_user.py
-.venv/bin/python -m pytest -q tests/                   # 2203 passed, 2 xfailed, 2 deselected at 8759bf0
+.venv/bin/python -m pytest -q tests/                   # 2203 passed, 2 xfailed, 2 deselected at 670e2d5
 (cd ../jarvis-frontend && npm test)                    # the frontend suite (vitest)
 
 # The whole loop, live (costs model calls; throwaway e2e- user, rows deleted).

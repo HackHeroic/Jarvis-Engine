@@ -1,6 +1,6 @@
 # 05 — Design patterns
 
-This document lists every design pattern that is actually present in the Jarvis backend at commit `e76bff9`, now part of `main`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen, and it hands every collaborator in: nothing looks the container up from a process-wide registry.
+This document lists every design pattern that is actually present in the Jarvis backend at commit `d3e9132`, now part of `main`, and only those. For each one it gives the problem it solves, where it lives (`path:line`), a short excerpt copied from the code, how a new variant is added without editing existing classes, the alternative that was rejected and why, and the test that pins the behaviour. Where a pattern is only partly applied, the section says so and says where the gap is. The patterns cluster around three subsystems: persistence (Repository, Abstract Factory, Adapter), the language-model chain (Strategy, Decorator, Chain of Responsibility, Factory, Adapter), and anticipation (Template Method, Chain of Responsibility, Strategy, Command, State, Observer). The composition root `AppContainer` is the one place where the concrete classes are chosen, and it hands every collaborator in: nothing looks the container up from a process-wide registry.
 
 **Owner: ______**
 
@@ -660,7 +660,7 @@ A new `ProactiveAction` subclass with `kind`, `risk` and the three methods, plus
 
 ## 13. Patterns named in the spec that are not in the code
 
-| Spec §6.3 entry | Status at `e76bff9` |
+| Spec §6.3 entry | Status at `d3e9132` |
 |---|---|
 | Command `Step` with `StepExecutor.run` as a Template Method | Not built. Module steps are still `ModuleStep` handlers wrapped by `app/core/module_framework.py` |
 | `CognitiveModule` registry with derived routing | Not built (no `CognitiveModule` class); routing is `INTENT_TO_MODULE` in the orchestrator. The restructure plan's task for it was dropped |

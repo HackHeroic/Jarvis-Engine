@@ -9,7 +9,7 @@ Plan 2's status change, `20261115000000_skip_writes_skipped.sql`, has its own se
 
 They record why each choice was made. They are also the source for the ER diagram: every key, relationship and constraint below was checked by introspecting a database built from `supabase/migrations/` alone (PostgreSQL 18, local).
 
-**Refreshed at `e76bff9`.** No migration changed after `5c6ffd3`. The plan 3 restructure changed only the application side, and the notes on who reads and writes each table are updated for it: repositories now own tasks, rules, goals' deadline updates, habit trackers and drafts, and the legacy `DraftStore`, the v1 memory store and PEARL module, `_persist_fused_tasks` and the task edit and delete routes are gone. `docs/capstone/08-database-schema.md` is the full schema reference.
+**Refreshed at `d3e9132`.** No migration changed after `dca181d`. The plan 3 restructure changed only the application side, and the notes on who reads and writes each table are updated for it: repositories now own tasks, rules, goals' deadline updates, habit trackers and drafts, and the legacy `DraftStore`, the v1 memory store and PEARL module, `_persist_fused_tasks` and the task edit and delete routes are gone. `docs/capstone/08-database-schema.md` is the full schema reference.
 
 ## Before you apply
 
@@ -183,7 +183,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 - `missed` (`missed_deadlines`)
 - `TaskStatus` values (repository `update_status`)
 
-No code wrote `in_progress`, `cancelled` or `rolled_forward`, so those three statuses are not allowed. At `e76bff9` every status write goes through `TaskRepository` (`update_status`, `bring_back`) or `accept_draft()`, with `TaskStatus` values only. Plan 3 deleted `PATCH /tasks/{id}` and its `TaskUpdateRequest`, the last place that described `rolled_forward`, so no route can send a free-form status.
+No code wrote `in_progress`, `cancelled` or `rolled_forward`, so those three statuses are not allowed. At `d3e9132` every status write goes through `TaskRepository` (`update_status`, `bring_back`) or `accept_draft()`, with `TaskStatus` values only. Plan 3 deleted `PATCH /tasks/{id}` and its `TaskUpdateRequest`, the last place that described `rolled_forward`, so no route can send a free-form status.
 
 **`duration_minutes` / `difficulty_weight` NOT NULL.** The one insert path, `accept_draft()`, takes rows that `build_task_rows` builds from validated `TaskChunk`s, which always carry both values. (The v1 `_persist_fused_tasks` path did the same; plan 3 deleted it.) The `Task` entity also requires both, and `accepted_task_rows` (`app/infrastructure/persistence/_mapping.py:207`) rejects a row without them before the RPC is sent.
 

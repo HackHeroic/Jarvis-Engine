@@ -1,6 +1,6 @@
 # 08 — Database schema
 
-Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 20 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (now part of `main`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
+Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 20 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `d3e9132` (now part of `main`), not from memory. No migration changed between `dca181d`, where it was first written, and `d3e9132`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -555,7 +555,7 @@ Indexes: `idx_llm_usage_events_user_created (user_id, created_at desc)`. RLS: `o
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** |
 | `user_id` | `text` | NO | — | FK `ingested_documents_user_id_fkey` → `user_profiles` CASCADE |
 | `source_id` | `text` | NO | — | **UK** `ingested_documents_user_id_source_id_key` `(user_id, source_id)`; the key ChromaDB chunks carry |
-| `file_name` | `text` | yes | — | the upload's own name; since `be76c48` `POST /ingestion/process` passes it through (`IngestionRequest.file_name`, at most 255 characters) |
+| `file_name` | `text` | yes | — | the upload's own name; since `0e40e5f` `POST /ingestion/process` passes it through (`IngestionRequest.file_name`, at most 255 characters) |
 | `media_type` | `text` | yes | — | |
 | `document_topics` | `text[]` | yes | `'{}'` | |
 | `chunk_count` | `integer` | yes | `0` | |
@@ -645,7 +645,7 @@ Indexes: the UK; `task_workspaces_user_task_idx (user_id, task_id)`, which dupli
 
 ### 3.19 `task_completion_signals` — completion telemetry (no longer written)
 
-*Origin:* `20260329000002`; capstone §5. No entity. Nothing in `app/` reads or writes it: plan 3 (commit `7547d4f`) removed the insert from Complete, because the `completed` task event is the one outcome record. No migration drops the table.
+*Origin:* `20260329000002`; capstone §5. No entity. Nothing in `app/` reads or writes it: plan 3 (commit `1393896`) removed the insert from Complete, because the `completed` task event is the one outcome record. No migration drops the table.
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
@@ -854,7 +854,7 @@ The legal moves are the `_Move` table in `app/services/task_service.py:74–84`.
 | `missed` → (deleted) → `pending` (new row, same `task_id`) | A new plan re-slots it | `rescheduled` | `accept_draft()` v2 delete rule |
 | `pending` → (deleted) | Every accept replaces the pending set | none | `accept_draft()` step 4 |
 
-No route deletes or edits a task: plan 3 removed `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/` (commit `7547d4f`).
+No route deletes or edits a task: plan 3 removed `PATCH /tasks/{id}`, `DELETE /tasks/{id}` and `DELETE /tasks/` (commit `1393896`).
 
 A row's `id` is therefore not stable across accepts. `task_id` is the stable identity, which is why `task_events` keys on it.
 

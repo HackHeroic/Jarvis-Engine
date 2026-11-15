@@ -1,6 +1,6 @@
 # 09 — Error handling, edge cases and concurrency
 
-Jarvis raises errors on purpose from one hierarchy rooted at `JarvisError`; each class carries a stable machine code and the HTTP status the API answers with. Global handlers turn every error a request can end in — a `JarvisError`, a request-validation error, Starlette's own `HTTPException` for an unknown path or method, or an exception nobody caught — into one JSON envelope `{"error": {"code", "message", "details", "request_id"}}`, whose model is `ErrorResponse` (`app/schemas/errors.py`). A streamed chat turn sends the same model as an SSE `error` frame. No route raises `HTTPException`. Exception text from libraries never reaches a client; it is logged with the request id. This document gives the hierarchy, real envelope examples, a failure-scenario table (what the user sees, what the system does, where, and which test pins it), the concurrency mechanisms in depth (the atomic `accept_draft` function and its lock order, the draft version check, compare-and-set on statuses, the turn lock and the stream that always closes, per-user locks and single-flight, the PRIMARY-model lock, the compaction lock, and what is process-local), and the edge-case rules for the user's clock, read caps and bounded waits. References are `path:line` at commit `e76bff9`, now part of `main`. Rows changed or added by the fixes up to `c956a8f` (a resumed conversation reading its draft's status, a dropped kept-alive connection retried on reads, documents read off the event loop, the web-search cooldown, short questions about notes) cite functions and tests instead of lines.
+Jarvis raises errors on purpose from one hierarchy rooted at `JarvisError`; each class carries a stable machine code and the HTTP status the API answers with. Global handlers turn every error a request can end in — a `JarvisError`, a request-validation error, Starlette's own `HTTPException` for an unknown path or method, or an exception nobody caught — into one JSON envelope `{"error": {"code", "message", "details", "request_id"}}`, whose model is `ErrorResponse` (`app/schemas/errors.py`). A streamed chat turn sends the same model as an SSE `error` frame. No route raises `HTTPException`. Exception text from libraries never reaches a client; it is logged with the request id. This document gives the hierarchy, real envelope examples, a failure-scenario table (what the user sees, what the system does, where, and which test pins it), the concurrency mechanisms in depth (the atomic `accept_draft` function and its lock order, the draft version check, compare-and-set on statuses, the turn lock and the stream that always closes, per-user locks and single-flight, the PRIMARY-model lock, the compaction lock, and what is process-local), and the edge-case rules for the user's clock, read caps and bounded waits. References are `path:line` at commit `d3e9132`, now part of `main`. Rows changed or added by the fixes up to `cc8d170` (a resumed conversation reading its draft's status, a dropped kept-alive connection retried on reads, documents read off the event loop, the web-search cooldown, short questions about notes) cite functions and tests instead of lines.
 
 **Owner: ______**
 
@@ -164,7 +164,7 @@ Pinned by `tests/test_errors.py::test_error_envelope__unhandled_exception__hides
 
 ## 3. Failure scenarios
 
-"User sees" is what reaches the screen or the API client. All `path:line` are at `e76bff9`.
+"User sees" is what reaches the screen or the API client. All `path:line` are at `d3e9132`.
 
 ### 3.1 Language models
 
@@ -463,7 +463,7 @@ From `Jarvis-Engine/` on branch `main`:
 .venv/bin/python -m pytest tests/test_turn_locks.py tests/test_chat_turn.py tests/test_anticipation_design.py \
   tests/test_anticipation_scheduler.py tests/test_conversation_memory.py tests/test_you_api.py -q
 
-# Fixes after e76bff9: dropped connection on a read, documents off the event loop, web-search cooldown,
+# Fixes after d3e9132: dropped connection on a read, documents off the event loop, web-search cooldown,
 # a resumed conversation after a card accept or discard, short questions about notes
 .venv/bin/python -m pytest tests/test_supabase_client.py tests/test_document_reading.py tests/test_workspace_web_search.py \
   tests/behaviour/test_chat_turns.py -q
@@ -471,7 +471,7 @@ From `Jarvis-Engine/` on branch `main`:
 # Local day and timezone rules, the streak
 .venv/bin/python -m pytest tests/test_local_time.py tests/test_local_day_fixes.py tests/behaviour/test_local_day.py -q
 
-# Everything (expect at 8759bf0: 2203 passed, 2 xfailed, 2 deselected)
+# Everything (expect at 670e2d5: 2203 passed, 2 xfailed, 2 deselected)
 .venv/bin/python -m pytest tests/ -q
 
 # Read the accept_draft function and its lock order
