@@ -386,7 +386,7 @@ Indexes: `idx_draft_schedules_user_status (user_id, status)`, `idx_draft_schedul
 |---|---|---|---|---|
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** |
 | `user_id` | `text` | NO | — | FK `behavioral_constraints_user_id_fkey` → `user_profiles` CASCADE |
-| `raw_text` | `text` | NO | — | the rule in the user's words |
+| `raw_text` | `text` | NO | — | the rule's words: the cleaned memory of stating it when one states that rule alone, else the user's own words |
 | `constraint_type` | `text` | NO | `'preference'` | no CHECK |
 | `structured_override` | `jsonb` | yes | `'{}'` | dead: nothing in `app/` reads or writes it |
 | `created_at` | `timestamptz` | NO | `now()` | |

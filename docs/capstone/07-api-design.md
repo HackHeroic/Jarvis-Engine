@@ -86,7 +86,7 @@ flowchart TB
 **Routes that still reach the database directly.** These files are on the raw-table allow-list (`tests/test_layering.py:451-462`), each with its reason; Task 6 of the restructure (repositories for sessions and the pending calendar) was dropped:
 - `sessions` (`chat_sessions`);
 - `ingestion` pending-calendar routes (`pending_calendar_updates`), and `/ingestion/process` through `services/extraction/orchestrator.py` (its pending calendar row; a kept document goes through `DocumentService`);
-- the workspace routes, through `workspace_builder.py` (`task_workspaces` cache, `user_tasks` columns the `Task` entity does not carry, its own `task_materials` read for the task's chunks) and `user_preferences.py`;
+- the workspace routes, through `workspace_builder.py` (`task_workspaces` cache only; the task and its documents come through repositories) and `user_preferences.py`;
 - the chat stream's session and message writes (`app/services/chat_history.py`).
 
 The pending-calendar handlers make synchronous supabase-py calls inside `async def` (`ingestion.py:208-218`), and the document chunks read calls ChromaDB the same way (`documents.py:137-142`), so each round trip blocks the event loop. The other documents routes go through `DocumentService`, whose repositories and file store run their calls on worker threads.

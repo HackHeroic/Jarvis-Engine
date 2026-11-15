@@ -81,7 +81,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `chat_sessions` | `ConversationSession` | `chat_history` and the sessions endpoints (sessions, titles, pins, archive, activity); `SupabaseConversationRepository.set_summary` (the summary columns only) |
 | `chat_messages` | `ChatMessage` | `chat_history` (read by `SupabaseConversationRepository`) |
 | `ingested_documents` | `IngestedDocument` | `SupabaseDocumentRepository`, reached through `DocumentService` (the ingestion pipeline keeps a document; the documents routes list and delete it) |
-| `task_materials` | `TaskMaterialLink` | `SupabaseDocumentRepository.link`, called by `DocumentLinker` (both directions); `workspace_builder` still reads it directly for a task's chunks |
+| `task_materials` | `TaskMaterialLink` | `SupabaseDocumentRepository.link`, called by `DocumentLinker` (both directions); the workspace reads it through `DocumentRepository.links_for_task` |
 
 `Pattern` is computed and never stored. The other user tables have no domain entity, and the code that reaches them is on the raw-table allow-list in `tests/test_layering.py` (`_RAW_TABLE_CALLS_ALLOWED`):
 

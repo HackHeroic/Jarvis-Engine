@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status (2026-11-16): built and merged.** M1 to M6 are on `main` in both repos; `scripts/memory_check.py` passes all seven steps against the live backend. One fix beyond this plan: a correction in the user's words no longer leaves a second, raw-worded memory beside the cleaned one.
+
 **Goal:** What the user tells Jarvis is found when it is asked about, corrected when the user corrects it, kept for as long as it stays true, and visible and editable by the user.
 
 **Architecture:** The memory architecture stays as it is: memories in Postgres with pgvector (`MemoryRepository`), one service that stores, reinforces, supersedes, recalls and fades them (`MemoryService`, `app/services/memory/memory_service.py`), extraction after each turn (`app/core/observation.py`), stated rules linked to the memory of stating them (`StatedRules`, `app/services/memory/stated_rules.py`), and the context note the model reads (`app/services/memory/context.py`). This plan fixes four behaviours inside that design and adds a check that proves the loop end to end. No new store, no new framework.

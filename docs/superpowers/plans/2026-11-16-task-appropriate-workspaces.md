@@ -1,5 +1,7 @@
 # Task-Appropriate Workspaces Implementation Plan
 
+**Status (2026-11-16): built and merged.** Packages A to E are on `main` in both repos, verified against the live backend. Two additions beyond this plan: a quiz tests the subject, not the document, and study and practice tasks with no document get questions from general knowledge, labelled as such. Known follow-ups: a re-planned carried-over task can lose its completion criteria (`planning_graph.fuse_tasks`); the 0.45 relevance bar is untuned on real data.
+
 **Goal:** When a task's workspace opens, everything in it is for that task: the right kind of help for the kind of work, drawn only from documents that are actually about it, and shown as something to use, not a block of text.
 
 **Why:** Today every task gets the same recipe. "Course project: write the README" was given a quiz, labelled "From your syllabus", built from an unrelated marks transcript (the model itself wrote "the supplied materials contain no README instructions"). A writing task can also be handed LeetCode links. This is the gap between a planner and Jarvis: the workspace should show it understood the task.

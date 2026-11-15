@@ -59,7 +59,7 @@ The six raw-table leftovers (`tests/test_layering.py:451-462`), each with the re
 
 | File | Reason in the allow-list |
 |---|---|
-| `services/analytical/workspace_builder.py` | `task_workspaces` cache (decision 10); its `user_tasks` reads need `topic_keywords` and `implementation_intention`, which the `Task` entity does not carry; its chunk lookup reads `task_materials` itself (module functions the container does not build) |
+| `services/analytical/workspace_builder.py` | `task_workspaces` cache (decision 10). Its task and document reads go through `TaskRepository` and `DocumentRepository` since 2026-11-16 |
 | `services/user_preferences.py` | `learning_style` read (decision 10) |
 | `services/chat_history.py` | Plan 3 cut (Task 6): no repository yet for `chat_sessions` / `chat_messages` |
 | `api/v1/endpoints/sessions.py` | Plan 3 cut: `chat_sessions` |
@@ -345,7 +345,7 @@ Each task maps to a role (`MODEL_ROUTING`, `model_router.py:180-199`); the role 
 
 | Role | Tasks | Local model | Claude effort |
 |---|---|---|---|
-| `PRIMARY` | `socratic_chunker`, `habit_translation`, `document_understanding`, `research_summarization`, `practice_generation`, `calendar_parsing` | The detected heavy Gemma (`GEMMA_PRIMARY_MODEL`) | medium, `max_tokens` 8000 |
+| `PRIMARY` | `socratic_chunker`, `habit_translation`, `document_understanding`, `research_summarization`, `practice_generation`, `workspace_outline`, `calendar_parsing` | The detected heavy Gemma (`GEMMA_PRIMARY_MODEL`) | medium, `max_tokens` 8000 |
 | `FAST` | `intent_classification`, `brain_dump_extraction`, `memory_extraction`, `voice_of_jarvis`, `voice_of_jarvis_synthesis`, `goal_validation`, `task_edit_parsing`, `action_item_extraction`, `session_summary` | The detected small Gemma (`GEMMA_FAST_MODEL`) | low, `max_tokens` 2048 structured / 4096 text |
 | `CLOUD` | `web_search`, `real_time_research` | never local | medium |
 

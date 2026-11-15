@@ -19,12 +19,12 @@ Everything here was checked against the code on branch `main` (commit `cc8d170`)
 
 **Tips.**
 - Keep the code open next to this guide. When a section names a file, open it and find the class.
-- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 91 seconds; at `670e2d5` the result is `2203 passed, 2 xfailed, 2 deselected`).
+- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 91 seconds; at `670e2d5` the result is `2340 passed, 2 xfailed, 2 deselected`).
 - Section 11 defines every term. When a word is new, look it up there.
 - Do not claim anything listed in section 9 as working.
 
 **Numbers to quote** (measured at `cc8d170`):
-- Tests: **2203 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2203 passed, 2 xfailed, 2 deselected**, in 94 test files.
+- Tests: **2340 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2340 passed, 2 xfailed, 2 deselected**, in 94 test files.
 - The chat router `app/api/v1/endpoints/chat.py` is **56 lines**.
 - PEARL reads the last **28 days** (`FOCUS_WINDOW_DAYS`).
 - The API has **43 paths and 49 operations** (42 and 48 at `cc8d170`; the documents work added `GET /documents/{source_id}/file`); there are **20 migration files**.
@@ -352,7 +352,7 @@ sequenceDiagram
 
 ### D14. Vector recall in Postgres (pgvector), within a token budget
 - **The problem.** The model should be told the memories that matter for this message, never all of them, and never one the user let go of.
-- **What we chose.** Memories live in `user_memories` with an `embedding vector(384)` column (the local `MiniLMEmbedder`, all-MiniLM-L6-v2). The SQL function `match_memories()` filters by user, status and type and orders by cosine distance, in one query. `MemoryService.recall` builds a **budget**: an always-on profile (constraints, preferences, goals at least 0.6 sure) within 200 tokens, then up to 12 nearest relevant memories (similarity ≥ 0.3), ranked by similarity × (0.5 + 0.5 × strength now) × confidence, within 300 tokens.
+- **What we chose.** Memories live in `user_memories` with an `embedding vector(384)` column (the local `MiniLMEmbedder`, all-MiniLM-L6-v2). The SQL function `match_memories()` filters by user, status and type and orders by cosine distance, in one query. `MemoryService.recall` builds a **budget**: an always-on profile (constraints, preferences, goals at least 0.6 sure) within 200 tokens, then the relevant memories: the message and each of its clauses (up to 3) are looked up, a memory counts from similarity 0.3, or from 0.2 when it shares a content word with the message, and up to 12 are ranked by similarity × (0.5 + 0.5 × strength now) × confidence, within 300 tokens.
 - **What we rejected, and why.** A ChromaDB archive for memories (ADR-14): a second store that would have to stay in step with every forget and dismiss. ChromaDB is still used, but only for document chunks.
 - **What it costs us.** No approximate-nearest-neighbour index: a user's tens or hundreds of memories are scanned exactly behind the `user_id` filter (doc 08 §3.8). If the embedder is down, recall gives the profile only, and nothing new is learned that turn.
 - **Where to see it.** `app/services/memory/memory_service.py` (`recall`), `supabase/migrations/20261115000002_memory_lifecycle_and_vectors.sql`.
@@ -517,6 +517,22 @@ sequenceDiagram
 - **Where to see it.** `app/services/analytical/rule_check_ins.py`; `app/domain/ports.py` (`HabitTrackerRepository.add_for_constraint`, `delete_for_constraint`); `app/services/memory/stated_rules.py` (`_delete`); `app/schemas/habits.py`; `jarvis-frontend/app/(app)/habits/page.tsx`; `scripts/seed_demo_user.py` (`_RULES`).
 - **The test that pins it.** `tests/behaviour/test_rule_check_ins.py::test_rule_taught_in_chat__checked_on_the_next_day_spaced_out_and_gone_with_the_rule`; `tests/test_rule_check_ins.py::test_check_ins__two_reads_at_once__one_tracker_per_rule`, `::test_check_ins__rule_without_a_tracker__started_on_read_counting_from_when_learned`, `::test_check_ins__memory_of_a_rule_forgotten__the_rule_and_its_tracker_go`; `tests/test_repository_contracts.py::test_trackers__add_for_constraint__one_per_user_and_rule_counting_from_started_at` (both families); `tests/test_seed_demo_user.py::test_seed__habits_page__two_rules_due_for_a_check_in_and_one_not_yet`.
 
+### D34. A workspace that fits the kind of task
+- **The problem.** Every task got the same workspace: a quiz when any document text was near, otherwise LeetCode links. "Write the README" was given a quiz built from an unrelated marks transcript, labelled "From your syllabus".
+- **What we chose.** `classify_task` (`app/services/analytical/task_kind.py`) reads the title's verbs and nouns, with no model call, into one of five kinds: practice, study, write, build, admin. Each kind has a recipe behind one `WorkspaceRecipe` protocol (Strategy, `app/services/analytical/workspace/recipes.py`): study and practice get a quiz, write gets an outline, build gets a step checklist, admin gets a short "have ready" checklist and no web search. Material comes from the task's linked documents first, ranked against the task; the unlinked fallback has a stricter bar (similarity ≥ 0.45) and may return nothing. A quiz is data (`Quiz`, 3 to 5 `QuizQuestion`s, parsed through Pydantic); a reply that does not parse shows no quiz, never raw model text. With no document, the questions come from general knowledge and the card says so.
+- **What we rejected, and why.** *Asking the model what kind of task it is:* a second model call on every workspace for something a word table gets right for the common cases, and it would not be testable offline. *Showing the nearest document text whatever its score:* that is what produced the transcript quiz.
+- **What it costs us.** The classifier is a word table and some titles land in the wrong kind ("Review and submit the form" reads as study). A carried-over task that was re-planned can lose its completion criteria (`planning_graph.fuse_tasks`).
+- **Where to see it.** `app/services/analytical/task_kind.py`; `app/services/analytical/workspace/` (`materials.py`, `quiz.py`, `outline.py`, `recipes.py`); `app/schemas/workspace.py`; the page `jarvis-frontend/app/(app)/workspace/[taskId]/page.tsx` and `components/app/QuizCard.tsx`.
+- **The test that pins it.** `tests/test_task_kind.py`; `tests/test_workspace_recipes.py::test_workspace__write_task__no_quiz_and_no_problem_links`; `tests/test_workspace_materials.py::test_materials__no_linked_document_and_nothing_relevant__no_chunks_and_no_quiz`; `tests/test_workspace_quiz.py`.
+
+### D35. Memory that is found, corrected and kept
+- **The problem.** Live tests on 2026-11-16 found three defects. A two-part question ("when is my gym, and what about Thursdays?") missed the second memory. Correcting a rule ("gym moved to 7 AM") replaced the memory but left the old rule beside the new one. A stated preference faded out of recall in about 16 days.
+- **What we chose.** Recall looks up the whole message and each clause (`_query_parts`, at most 3), and accepts a weaker match (0.2) when the memory shares a content word with the message. When a memory supersedes another, `StatedRules.replace_for_superseded` deletes the rules that rested on the old memory, and the new rule takes the cleaned words of the memory. A new memory starts with a stability that fits what it is (`initial_stability`: a stated constraint 16 weeks, a stated fact 8, an inferred fact 2), and a memory that is recalled for a reply is strengthened at most once a day (`note_used`).
+- **What we rejected, and why.** *A model call to rewrite the question for recall:* recall must stay one embedding batch with no model call, and deterministic for the cached prompt prefix. *Strengthening on every recall:* everything asked about often would become permanent within a day.
+- **What it costs us.** Recall makes one similarity read per clause (up to four). Memories stored before the change keep their old stability until they are confirmed or said again.
+- **Where to see it.** `app/services/memory/memory_service.py` (`recall`, `initial_stability`, `note_used`); `app/services/memory/stated_rules.py`; `app/core/observation.py` (`rule_text`, `_replace_corrected_rules`); the chat's "Remembered … Undo" line, `jarvis-frontend/components/app/RememberedLine.tsx`.
+- **The test that pins it.** `tests/behaviour/test_memory_loop.py` (six scenarios); `tests/behaviour/test_rule_correction.py`; the live check `scripts/memory_check.py`.
+
 ---
 
 ## 6. The ten criteria, one by one
@@ -577,7 +593,7 @@ sequenceDiagram
 
 **C10. A working implementation that matches the design.**
 - *Looking for:* it runs end to end, and the code is what the diagrams say.
-- *How Jarvis meets it:* 2203 offline tests at `670e2d5` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
+- *How Jarvis meets it:* 2340 offline tests at `dab11aa` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
 - *Best example:* the demo's terminal step (doc 10, minute 8:45): the concurrent-accept test, the SQL lock-order test, `test_layering.py` and `test_design_conformance.py`, all passing.
 - *Detail:* `10-demo-and-contributions.md`.
 
@@ -648,7 +664,7 @@ State these plainly. Never present them as working.
 10. The Supabase family is tested offline against a fake; only the live script uses the real database. A hands-on browser pass was never done (headless renders and API reads only).
 11. Daylight-saving transitions are not handled in multi-day plans.
 12. Some request fields have no length bound (D26).
-13. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 6 allow-listed raw-table leftovers). Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
+13. **The workspace still makes one blocking read.** `workspace_builder.build_task_workspace` reads the learning style with a synchronous Supabase call (the `user_preferences` leftover); the task and its documents go through repositories since 2026-11-16. Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
 15. **A kept file is best effort** (D32). A document uploaded while the file store could not be reached, and every document uploaded before files were kept, has no file to open (`has_file: false`). Linking by meaning is a measured threshold: on the 192 calibration pairs it missed one true link and made one wrong one.
 14. **A slow upload in chat ends at the step's limit**: 60 s for the knowledge step, before the reader's own 120 s (D29).
 16. **One check-in tracker per rule is enforced in code, not by the database** (D33). The repository reads before it inserts and a per-user lock serialises it within one server process; two processes racing could leave a second tracker, which is listed once.
@@ -714,7 +730,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 32. **Why CP-SAT and not let the model schedule?** A model makes overlaps and ignores constraints. CP-SAT returns a schedule that meets every hard constraint, or proves none exists; it is capped at 10 s and keeps the best schedule found.
 33. **Why the local model first?** Privacy: the prompt never leaves the machine. Claude is the cloud tier for schema-valid structured output in the demo; Gemini is the last resort (ADR-10).
 34. **Is the demo data fake?** The history is seeded, the inference is live. `scripts/seed_demo_user.py` writes three weeks of history through the real services under a simulated clock; patterns, the focus profile and the brief are computed live. A test checks that every seeded row has a shape the live app writes.
-35. **How do you prove it works end to end?** 2203 offline tests at `670e2d5` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
+35. **How do you prove it works end to end?** 2340 offline tests at `dab11aa` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
 36. **If you had another week?** From the build ledgers: repositories for sessions and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
 
 ---
