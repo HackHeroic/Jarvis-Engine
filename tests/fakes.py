@@ -412,6 +412,16 @@ class FakeStorage:
         return _FakeBucketFiles(self, id)
 
 
+# The user_tasks columns accept_draft writes: its v_columns list as the latest
+# migration that defines it has it (tests/test_migrations.py checks the two agree).
+ACCEPT_DRAFT_COLUMNS = frozenset({
+    "user_id", "plan_id", "task_id", "goal_id", "title", "status",
+    "duration_minutes", "difficulty_weight", "dependencies", "deadline_hint",
+    "completion_criteria", "implementation_intention", "topic_keywords",
+    "scheduled_start", "scheduled_end", "created_at", "not_before",
+})
+
+
 class FakeSupabase:
     """Chainable in-memory Supabase stand-in. No network, no MagicMock."""
 
@@ -476,10 +486,13 @@ class FakeSupabase:
         return _Result(found[:p_limit])
 
     def _accept_draft(self, p_draft_id: str, p_user_id: str, p_rows: list[dict]) -> _Result:
-        """Mirror of the accept_draft SQL function (v2): one transaction, all or nothing.
+        """Mirror of the accept_draft SQL function (v3): one transaction, all or nothing.
 
         It replaces the user's pending rows, plus their missed rows whose task_id
-        appears in ``p_rows`` (20261115000001_accept_draft_reslots_missed.sql).
+        appears in ``p_rows`` (20261115000001_accept_draft_reslots_missed.sql), and
+        writes only the columns its list names, for the draft's owner
+        (``ACCEPT_DRAFT_COLUMNS``; v3, 20261115000007_user_tasks_not_before.sql, added
+        ``not_before``).
 
         Also enforces the migrated table's ``UNIQUE (user_id, task_id)``: a row whose
         task_id one of the user's surviving rows, or an earlier row of the same call,
@@ -529,8 +542,14 @@ class FakeSupabase:
                 taken.add(row.get("task_id"))
             tasks[:] = remaining
             for row in p_rows:
+                # As the function does: only the listed keys, written for the draft's owner.
+                listed = {
+                    key: value
+                    for key, value in {**row, "user_id": p_user_id}.items()
+                    if key in ACCEPT_DRAFT_COLUMNS
+                }
                 # Table defaults the explicit column list leaves to Postgres.
-                tasks.append({"id": str(uuid.uuid4()), "created_at": now.isoformat(), **row})
+                tasks.append({"id": str(uuid.uuid4()), "created_at": now.isoformat(), **listed})
             draft["status"] = "accepted"
             # The accepted plan replaces every other plan the user had open.
             for other in self.rows["draft_schedules"]:

@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.services.planning.local_time import resolve_not_before
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,7 +158,8 @@ def build_task_rows(
 
     Chunks are TaskChunk objects or plain dicts with prefixed task_ids
     (``{goal_id}_{run}_{task_id}``, or ``{goal_id}_{task_id}`` from older plans).
-    Every row carries the plan_id minted here.
+    Every row carries the plan_id minted here. A chunk with a ``not_before`` gets it as
+    an offset-aware instant; a row has no ``not_before`` key otherwise.
 
     A row's goal_id is the chunk's own ``goal_id`` (the planner stamps one on every
     chunk). Only a chunk without one, written before goal_id travelled, falls back
@@ -224,6 +227,15 @@ def build_task_rows(
         keywords = _field(chunk, "topic_keywords")
         if keywords:
             row["topic_keywords"] = keywords
+
+        # The earliest start, as the instant user_tasks.not_before (a timestamptz) holds.
+        # The planner hands an instant; a wall time without an offset is read on the
+        # horizon's own offset, the user's (UTC without a horizon).
+        not_before = resolve_not_before(
+            _field(chunk, "not_before"), horizon.tzinfo if horizon else timezone.utc
+        )
+        if not_before is not None:
+            row["not_before"] = not_before.isoformat()
 
         if schedule and task_id and task_id in schedule and horizon:
             times = _wall_clock(schedule[task_id], horizon)

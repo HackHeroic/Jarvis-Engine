@@ -33,6 +33,7 @@ MEMORY_VECTORS = MIGRATIONS / "20261115000002_memory_lifecycle_and_vectors.sql"
 SESSION_SUMMARIES = MIGRATIONS / "20261115000003_session_summaries.sql"
 SUMMARY_REACH = MIGRATIONS / "20261115000006_session_summary_reach.sql"
 SUGGESTION_CONSENT_KIND = MIGRATIONS / "20261115000004_suggestion_consent_kind.sql"
+TASK_NOT_BEFORE = MIGRATIONS / "20261115000007_user_tasks_not_before.sql"
 
 NEW_TABLES = ("user_profiles", "goals", "task_events", "proactive_suggestions", "llm_usage_events")
 # Tables a migration creates that need no row-level security: the dead tables the
@@ -96,6 +97,18 @@ def _accept_draft_body(path: Path = CAPSTONE) -> str:
     return function.group(0)
 
 
+def _accept_draft_in_force() -> str:
+    """The body of accept_draft as the last migration that defines it has it."""
+    defining = [path for path in _all_migrations() if "function public.accept_draft" in _sql(path)]
+    return _accept_draft_body(defining[-1])
+
+
+def _accept_draft_columns(body: str) -> set[str]:
+    listed = re.search(r"v_columns\s+constant\s+text\[\]\s*:=\s*array\[(.*?)\]", body, re.S)
+    assert listed, "accept_draft has no explicit column list"
+    return set(re.findall(r"'(\w+)'", listed.group(1)))
+
+
 def _check_values(sql: str, constraint: str) -> set[str]:
     """The quoted values in ``constraint``'s ``in (...)`` list, as the file last defines it."""
     found = re.findall(
@@ -117,6 +130,7 @@ def _full_task_row() -> dict:
         "completion_criteria": "An outline exists",
         "implementation_intention": {"obstacle_trigger": "if tired", "behavioral_response": "walk"},
         "topic_keywords": ["thesis"],
+        "not_before": "2026-11-15T18:00:00+00:00",
     }
     _, rows = build_task_rows(
         "alice",
@@ -194,13 +208,35 @@ def test_migrations__statements_are_idempotent(path: Path):
 
 
 def test_migrations__accept_draft_columns__match_build_task_rows():
-    body = _accept_draft_body()
-    listed = re.search(r"v_columns\s+constant\s+text\[\]\s*:=\s*array\[(.*?)\]", body, re.S)
-    assert listed, "accept_draft has no explicit column list"
-    columns = set(re.findall(r"'(\w+)'", listed.group(1)))
+    body = _accept_draft_in_force()
+    columns = _accept_draft_columns(body)
 
     assert set(_full_task_row()) <= columns
     assert "select *" not in body
+
+
+def test_migrations__accept_draft_columns__fake_supabase_mirrors_the_definition_in_force():
+    from tests.fakes import ACCEPT_DRAFT_COLUMNS
+
+    assert _accept_draft_columns(_accept_draft_in_force()) == ACCEPT_DRAFT_COLUMNS
+
+
+def test_migrations__accept_draft_v3__adds_not_before_and_changes_nothing_else():
+    """v3 writes user_tasks.not_before, a new timestamptz column; the rest is v2 word for
+    word, so every check above on v2 and the capstone function still holds for it."""
+    v2, v3 = _accept_draft_body(ACCEPT_DRAFT_RESLOTS), _accept_draft_body(TASK_NOT_BEFORE)
+    sql = _sql(TASK_NOT_BEFORE)
+
+    assert _accept_draft_in_force() == v3
+    assert _accept_draft_columns(v3) == _accept_draft_columns(v2) | {"not_before"}
+    assert " ".join(v3.replace(", 'not_before'", "").split()) == " ".join(v2.split())
+    assert re.search(
+        rf"alter table {_TABLE}user_tasks add column if not exists not_before timestamptz;", sql
+    )
+    signature = r"function public\.accept_draft\(uuid, text, jsonb\)"
+    assert re.search(rf"comment on {signature} is", sql)
+    assert re.search(rf"revoke execute on {signature} from public, anon;", sql)
+    assert re.search(rf"grant execute on {signature} to service_role, authenticated;", sql)
 
 
 def test_migrations__accept_draft__locks_the_user_before_the_draft():

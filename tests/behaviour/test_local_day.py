@@ -300,3 +300,33 @@ async def test_local_day__tomorrow_evening_asked_at_7_45_pm__drafted_tomorrow_fr
     # The draft keeps the instant, which accepting it writes to the task.
     tasks = jarvis.draft(turn.draft_id)["tasks"]
     assert {t["not_before"] for t in tasks} == {"2026-11-17T18:00:00+05:30"}
+
+
+@pytest.mark.asyncio
+async def test_local_day__tomorrow_evening_accepted_then_another_plan__sql_work_stays_tomorrow_evening(
+    jarvis, llm, clock
+):
+    """Accepting writes each task's not_before; the next plan carries the pending SQL
+    tasks in and re-solves them, and they stay at tomorrow evening instead of being
+    pulled into tonight's free time."""
+    import app.domain.clock as utc_clock
+
+    clock.freeze(datetime.combine(MONDAY, time(19, 45), tzinfo=IST), scheduling, utc_clock)
+    _script_sql_plan(llm)
+    planned = await jarvis.say(SQL_ASK)
+
+    await jarvis.say("looks good", session=planned.conversation_id)
+
+    rows = jarvis.rows("user_tasks", user_id="alice")
+    assert {row["title"] for row in rows} == set(SQL_TOPICS)
+    assert {datetime.fromisoformat(row["not_before"]) for row in rows} == {TOMORROW_6PM}
+
+    clock.advance(minutes=5)
+    replanned = await jarvis.say("Plan my DSA revision")
+
+    starts = _slots_by_title(replanned)
+    sql = {title: start for title, start in starts.items() if title in SQL_TOPICS}
+    assert len(sql) == len(SQL_TOPICS)  # carried into the new plan, and re-solved
+    assert all(start >= TOMORROW_6PM for start in sql.values()), sql
+    tonight = [title for title, start in starts.items() if start.date() == MONDAY]
+    assert tonight and not set(tonight) & set(SQL_TOPICS)  # tonight's time went to DSA

@@ -974,6 +974,23 @@ async def test_drafts__accept_atomic__unrelated_missed_row_kept(repos):
     assert [t.task_id for t in await repos.tasks.list_pending(U1)] == ["x"]
 
 
+@pytest.mark.asyncio
+async def test_drafts__accept_atomic__not_before__read_back_as_that_instant(repos):
+    """A task's earliest start survives the accept: list_pending and get return it."""
+    held = datetime(2026, 11, 17, 18, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    draft = await _new_draft(repos)
+
+    await repos.drafts.accept_atomic(
+        U1, draft.id, [{**_row("held"), "not_before": held.isoformat()}, _row("free")]
+    )
+
+    pending = {t.task_id: t for t in await repos.tasks.list_pending(U1)}
+    assert pending["held"].not_before == held
+    assert pending["held"].not_before.utcoffset() is not None
+    assert pending["free"].not_before is None
+    assert (await repos.tasks.get(U1, "held")).not_before == held
+
+
 # --- Constraints -------------------------------------------------------------
 
 

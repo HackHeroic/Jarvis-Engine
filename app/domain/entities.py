@@ -309,6 +309,13 @@ class Task(BaseModel):
     deadline_hint: str | None = Field(
         default=None, description="Free-text deadline the task was planned against."
     )
+    not_before: datetime | None = Field(
+        default=None,
+        description=(
+            "Earliest instant the task may be scheduled, because the user asked for it then"
+            " ('tomorrow evening'); every re-plan keeps it. None when there is no such bound."
+        ),
+    )
 
 
 class TaskEvent(BaseModel):

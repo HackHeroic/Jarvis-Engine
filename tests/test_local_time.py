@@ -233,3 +233,29 @@ def test_resolve_not_before__fixed_offset_zone__wall_time_on_that_offset():
     assert resolve_not_before("2026-11-17T18:00", offset).isoformat() == (
         "2026-11-17T18:00:00+05:30"
     )
+
+
+@pytest.mark.parametrize(
+    ("not_before", "stored"),
+    [
+        ("2026-11-17T18:00:00+05:30", "2026-11-17T18:00:00+05:30"),
+        ("2026-11-17T12:30:00Z", "2026-11-17T18:00:00+05:30"),
+        # A wall time without an offset is read on the horizon's offset, the user's.
+        ("2026-11-17T18:00", "2026-11-17T18:00:00+05:30"),
+        (None, None),
+        ("tomorrow evening", None),
+    ],
+)
+def test_build_task_rows__not_before__stored_as_an_offset_aware_instant(not_before, stored):
+    from app.services.planning.task_rows import build_task_rows
+
+    _, (row,) = build_task_rows(
+        "u1",
+        [{"task_id": "g_t1", "title": "Joins", "duration_minutes": 20, "goal_id": "g",
+          "not_before": not_before}],
+        schedule={"g_t1": {"start_min": 2040, "end_min": 2060}},
+        horizon_start="2026-11-16T08:00:00+05:30",
+    )
+
+    assert row.get("not_before") == stored
+    assert ("not_before" in row) is (stored is not None)
