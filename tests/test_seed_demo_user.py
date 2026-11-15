@@ -789,8 +789,13 @@ async def test_seed__current_plate__work_ahead_one_due_today_and_yesterdays_set_
     due_today = [t for t in pending if _deadline(t) == today]
     assert 6 <= len(ahead) <= 8 and len(due_today) == 1
     assert len(pending) == len(ahead) + 1
+    os_work = [t for t in ahead if t.goal_id == "os_assignment"]
+    assert len(os_work) == 1  # "due every Friday": the coming one, never today
+    assert _deadline(os_work[0]).weekday() == 4
+    assert today < _deadline(os_work[0]) <= today + timedelta(days=7)
+    assert os_work[0].scheduled_start.date() <= _deadline(os_work[0])
     assert all(today + timedelta(days=2) <= _deadline(t) <= today + timedelta(days=4)
-               for t in ahead)
+               for t in ahead if t not in os_work)
     assert len([t for t in ahead if t.difficulty_weight >= 0.8]) >= 2
     assert len({t.difficulty_weight for t in pending}) >= 4  # mixed difficulty
     assert all(t.scheduled_start >= _start_of(today) for t in pending)  # slots still ahead

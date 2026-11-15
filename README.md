@@ -50,7 +50,7 @@ app/container.py        the composition root: the one place that wires everythin
 app/core/or_tools/      the CP-SAT solver and its constraints
 supabase/migrations/    the database schema (source of truth)
 tests/                  the offline suite; tests/behaviour/ drives whole chat turns
-scripts/                seed_demo_user.py, live_e2e.py, smoke_claude.py
+scripts/                demo_day.sh, seed_demo_user.py, live_e2e.py, smoke_claude.py
 ```
 
 ## Running it
@@ -79,13 +79,15 @@ Then start the frontend (`npm install && npm run dev` in jarvis-frontend) and op
 
 ## Demo data
 
-With the backend stopped:
+On the morning of each demo day, with every backend that uses the shared database stopped (teammates' too):
 
 ```bash
-.venv/bin/python scripts/seed_demo_user.py --reset
+bash scripts/demo_day.sh
 ```
 
-This seeds about three weeks of history for the user `demo`. Start the backend again afterwards.
+It reseeds the user `demo` as of today (about three weeks of history ending yesterday, today's plan, the rule check-ins due), starts the backend with Claude first, uploads the demo syllabus (`docs/capstone/demo/`) and asks for today's morning brief. The seed is dated from the day it runs, so run it again on each demo day.
+
+To reseed only: `.venv/bin/python scripts/seed_demo_user.py --reset`, then start the backend.
 
 ## Not built
 

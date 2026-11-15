@@ -468,11 +468,15 @@ def _plate(
 
     ``evening`` blocks that same evening (never got to: no outcome, so the sweep sets
     them aside), then ``_UPCOMING`` in deadline order, four a day from today 11:00.
+    The OS assignment is due the coming Friday (never today), whatever day the demo is,
+    so the plate agrees with what the user said about it.
     """
     slots: list[_Slot] = []
 
     def add(item: _Upcoming, start: datetime) -> None:
         deadline = today + timedelta(days=item.due_in) if item.due_in is not None else None
+        if item.goal_id == _OS.goal_id:  # "My OS assignment is due every Friday."
+            deadline = today + timedelta(days=(FRIDAY - today.weekday() - 1) % 7 + 1)
         task_id = f"{item.goal_id}_{run}_task_{len(slots) + 1}"
         slots.append(_Slot(_chunk(item, item.title, task_id, deadline), start, UNTOUCHED))
 

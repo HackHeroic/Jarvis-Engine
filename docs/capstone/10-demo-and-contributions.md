@@ -29,6 +29,8 @@ Stop the backend → apply migrations only if there are new ones → seed the de
 
 All commands run from `Jarvis-Engine/` unless stated.
 
+**Shortcut:** `bash scripts/demo_day.sh` does steps 3 and 4, uploads the demo syllabus (`docs/capstone/demo/DBMS-Syllabus-CS304.pdf`) and asks for the morning brief, in one command. Run it on the morning of each demo day; the backend on this machine and every teammate's backend must be stopped first, because they share one database.
+
 | # | Do | Command | Expect |
 |---|---|---|---|
 | 1 | Stop the backend | Ctrl-C in its terminal. If you cannot find it: `lsof -ti tcp:8000` then `kill <pid>` (a plain `kill` lets the lifespan stop the scheduler and drain the usage ledger, `app/main.py:173-182`). | `curl -s localhost:8000/health` fails to connect. |
