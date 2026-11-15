@@ -233,6 +233,7 @@ async def test_check_ins__answers__spaced_out_while_it_holds_and_back_tomorrow_a
     assert (first.next_interval_days, first.next_due_on) == (1, date(2026, 11, 18))
     assert (second.next_interval_days, second.next_due_on) == (6, date(2026, 11, 24))
     assert second.next_review_date == datetime(2026, 11, 24, 21, 0, tzinfo=IST)
+    assert second.next_review_date.utcoffset() == timedelta(0)  # documented as UTC
     assert after.due_trackers == []
     (later,) = after.upcoming_trackers
     assert (later.next_due_on, later.interval_days) == (date(2026, 11, 24), 6)

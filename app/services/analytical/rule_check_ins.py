@@ -128,7 +128,7 @@ class RuleCheckIns:
         stored = await record_completion(self._trackers, user_id, tracker_id, quality, now=now)
         interval = stored.next_interval_days or 1
         return CheckInReviewed(
-            next_review_date=now + timedelta(days=interval),
+            next_review_date=(now + timedelta(days=interval)).astimezone(timezone.utc),
             next_interval_days=interval,
             next_due_on=next_due_on(stored, zone, today=local_date(now, zone)),
         )
