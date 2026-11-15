@@ -4,6 +4,8 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.documents import LinkedDocument
+
 ASSET_TYPES = Literal[
     "pdf_chunk",
     "youtube_link",
@@ -69,4 +71,11 @@ class TaskWorkspace(BaseModel):
     notices: List[str] = Field(
         default_factory=list,
         description="Plain statements of what could not be surfaced, e.g. that web results are unavailable",
+    )
+    linked_documents: List[LinkedDocument] = Field(
+        default_factory=list,
+        description=(
+            "The caller's documents linked to this task (\"From your documents\"), each with"
+            " whether its file can be opened. Read fresh on every request, never cached."
+        ),
     )

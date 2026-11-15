@@ -23,6 +23,7 @@ from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
+from app.services.documents.service import DocumentService
 from app.services.user_preferences import get_learning_style
 from app.db.supabase_py import build_supabase_client
 
@@ -547,21 +548,28 @@ async def get_or_build_task_workspace(
     *,
     goals: GoalRepository | None = None,
     bus: EventBus,
+    documents: DocumentService | None = None,
 ) -> TaskWorkspace:
     """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
 
     ``goals`` and ``bus`` are the composition root's (see ``build_task_workspace``).
+    ``documents`` (the composition root's DocumentService) lists the task's linked
+    documents, read fresh on every request after the cache, so a document deleted or a
+    file kept since shows as it is now; None leaves the list empty.
     """
+    ws = None
     if not refresh:
-        cached = await _read_cached_workspace(user_id, task_id)
-        if cached is not None:
-            return cached
-
-    ws = await build_task_workspace(
-        user_id=user_id, task_id=task_id, user_prompt=user_prompt, goals=goals, bus=bus
+        ws = await _read_cached_workspace(user_id, task_id)
+    if ws is None:
+        ws = await build_task_workspace(
+            user_id=user_id, task_id=task_id, user_prompt=user_prompt, goals=goals, bus=bus
+        )
+        if not ws.notices:
+            # A workspace missing its web results is not cached: once search is back,
+            # the next open rebuilds it instead of repeating the notice for a day.
+            await _write_cached_workspace(user_id, task_id, ws)
+    if documents is None:
+        return ws
+    return ws.model_copy(
+        update={"linked_documents": await documents.linked_documents(user_id, task_id)}
     )
-    if not ws.notices:
-        # A workspace missing its web results is not cached: once search is back,
-        # the next open rebuilds it instead of repeating the notice for a day.
-        await _write_cached_workspace(user_id, task_id, ws)
-    return ws

@@ -36,6 +36,35 @@ async def _accepted(repos, user_id: str, tasks: list[tuple[str, str]]) -> None:
     ])
 
 
+class _KnowledgeStore:
+    """The chunk collection, as the documents code calls it: get by filter, delete by id."""
+
+    def __init__(self) -> None:
+        self.chunks = [
+            {"id": "c1", "user_id": U, "source_id": "doc-1"},
+            {"id": "c2", "user_id": OTHER, "source_id": "doc-1"},
+        ]
+
+    def get_or_create_collection(self, *_args, **_kwargs):
+        return self
+
+    def get(self, where):
+        wanted = {k: v for clause in where["$and"] for k, v in clause.items()}
+        return {"ids": [c["id"] for c in self.chunks
+                        if all(c[k] == v for k, v in wanted.items())]}
+
+    def delete(self, ids):
+        self.chunks = [c for c in self.chunks if c["id"] not in ids]
+
+
+@pytest.fixture(autouse=True)
+def knowledge(monkeypatch) -> _KnowledgeStore:
+    """No Chroma in these tests: deleting a document removes chunks from this one."""
+    store = _KnowledgeStore()
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", lambda: store)
+    return store
+
+
 @pytest.fixture(params=["in_memory", "supabase_fake"])
 def repos(request):
     if request.param == "in_memory":
@@ -224,7 +253,7 @@ async def test_open_file__file_store_down__persistence_error_chained():
 
 
 @pytest.mark.asyncio
-async def test_delete__file_removed_and_the_linked_tasks_workspaces_dropped(repos):
+async def test_delete__chunks_file_and_record_removed_linked_workspaces_dropped(repos, knowledge):
     recorder = _Recorder()
     service = _service(repos, recorder)
     await service.add(U, _doc("doc-1"), file=PDF)
@@ -234,6 +263,7 @@ async def test_delete__file_removed_and_the_linked_tasks_workspaces_dropped(repo
 
     assert await repos.documents.get(U, "doc-1") is None
     assert await repos.document_files.read(U, "doc-1") is None
+    assert [c["id"] for c in knowledge.chunks] == ["c2"]  # the other user's chunk stays
     assert recorder.changed == [(U, ["t1"])]
 
 
@@ -365,9 +395,8 @@ async def test_file_route__no_database__503_persistence_unavailable(api, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_delete_route__removes_the_kept_file(api, monkeypatch):
+async def test_delete_route__removes_the_kept_file(api):
     client, container, db = api
-    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _no_chroma)
     await container.documents.add(U, _doc("doc-1"), file=PDF)
 
     response = await client.delete("/api/v1/documents/doc-1", params={"user_id": U})
@@ -376,8 +405,20 @@ async def test_delete_route__removes_the_kept_file(api, monkeypatch):
     assert db.storage.objects["jarvis-documents"] == {}
 
 
-def _no_chroma():
-    raise ConnectionError("no knowledge store in tests")
+@pytest.mark.asyncio
+async def test_delete__knowledge_store_down__document_still_deleted(repos, monkeypatch, caplog):
+    def unreachable():
+        raise ConnectionError("[SSL] could not reach chroma.internal")
+
+    monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", unreachable)
+    service = _service(repos)
+    await service.add(U, _doc("doc-1"), file=PDF)
+
+    with caplog.at_level(logging.WARNING):
+        await service.delete(U, "doc-1")
+
+    assert await repos.documents.get(U, "doc-1") is None
+    assert "chunks could not be removed (ConnectionError)" in caplog.text
 
 
 # --- ingestion keeps the uploaded file ----------------------------------------------------
@@ -470,3 +511,105 @@ def test_download_name__no_folder_quotes_or_control_characters(file_name, conten
 def test_ascii_name__accents_folded_the_rest_dropped():
     assert ascii_name("Résumé.pdf") == "Resume.pdf"
     assert ascii_name("日本語") == "document"
+
+
+# --- the task workspace lists the task's documents ----------------------------------------
+
+
+def _cached_workspace(monkeypatch, written: list | None = None):
+    """The workspace builder with a cached workspace for every task, and no network."""
+    import app.services.analytical.workspace_builder as wb
+    from app.schemas.workspace import TaskWorkspace
+
+    async def cached(user_id, task_id):
+        return TaskWorkspace(task_id=task_id, task_title="Revise gradient descent",
+                             primary_objective="Revise gradient descent")
+
+    async def record(*args):
+        if written is not None:
+            written.append(args)
+
+    monkeypatch.setattr(wb, "_read_cached_workspace", cached)
+    monkeypatch.setattr(wb, "_write_cached_workspace", record)
+    return wb
+
+
+@pytest.mark.asyncio
+async def test_workspace__linked_documents_read_fresh_after_the_cache(monkeypatch, repos):
+    wb = _cached_workspace(monkeypatch)
+    service = _service(repos)
+    await service.add(U, _doc("with-file", file_name="ML syllabus.pdf"), file=PDF)
+    await service.add(U, _doc("pasted", file_name=None))
+    await service.add(U, _doc("unlinked", file_name="Other.pdf"), file=PDF)
+    await repos.documents.link(U, [
+        TaskMaterialLink(user_id=U, task_id="t1", source_id="with-file"),
+        TaskMaterialLink(user_id=U, task_id="t1", source_id="pasted"),
+    ])
+
+    ws = await wb.get_or_build_task_workspace(U, "t1", bus=None, documents=service)
+
+    assert sorted((d.source_id, d.file_name, d.has_file) for d in ws.linked_documents) == [
+        ("pasted", None, False), ("with-file", "ML syllabus.pdf", True),
+    ]
+    await service.delete(U, "with-file")
+    ws = await wb.get_or_build_task_workspace(U, "t1", bus=None, documents=service)
+    assert [d.source_id for d in ws.linked_documents] == ["pasted"]
+
+
+@pytest.mark.asyncio
+async def test_workspace__links_unreadable__workspace_served_with_no_documents(monkeypatch, caplog):
+    wb = _cached_workspace(monkeypatch)
+    repos = RepositoryFactory.in_memory()
+
+    class _Unreadable:
+        async def links_for_task(self, *_args):
+            raise errors.PersistenceError("Could not reach the database.")
+
+    service = DocumentService(_Unreadable(), repos.document_files, repos.tasks)
+
+    with caplog.at_level(logging.WARNING):
+        ws = await wb.get_or_build_task_workspace(U, "t1", bus=None, documents=service)
+
+    assert ws.task_title == "Revise gradient descent" and ws.linked_documents == []
+    assert "could not be read" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_workspace_route__linked_documents_in_the_response(api, monkeypatch):
+    client, container, _db = api
+    _cached_workspace(monkeypatch)
+    await container.documents.add(U, _doc("doc-1", file_name="ML syllabus.pdf"), file=PDF)
+    await container.repos.documents.link(U, [TaskMaterialLink(user_id=U, task_id="t1", source_id="doc-1")])
+
+    response = await client.get("/api/v1/tasks/t1/workspace", params={"user_id": U})
+    other = await client.get("/api/v1/tasks/t2/workspace", params={"user_id": U})
+
+    assert response.status_code == 200
+    assert response.json()["linked_documents"] == [
+        {"source_id": "doc-1", "file_name": "ML syllabus.pdf", "has_file": True}
+    ]
+    assert other.json()["linked_documents"] == []
+
+
+@pytest.mark.asyncio
+async def test_workspace__built_fresh__cached_without_its_documents(monkeypatch):
+    import app.services.analytical.workspace_builder as wb
+    from app.schemas.workspace import TaskWorkspace
+
+    written: list = []
+    _cached_workspace(monkeypatch, written)
+    repos = RepositoryFactory.in_memory()
+    service = _service(repos)
+    await service.add(U, _doc("doc-1"), file=PDF)
+    await repos.documents.link(U, [TaskMaterialLink(user_id=U, task_id="t1", source_id="doc-1")])
+
+    async def built(**_kwargs):
+        return TaskWorkspace(task_id="t1", task_title="t", primary_objective="t")
+
+    monkeypatch.setattr(wb, "build_task_workspace", built)
+
+    ws = await wb.get_or_build_task_workspace(U, "t1", refresh=True, bus=None, documents=service)
+
+    assert [d.source_id for d in ws.linked_documents] == ["doc-1"]
+    ((_user, _task, cached),) = written
+    assert cached.linked_documents == []  # never cached: read fresh each time
