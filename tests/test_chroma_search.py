@@ -12,54 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 import app.utils.chroma_client as chroma
-
-
-class _FakeCollection:
-    """Chunks with metadata; ``query`` honours ``where`` and returns per-chunk distances."""
-
-    def __init__(self, chunks: list[dict], space: str = "cosine") -> None:
-        self.chunks = chunks  # {"id", "document", "metadata", "distance"}
-        self.metadata = {"hnsw:space": space}
-        self.queries: list[dict] = []
-        self.gets: list[dict] = []
-
-    @staticmethod
-    def _matches(meta: dict, where: dict | None) -> bool:
-        if not where:
-            return True
-        if "$and" in where:
-            return all(_FakeCollection._matches(meta, clause) for clause in where["$and"])
-        return all(meta.get(k) == v for k, v in where.items())
-
-    def query(self, query_texts, n_results=10, where=None, include=None):
-        self.queries.append({"query_texts": query_texts, "n_results": n_results, "where": where})
-        hits = sorted(
-            (c for c in self.chunks if self._matches(c["metadata"], where)),
-            key=lambda c: c["distance"],
-        )[:n_results]
-        return {
-            "ids": [[c["id"] for c in hits]],
-            "documents": [[c["document"] for c in hits]],
-            "metadatas": [[c["metadata"] for c in hits]],
-            "distances": [[c["distance"] for c in hits]],
-        }
-
-    def get(self, where=None, **_kwargs):
-        self.gets.append({"where": where})
-        hits = [c for c in self.chunks if self._matches(c["metadata"], where)]
-        return {"ids": [c["id"] for c in hits], "documents": [c["document"] for c in hits]}
-
-    def delete(self, ids):
-        self.chunks = [c for c in self.chunks if c["id"] not in ids]
-
-
-def _chunk(cid: str, user: str, text: str, distance: float, source: str = "src-a") -> dict:
-    return {
-        "id": cid,
-        "document": text,
-        "metadata": {"user_id": user, "source_id": source},
-        "distance": distance,
-    }
+from tests.fakes import FakeKnowledgeCollection as _FakeCollection
+from tests.fakes import knowledge_chunk as _chunk
 
 
 @pytest.fixture
@@ -248,15 +202,23 @@ def test_delete_document__another_users_source__their_chunks_survive(api):
 
 
 @pytest.mark.asyncio
-async def test_workspace_chunks__no_linked_materials__falls_back_to_the_users_own_search(
-    collection, monkeypatch
-):
+async def test_workspace_chunks__no_linked_materials__falls_back_to_the_users_own_search(collection):
     import app.services.analytical.workspace_builder as wb
+    from app.domain.entities import IngestedDocument
+    from app.infrastructure.persistence.factory import RepositoryFactory
 
-    monkeypatch.setattr(wb, "_get_supabase", lambda: None)  # no task_materials links
+    repos = RepositoryFactory.in_memory()  # no task_materials links
+    await repos.documents.save(
+        "alice", IngestedDocument(user_id="alice", source_id="src-a", file_name="Graphs.pdf")
+    )
 
-    assert await wb.fetch_chunks_for_task("bob", "t1", "graph algorithms") == []
-    assert await wb.fetch_chunks_for_task("alice", "t1", "graph algorithms") == [
+    assert await wb.fetch_chunks_for_task("bob", "t1", "graph algorithms", documents=repos.documents) == []
+    assert [
+        c.text
+        for c in await wb.fetch_chunks_for_task(
+            "alice", "t1", "graph algorithms", documents=repos.documents
+        )
+    ] == [
         "Alice's syllabus: graph algorithms unit",
         "Alice's notes on Dijkstra",
     ]

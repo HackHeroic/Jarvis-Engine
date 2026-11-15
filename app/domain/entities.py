@@ -316,6 +316,38 @@ class Task(BaseModel):
             " ('tomorrow evening'); every re-plan keeps it. None when there is no such bound."
         ),
     )
+    completion_criteria: str | None = Field(
+        default=None,
+        description="What the user does to show the task is done, as it was planned.",
+    )
+    topic_keywords: list[str] = Field(
+        default_factory=list, description="The topics the task covers, as it was planned."
+    )
+    implementation_intention: dict | None = Field(
+        default=None,
+        description=(
+            "The task's if-then plan (obstacle_trigger, behavioral_response), as it was"
+            " planned; None when it has none."
+        ),
+    )
+
+    @field_validator("topic_keywords", mode="before")
+    @classmethod
+    def _keywords_as_a_list(cls, value: object) -> object:
+        """A stored NULL or a non-list reads as no keywords."""
+        return [str(v) for v in value] if isinstance(value, (list, tuple)) else []
+
+    @field_validator("implementation_intention", mode="before")
+    @classmethod
+    def _intention_as_a_dict(cls, value: object) -> object:
+        """An if-then plan stored as JSON text reads as its object; anything that is not
+        an object reads as no plan, so one odd row never makes the user's tasks unreadable."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        return value if isinstance(value, dict) else None
 
 
 class TaskEvent(BaseModel):

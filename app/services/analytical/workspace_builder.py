@@ -1,6 +1,11 @@
-"""Proactive Task Workspace: RAG + learning-style web search + dynamic practice assets.
+"""Proactive Task Workspace: the right kind of help for the kind of task.
 
-Workspaces are now PERSISTED in `task_workspaces` table with a 24h TTL.
+A task's workspace is built by the recipe for its kind (``task_kind.classify_task``,
+``workspace/recipes.py``): material from the documents that are about it
+(``workspace/materials.py``), a quiz (``workspace/quiz.py``) or an outline
+(``workspace/outline.py``), and links from at most one web search.
+
+Workspaces are PERSISTED in `task_workspaces` table with a 24h TTL.
 get_or_build_task_workspace() is the public entry — checks cache, returns if fresh,
 else rebuilds via build_task_workspace() and upserts. The cache is dropped when the
 documents linked to the task change (``DocumentLinker``, ``DocumentService.delete``).
@@ -9,34 +14,40 @@ documents linked to the task change (``DocumentLinker``, ``DocumentService.delet
 import asyncio
 import json
 import time
-import re
-from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Optional
 
 from app.core.config import CLAUDE_MODEL, SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.core.model_router import PreCloudLLMRedactor, metered_web_search
+from app.domain import errors
+from app.domain.entities import Task
 from app.domain.errors import LLMUnavailableError
 from app.domain.events import EventBus
-from app.domain.ports import GoalRepository
+from app.domain.ports import DocumentRepository, GoalRepository, TaskRepository
 from app.models.brain.claude_web_search import claude_web_search
 from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
+from app.schemas.workspace import StudyAsset, TaskWorkspace
+from app.services.analytical.task_kind import classify_task
+from app.services.analytical.workspace.materials import MaterialChunk, fetch_chunks_for_task
+from app.services.analytical.workspace.recipes import RecipeContext, recipe_for
+from app.services.analytical.workspace.web import (
+    WEB_RESULTS_UNAVAILABLE,
+    WebSearchUnavailableError,
+    found_links,
+    link_type,
+)
+from app.services.analytical.workspace.woop import woop_card
 from app.services.documents.service import DocumentService
 from app.services.user_preferences import get_learning_style
 from app.db.supabase_py import build_supabase_client
 
 WORKSPACE_TTL_HOURS = 24
 
-WEB_RESULTS_UNAVAILABLE = "Web results are unavailable right now, so no links are shown"
-
-
-class WebSearchUnavailableError(LLMUnavailableError):
-    """Gemini's grounded web search did not answer; there are no web results to show."""
-
-    code = "web_search_unavailable"
+_NO_TASK_STORE = "Could not reach the database."
+_NO_SUCH_TASK = "That task does not exist."
 
 
 # After the web search fails (no key, no quota, the provider is down) it is not tried
@@ -113,62 +124,6 @@ def _get_supabase():
     return build_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-async def fetch_chunks_for_task(
-    user_id: str,
-    task_id: str,
-    task_title: str = "",
-    topic_keywords: Optional[list[str]] = None,
-) -> list[str]:
-    """Fetch RAG chunks linked to this task via task_materials.
-
-    For each source_id in task_materials, query ChromaDB. If no links exist,
-    fall back to semantic query on task title + topic_keywords.
-    """
-    chunks: list[str] = []
-    supabase = _get_supabase()
-    topic_kw = topic_keywords or []
-
-    try:
-        from app.utils.chroma_client import get_chroma_client
-
-        client = get_chroma_client()
-        collection = client.get_or_create_collection("jarvis_knowledge", metadata={"hnsw:space": "cosine"})
-
-        if supabase:
-            result = (
-                supabase.table("task_materials")
-                .select("source_id")
-                .eq("user_id", user_id)
-                .eq("task_id", task_id)
-                .execute()
-            )
-            source_ids = [r["source_id"] for r in (result.data or []) if r.get("source_id")]
-
-            for sid in source_ids:
-                try:
-                    # The owner too, not the source id alone: chunks are user-scoped.
-                    out = collection.get(where={"$and": [{"source_id": sid}, {"user_id": user_id}]})
-                    if out and out.get("documents"):
-                        chunks.extend(out["documents"])
-                except Exception:
-                    pass
-
-        if not chunks and (task_title or topic_kw):
-            query_text = f"{task_title} {' '.join(topic_kw)}".strip()
-            if query_text and user_id:
-                # The shared, user-scoped search with its relevance cut-off — an
-                # unfiltered query here surfaced other users' documents.
-                from app.utils.chroma_client import query_knowledge
-
-                chunks.extend(await asyncio.to_thread(query_knowledge, user_id, query_text, 5))
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[Workspace] fetch_chunks_for_task error: {e}")
-
-    return chunks
-
-
 async def perform_learning_style_search(
     task_title: str, learning_style: str, *, bus: EventBus
 ) -> list[StudyAsset]:
@@ -202,134 +157,22 @@ async def perform_learning_style_search(
 
     raw = await _search_web(prompt, sys, bus=bus)
 
-    # Parse URL | Title lines
-    url_re = re.compile(r"https?://[^\s|]+")
-    lines = [ln.strip() for ln in raw.replace("\r", "\n").split("\n") if ln.strip()]
-    seen_urls: set[str] = set()
-
-    for line in lines:
-        match = url_re.search(line)
-        if match:
-            url = match.group(0).rstrip(".,;)")
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            title = line.split("|")[-1].strip() if "|" in line else url[:60]
-            asset_type = "youtube_link" if "youtube.com" in url or "youtu.be" in url else "article_link"
-            if learning_style == "interactive" and asset_type == "article_link" and "blog" in line.lower():
-                asset_type = "blog_link"
-            assets.append(
-                StudyAsset(
-                    asset_type=asset_type,
-                    title=title[:200],
-                    content_or_url=url,
-                    rationale=f"Matches your {learning_style} learning style",
-                )
+    for link in found_links(raw):
+        asset_type = "youtube_link" if link_type(link.url) == "youtube_link" else "article_link"
+        if learning_style == "interactive" and asset_type == "article_link" and "blog" in link.line.lower():
+            asset_type = "blog_link"
+        assets.append(
+            StudyAsset(
+                asset_type=asset_type,
+                title=link.title,
+                content_or_url=link.url,
+                rationale=f"Matches your {learning_style} learning style",
             )
-            if learning_style != "interactive" and len(assets) >= 1:
-                break
-            if learning_style == "interactive" and len(assets) >= 2:
-                break
-
-    return assets
-
-
-async def generate_practice_assets(
-    chunks: list[str],
-    task_title: str,
-    topic_keywords: list[str],
-    learning_style: str = "reader",
-    user_prompt: Optional[str] = None,
-    *,
-    bus: EventBus,
-) -> list[StudyAsset]:
-    """Generate context-aware practice assets.
-
-    If RAG chunks exist: the PRIMARY model creates a 3-5 question quiz from materials.
-    If no chunks: Gemini searches for 2 LeetCode/Codeforces links + 1 YouTube, and
-    ``WebSearchUnavailableError`` is raised when that search could not run.
-    If user_prompt provided: incorporate into the generation.
-    """
-    assets: list[StudyAsset] = []
-
-    if chunks:
-        context = "\n\n".join(chunks[:8])[:8000]
-        user_hint = f"\n\nUser request: {user_prompt}" if user_prompt else ""
-        prompt = f"""Based on the following syllabus/materials, create a short practice quiz (3-5 questions) testing "{task_title}".{user_hint}
-Use the content heavily - pick or adapt questions from the material. Cover multiple topics if present.
-Format as markdown with numbered questions and brief expected answers.
-
-Materials:
-{context}
-
-Return a JSON object: {{"assets": [{{"asset_type": "generated_quiz", "title": "Quiz: ...", "content_or_url": "<markdown>", "rationale": "From your syllabus"}}]}}"""
-        try:
-            from app.core.model_router import route_llm_call
-
-            result = await route_llm_call(
-                task="practice_generation",
-                prompt=prompt,
-                system_prompt="You are a tutor. Generate practice questions from the materials. Return valid JSON only.",
-            )
-            if isinstance(result, str):
-                import json
-                try:
-                    parsed = json.loads(result)
-                    for a in parsed.get("assets", [])[:3]:
-                        assets.append(StudyAsset(
-                            asset_type=a.get("asset_type", "generated_quiz"),
-                            title=a.get("title", "Practice Quiz"),
-                            content_or_url=a.get("content_or_url", ""),
-                            rationale=a.get("rationale", "From your syllabus"),
-                        ))
-                except json.JSONDecodeError:
-                    assets.append(StudyAsset(
-                        asset_type="generated_quiz",
-                        title=f"Quiz: {task_title}",
-                        content_or_url=result[:4000],
-                        rationale="Generated from your materials",
-                    ))
-        except Exception as e:
-            print(f"[Workspace] generate_practice_assets (chunks) error: {e}")
-
-    else:
-        topic = task_title or " ".join(topic_keywords) or "programming"
-        user_hint = f" User specifically asked: {user_prompt}." if user_prompt else ""
-        prompt = (
-            f"Search for practice resources for: {topic}.{user_hint} "
-            "Return: (1) 2 LeetCode or Codeforces problem URLs with titles, "
-            "(2) 1 YouTube tutorial URL with title. "
-            "Format each as: URL | Title. Use real URLs from leetcode.com, codeforces.com, youtube.com."
         )
-        raw = await _search_web(
-            prompt,
-            "You are a tutor. Find real LeetCode, Codeforces, and YouTube URLs. Return URL | Title per line.",
-            bus=bus,
-        )
-        if raw:
-            url_re = re.compile(r"https?://[^\s|]+")
-            for line in raw.replace("\r", "\n").split("\n"):
-                line = line.strip()
-                match = url_re.search(line)
-                if match:
-                    url = match.group(0).rstrip(".,;)")
-                    title = line.split("|")[-1].strip() if "|" in line else url[:60]
-                    if "leetcode.com" in url:
-                        asset_type = "leetcode_link"
-                    elif "codeforces.com" in url:
-                        asset_type = "codeforces_link"
-                    elif "youtube.com" in url or "youtu.be" in url:
-                        asset_type = "youtube_link"
-                    else:
-                        asset_type = "article_link"
-                    assets.append(StudyAsset(
-                        asset_type=asset_type,
-                        title=title[:200],
-                        content_or_url=url,
-                        rationale=f"Practice resource for {topic}",
-                    ))
-                    if len(assets) >= 3:
-                        break
+        if learning_style != "interactive" and len(assets) >= 1:
+            break
+        if learning_style == "interactive" and len(assets) >= 2:
+            break
 
     return assets
 
@@ -339,133 +182,77 @@ async def build_task_workspace(
     task_id: str,
     user_prompt: Optional[str] = None,
     *,
+    tasks: TaskRepository | None,
     goals: GoalRepository | None = None,
+    materials: DocumentRepository | None = None,
     bus: EventBus,
 ) -> TaskWorkspace:
-    """Assemble proactive workspace: RAG chunks, web links, practice assets. Target <5s.
+    """Assemble the workspace the task's kind calls for (its recipe). Target <5s.
 
-    ``goals`` (the composition root's repository) gives the WOOP card its wish and
-    outcome; None leaves them at the task's title. Web searches are metered onto ``bus``,
-    the composition root's, which is required (``metered_web_search``).
+    The task is read once, the user's own, through ``tasks`` (the composition root's
+    repository): its title, keywords, goal, criteria, length, deadline and if-then plan.
+    NotFoundError when the user has no such task (another user's included);
+    PersistenceError when the task store cannot answer, or there is none. ``goals``
+    gives the WOOP card its wish and outcome; None leaves them at the task's title.
+    ``materials`` (the document repository) gives the task's linked documents and their
+    names; None means no material. Web searches are metered onto ``bus``, the
+    composition root's, which is required (``metered_web_search``).
     """
-    supabase = _get_supabase()
-    task_title = ""
-    topic_keywords: list[str] = []
+    if tasks is None:
+        raise errors.PersistenceError(_NO_TASK_STORE)
+    task = await tasks.get(user_id, task_id)
+    if task is None:
+        raise errors.NotFoundError(_NO_SUCH_TASK, details={"task_id": task_id})
+    title = task.title.strip() or task_id
+    keywords = task.topic_keywords
+    kind = classify_task(title, keywords, task.goal_id)
+    recipe = recipe_for(kind)
+    criteria = _criteria(task, title)
 
-    if supabase:
-        try:
-            task_result = (
-                supabase.table("user_tasks")
-                .select("title, topic_keywords")
-                .eq("user_id", user_id)
-                .eq("task_id", task_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if task_result.data and len(task_result.data) > 0:
-                t = task_result.data[0]
-                task_title = t.get("title", "") or ""
-                kw = t.get("topic_keywords")
-                topic_keywords = list(kw) if isinstance(kw, (list, tuple)) else []
-        except Exception as e:
-            print(f"[Workspace] fetch task error: {e}")
-            task_title = task_id
-
-    if not task_title:
-        task_title = task_id
-
-    primary_objective = f"{task_title} {' '.join(topic_keywords)}".strip() or task_id
-
-    chunks_task = fetch_chunks_for_task(user_id, task_id, task_title, topic_keywords)
-    style_task = get_learning_style(user_id, supabase)
-
-    chunks, learning_style = await asyncio.gather(chunks_task, style_task)
-
-    web_task = perform_learning_style_search(task_title, learning_style, bus=bus)
-    practice_task = generate_practice_assets(
-        chunks, task_title, topic_keywords, learning_style, user_prompt, bus=bus
+    material, learning_style = await asyncio.gather(
+        fetch_chunks_for_task(user_id, task_id, title, keywords, documents=materials)
+        if recipe.reads_documents
+        else _no_material(),
+        get_learning_style(user_id, _get_supabase()),
     )
-
-    web_assets, practice_assets = await asyncio.gather(
-        _unless_search_failed(web_task), _unless_search_failed(practice_task)
+    ctx = RecipeContext(
+        task_title=title,
+        topic_keywords=keywords,
+        goal_id=task.goal_id,
+        completion_criteria=criteria,
+        learning_style=learning_style,
+        user_prompt=user_prompt,
+        material=material,
+        search_web=partial(_search_web, bus=bus),
+        style_search=partial(perform_learning_style_search, bus=bus),
     )
-    notices = [WEB_RESULTS_UNAVAILABLE] if web_assets is None or practice_assets is None else []
-
-    surfaced: list[StudyAsset] = []
-
-    for i, c in enumerate(chunks[:5]):
-        surfaced.append(
-            StudyAsset(
-                asset_type="pdf_chunk",
-                title=f"Material excerpt {i + 1}",
-                content_or_url=c[:3000],
-                rationale="From your ingested materials",
-            )
-        )
-
-    surfaced.extend(web_assets or [])
-    surfaced.extend(practice_assets or [])
-
-    # Build WOOP card from task's implementation_intention + goal metadata
-    woop_card = None
-    task_data = None
-    try:
-        sb = _get_supabase()
-        if sb:
-            task_result = sb.table("user_tasks").select("implementation_intention, goal_id").eq("task_id", task_id).eq("user_id", user_id).limit(1).execute()
-            if task_result.data:
-                task_data = task_result.data[0]
-                intention = task_data.get("implementation_intention") or {}
-                if isinstance(intention, str):
-                    try:
-                        intention = json.loads(intention)
-                    except (json.JSONDecodeError, TypeError):
-                        intention = {}
-                obstacle = intention.get("obstacle_trigger", "")
-                plan = intention.get("behavioral_response", "")
-                if obstacle and plan:
-                    # Fetch goal metadata for Wish + Outcome stages
-                    goal_id = task_data.get("goal_id", "")
-                    wish = task_title
-                    outcome = ""
-                    if goal_id and goals is not None:
-                        # goal_metadata is stored inside the update's context_snippet
-                        snippet = await goals.latest_context(user_id, goal_id) or {}
-                        if isinstance(snippet, str):
-                            try:
-                                snippet = json.loads(snippet)
-                            except (json.JSONDecodeError, TypeError):
-                                snippet = {}
-                        if isinstance(snippet, dict):
-                            wish = snippet.get("planning_goal", task_title)
-                            meta = snippet.get("goal_metadata") or {}
-                            if isinstance(meta, str):
-                                try:
-                                    meta = json.loads(meta)
-                                except (json.JSONDecodeError, TypeError):
-                                    meta = {}
-                            outcome = meta.get("outcome_visualization", "") if isinstance(meta, dict) else ""
-                    woop_card = WoopCard(wish=wish, outcome=outcome, obstacle=obstacle, plan=plan)
-    except Exception as e:
-        logger.warning(f"WOOP card construction failed (non-fatal): {e}")
+    surfaced = await recipe.assets(ctx)
 
     return TaskWorkspace(
         task_id=task_id,
-        task_title=task_title,
-        primary_objective=primary_objective,
+        task_title=title,
+        primary_objective=f"{title} {' '.join(keywords)}".strip(),
+        task_kind=kind.value,
+        completion_criteria=criteria,
+        duration_minutes=task.duration_minutes,
+        deadline_hint=task.deadline_hint,
         surfaced_assets=surfaced,
-        woop_card=woop_card,
-        notices=notices,
+        woop_card=await woop_card(user_id, task, title, goals),
+        notices=[WEB_RESULTS_UNAVAILABLE] if ctx.web_unavailable else [],
     )
 
 
-async def _unless_search_failed(assets: Awaitable[list[StudyAsset]]) -> list[StudyAsset] | None:
-    """The assets, or None when the web search behind them could not run."""
-    try:
-        return await assets
-    except WebSearchUnavailableError:
-        return None
+def _criteria(task: Task, title: str) -> str:
+    """The task's completion criteria, or "" when it has none worth showing: a carried-
+    over task gets the filler "Finish: <title>" (``task_rows.to_task_chunk``), which only
+    says the title again."""
+    criteria = (task.completion_criteria or "").strip()
+    return "" if criteria in ("", f"Finish: {title}", f"Finish: {task.title}") else criteria
+
+
+async def _no_material() -> list[MaterialChunk]:
+    """A recipe that reads no documents gets no material, and no document is read."""
+    return []
 
 
 # ─── Workspace persistence ────────────────────────────────────────────
@@ -501,8 +288,11 @@ async def _read_cached_workspace(user_id: str, task_id: str) -> Optional[TaskWor
             ws_json = json.loads(ws_json)
         if isinstance(ws_json, dict):
             return TaskWorkspace.model_validate(ws_json)
-    except Exception as e:
-        logger.debug(f"Workspace cache read failed (non-fatal — table may not exist yet): {e}")
+    except Exception as exc:
+        logger.debug(
+            "Workspace cache read failed (non-fatal — table may not exist yet): %s",
+            type(exc).__name__,
+        )
     return None
 
 
@@ -525,8 +315,11 @@ async def _write_cached_workspace(user_id: str, task_id: str, ws: TaskWorkspace)
             .upsert(payload, on_conflict="user_id,task_id")
             .execute()
         )
-    except Exception as e:
-        logger.debug(f"Workspace cache write failed (non-fatal — table may not exist yet): {e}")
+    except Exception as exc:
+        logger.debug(
+            "Workspace cache write failed (non-fatal — table may not exist yet): %s",
+            type(exc).__name__,
+        )
 
 
 async def invalidate_workspace_cache(user_id: str, task_id: str) -> None:
@@ -561,10 +354,13 @@ async def get_or_build_task_workspace(
     goals: GoalRepository | None = None,
     bus: EventBus,
     documents: DocumentService | None = None,
+    materials: DocumentRepository | None = None,
+    tasks: TaskRepository | None = None,
 ) -> TaskWorkspace:
     """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
 
-    ``goals`` and ``bus`` are the composition root's (see ``build_task_workspace``).
+    ``tasks``, ``goals``, ``materials`` and ``bus`` are the composition root's (see
+    ``build_task_workspace``, whose NotFoundError and PersistenceError pass through).
     ``documents`` (the composition root's DocumentService) lists the task's linked
     documents, read fresh on every request after the cache, so a document deleted or a
     file kept since shows as it is now; None leaves the list empty.
@@ -574,7 +370,8 @@ async def get_or_build_task_workspace(
         ws = await _read_cached_workspace(user_id, task_id)
     if ws is None:
         ws = await build_task_workspace(
-            user_id=user_id, task_id=task_id, user_prompt=user_prompt, goals=goals, bus=bus
+            user_id=user_id, task_id=task_id, user_prompt=user_prompt,
+            tasks=tasks, goals=goals, materials=materials, bus=bus,
         )
         if not ws.notices:
             # A workspace missing its web results is not cached: once search is back,

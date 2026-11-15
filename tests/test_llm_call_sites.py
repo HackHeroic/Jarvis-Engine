@@ -12,72 +12,25 @@ search says so plainly and never surfaces a link.
 """
 
 import json
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
 from app.domain.events import NullEventBus
-from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
-from app.infrastructure.llm.transport import strip_fences, translated_errors
+from app.services.analytical.workspace.materials import MaterialChunk
+from tests.fakes import ScriptedModel
 
 # A web search must be metered onto a bus (``metered_web_search`` refuses one without):
 # these tests check the search itself, so they pass one that meters nowhere.
 _NO_LEDGER = NullEventBus()
 _TURN_CONTAINER = SimpleNamespace(events=_NO_LEDGER)  # the turn's composition root, faked
-
-
-class ScriptedModel(LLMProvider):
-    """A model that answers each task from a script and records every request.
-
-    A reply is a value (text, a dict or a schema instance), an exception to raise,
-    or a list of those consumed one per call. A task without a reply is unavailable.
-    """
-
-    name = "scripted"
-
-    def __init__(self, replies: dict[str, Any], location: LLMLocation = LLMLocation.CLOUD) -> None:
-        self.location = location
-        self.calls: list[LLMRequest] = []
-        self._replies = {task: list(r) if isinstance(r, list) else r for task, r in replies.items()}
-
-    @property
-    def tasks(self) -> list[str]:
-        return [c.task for c in self.calls]
-
-    def is_available(self) -> bool:
-        return True
-
-    def _answer(self, req: LLMRequest) -> Any:
-        self.calls.append(req)
-        reply = self._replies.get(req.task)
-        if isinstance(reply, list):
-            reply = reply.pop(0) if reply else None
-        if reply is None:
-            raise LLMUnavailableError(f"no scripted reply for {req.task!r}")
-        if isinstance(reply, BaseException):
-            raise reply
-        schema = req.response_schema
-        if schema is None or isinstance(reply, schema):
-            return reply
-        with translated_errors():  # unparseable output is a model failure, as in the adapters
-            if isinstance(reply, dict):
-                return schema.model_validate(reply)
-            return schema.model_validate_json(strip_fences(reply))
-
-    async def complete(self, req: LLMRequest) -> Any:
-        return self._answer(req)
-
-    async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
-        text = self._answer(req)
-        for i in range(0, len(text), 4):  # mid-word chunks, as a real stream arrives
-            yield ("content", text[i : i + 4])
 
 
 @pytest.fixture
@@ -283,34 +236,38 @@ async def test_habit_translation__model_down__raises_to_the_caller(llm, habit_tr
 # --- workspace practice quiz -----------------------------------------------------------
 
 
+_DIJKSTRA = [MaterialChunk(text="Dijkstra uses a min-heap.", source_id="src-1", file_name="Graphs.pdf")]
+
+
 @pytest.mark.asyncio
 async def test_practice_quiz__routes_through_the_chain__returns_the_quiz_assets(llm):
-    from app.services.analytical.workspace_builder import generate_practice_assets
+    from app.services.analytical.workspace.quiz import generate_quiz
 
-    quiz = {
-        "asset_type": "generated_quiz", "title": "Quiz: Dijkstra",
-        "content_or_url": "1. Why a heap?", "rationale": "From your syllabus",
-    }
-    model = llm(practice_generation=json.dumps({"assets": [quiz]}))
+    questions = [
+        {"question": f"Why a heap ({i})?", "answer": "To pop the nearest vertex.", "hint": ""}
+        for i in range(3)
+    ]
+    model = llm(practice_generation=json.dumps(
+        {"assets": [{"title": "Dijkstra", "questions": questions}]}
+    ))
 
-    assets = await generate_practice_assets(
-        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
-    )
+    assets = await generate_quiz(_DIJKSTRA, "Dijkstra")
 
     assert model.tasks == ["practice_generation"]
     assert model.calls[0].role == "primary"
-    assert [a.model_dump(exclude={"metadata"}) for a in assets] == [quiz]
+    assert [(a.asset_type, a.title, a.rationale) for a in assets] == [
+        ("generated_quiz", "Quiz: Dijkstra", "From Graphs.pdf")
+    ]
+    assert assets[0].metadata == {"quiz": {"title": "Dijkstra", "questions": questions}}
 
 
 @pytest.mark.asyncio
 async def test_practice_quiz__model_down__returns_no_assets(llm):
-    from app.services.analytical.workspace_builder import generate_practice_assets
+    from app.services.analytical.workspace.quiz import generate_quiz
 
     llm(practice_generation=_down())
 
-    assert await generate_practice_assets(
-        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
-    ) == []
+    assert await generate_quiz(_DIJKSTRA, "Dijkstra") == []
 
 
 # --- documents and ingestion ------------------------------------------------------------
@@ -534,6 +491,17 @@ def web_search_down(monkeypatch):
     monkeypatch.setattr(_llm.litellm, "acompletion", failing_completion)
 
 
+@pytest_asyncio.fixture
+async def offline_tasks():
+    """The user's tasks, as accepting a draft writes them: one, graphs_task_1."""
+    from app.infrastructure.persistence.factory import RepositoryFactory
+    from tests.fakes import accept_tasks
+
+    repos = RepositoryFactory.in_memory()
+    await accept_tasks(repos, "alice", [{"task_id": "graphs_task_1", "title": "Graph algorithms"}])
+    return repos.tasks
+
+
 @pytest.fixture
 def offline_workspace(monkeypatch):
     """A workspace build with no database and no ingested materials."""
@@ -553,9 +521,11 @@ def offline_workspace(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_workspace__web_search_fails__says_web_results_are_unavailable_and_shows_no_links(
-    web_search_down, offline_workspace
+    web_search_down, offline_workspace, offline_tasks
 ):
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.build_task_workspace(
+        "alice", "graphs_task_1", tasks=offline_tasks, bus=_NO_LEDGER
+    )
 
     assert ws.notices == [offline_workspace.WEB_RESULTS_UNAVAILABLE]
     assert "web results are unavailable" in ws.notices[0].lower()
@@ -564,7 +534,7 @@ async def test_workspace__web_search_fails__says_web_results_are_unavailable_and
 
 @pytest.mark.asyncio
 async def test_workspace__web_search_fails__degraded_workspace_is_not_cached(
-    web_search_down, offline_workspace, monkeypatch
+    web_search_down, offline_workspace, offline_tasks, monkeypatch
 ):
     written: list = []
 
@@ -577,19 +547,25 @@ async def test_workspace__web_search_fails__degraded_workspace_is_not_cached(
     monkeypatch.setattr(offline_workspace, "_read_cached_workspace", no_cache)
     monkeypatch.setattr(offline_workspace, "_write_cached_workspace", record_write)
 
-    ws = await offline_workspace.get_or_build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.get_or_build_task_workspace(
+        "alice", "graphs_task_1", bus=_NO_LEDGER, tasks=offline_tasks
+    )
 
     assert ws.notices and written == []
 
 
 @pytest.mark.asyncio
-async def test_workspace__web_search_answers__links_surface_without_a_notice(offline_workspace, monkeypatch):
+async def test_workspace__web_search_answers__links_surface_without_a_notice(
+    offline_workspace, offline_tasks, monkeypatch
+):
     async def search(**_kwargs):
         return "https://www.youtube.com/watch?v=abc | Graphs in 10 minutes"
 
     monkeypatch.setattr(offline_workspace, "gemini_web_search", search)
 
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.build_task_workspace(
+        "alice", "graphs_task_1", tasks=offline_tasks, bus=_NO_LEDGER
+    )
 
     assert ws.notices == []
     assert "https://www.youtube.com/watch?v=abc" in [a.content_or_url for a in ws.surfaced_assets]

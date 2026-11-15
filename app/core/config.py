@@ -254,6 +254,16 @@ CHROMA_DATABASE: str = os.getenv("CHROMA_DATABASE", "Jarvis-Vector-Db")
 # match pasted into the prompt misleads the model — so err strict.
 RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE", "0.6"))
 
+# A task's workspace shows material from a document NOT linked to the task only when a
+# chunk is at least this close to the task (its title and topic keywords), as cosine
+# similarity under the same embedder; the search cut-off is 1 minus this. Stricter than
+# document search above (similarity >= 0.4): the workspace presents the excerpt as
+# material for the task and builds its quiz on it, so no material beats loose material.
+# A starting value, not yet measured on real documents: tune it on the demo data.
+WORKSPACE_MATERIAL_MIN_SIMILARITY: float = float(
+    os.getenv("JARVIS_WORKSPACE_MATERIAL_MIN_SIMILARITY", "0.45")
+)
+
 # Memory (MemoryService), as cosine similarity under the memory embedder. A fact said or
 # noticed at least MEMORY_SUPPRESS_SIMILARITY close to one the user forgot or dismissed is
 # not stored again; one at least MEMORY_DEDUPE_SIMILARITY close to an active or faded

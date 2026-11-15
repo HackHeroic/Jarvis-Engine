@@ -350,9 +350,10 @@ async def test_workspace_route__web_search_answered__one_web_search_usage_on_the
 
     import app.services.analytical.workspace_builder as wb
     from app.main import app
-    from tests.fakes import build_test_container
+    from tests.fakes import accept_tasks, build_test_container
 
     container = build_test_container()
+    await accept_tasks(container.repos, U, [{"task_id": "graphs_t1", "title": "Graph algorithms"}])
     usage_seen = _UsageRecorder(container.events)
     queries = _stub_web_search(monkeypatch)
 
@@ -370,7 +371,6 @@ async def test_workspace_route__web_search_answered__one_web_search_usage_on_the
     monkeypatch.setattr(wb, "_write_cached_workspace", nothing)
     monkeypatch.setattr(wb, "fetch_chunks_for_task", no_chunks)
     monkeypatch.setattr(wb, "get_learning_style", reader)
-    monkeypatch.setattr(wb, "generate_practice_assets", no_chunks)  # one search: the links
     monkeypatch.setattr(app.state, "container", container, raising=False)
 
     transport = httpx.ASGITransport(app=app)

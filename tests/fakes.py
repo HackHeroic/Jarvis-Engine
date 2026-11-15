@@ -29,14 +29,17 @@ import math
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from storage3.exceptions import StorageApiError
 
-from app.domain.ports import TextEmbedder
+from app.domain.entities import LLMLocation
+from app.domain.errors import LLMUnavailableError
+from app.domain.ports import LLMProvider, LLMRequest, TextEmbedder
+from app.infrastructure.llm.transport import strip_fences, translated_errors
 from app.utils.embedding import cosine_similarity
 
 if TYPE_CHECKING:
@@ -412,6 +415,67 @@ class FakeStorage:
         return _FakeBucketFiles(self, id)
 
 
+class ScriptedModel(LLMProvider):
+    """A model that answers each task from a script and records every request.
+
+    A reply is a value (text, a dict or a schema instance), an exception to raise,
+    or a list of those consumed one per call. A task without a reply is unavailable.
+    """
+
+    name = "scripted"
+
+    def __init__(self, replies: dict[str, Any], location: LLMLocation = LLMLocation.CLOUD) -> None:
+        self.location = location
+        self.calls: list[LLMRequest] = []
+        self._replies = {task: list(r) if isinstance(r, list) else r for task, r in replies.items()}
+
+    @property
+    def tasks(self) -> list[str]:
+        return [c.task for c in self.calls]
+
+    def is_available(self) -> bool:
+        return True
+
+    def _answer(self, req: LLMRequest) -> Any:
+        self.calls.append(req)
+        reply = self._replies.get(req.task)
+        if isinstance(reply, list):
+            reply = reply.pop(0) if reply else None
+        if reply is None:
+            raise LLMUnavailableError(f"no scripted reply for {req.task!r}")
+        if isinstance(reply, BaseException):
+            raise reply
+        schema = req.response_schema
+        if schema is None or isinstance(reply, schema):
+            return reply
+        with translated_errors():  # unparseable output is a model failure, as in the adapters
+            if isinstance(reply, dict):
+                return schema.model_validate(reply)
+            return schema.model_validate_json(strip_fences(reply))
+
+    async def complete(self, req: LLMRequest) -> Any:
+        return self._answer(req)
+
+    async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
+        text = self._answer(req)
+        for i in range(0, len(text), 4):  # mid-word chunks, as a real stream arrives
+            yield ("content", text[i : i + 4])
+
+
+def install_scripted_model(**replies: Any) -> ScriptedModel:
+    """Install ``ScriptedModel(replies)`` as the whole provider chain and return it.
+
+    ``route_llm_call`` reaches it and nothing else; conftest's ``_fresh_llm_chain``
+    removes it after the test.
+    """
+    from app.infrastructure.llm.chain import FallbackChainProvider
+    from app.infrastructure.llm.factory import set_chain
+
+    model = ScriptedModel(replies)
+    set_chain(FallbackChainProvider([model]))
+    return model
+
+
 # The user_tasks columns accept_draft writes: its v_columns list as the latest
 # migration that defines it has it (tests/test_migrations.py checks the two agree).
 ACCEPT_DRAFT_COLUMNS = frozenset({
@@ -562,6 +626,69 @@ class FakeSupabase:
             return _Result(len(p_rows))
 
 
+class FakeKnowledgeCollection:
+    """ChromaDB's knowledge collection: chunks with metadata, no embedder.
+
+    ``query`` honours ``where`` (including ``$and``) the way Chroma does and reports each
+    chunk's fixed distance, closest first; ``get`` and ``delete`` work on the same
+    chunks. Every query and get is recorded. Install it with ``install(monkeypatch)``.
+    """
+
+    def __init__(self, chunks: list[dict], space: str = "cosine") -> None:
+        self.chunks = chunks  # {"id", "document", "metadata", "distance"}
+        self.metadata = {"hnsw:space": space}
+        self.queries: list[dict] = []
+        self.gets: list[dict] = []
+
+    @staticmethod
+    def _matches(meta: dict, where: dict | None) -> bool:
+        if not where:
+            return True
+        if "$and" in where:
+            return all(FakeKnowledgeCollection._matches(meta, clause) for clause in where["$and"])
+        return all(meta.get(k) == v for k, v in where.items())
+
+    def query(self, query_texts, n_results=10, where=None, include=None):
+        self.queries.append({"query_texts": query_texts, "n_results": n_results, "where": where})
+        hits = sorted(
+            (c for c in self.chunks if self._matches(c["metadata"], where)),
+            key=lambda c: c["distance"],
+        )[:n_results]
+        return {
+            "ids": [[c["id"] for c in hits]],
+            "documents": [[c["document"] for c in hits]],
+            "metadatas": [[c["metadata"] for c in hits]],
+            "distances": [[c["distance"] for c in hits]],
+        }
+
+    def get(self, where=None, **_kwargs):
+        self.gets.append({"where": where})
+        hits = [c for c in self.chunks if self._matches(c["metadata"], where)]
+        return {"ids": [c["id"] for c in hits], "documents": [c["document"] for c in hits]}
+
+    def delete(self, ids):
+        self.chunks = [c for c in self.chunks if c["id"] not in ids]
+
+    def install(self, monkeypatch) -> "FakeKnowledgeCollection":
+        """Make it the collection ``app.utils.chroma_client`` hands out; returns itself."""
+        import app.utils.chroma_client as chroma
+
+        client = SimpleNamespace(get_or_create_collection=lambda *_a, **_k: self)
+        monkeypatch.setattr(chroma, "get_chroma_client", lambda: client)
+        return self
+
+
+def knowledge_chunk(cid: str, user: str, text: str, distance: float, source: str = "src-a") -> dict:
+    """A chunk for ``FakeKnowledgeCollection``: ``user``'s, from document ``source``, at
+    ``distance`` from every query."""
+    return {
+        "id": cid,
+        "document": text,
+        "metadata": {"user_id": user, "source_id": source},
+        "distance": distance,
+    }
+
+
 def bag_of_words_embedding(text: str, dims: int = 128) -> list[float]:
     """Deterministic stand-in for the sentence embedder: hashed word counts."""
     vector = [0.0] * dims
@@ -614,6 +741,19 @@ def build_test_container(supabase: FakeSupabase | None = None) -> "AppContainer"
         embedder=BagOfWordsEmbedder(),
         install_chain=False,
     )
+
+
+async def accept_tasks(repos: Any, user_id: str, rows: list[dict]) -> None:
+    """Give the user these tasks the only way user_tasks is ever written: by accepting a
+    draft (``repos`` is either repository family). A row needs at least ``task_id`` and
+    ``title``; the rest defaults to a pending 25-minute task of middling difficulty."""
+    draft = await repos.drafts.create(
+        user_id, tasks=[], horizon_start=None, goal_id=None, schedule=None
+    )
+    await repos.drafts.accept_atomic(user_id, draft.id, [
+        {"status": "pending", "duration_minutes": 25, "difficulty_weight": 0.5, **row}
+        for row in rows
+    ])
 
 
 def planning_services(repos: Any, *, drafts: Any = None, events: Any = None) -> Any:
