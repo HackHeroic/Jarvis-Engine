@@ -410,7 +410,7 @@ SM2_EF_FLOOR = 1.3
 
 
 class HabitTracker(BaseModel):
-    """The spaced-repetition (SM-2) state of one habit the user reviews."""
+    """The SM-2 state of one rule (or habit) the user reviews: "still how you work?" 0-5."""
 
     id: str = Field(description="Tracker identifier (a UUID).")
     user_id: str = Field(description="Owner of the tracker.")
@@ -431,7 +431,7 @@ class HabitTracker(BaseModel):
         default=1, ge=0, description="Days after the last review that the next one is due."
     )
     last_done_at: datetime | None = Field(
-        default=None, description="When it was last reviewed; None if never."
+        default=None, description="Last reviewed; before any review, when started. None: due now."
     )
 
 

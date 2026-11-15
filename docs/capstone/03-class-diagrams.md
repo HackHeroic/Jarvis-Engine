@@ -726,6 +726,8 @@ classDiagram
         +get(user_id, tracker_id) HabitTracker | None*
         +list_for_user(user_id) list~HabitTracker~*
         +record_review(user_id, tracker_id, repetitions, ef, next_interval_days, quality, done_at) HabitTracker*
+        +add_for_constraint(user_id, constraint_id, started_at) HabitTracker*
+        +delete_for_constraint(user_id, constraint_id) int*
     }
     class ProfileRepository {
         <<interface>>

@@ -89,6 +89,7 @@ from app.infrastructure.persistence._mapping import (
     memory_id_taken,
     memory_to_row,
     new_draft,
+    new_tracker,
     not_found,
     now_utc,
     pattern_key_taken,
@@ -664,6 +665,31 @@ class SupabaseHabitTrackerRepository(_SupabaseRepository, HabitTrackerRepository
         if not rows:
             raise not_found("tracker", tracker_id)
         return _read(HabitTracker, rows[0])
+
+    async def add_for_constraint(
+        self, user_id: str, constraint_id: str, *, started_at: datetime
+    ) -> HabitTracker:
+        tracker = new_tracker(user_id, constraint_id, started_at)
+        # No unique key on (user_id, constraint_id), and no DDL to add one: read first.
+        held = await self._run(
+            lambda q: q.select("*")
+            .eq("user_id", user_id)
+            .eq("constraint_id", constraint_id)
+            .order("created_at")
+            .limit(1)
+        )
+        if held:
+            return _read(HabitTracker, held[0])
+        rows = await self._run(lambda q: q.insert(to_row(tracker)))
+        return _read(HabitTracker, rows[0]) if rows else tracker
+
+    async def delete_for_constraint(self, user_id: str, constraint_id: str) -> int:
+        if not is_uuid(constraint_id):  # the column is a uuid; anything else matches nothing
+            return 0
+        rows = await self._run(
+            lambda q: q.delete().eq("user_id", user_id).eq("constraint_id", constraint_id)
+        )
+        return len(rows)
 
 
 class SupabaseProfileRepository(_SupabaseRepository, ProfileRepository):

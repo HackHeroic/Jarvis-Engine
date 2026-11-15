@@ -281,7 +281,8 @@ class GoalRepository(ABC):
 
 
 class HabitTrackerRepository(ABC):
-    """The SM-2 state of the user's habit trackers."""
+    """The SM-2 state of the user's habit trackers: one per rule the user has, which
+    Jarvis checks in on (``RuleCheckIns``)."""
 
     @abstractmethod
     async def get(self, user_id: str, tracker_id: str) -> HabitTracker | None:
@@ -308,6 +309,27 @@ class HabitTrackerRepository(ABC):
 
         Raises NotFoundError if the user has no such tracker (another user's included),
         and ValidationError, writing nothing, for a value the tracker rejects.
+        """
+
+    @abstractmethod
+    async def add_for_constraint(
+        self, user_id: str, constraint_id: str, *, started_at: datetime
+    ) -> HabitTracker:
+        """Start tracking the user's constraint (a rule); return its tracker.
+
+        At most one per user and constraint: when the user already has one, it is
+        returned and nothing is written. The table does not enforce that, so the store
+        reads before it inserts. A new tracker counts from ``started_at``, held as its
+        ``last_done_at`` with no rating yet, so its first review is due
+        ``next_interval_days`` (1) after it. Raises ValidationError, writing nothing,
+        for a constraint id that is no UUID.
+        """
+
+    @abstractmethod
+    async def delete_for_constraint(self, user_id: str, constraint_id: str) -> int:
+        """Delete every tracker the user has for the constraint; return how many went.
+
+        Another user's trackers are never touched; an id that is no UUID deletes nothing.
         """
 
 

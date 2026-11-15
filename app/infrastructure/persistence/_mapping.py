@@ -520,6 +520,23 @@ def checked_review(
     return {name: getattr(normalized(checked), name) for name in fields}
 
 
+def new_tracker(user_id: str, constraint_id: str, started_at: datetime) -> HabitTracker:
+    """A fresh tracker for the user's constraint, counting from ``started_at`` (UTC).
+
+    It is held as ``last_done_at`` with no rating yet (``quality_last`` None), so the
+    first review is due one interval (the default, 1 day) after it. Raises
+    ValidationError for a constraint id the uuid column would reject.
+    """
+    if not is_uuid(constraint_id):
+        raise errors.ValidationError(
+            "A tracker's rule id must be a UUID.", details={"constraint_id": constraint_id}
+        )
+    return HabitTracker(
+        id=str(uuid4()), user_id=user_id, constraint_id=constraint_id,
+        last_done_at=utc(started_at),
+    )
+
+
 # --- documents ---------------------------------------------------------------------
 
 

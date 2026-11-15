@@ -80,6 +80,7 @@ from app.infrastructure.persistence._mapping import (
     file_key_part,
     is_uuid,
     new_draft,
+    new_tracker,
     normalized,
     not_found,
     now_utc,
@@ -517,6 +518,32 @@ class InMemoryHabitTrackerRepository(HabitTrackerRepository):
             raise not_found("tracker", tracker_id)
         self._store.habit_trackers[i] = self._store.habit_trackers[i].model_copy(update=fields)
         return self._store.habit_trackers[i].model_copy(deep=True)
+
+    async def add_for_constraint(
+        self, user_id: str, constraint_id: str, *, started_at: datetime
+    ) -> HabitTracker:
+        tracker = new_tracker(user_id, constraint_id, started_at)
+        held = next(
+            (
+                t
+                for t in self._store.habit_trackers
+                if t.user_id == user_id and t.constraint_id == constraint_id
+            ),
+            None,
+        )
+        if held is not None:
+            return held.model_copy(deep=True)
+        self._store.habit_trackers.append(tracker)
+        return tracker.model_copy(deep=True)
+
+    async def delete_for_constraint(self, user_id: str, constraint_id: str) -> int:
+        before = len(self._store.habit_trackers)
+        self._store.habit_trackers[:] = [
+            t
+            for t in self._store.habit_trackers
+            if not (t.user_id == user_id and t.constraint_id == constraint_id)
+        ]
+        return before - len(self._store.habit_trackers)
 
 
 class InMemoryProfileRepository(ProfileRepository):

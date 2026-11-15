@@ -127,7 +127,8 @@ def seed_goal(memory_store, fake_client):
 @pytest.fixture
 def seed_tracker(memory_store, fake_client):
     """Store a habit tracker in whichever store backs ``repos``, each one newer than
-    the last. No port creates a tracker, so the suite writes both stores."""
+    the last: any state, even one no port writes (a review's, or a second tracker for
+    a rule), so the suite writes both stores."""
     ages = itertools.count()
 
     def _seed(user_id: str, **fields) -> HabitTracker:
@@ -1105,6 +1106,50 @@ async def test_trackers__list_for_user__only_theirs(repos, seed_tracker):
 
     assert listed == [second, first]  # newest first
     assert await repos.habit_trackers.list_for_user("nobody") == []
+
+
+@pytest.mark.asyncio
+async def test_trackers__add_for_constraint__one_per_user_and_rule_counting_from_started_at(repos):
+    rule = str(uuid4())
+    learned = T0 - timedelta(days=3)
+
+    first = await repos.habit_trackers.add_for_constraint(U1, rule, started_at=learned)
+    again = await repos.habit_trackers.add_for_constraint(U1, rule, started_at=T0)
+    theirs = await repos.habit_trackers.add_for_constraint(U2, rule, started_at=T0)
+
+    assert again == first  # the one already there, nothing written
+    assert (first.user_id, first.constraint_id, first.last_done_at) == (U1, rule, learned)
+    assert (first.repetitions, first.quality_last, first.next_interval_days) == (0, None, 1)
+    assert first.ef == 2.5 and first.habit_id is None
+    assert theirs.id != first.id and theirs.user_id == U2
+    assert await repos.habit_trackers.list_for_user(U1) == [first]
+    assert await repos.habit_trackers.get(U1, first.id) == first
+
+
+@pytest.mark.asyncio
+async def test_trackers__add_for_constraint__id_not_a_uuid__validation_error_nothing_stored(repos):
+    with pytest.raises(errors.ValidationError):
+        await repos.habit_trackers.add_for_constraint(U1, "rule-1", started_at=T0)
+
+    assert await repos.habit_trackers.list_for_user(U1) == []
+
+
+@pytest.mark.asyncio
+async def test_trackers__delete_for_constraint__only_this_users_trackers_of_that_rule(
+    repos, seed_tracker
+):
+    rule, other_rule = str(uuid4()), str(uuid4())
+    await repos.habit_trackers.add_for_constraint(U1, rule, started_at=T0)
+    seed_tracker(U1, constraint_id=rule)  # a second one, as a race between processes leaves
+    kept = await repos.habit_trackers.add_for_constraint(U1, other_rule, started_at=T0)
+    theirs = await repos.habit_trackers.add_for_constraint(U2, rule, started_at=T0)
+
+    assert await repos.habit_trackers.delete_for_constraint(U1, rule) == 2
+
+    assert await repos.habit_trackers.list_for_user(U1) == [kept]
+    assert await repos.habit_trackers.list_for_user(U2) == [theirs]
+    assert await repos.habit_trackers.delete_for_constraint(U1, rule) == 0
+    assert await repos.habit_trackers.delete_for_constraint(U1, "not-a-uuid") == 0
 
 
 # --- Profiles ----------------------------------------------------------------
@@ -2239,6 +2284,8 @@ class _UnreachableClient:
         lambda r: r.habit_trackers.record_review(
             U1, str(uuid4()), repetitions=1, ef=2.5, next_interval_days=1, quality=4, done_at=T0
         ),
+        lambda r: r.habit_trackers.add_for_constraint(U1, str(uuid4()), started_at=T0),
+        lambda r: r.habit_trackers.delete_for_constraint(U1, str(uuid4())),
         lambda r: r.profiles.get_or_create(U1),
         lambda r: r.suggestions.exists_today(U1, "evening_review", T0.date()),
         lambda r: r.usage.record(_usage(U1, LLMLocation.LOCAL, 1, 1)),
