@@ -6,7 +6,7 @@ phrase-to-title cosine similarity, on the container's sentence embedder, reaches
 threshold (``DOCUMENT_LINK_SIMILARITY``). Each topic is compared on its own: ten topics
 joined into one string blur into a vague average that no specific title comes close to.
 
-Both directions run the same match: a new document against the user's open tasks
+Both directions run the same match: a new document against the user's pending tasks
 (``link_document``, when it is kept), and newly accepted tasks against the user's
 documents (``link_tasks``, from ``DocumentLinkListener`` after the accept commits).
 """
@@ -28,9 +28,10 @@ logger = logging.getLogger(__name__)
 # (user_id, task_ids). The composition root passes the workspace builder's invalidation.
 WorkspacesChanged = Callable[[str, list[str]], Awaitable[None]]
 
-# The tasks a new document is offered to: the ones still to do (or set aside and due a
-# new slot). A finished task's workspace is not opened again.
-_OPEN = frozenset({TaskStatus.PENDING, TaskStatus.MISSED})
+# The tasks a new document is offered to: the ones still to do. A finished task's
+# workspace is not opened again, and a set-aside one is linked if a plan brings it back
+# (the accept's tasks are offered to the documents, ``link_tasks``).
+_TO_DO = frozenset({TaskStatus.PENDING})
 # Words in a file name that say what kind of file it is, not what it is about.
 _GENERIC_FILE_WORDS = frozenset({
     "syllabus", "notes", "note", "unit", "units", "lecture", "lectures", "slides", "slide",
@@ -91,13 +92,13 @@ class DocumentLinker:
         self._on_links_changed = on_links_changed
 
     async def link_document(self, user_id: str, document: IngestedDocument) -> list[str]:
-        """Link a newly kept document to the user's open tasks it is material for.
+        """Link a newly kept document to the user's pending tasks it is material for.
 
         Returns the ids of the tasks linked, in the order the user's tasks are read
         (newest first). Raises what its stores and embedder raise; the caller decides
         whether that may fail it.
         """
-        tasks = await self._tasks.list_by_status(user_id, _OPEN)
+        tasks = await self._tasks.list_by_status(user_id, _TO_DO)
         return await self._link(user_id, [document], tasks)
 
     async def link_tasks(self, user_id: str, task_ids: Collection[str]) -> list[str]:

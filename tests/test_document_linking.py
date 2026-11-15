@@ -135,9 +135,11 @@ async def test_link_document__the_file_name_subject_alone__links_its_tasks():
 
 
 @pytest.mark.asyncio
-async def test_link_document__finished_tasks__left_out():
+async def test_link_document__finished_and_set_aside_tasks__left_out():
+    """A set-aside task is linked if a plan brings it back: its accept offers it."""
     repos = RepositoryFactory.in_memory()
-    await _hold(repos, {"t-old": "gradient descent"}, status="completed")
+    await _hold(repos, {"t-done": "gradient descent"}, status="completed")
+    await _hold(repos, {"t-aside": "gradient descent recap"}, status="missed")
     await _hold(repos, {"t-new": "gradient descent drills"})
 
     linked = await _linker(repos).link_document(U, _document("ml", ["gradient descent"]))

@@ -132,7 +132,7 @@ async def process_ingestion(
             document names is stored for the goal of the tasks it matched. None: not stored.
         documents: The container's DocumentService: a document read for knowledge is
             kept through it (its record, the uploaded file itself, and its links to the
-            user's open tasks). None: not kept, and linked to nothing.
+            user's pending tasks). None: not kept, and linked to nothing.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -240,7 +240,7 @@ async def process_ingestion(
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
         # Keep the document for the documents page: its record, for an upload the file
-        # itself, and links to the user's open tasks it is material for (best effort:
+        # itself, and links to the user's pending tasks it is material for (best effort:
         # its chunks are stored whatever happens here).
         matched: list[str] = []
         if user_id and documents is not None:

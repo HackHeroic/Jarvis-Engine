@@ -63,7 +63,7 @@ class DocumentService:
         self, user_id: str, document: IngestedDocument, *, file: StoredFile | None = None
     ) -> list[str]:
         """Keep a newly ingested document: its record, its file when one was uploaded, and
-        links to the user's open tasks it is material for (``DocumentLinker``).
+        links to the user's pending tasks it is material for (``DocumentLinker``).
 
         Best effort, never raising: the document's chunks are already stored, so a store
         that fails here is logged (by its exception type) and the rest goes on without

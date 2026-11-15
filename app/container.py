@@ -170,7 +170,7 @@ class AppContainer:
             repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
         )
         # Documents and tasks find each other by meaning, both ways: a new document is
-        # linked to the open tasks it fits when it is kept, and an accepted plan's tasks
+        # linked to the pending tasks it fits when it is kept, and an accepted plan's tasks
         # to the documents they fit once the accept has committed (DraftAccepted). A
         # change to a task's documents drops its cached workspace.
         document_linker = DocumentLinker(
