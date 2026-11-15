@@ -70,7 +70,7 @@ async def test_materials__no_linked_document_and_nothing_relevant__no_chunks_and
         knowledge_chunk("t1", ALICE, "Semester 5 marks: DBMS 8, OS 9", 0.58, source="transcript"),
     ]).install(monkeypatch)
     await _keep(repos, ALICE, "transcript", "Marks-Transcript.pdf")
-    model = install_scripted_model()  # nothing scripted: a quiz call would be recorded
+    model = install_scripted_model()  # nothing scripted: every call is recorded
 
     chunks = await wb.fetch_chunks_for_task(
         ALICE, "readme_task", "Course project: write the README", documents=repos.documents
@@ -81,8 +81,10 @@ async def test_materials__no_linked_document_and_nothing_relevant__no_chunks_and
     assert chunks == []
     assert chroma.query_knowledge(ALICE, "Course project: write the README") != []  # general bar
     for ws in (readme, revise):
-        assert [a for a in ws.surfaced_assets if a.asset_type in ("pdf_chunk", "generated_quiz")] == []
-    assert "practice_generation" not in model.tasks  # no material, so no quiz was asked for
+        assert [a for a in ws.surfaced_assets if a.asset_type == "pdf_chunk"] == []
+    assert [a for a in readme.surfaced_assets if a.asset_type == "generated_quiz"] == []
+    # The study task may ask for questions from general knowledge; never from the transcript.
+    assert all("marks" not in call.prompt.lower() for call in model.calls)
 
 
 @pytest.mark.asyncio

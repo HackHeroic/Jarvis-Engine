@@ -28,25 +28,51 @@ QUIZ_CONTEXT_CHUNKS = 8
 QUIZ_CONTEXT_MAX_CHARS = 8000
 
 _SYSTEM = (
-    "You are a tutor. Write practice questions from the material you are given. "
+    "You are a tutor. Write practice questions that test the subject of the task. "
     "Return valid JSON only, with no text around it."
 )
 
 
+_SHAPE = (
+    '{{"assets": [{{"title": "<what it covers>", "questions": '
+    '[{{"question": "...", "answer": "...", "hint": "..."}}]}}]}} with '
+    f"{QUIZ_MIN_QUESTIONS} to {QUIZ_MAX_QUESTIONS} questions. Each answer is brief (one to "
+    'three sentences) and correct; a hint is a short nudge, or "".'
+).replace("{{", "{").replace("}}", "}")
+
+# Shown on a quiz that was not drawn from the user's documents.
+FROM_KNOWLEDGE = "Practice questions on this topic, not from your documents"
+
+
 def quiz_prompt(material: list[MaterialChunk], task_title: str, user_prompt: str | None) -> str:
-    """The quiz request: the task, the material with each chunk's document, and the shape."""
+    """The quiz request: the task, the material with each chunk's document (when there is
+    any), and the shape.
+
+    The questions test the subject, not the document: a syllabus that lists "3NF" calls
+    for a question on 3NF, never "which forms does the syllabus list?". With no material
+    the questions come from standard knowledge of the task's topic.
+    """
+    request = f"\nThe user asked: {user_prompt}" if user_prompt else ""
+    if not material:
+        return (
+            f'Write a short set of practice questions for the task "{task_title}", from '
+            f"standard knowledge of its topic.{request}\n"
+            "Each question makes the student do the work the task is about (solve, derive, "
+            "explain, compare), from easier to harder.\n"
+            f"Return {_SHAPE}"
+        )
     context = "\n\n".join(
         f"[From {chunk.file_name}]\n{chunk.text}" for chunk in material[:QUIZ_CONTEXT_CHUNKS]
     )[:QUIZ_CONTEXT_MAX_CHARS]
-    request = f"\nThe user asked: {user_prompt}" if user_prompt else ""
     return (
-        f'Write a short practice quiz for the task "{task_title}", using only the material '
-        f"below.{request}\n"
+        f'Write a short practice quiz for the task "{task_title}", within the scope of the '
+        f"material below.{request}\n"
         f'If the material is not about "{task_title}", return {{"assets": []}} and nothing else.\n'
-        f'Otherwise return {{"assets": [{{"title": "<what it covers>", "questions": '
-        f'[{{"question": "...", "answer": "...", "hint": "..."}}]}}]}} with '
-        f"{QUIZ_MIN_QUESTIONS} to {QUIZ_MAX_QUESTIONS} questions. Each answer is brief (one "
-        'to three sentences) and comes from the material; a hint is a short nudge, or "".\n\n'
+        "The questions test understanding of the subject itself (define, apply, work an "
+        "example, compare), never what the document says or lists. Where the material "
+        "explains a point, the answer follows it; where it only names a topic (a syllabus, "
+        "a contents list), the answer comes from standard knowledge of that topic.\n"
+        f"Otherwise return {_SHAPE}\n\n"
         f"Material:\n{context}"
     )
 
@@ -91,20 +117,27 @@ def quiz_asset(quiz: Quiz, material: list[MaterialChunk]) -> StudyAsset:
         asset_type="generated_quiz",
         title=title[:200],
         content_or_url=quiz_markdown(quiz),
-        rationale=f"From {sources_phrase(material)}",
+        rationale=f"From {sources_phrase(material)}" if material else FROM_KNOWLEDGE,
         metadata={"quiz": quiz.model_dump()},
     )
 
 
 async def generate_quiz(
-    material: list[MaterialChunk], task_title: str, user_prompt: str | None = None
+    material: list[MaterialChunk],
+    task_title: str,
+    user_prompt: str | None = None,
+    *,
+    from_knowledge: bool = False,
 ) -> list[StudyAsset]:
-    """A quiz asset drawn from ``material``, or [] (no material: no model call is made).
+    """A quiz asset drawn from ``material``, or [].
+
+    With no material no model call is made, unless ``from_knowledge``: then the questions
+    come from standard knowledge of the task's topic, and the asset says so.
 
     Best effort: a model that fails, or a reply that is not a quiz, gives no quiz (logged
     by the exception's type, never the reply).
     """
-    if not material or not task_title.strip():
+    if not task_title.strip() or (not material and not from_knowledge):
         return []
     try:
         raw = await route_llm_call(

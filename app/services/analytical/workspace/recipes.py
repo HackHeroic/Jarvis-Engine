@@ -83,7 +83,7 @@ class StudyRecipe:
 
     async def assets(self, ctx: RecipeContext) -> list[StudyAsset]:
         quiz, links = await asyncio.gather(
-            generate_quiz(ctx.material, ctx.task_title, ctx.user_prompt),
+            generate_quiz(ctx.material, ctx.task_title, ctx.user_prompt, from_knowledge=True),
             ctx.links(ctx.style_search(ctx.task_title, ctx.learning_style)),
         )
         return [*excerpt_assets(ctx.material), *quiz, *links]
@@ -95,7 +95,7 @@ class PracticeRecipe:
 
     async def assets(self, ctx: RecipeContext) -> list[StudyAsset]:
         quiz, links = await asyncio.gather(
-            generate_quiz(ctx.material, ctx.task_title, ctx.user_prompt),
+            generate_quiz(ctx.material, ctx.task_title, ctx.user_prompt, from_knowledge=True),
             ctx.links(practice_links(ctx)),
         )
         return [*excerpt_assets(ctx.material), *quiz, *links]

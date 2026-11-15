@@ -206,12 +206,17 @@ async def test_workspace__study_task__excerpts_quiz_and_one_learning_style_link(
 
 
 @pytest.mark.asyncio
-async def test_workspace__study_task_without_material__no_quiz_call(env):
+async def test_workspace__study_task_without_material__questions_from_knowledge_and_say_so(env):
+    from app.services.analytical.workspace.quiz import FROM_KNOWLEDGE
+
     model = install_scripted_model(practice_generation=QUIZ)
 
     ws = await env.build("Revise DBMS normalisation")
 
-    assert "generated_quiz" not in _types(ws) and model.calls == []
+    (quiz,) = [a for a in ws.surfaced_assets if a.asset_type == "generated_quiz"]
+    assert quiz.rationale == FROM_KNOWLEDGE  # never passed off as from the user's documents
+    assert model.tasks == ["practice_generation"]
+    assert "Material:" not in model.calls[0].prompt
 
 
 @pytest.mark.asyncio
