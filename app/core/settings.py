@@ -31,6 +31,8 @@ class MemorySettings:
     retention_floor: float  # below this strength a memory leaves recall
     suppress_similarity: float  # this close to a let-go memory: never stored again
     summary_suppress_similarity: float  # a summary sentence this close to one is dropped
+    use_stability_step: float  # a memory recalled for a message: this much steadier
+    use_interval_hours: float  # ... at most once in this many hours
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,8 @@ class Settings:
                 retention_floor=cfg.MEMORY_RETENTION_FLOOR,
                 suppress_similarity=cfg.MEMORY_SUPPRESS_SIMILARITY,
                 summary_suppress_similarity=cfg.SUMMARY_SUPPRESS_SIMILARITY,
+                use_stability_step=cfg.MEMORY_USE_STABILITY_STEP,
+                use_interval_hours=cfg.MEMORY_USE_INTERVAL_HOURS,
             ),
             conversation=ConversationSettings(
                 compact_after_messages=cfg.COMPACT_AFTER_MESSAGES,

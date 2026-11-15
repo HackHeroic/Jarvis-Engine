@@ -163,7 +163,6 @@ async def test_loop__correction__one_rule_and_old_memory_not_in_the_note(
 # --- kept ----------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="M3")
 @pytest.mark.asyncio
 async def test_loop__thirty_days_later__stated_preference_still_in_the_note(
     jarvis, scripted, clock
@@ -175,6 +174,28 @@ async def test_loop__thirty_days_later__stated_preference_still_in_the_note(
     note = await _ask(jarvis, scripted, "What do you know about how I work?")
 
     assert EVENINGS in note
+
+
+@pytest.mark.asyncio
+async def test_loop__recalled_for_replies__strengthened_once_a_day_and_the_profile_not(
+    jarvis, scripted, clock
+):
+    clock.freeze(_T0, utc_clock)
+    await jarvis.say(TWO_FACTS)
+    await jarvis.say("I think most clearly in the evenings, after about 7 PM.")
+    before = {r["content"]: r for r in jarvis.rows("user_memories", user_id="alice")}
+    clock.advance(days=3)
+
+    first = await _ask(jarvis, scripted, "Tell me about Dr. Rao and his quizzes")
+    clock.advance(hours=2)
+    second = await _ask(jarvis, scripted, "Tell me about Dr. Rao and his quizzes")
+
+    assert RAO in first and RAO in second and EVENINGS in first  # relevant, and the profile
+    after = {r["content"]: r for r in jarvis.rows("user_memories", user_id="alice")}
+    assert after[RAO]["stability"] == pytest.approx(before[RAO]["stability"] + 0.5)  # once
+    assert after[RAO]["strength"] == 1.0
+    for unused in (EVENINGS, MESS):  # shown on every turn, or not recalled: not "used"
+        assert after[unused]["stability"] == before[unused]["stability"]
 
 
 # --- forgotten -----------------------------------------------------------------------

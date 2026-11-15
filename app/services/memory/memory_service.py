@@ -16,6 +16,7 @@ forgotten memory never changes again. Confirming or editing either is a conflict
 """
 
 import asyncio
+import contextvars
 import logging
 import re
 import uuid
@@ -45,6 +46,21 @@ logger = logging.getLogger(__name__)
 
 # The entity's ceiling on stability: at 20 a memory loses a factor of e every 20 weeks.
 _MAX_STABILITY = 20.0
+# A new memory's stability, in weeks to lose a factor of e unused, by what it is and
+# whether the user said it or Jarvis inferred it: what the user said lasts months, a guess
+# fades within weeks unless it comes up again. Any other type (a learned pattern,
+# feedback, a dated event) starts at a week, as every memory used to.
+_INITIAL_STABILITY_WEEKS: dict[tuple[str, MemorySource], float] = {
+    ("constraint", MemorySource.SAID): 16.0,
+    ("constraint", MemorySource.INFERRED): 4.0,
+    ("goal", MemorySource.SAID): 12.0,
+    ("goal", MemorySource.INFERRED): 4.0,
+    ("preference", MemorySource.SAID): 12.0,
+    ("preference", MemorySource.INFERRED): 3.0,
+    ("fact", MemorySource.SAID): 8.0,
+    ("fact", MemorySource.INFERRED): 2.0,
+}
+_DEFAULT_STABILITY_WEEKS = 1.0
 # Confirming a memory makes Jarvis at least this sure of it.
 _CONFIRMED_CONFIDENCE = 0.9
 # Each write's compare-and-set guard: the statuses the domain's MEMORY_TRANSITIONS lets
@@ -132,6 +148,22 @@ class RememberOutcome(BaseModel):
 
 def _has_words(text: str) -> bool:
     return _WORD.search(text) is not None
+
+
+def initial_stability(memory_type: MemoryType, provenance: MemorySource) -> float:
+    """A new memory's stability: the weeks it takes to lose a factor of e unused.
+
+    Said: constraint 16, goal and preference 12, fact 8. Inferred: constraint and goal
+    4, preference 3, fact 2. Any other type: 1.
+    """
+    return _INITIAL_STABILITY_WEEKS.get((memory_type, provenance), _DEFAULT_STABILITY_WEEKS)
+
+
+def _recently_full(memory: Memory, now: datetime, interval: timedelta) -> bool:
+    """Whether ``memory`` was set to full strength (learned, said again, confirmed or
+    used) no more than ``interval`` before ``now``. Only the decay sweep stores a strength
+    under 1, so a memory under 1 was last set to full longer ago than that."""
+    return memory.strength >= 1.0 and now - memory.strength_as_of <= interval
 
 
 def _query_parts(query: str, max_parts: int) -> list[str]:
@@ -246,6 +278,9 @@ class MemoryService:
         self._settings = settings or default_settings().memory
         # drop_suppressed's answers: (user, texts, let-go ids, threshold) -> texts kept.
         self._kept: dict[tuple, tuple[str, ...]] = {}
+        # note_used runs no turn waits for (note_used_in_background), until shutdown.
+        self._background: set[asyncio.Task] = set()
+        self._closed = False
 
     async def remember(
         self,
@@ -265,6 +300,8 @@ class MemoryService:
         active or faded memory of the same
         type reinforces it (and confirms it when the user said it); anything else is
         created. Text with no words is never embedded: there is nothing to remember.
+        A new memory starts at ``initial_stability`` for its type and provenance; a
+        reinforced one gains a week of stability (at most 20).
         """
         if not _has_words(candidate.content):
             return RememberOutcome(action="suppressed", memory=None)
@@ -288,6 +325,7 @@ class MemoryService:
             provenance=provenance,
             origin=origin,
             confidence=candidate.confidence,
+            stability=initial_stability(candidate.memory_type, provenance),
             strength_as_of=now,
             created_at=now,
             expires_at=candidate.expires_at,
@@ -520,6 +558,89 @@ class MemoryService:
         )
         return Recall(profile=profile, relevant=relevant, tokens=profile_tokens + relevant_tokens)
 
+    async def note_used(self, user_id: str, memories: list[Memory], now: datetime) -> int:
+        """The memories a turn recalled as relevant were used: each goes back to full
+        strength as of ``now`` and gains MEMORY_USE_STABILITY_STEP of stability (at most
+        20). Return how many were strengthened.
+
+        For ``Recall.relevant`` only: the profile is shown on every turn, so showing it
+        says nothing. At most once per MEMORY_USE_INTERVAL_HOURS: a memory set to full
+        strength (learned, said again, confirmed or used) no longer ago than that is left
+        as it is, so a memory recalled in ten replies in a day is strengthened once. Only
+        an active memory that nothing superseded is strengthened, and the write is a
+        compare-and-set on its status: one dismissed or forgotten since it was read is
+        never touched. Best effort: a failed write is logged by its type, never its
+        words, and the others are still tried.
+        """
+        interval = timedelta(hours=self._settings.use_interval_hours)
+        strengthened = 0
+        failures: dict[str, int] = {}
+        for memory in memories:
+            if (
+                memory.id is None
+                or memory.user_id != user_id
+                or memory.status is not MemoryStatus.ACTIVE
+                or memory.superseded_by is not None
+                or _recently_full(memory, now, interval)
+            ):
+                continue
+            steadier = min(_MAX_STABILITY, memory.stability + self._settings.use_stability_step)
+            try:
+                await self._memories.update(
+                    user_id, memory.id, only_if_status=_ACTIVE,
+                    strength=1.0, strength_as_of=now, stability=steadier,
+                )
+            except errors.StaleVersionError:  # dismissed, forgotten or faded since it was read
+                continue
+            except Exception as exc:  # best effort: the turn never fails for this
+                kind = type(exc).__name__
+                failures[kind] = failures.get(kind, 0) + 1
+                continue
+            strengthened += 1
+        if failures:
+            logger.warning(
+                "Recalled memories not strengthened: %d of %d (%s)",
+                sum(failures.values()),
+                len(memories),
+                ", ".join(f"{kind} x{count}" for kind, count in sorted(failures.items())),
+            )
+        return strengthened
+
+    def note_used_in_background(self, user_id: str, memories: list[Memory], now: datetime) -> None:
+        """``note_used`` in a background task the turn never waits for (off the reply's
+        path), in a fresh context. A failure is logged by its type. Nothing to note, or
+        after ``shutdown``: nothing starts."""
+        if self._closed or not memories:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._note_used_quietly(user_id, list(memories), now), context=contextvars.Context()
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _note_used_quietly(self, user_id: str, memories: list[Memory], now: datetime) -> None:
+        try:
+            await self.note_used(user_id, memories, now)
+        except Exception as exc:  # never an unretrieved task exception
+            logger.warning("Recalled memories not strengthened (%s)", type(exc).__name__)
+
+    async def settle(self) -> None:
+        """Wait until no ``note_used_in_background`` run is in flight."""
+        while self._background:
+            await asyncio.wait(set(self._background))
+
+    async def shutdown(self, grace_s: float = 2.0) -> None:
+        """Start no more background runs; give those in flight ``grace_s`` to finish, then
+        cancel the rest and wait for them to end."""
+        self._closed = True
+        running = set(self._background)
+        if not running:
+            return
+        _, unfinished = await asyncio.wait(running, timeout=grace_s)
+        for task in unfinished:
+            task.cancel()
+        await asyncio.gather(*unfinished, return_exceptions=True)
+
     async def drop_let_go(self, user_id: str, texts: list[str]) -> list[str]:
         """``texts``, in order, less each one ``remember`` would suppress: one at least
         ``suppress_similarity`` close to a memory the user forgot or dismissed.
@@ -598,11 +719,15 @@ class MemoryService:
         Strength is stored as measured at ``now`` (with ``strength_as_of = now``), so
         reading it later never decays the same hours twice. A memory below
         MEMORY_RETENTION_FLOOR fades, unless it is a constraint. A memory measured at or
-        after ``now`` has not decayed and is left alone.
+        after ``now`` has not decayed and is left alone, and so is one set to full
+        strength within MEMORY_USE_INTERVAL_HOURS: that mark is how ``note_used`` knows
+        it was just used. Nothing is lost: the next sweep persists its decay from the
+        same instant, and recall reads strength as of the moment it asks.
         """
+        interval = timedelta(hours=self._settings.use_interval_hours)
         faded = 0
         for memory in await self._memories.list(user_id):
-            if memory.strength_as_of >= now:
+            if memory.strength_as_of >= now or _recently_full(memory, now, interval):
                 continue
             strength = memory.strength_at(now)
             fields: dict = {"strength": strength, "strength_as_of": now}

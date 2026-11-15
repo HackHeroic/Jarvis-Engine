@@ -273,8 +273,9 @@ class AppContainer:
 
     async def shutdown(self) -> None:
         """Stop the background work the container owns: PEARL runs, the pattern
-        proposals they start and conversation compactions get a short grace to finish,
-        then are cancelled."""
+        proposals they start, conversation compactions and the strengthening of recalled
+        memories get a short grace to finish, then are cancelled."""
         await self.pattern_observer.shutdown()
         await self.anticipation_listener.shutdown()
         await self.conversation_memory.shutdown()
+        await self.memory_service.shutdown()

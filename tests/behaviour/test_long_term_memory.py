@@ -220,13 +220,14 @@ async def test_memory__unused_for_a_week__still_in_context(jarvis, llm, frozen_m
 
 
 @pytest.mark.asyncio
-async def test_memory__unused_for_a_month__fades_below_the_floor_and_leaves_context(
+async def test_memory__unused_for_seven_months__fades_below_the_floor_and_leaves_context(
     jarvis, llm, frozen_memory_clock
 ):
     _script_memories(llm, _RULES)
     await jarvis.say("I'm training for the Mumbai marathon in March")
 
-    frozen_memory_clock.advance(days=30)
+    # A said goal loses a factor of e every 12 weeks: under the floor after ~28 unused.
+    frozen_memory_clock.advance(days=200)
     calls_before = len(llm.calls)
     turn = await jarvis.say("What should I focus on this week?")
 

@@ -279,6 +279,12 @@ MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
 # word with the message ("Thursdays" in "anything about Thursdays?").
 MEMORY_RECALL_MAX_PARTS: int = 3
 MEMORY_RECALL_WORD_MATCH_SIMILARITY: float = 0.2
+# A memory recalled as relevant to a message (not the always-shown profile) is used:
+# it goes back to full strength and its stability (weeks to lose a factor of e) grows by
+# MEMORY_USE_STABILITY_STEP, at most once every MEMORY_USE_INTERVAL_HOURS. How long a new
+# memory lasts before that depends on what it is and who said it (initial_stability).
+MEMORY_USE_STABILITY_STEP: float = 0.5
+MEMORY_USE_INTERVAL_HOURS: float = 20.0
 
 # The largest chat turn the stream accepts (ChatStreamRequest): a message of at most
 # MAX_CHAT_PROMPT_CHARS characters, and an upload that decodes to at most

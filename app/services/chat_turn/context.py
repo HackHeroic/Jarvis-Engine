@@ -125,7 +125,9 @@ async def read_conversation(
 
     Then the turn's context note: what ``MemoryService.recall`` finds for this message
     within its token budgets (a trivial message gets the profile only), the plate and the
-    time on the user's clock. The memory panel shows exactly the recalled memories. A read
+    time on the user's clock. The memory panel shows exactly the recalled memories. The
+    relevant ones are then noted as used (``MemoryService.note_used_in_background``), off
+    the reply's path. A read
     that fails is left out of the note and logged; the turn goes on. Without a composition
     root there is no note, and the history is the plain newest-ten window, as it is when
     the window cannot be read (for one, before the summary columns' migration is applied).
@@ -232,6 +234,9 @@ async def read_conversation(
         recall, now=now, zone=zone, since=since,
         earlier=window.earlier if window is not None else None, plate=plate,
     )
+    # The memories recalled for this message were used: they are kept fresh, in the
+    # background (the reply never waits for it). The profile is shown on every turn.
+    container.memory_service.note_used_in_background(request.user_id, recall.relevant, now)
     return TurnContext(
         history=history,
         memory_note=note or "",

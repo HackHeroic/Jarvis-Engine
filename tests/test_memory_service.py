@@ -3,7 +3,8 @@
 InMemory repositories, the bag-of-words embedder and a fixed clock. A fact said
 again is reinforced, not stored twice; a contradiction supersedes the old fact; a
 fact the user forgot or dismissed is recognised when it comes up again and is not
-stored. Decay is persisted by a sweep, and a month-unused memory fades.
+stored. Decay is persisted by a sweep, and a memory unused past the retention floor
+fades: how soon depends on what it is and who said it, and using it keeps it.
 """
 
 import logging
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 import pytest
 
+import app.core.config as config
 from app.domain import errors
 from app.domain.entities import Memory, MemorySource, MemoryStatus, SUPPRESSING_STATUSES
 from app.infrastructure.persistence.factory import RepositoryFactory
@@ -116,7 +118,7 @@ async def test_remember__same_fact_again__reinforced_not_duplicated_and_confirme
     (stored,) = await _every_row(memories)
     assert stored.id == outcome.memory.id == first.id
     assert stored.content == MARATHON  # the words it was first learned in
-    assert stored.stability == pytest.approx(2.0)
+    assert stored.stability == pytest.approx(first.stability + 1.0)  # 12 weeks, then 13
     assert stored.observation_count == 2
     assert stored.confidence == pytest.approx(0.6)
     assert (stored.strength, stored.strength_as_of) == (1.0, clock.now)
@@ -214,7 +216,7 @@ async def test_remember__after_dismiss__suppressed(service, memories):
 @pytest.mark.asyncio
 async def test_remember__faded_fact_mentioned__reactivated(service, memories, clock):
     memory = (await service.remember("alice", _candidate(MARATHON, "goal"))).memory
-    clock.advance(days=30)
+    clock.advance(weeks=30)  # a said goal (12 weeks) is under the floor after ~28 unused
     assert await service.fade_stale("alice", clock.now) == 1
 
     outcome = await service.remember("alice", _candidate(MARATHON_AGAIN, "goal"))
@@ -340,18 +342,20 @@ async def test_list_active__expired_temporal_event__excluded(service, clock):
 
 
 @pytest.mark.asyncio
-async def test_fade_stale__month_unused__faded_and_constraint_kept(service, memories):
+async def test_fade_stale__unused_past_the_floor__faded_and_constraint_kept(service, memories):
     fact = (await service.remember("alice", _candidate(MARATHON, "goal"))).memory
     rule = (await service.remember("alice", _candidate("Never schedule before 11 AM", "constraint"))).memory
-    month_later = NOW + timedelta(days=30)
+    # Both under the floor: the said goal (12 weeks) and the said constraint (16 weeks).
+    much_later = NOW + timedelta(weeks=40)
 
-    assert await service.fade_stale("alice", month_later) == 1
+    assert await service.fade_stale("alice", much_later) == 1
 
     assert (await memories.get("alice", fact.id)).status is MemoryStatus.FADED
     kept = await memories.get("alice", rule.id)
     assert kept.status is MemoryStatus.ACTIVE
-    assert kept.strength == pytest.approx(math.exp(-30 * 24 / 168))
-    assert kept.strength_as_of == month_later
+    assert kept.strength == pytest.approx(math.exp(-40 / 16))
+    assert kept.strength < config.MEMORY_RETENTION_FLOOR  # under it, and still kept
+    assert kept.strength_as_of == much_later
 
 
 @pytest.mark.asyncio
@@ -364,7 +368,7 @@ async def test_fade_stale__persists_strength_without_double_decay(service, memor
 
     stored = await memories.get("alice", memory.id)
     assert stored.strength_as_of == NOW + timedelta(days=4)
-    assert stored.strength == pytest.approx(math.exp(-4 * 24 / 168))
+    assert stored.strength == pytest.approx(math.exp(-4 * 24 / (168 * memory.stability)))
     assert stored.strength_at(later) == pytest.approx(expected)
 
 
@@ -382,7 +386,7 @@ async def test_memory_decay_sweep__one_users_failure__others_faded(store, clock,
     sweep = MemoryDecaySweep(service)
 
     with caplog.at_level(logging.WARNING, logger="app.services.memory.memory_service"):
-        changed = await sweep.run(["bob", "alice"], NOW + timedelta(days=30))
+        changed = await sweep.run(["bob", "alice"], NOW + timedelta(weeks=30))
 
     assert changed == 1
     assert (await memories.get("alice", memory.id)).status is MemoryStatus.FADED
@@ -561,3 +565,194 @@ async def test_drop_let_go__forgotten_rule__dropped_by_the_test_remember_uses(se
     assert await service.drop_let_go("bob", ["Never study before 11 AM"]) == [
         "Never study before 11 AM"
     ]  # another user's forgetting is not bob's
+
+
+# --- how long a memory lasts: what it is, who said it, and whether it is used ----------
+
+
+def test_initial_stability__said_preference__12_weeks():
+    from app.services.memory.memory_service import initial_stability
+
+    assert initial_stability("preference", MemorySource.SAID) == 12.0
+
+
+def test_initial_stability__inferred_fact__2_weeks():
+    from app.services.memory.memory_service import initial_stability
+
+    assert initial_stability("fact", MemorySource.INFERRED) == 2.0
+
+
+@pytest.mark.parametrize(
+    ("memory_type", "said", "inferred"),
+    [
+        ("constraint", 16.0, 4.0),
+        ("goal", 12.0, 4.0),
+        ("preference", 12.0, 3.0),
+        ("fact", 8.0, 2.0),
+        ("behavioral_pattern", 1.0, 1.0),  # not in the table: a week, as before
+        ("feedback", 1.0, 1.0),
+        ("temporal_event", 1.0, 1.0),
+    ],
+)
+def test_initial_stability__by_type_and_provenance__weeks_to_lose_a_factor_of_e(
+    memory_type, said, inferred
+):
+    from app.services.memory.memory_service import initial_stability
+
+    assert initial_stability(memory_type, MemorySource.SAID) == said
+    assert initial_stability(memory_type, MemorySource.INFERRED) == inferred
+
+
+@pytest.mark.asyncio
+async def test_remember__said_preference__after_13_days_strength_at_least_0_8(service, clock):
+    """The measured case: "I think most clearly in the evenings" read 0.20 after 13 days."""
+    memory = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+    assert memory.stability == 12.0
+
+    clock.advance(days=13)
+
+    assert memory.strength_at(clock.now) >= 0.8
+    assert [m.id for m in await service.list_active("alice")] == [memory.id]
+
+
+@pytest.mark.asyncio
+async def test_remember__inferred_fact_never_seen_again__below_the_floor_within_six_weeks(
+    service, memories, clock
+):
+    memory = (await service.remember(
+        "alice", _candidate("Works in the library on Tuesdays"), provenance=MemorySource.INFERRED,
+    )).memory
+    clock.advance(weeks=1)
+    assert [m.id for m in await service.list_active("alice")] == [memory.id]
+
+    clock.advance(weeks=5)
+
+    assert await service.list_active("alice") == []
+    assert await service.fade_stale("alice", clock.now) == 1
+    assert (await memories.get("alice", memory.id)).status is MemoryStatus.FADED
+
+
+@pytest.mark.asyncio
+async def test_remember__said_again__stability_up_by_one_and_capped(service, memories):
+    rule = _candidate("Never schedule before 11 AM", "constraint")
+    first = (await service.remember("alice", rule)).memory
+    assert first.stability == 16.0
+
+    for _ in range(6):
+        await service.remember("alice", rule)
+
+    assert (await memories.get("alice", first.id)).stability == 20.0  # 16 + 1 x 4, then capped
+
+
+async def _note_used_now(service, memories, memory: Memory, clock) -> int:
+    """``note_used`` at the clock's now, for the memory as stored now (what a turn's recall
+    would hand it)."""
+    return await service.note_used("alice", [await memories.get("alice", memory.id)], clock.now)
+
+
+@pytest.mark.asyncio
+async def test_note_used__relevant_memory__strength_reset_and_stability_up_by_half(
+    service, memories, clock
+):
+    memory = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(days=3)
+
+    assert await _note_used_now(service, memories, memory, clock) == 1
+
+    stored = await memories.get("alice", memory.id)
+    assert (stored.strength, stored.strength_as_of) == (1.0, clock.now)
+    assert stored.stability == pytest.approx(8.5)
+    # Being used is not being said: no repeat counted, nothing confirmed.
+    assert (stored.observation_count, stored.last_confirmed_at) == (1, None)
+
+
+@pytest.mark.asyncio
+async def test_note_used__same_memory_twice_within_20_hours__strengthened_once(
+    service, memories, clock
+):
+    """Review Focus 4: recalled in ten replies in one day, it is strengthened once, the
+    decay sweep running in between or not."""
+    memory = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(days=3)
+
+    strengthened = 0
+    for hour in range(10):
+        if hour == 5:
+            await service.fade_stale("alice", clock.now)  # the daily sweep, mid-day
+        recall = await service.recall("alice", "how is my marathon training", now=clock.now)
+        assert [m.id for m in recall.relevant] == [memory.id]
+        strengthened += await service.note_used("alice", recall.relevant, clock.now)
+        clock.advance(hours=1)
+
+    assert strengthened == 1
+    assert (await memories.get("alice", memory.id)).stability == pytest.approx(8.5)
+    clock.advance(hours=11)  # 21 hours after the first use: once more
+    assert await _note_used_now(service, memories, memory, clock) == 1
+    assert (await memories.get("alice", memory.id)).stability == pytest.approx(9.0)
+
+
+@pytest.mark.asyncio
+async def test_note_used__decay_persisted_since_its_last_use__strengthened(
+    service, memories, clock
+):
+    """The sweep moved ``strength_as_of`` an hour ago, but nothing set the memory to full
+    strength within 20 hours: being used now strengthens it."""
+    memory = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(days=3)
+    await service.fade_stale("alice", clock.now)
+    clock.advance(hours=1)
+
+    assert await _note_used_now(service, memories, memory, clock) == 1
+    assert (await memories.get("alice", memory.id)).strength == 1.0
+
+
+@pytest.mark.asyncio
+async def test_note_used__just_learned__not_strengthened(service, memories, clock):
+    memory = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(hours=2)
+
+    assert await _note_used_now(service, memories, memory, clock) == 0
+    assert (await memories.get("alice", memory.id)).stability == 8.0
+
+
+@pytest.mark.asyncio
+async def test_note_used__dismissed_or_forgotten_memory__untouched(service, memories, clock):
+    """Review Focus 5: read while still active (as recall read it), let go of before the
+    write: never strengthened, and a forgotten one stays without its words."""
+    dismissed = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+    forgotten = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(days=3)
+    read = [await memories.get("alice", dismissed.id), await memories.get("alice", forgotten.id)]
+    await service.dismiss("alice", dismissed.id)
+    await service.forget("alice", forgotten.id)
+    before = await _every_row(memories)
+
+    assert await service.note_used("alice", read, clock.now) == 0
+    assert await service.note_used("alice", await _every_row(memories), clock.now) == 0
+
+    assert await _every_row(memories) == before
+
+
+@pytest.mark.asyncio
+async def test_note_used__store_fails__logged_and_nothing_raised(store, clock, caplog):
+    class _WritesFail(InMemoryMemoryRepository):
+        async def update(self, user_id, memory_id, **fields):
+            if "stability" in fields and "observation_count" not in fields:
+                raise errors.PersistenceError("Could not reach the database.")
+            return await super().update(user_id, memory_id, **fields)
+
+    service = MemoryService(_WritesFail(store), BagOfWordsEmbedder(), clock=clock)
+    memory = (await service.remember("alice", _candidate(MARATHON, "fact"))).memory
+    clock.advance(days=3)
+    recall = await service.recall("alice", "how is my marathon training", now=clock.now)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.memory.memory_service"):
+        assert await service.note_used("alice", recall.relevant, clock.now) == 0
+        service.note_used_in_background("alice", recall.relevant, clock.now)
+        await service.settle()
+
+    assert [m.id for m in recall.relevant] == [memory.id]  # the recall stands
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "app.services.memory.memory_service"]
+    assert len(warnings) == 2 and all("PersistenceError" in w for w in warnings)
+    assert all("marathon" not in w.lower() for w in warnings)  # no memory words in the log

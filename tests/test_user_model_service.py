@@ -232,7 +232,7 @@ async def test_snapshot__memories__provenance_and_freshness(service, repos, memo
         provenance=MemorySource.INFERRED,
         origin="behavior",
     )).memory
-    clock.advance(days=7)  # a week unused: strength falls by a factor of e
+    clock.advance(days=7)  # a week unused
 
     view = await service.snapshot("alice")
 
@@ -241,8 +241,10 @@ async def test_snapshot__memories__provenance_and_freshness(service, repos, memo
         MemorySource.SAID, MemorySource.INFERRED, MemorySource.INFERRED
     ]
     assert view.as_of == NOW + timedelta(days=7)
+    # A factor of e every 12 weeks for the said goal, 3 for the noticed preference, 1 for
+    # the learned pattern.
     assert [m.strength_at(view.as_of) for m in view.memories] == pytest.approx(
-        [math.exp(-1)] * 3
+        [math.exp(-1 / 12), math.exp(-1 / 3), math.exp(-1)]
     )
 
 
