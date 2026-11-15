@@ -2,7 +2,7 @@
 
 Jarvis raises errors on purpose from one hierarchy rooted at `JarvisError`; each class carries a stable machine code and the HTTP status the API answers with. Global handlers turn every error a request can end in — a `JarvisError`, a request-validation error, Starlette's own `HTTPException` for an unknown path or method, or an exception nobody caught — into one JSON envelope `{"error": {"code", "message", "details", "request_id"}}`, whose model is `ErrorResponse` (`app/schemas/errors.py`). A streamed chat turn sends the same model as an SSE `error` frame. No route raises `HTTPException`. Exception text from libraries never reaches a client; it is logged with the request id. This document gives the hierarchy, real envelope examples, a failure-scenario table (what the user sees, what the system does, where, and which test pins it), the concurrency mechanisms in depth (the atomic `accept_draft` function and its lock order, the draft version check, compare-and-set on statuses, the turn lock and the stream that always closes, per-user locks and single-flight, the PRIMARY-model lock, the compaction lock, and what is process-local), and the edge-case rules for the user's clock, read caps and bounded waits. References are `path:line` at commit `d3e9132`, now part of `main`. Rows changed or added by the fixes up to `cc8d170` (a resumed conversation reading its draft's status, a dropped kept-alive connection retried on reads, documents read off the event loop, the web-search cooldown, short questions about notes) cite functions and tests instead of lines.
 
-**Owner: ______**
+**Owner: Pugal**
 
 ---
 

@@ -2,7 +2,7 @@
 
 Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 20 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `d3e9132` (now part of `main`), not from memory. No migration changed between `dca181d`, where it was first written, and `d3e9132`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
 
-Owner: ______
+Owner: Pugal
 
 ---
 

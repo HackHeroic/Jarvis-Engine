@@ -1377,25 +1377,25 @@ async function s23() {
     ["Planning and solver", "Tasks and outcome history", "PEARL and focus profile"],
     ["Anticipation and consent", "Frontend", "Tests, live check and seed"],
   ];
+  const owners = ["Pugal", "Amathziah", "Murali", "Ravi"];
   const gap = 0.3;
   const w = (CW - gap * 3) / 4;
   for (let i = 0; i < 4; i++) {
     const x = MX + i * (w + gap);
     box(s, x, 2.0, w, 4.3, { name: `Member ${i + 1}` });
     await orb(s, "User", x + 0.62, 2.6, 0.68, { solid: true, accent: i % 2 ? HEX.gold : HEX.terra, scheme: i % 2 ? C.accent2 : C.accent1 });
-    text(s, `MEMBER ${i + 1}`, { x: x + 1.1, y: 2.47, w: w - 1.2, h: 0.28, fontSize: 12, bold: true, color: C.text2, charSpacing: 2 });
-    text(s, "Owner: ________", { x: x + 0.3, y: 3.15, w: w - 0.5, h: 0.4, fontSize: 18, bold: true, objectName: `Owner placeholder ${i + 1}` });
+    text(s, owners[i], { x: x + 1.1, y: 2.47, w: w - 1.2, h: 0.32, fontSize: 16, bold: true, color: C.text2 });
+    text(s, "Owner", { x: x + 0.3, y: 3.15, w: w - 0.5, h: 0.4, fontSize: 18, bold: true, objectName: `Owner ${owners[i]}` });
     text(
       s,
       members[i].map((m, j) => ({ text: m, options: { bullet: { indent: 14 }, breakLine: j < 2 } })),
       { x: x + 0.3, y: 3.8, w: w - 0.5, h: 2.3, fontSize: 15, color: C.text2, paraSpaceAfter: 10 }
     );
   }
-  text(s, "Split suggested in doc 10 §4; owner names to be added.", { x: MX, y: 6.45, w: 9, h: 0.28, fontSize: 12, color: C.text2 });
+  text(s, "Each owner presents the areas listed here; see doc 10 §4.", { x: MX, y: 6.45, w: 9, h: 0.28, fontSize: 12, color: C.text2 });
   s.addNotes(
     "Each member explains their own part, so the contribution map in 10-demo-and-contributions.md section 4 assigns thirteen subsystems with their key files and what the owner must be able to explain. " +
-      "The four-way split shown here is the one suggested there; the team can change it. " +
-      "Fill in the owner names here and in the 'Owner:' line at the top of each capstone document before the evaluation. Docs are shared: each owner keeps their own sections current."
+      "The four-way ownership split shown here is recorded in doc 10 §4 and in the owner lines on the capstone documents. Docs are shared: each owner keeps their own sections current."
   );
 }
 

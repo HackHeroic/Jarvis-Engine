@@ -2,7 +2,7 @@
 
 Jarvis is a personal intelligence for one person. It keeps their work ready before they ask: it turns a brain dump into a plan they can review, learns from what actually happened to their tasks (the outcome history), remembers what they tell it and forgets on request, and makes the first move (a morning brief, an offer to turn a habit into a rule) only within a consent policy the user controls. It runs local-first on an on-device model, with a cloud tier (Claude Sonnet, then Gemini as a last resort) that only ever receives redacted text. This document lists what the system must do (functional requirements), how well it must do it (non-functional requirements), who and what it interacts with (actors), and the eight core use cases in detail. Every requirement is traced to the endpoint or service that implements it and to the test or live-check step that proves it. File references are `path:line` at commit `d3e9132`, now part of `main`.
 
-**Owner: ______**
+**Owner: Murali**
 
 ---
 

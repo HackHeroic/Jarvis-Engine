@@ -2,7 +2,7 @@
 
 Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 49 operations on 43 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `d3e9132` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
 
-Owner: ______
+Owner: Pugal
 
 ---
 
