@@ -12,7 +12,6 @@ search says so plainly and never surfaces a link.
 """
 
 import json
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,62 +21,15 @@ import app.core.config as _cfg
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
 from app.domain.events import NullEventBus
-from app.domain.ports import LLMProvider, LLMRequest
 from app.infrastructure.llm.chain import FallbackChainProvider
 from app.infrastructure.llm.factory import set_chain
-from app.infrastructure.llm.transport import strip_fences, translated_errors
+from app.services.analytical.workspace.materials import MaterialChunk
+from tests.fakes import ScriptedModel
 
 # A web search must be metered onto a bus (``metered_web_search`` refuses one without):
 # these tests check the search itself, so they pass one that meters nowhere.
 _NO_LEDGER = NullEventBus()
 _TURN_CONTAINER = SimpleNamespace(events=_NO_LEDGER)  # the turn's composition root, faked
-
-
-class ScriptedModel(LLMProvider):
-    """A model that answers each task from a script and records every request.
-
-    A reply is a value (text, a dict or a schema instance), an exception to raise,
-    or a list of those consumed one per call. A task without a reply is unavailable.
-    """
-
-    name = "scripted"
-
-    def __init__(self, replies: dict[str, Any], location: LLMLocation = LLMLocation.CLOUD) -> None:
-        self.location = location
-        self.calls: list[LLMRequest] = []
-        self._replies = {task: list(r) if isinstance(r, list) else r for task, r in replies.items()}
-
-    @property
-    def tasks(self) -> list[str]:
-        return [c.task for c in self.calls]
-
-    def is_available(self) -> bool:
-        return True
-
-    def _answer(self, req: LLMRequest) -> Any:
-        self.calls.append(req)
-        reply = self._replies.get(req.task)
-        if isinstance(reply, list):
-            reply = reply.pop(0) if reply else None
-        if reply is None:
-            raise LLMUnavailableError(f"no scripted reply for {req.task!r}")
-        if isinstance(reply, BaseException):
-            raise reply
-        schema = req.response_schema
-        if schema is None or isinstance(reply, schema):
-            return reply
-        with translated_errors():  # unparseable output is a model failure, as in the adapters
-            if isinstance(reply, dict):
-                return schema.model_validate(reply)
-            return schema.model_validate_json(strip_fences(reply))
-
-    async def complete(self, req: LLMRequest) -> Any:
-        return self._answer(req)
-
-    async def stream(self, req: LLMRequest) -> AsyncIterator[tuple[str, str]]:
-        text = self._answer(req)
-        for i in range(0, len(text), 4):  # mid-word chunks, as a real stream arrives
-            yield ("content", text[i : i + 4])
 
 
 @pytest.fixture
@@ -283,23 +235,26 @@ async def test_habit_translation__model_down__raises_to_the_caller(llm, habit_tr
 # --- workspace practice quiz -----------------------------------------------------------
 
 
+_DIJKSTRA = [MaterialChunk(text="Dijkstra uses a min-heap.", source_id="src-1", file_name="Graphs.pdf")]
+
+
 @pytest.mark.asyncio
 async def test_practice_quiz__routes_through_the_chain__returns_the_quiz_assets(llm):
     from app.services.analytical.workspace_builder import generate_practice_assets
 
     quiz = {
         "asset_type": "generated_quiz", "title": "Quiz: Dijkstra",
-        "content_or_url": "1. Why a heap?", "rationale": "From your syllabus",
+        "content_or_url": "1. Why a heap?",
     }
     model = llm(practice_generation=json.dumps({"assets": [quiz]}))
 
-    assets = await generate_practice_assets(
-        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
-    )
+    assets = await generate_practice_assets(_DIJKSTRA, "Dijkstra", [], bus=_NO_LEDGER)
 
     assert model.tasks == ["practice_generation"]
     assert model.calls[0].role == "primary"
-    assert [a.model_dump(exclude={"metadata"}) for a in assets] == [quiz]
+    assert [a.model_dump(exclude={"metadata"}) for a in assets] == [
+        {**quiz, "rationale": "From Graphs.pdf"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -308,9 +263,7 @@ async def test_practice_quiz__model_down__returns_no_assets(llm):
 
     llm(practice_generation=_down())
 
-    assert await generate_practice_assets(
-        ["Dijkstra uses a min-heap."], "Dijkstra", [], bus=_NO_LEDGER
-    ) == []
+    assert await generate_practice_assets(_DIJKSTRA, "Dijkstra", [], bus=_NO_LEDGER) == []
 
 
 # --- documents and ingestion ------------------------------------------------------------

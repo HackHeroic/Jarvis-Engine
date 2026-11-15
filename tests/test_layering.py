@@ -451,8 +451,7 @@ _PLAN_3_CUT = "Plan 3 cut (Task 6): no repository yet for"
 _RAW_TABLE_CALLS_ALLOWED: dict[str, str] = {
     "services/analytical/workspace_builder.py": (
         "task_workspaces cache (decision 10); its user_tasks reads need topic_keywords and"
-        " implementation_intention, which the Task entity does not carry; its chunk lookup"
-        " reads task_materials itself (module functions the container does not build)"
+        " implementation_intention, which the Task entity does not carry"
     ),
     "services/user_preferences.py": "learning_style read (decision 10)",
     "services/chat_history.py": f"{_PLAN_3_CUT} chat_sessions / chat_messages",

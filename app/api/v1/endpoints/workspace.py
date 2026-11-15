@@ -39,10 +39,11 @@ async def get_task_workspace(
     """Get cached workspace, or build + persist (24h TTL) if missing/stale/refresh."""
     if not user_id:
         raise errors.ValidationError("user_id is required.")
-    # The goals the WOOP card reads, the bus a web search is metered onto and the task's
-    # linked documents: the composition root's. Without one the card keeps the task's
-    # title, no web search is made (an unmetered cloud send is refused, never made
-    # silently) and no documents are listed.
+    # The goals the WOOP card reads, the bus a web search is metered onto, the task's
+    # linked documents and the document records its material is named from: the
+    # composition root's. Without one the card keeps the task's title, no web search is
+    # made (an unmetered cloud send is refused, never made silently), no documents are
+    # listed and the task has no material.
     container = container_of(http_request)
     try:
         return await get_or_build_task_workspace(
@@ -53,6 +54,7 @@ async def get_task_workspace(
             goals=container.repos.goals if container is not None else None,
             bus=container.events if container is not None else None,
             documents=container.documents if container is not None else None,
+            materials=container.repos.documents if container is not None else None,
         )
     except errors.JarvisError:
         raise  # already says what went wrong, with its own status
