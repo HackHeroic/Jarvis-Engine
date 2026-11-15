@@ -316,3 +316,44 @@ async def test_observation__slow_store_outlasts_the_cap__held_moments_told_this_
     ) == ["peak_hour:19", "skip_time_window:9"]
     assert result["patterns_detected_count"] == 2
     assert container.patterns.drain_pending("alice") == []  # told once
+
+
+# --- the words a stated rule is stored in ---------------------------------------------
+
+
+def _said(habits: list[str], memories: list[dict]) -> BrainDumpExtraction:
+    return BrainDumpExtraction(
+        inline_habits=habits, memories=[ExtractedMemory(**m) for m in memories]
+    )
+
+
+def test_rule_text__constraint_memory_states_the_habit__its_cleaned_words():
+    from app.core.observation import rule_text
+
+    habit = "Actually I moved my gym to 7 AM on weekdays, not 6 PM anymore."
+    said = _said([habit], [
+        {"type": "fact", "content": "Dr. Rao gives quizzes on Thursdays"},
+        {"type": "constraint", "content": "Goes to the gym at 7 AM on weekdays"},
+    ])
+
+    assert rule_text(habit, said) == "Goes to the gym at 7 AM on weekdays"
+
+
+@pytest.mark.parametrize(
+    ("habits", "memories"),
+    [
+        (["Never put study before 11 AM"], []),  # no memory: the habit is its own
+        (["Never put study before 11 AM"],
+         [{"type": "preference", "content": "Never puts study before 11 AM"}]),  # not a rule
+        (["Never put study before 11 AM", "Gym from 6 to 7 pm"],  # one memory says both
+         [{"type": "constraint",
+           "content": "Never put study before 11 AM, and gym from 6 to 7 pm"}]),
+    ],
+    ids=["no memory", "not a constraint", "one memory states two rules"],
+)
+def test_rule_text__no_memory_that_is_this_rule_alone__the_users_words(habits, memories):
+    from app.core.observation import rule_text
+
+    said = _said(habits, memories)
+
+    assert [rule_text(habit, said) for habit in habits] == habits

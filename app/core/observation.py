@@ -265,8 +265,31 @@ async def persist_turn_memories(state: dict) -> list[RememberOutcome]:
         landed.append(outcome)
         if outcome.memory is not None and outcome.memory.id:
             stored.append((memory, outcome.memory.id))
+    await _replace_corrected_rules(container, user_id, landed)
     await _link_rules(container, user_id, state.get("saved_rule_ids") or {}, stored)
     return landed
+
+
+async def _replace_corrected_rules(
+    container: Any, user_id: str, outcomes: list[RememberOutcome]
+) -> None:
+    """Delete the rules that rested on a memory this turn superseded
+    (``StatedRules.replace_for_superseded``): the user corrected what they said, so the
+    old rule goes and the corrected one, linked to the new memory next, is the one left.
+    A superseded memory no rule rests on deletes nothing. Failures are logged by type.
+    """
+    replaced = [o.superseded_id for o in outcomes if o.action == "superseded" and o.superseded_id]
+    if not replaced:
+        return
+
+    async def replace_all() -> None:
+        for memory_id in replaced:
+            await container.stated_rules.replace_for_superseded(user_id, memory_id)
+
+    try:
+        await asyncio.wait_for(replace_all(), timeout=MEMORY_WRITE_TIMEOUT_S)
+    except Exception as e:  # asyncio.TimeoutError included
+        logger.warning(f"A corrected rule's old rule was not removed ({type(e).__name__})")
 
 
 def _states(memory: ExtractedMemory, habit: str) -> bool:
@@ -274,6 +297,28 @@ def _states(memory: ExtractedMemory, habit: str) -> bool:
     covers them (``turn_memories`` stored no separate memory for the habit then)."""
     habit = habit.strip()
     return (memory.content or "").strip() == habit or _covered(habit, [memory])
+
+
+def rule_text(habit: str, brain_dump: object) -> str:
+    """The words a rule stated this turn is stored in: the cleaned words of the extracted
+    constraint memory that states ``habit`` ("Goes to the gym at 7 AM on weekdays"), else
+    ``habit`` as said. The user's own sentence stays in the conversation.
+
+    The memory is the first that states the habit, the one the rule is then linked to
+    (``_link_rules``). A memory that states several of the turn's habits is the saying of
+    all of them, not the words of one rule: each of those rules keeps its own words.
+    """
+    habits = [
+        h.strip() for h in getattr(brain_dump, "inline_habits", None) or []
+        if isinstance(h, str) and h.strip()
+    ]
+    for memory in getattr(brain_dump, "memories", None) or []:
+        content = (memory.content or "").strip()
+        if not content or not _states(memory, habit):
+            continue
+        stated = sum(1 for other in habits if _states(memory, other))
+        return content if memory.type == "constraint" and stated <= 1 else habit
+    return habit
 
 
 async def _link_rules(

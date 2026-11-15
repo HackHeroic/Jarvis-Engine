@@ -12,8 +12,10 @@ Planning plans from the rule alone and skips the memory a rule covers
 memory deletes every rule linked to it (it says them all), and deleting a rule deletes
 the copies of it said again in the same words and forgets its memory, unless a
 differently worded rule still rests on that memory. Deleting one rule never removes
-another. Each move is user-scoped and safe to repeat. A rule's check-ins
-(``RuleCheckIns``) end just before the rule is deleted, by whichever move.
+another. Correcting the statement (a newer memory supersedes the memory) deletes the
+rules linked to the old memory; the corrected rule rests on the new one. Each move is
+user-scoped and safe to repeat. A rule's check-ins (``RuleCheckIns``) end just before
+the rule is deleted, by whichever move.
 """
 
 import logging
@@ -98,6 +100,17 @@ class StatedRules:
         """
         await self._memory.forget(user_id, memory_id)
         return await self._delete_linked(user_id, memory_id)
+
+    async def replace_for_superseded(self, user_id: str, old_memory_id: str) -> list[str]:
+        """The user corrected the memory ``old_memory_id`` (a newer memory supersedes it):
+        delete every rule linked to it, with their check-ins, as ``forget_memory`` does,
+        and leave the memory as it is. Return the ids of the rules deleted.
+
+        The corrected rule is stored and linked to the new memory by the same turn, so
+        only what the old statement said goes. A memory no rule rests on (a plain fact),
+        or another user's, deletes nothing. Safe to repeat.
+        """
+        return await self._delete_linked(user_id, old_memory_id)
 
     async def _delete_linked(self, user_id: str, memory_id: str) -> list[str]:
         linked = [

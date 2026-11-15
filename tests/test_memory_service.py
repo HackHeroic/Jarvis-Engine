@@ -138,6 +138,41 @@ async def test_remember__contradiction__old_superseded_new_active(service, memor
 
 
 @pytest.mark.asyncio
+async def test_remember__supersedes__outcome_names_the_old_memory(service, memories):
+    old = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+    assert (await service.remember("alice", _candidate(MARATHON, "goal"))).superseded_id is None
+
+    outcome = await service.remember(
+        "alice", _candidate(NIGHTS, "preference", confidence=0.8, contradicts=old.id)
+    )
+
+    assert outcome.action == "superseded" and outcome.superseded_id == old.id
+    again = await service.remember("alice", _candidate(NIGHTS, "preference"))
+    assert (again.action, again.superseded_id) == ("reinforced", None)
+
+
+@pytest.mark.asyncio
+async def test_remember__contradicted_memory_let_go_meanwhile__created_and_names_none(
+    store, clock
+):
+    """The old memory stops being active between the read and the link: the new one
+    stands as created, and no memory is named as replaced (nothing of it may go)."""
+
+    class _ForgottenBeforeTheLink(InMemoryMemoryRepository):
+        async def update(self, user_id, memory_id, **fields):
+            if "superseded_by" in fields:
+                await super().update(user_id, memory_id, status=MemoryStatus.FORGOTTEN, content="")
+            return await super().update(user_id, memory_id, **fields)
+
+    service = MemoryService(_ForgottenBeforeTheLink(store), BagOfWordsEmbedder(), clock=clock)
+    old = (await service.remember("alice", _candidate(MORNINGS, "preference"))).memory
+
+    outcome = await service.remember("alice", _candidate(NIGHTS, "preference", contradicts=old.id))
+
+    assert (outcome.action, outcome.superseded_id) == ("created", None)
+
+
+@pytest.mark.asyncio
 async def test_remember__after_forget__suppressed_and_nothing_written(service, memories):
     """Review Focus 3: a forgotten fact said again, in another conversation and in
     other words, is not stored again, and the tombstone is not touched."""

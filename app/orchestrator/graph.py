@@ -32,7 +32,7 @@ from app.orchestrator.routing import (
 )
 from app.modules.conversation import run_general_chat, voice_of_jarvis_synthesis
 from app.modules.coach import run_coaching_response
-from app.core.observation import run_observation_loop
+from app.core.observation import rule_text, run_observation_loop
 from app.modules import module_registry
 from app.orchestrator.module_wrapper import create_module_wrapper
 
@@ -503,9 +503,11 @@ async def store_constraint(state: JarvisState) -> dict:
 
     BEHAVIORAL_CONSTRAINT is classified from ``brain_dump.inline_habits`` — the
     extraction already carries the verbatim habit phrases, and this node stores each as
-    a rule. A habit the user let go of (its memory forgotten or dismissed) is not stored
-    again, and nothing is said about it: like the suppressed memory, it is simply not
-    kept. Deterministic confirmation, no LLM call.
+    a rule, in the cleaned words of the constraint memory that states it when the
+    extraction has one (``observation.rule_text``); the confirmation quotes the user's
+    own words. A habit the user let go of (its memory forgotten or dismissed) is not
+    stored again, and nothing is said about it: like the suppressed memory, it is simply
+    not kept. Deterministic confirmation, no LLM call.
     """
     bd = state.get("brain_dump")
     habits = list(getattr(bd, "inline_habits", None) or [])
@@ -523,12 +525,12 @@ async def store_constraint(state: JarvisState) -> dict:
     habits = kept or []
 
     saved: list[str] = []
-    # Each stored rule's id, by its words: the observation loop links the rule to the
-    # memory of stating it, so the two are let go of together.
+    # Each stored rule's id, by the habit's words: the observation loop links the rule to
+    # the memory of stating it, so the two are let go of together.
     rule_ids: dict[str, str] = {}
     for habit in habits:
         try:
-            result = await _store_rule(state, habit)
+            result = await _store_rule(state, rule_text(habit, bd))
         except Exception as e:  # storage must never crash the turn
             logger.warning(f"store_constraint failed ({type(e).__name__})")
             result = {"status": "error"}

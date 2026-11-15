@@ -385,3 +385,75 @@ async def test_delete_adopted_rule__pattern_dismissed_not_forgotten_never_propos
     assert stored.status is MemoryStatus.DISMISSED  # PEARL never re-learns or re-proposes it
     assert stored.content == pattern.content  # dismissed, not erased
     assert await repos.constraints.list_active("alice") == []
+
+
+# --- a corrected rule: the memory it rested on was superseded -------------------------
+
+GYM_6PM = "Goes to the gym every weekday at 6 PM"
+GYM_7AM = "Goes to the gym at 7 AM on weekdays"
+
+
+async def _superseded(memory: MemoryService, old_id: str, text: str = GYM_7AM):
+    """The user corrects the memory ``old_id``: the new memory, which supersedes it."""
+    outcome = await memory.remember(
+        "alice",
+        MemoryCandidate(memory_type="constraint", content=text, confidence=0.9, contradicts=old_id),
+    )
+    assert outcome.action == "superseded"
+    return outcome.memory
+
+
+@pytest.mark.asyncio
+async def test_replace_for_superseded__old_memory_had_a_rule__rule_and_its_check_in_deleted(
+    repos, memory
+):
+    from app.services.analytical.rule_check_ins import RuleCheckIns
+    from app.services.extraction.behavioral_store import store_behavioral_constraint
+
+    check_ins = RuleCheckIns(repos.habit_trackers, repos.constraints, repos.profiles,
+                             clock=lambda: NOW)
+    rules = StatedRules(repos.constraints, memory, check_ins=check_ins)
+    stored = await store_behavioral_constraint(
+        repos.constraints, GYM_6PM, user_id="alice", check_ins=check_ins
+    )
+    old = await _said(memory, text=GYM_6PM)
+    assert await rules.link("alice", stored["id"], old.id)
+    kept, _ = await _linked(repos, rules, memory)  # another rule, on another memory
+    assert len(await repos.habit_trackers.list_for_user("alice")) == 1
+    await _superseded(memory, old.id)
+
+    assert await rules.replace_for_superseded("alice", old.id) == [stored["id"]]
+
+    assert [r.id for r in await repos.constraints.list_active("alice")] == [kept.id]
+    assert await repos.habit_trackers.list_for_user("alice") == []
+    untouched = await repos.memories.get("alice", old.id)  # the memory is left as it was
+    assert untouched.status is MemoryStatus.ACTIVE and untouched.content == GYM_6PM
+    assert await rules.replace_for_superseded("alice", old.id) == []  # again: nothing left
+
+
+@pytest.mark.asyncio
+async def test_replace_for_superseded__old_memory_had_no_rule__nothing_deleted(
+    repos, rules, memory
+):
+    rule, _ = await _linked(repos, rules, memory)
+    unlinked = await repos.constraints.add("alice", _rule(text="Gym at 6 PM on Mondays"))
+    fact = (await memory.remember(
+        "alice", MemoryCandidate(memory_type="fact", content="Dr. Rao teaches Networks"),
+    )).memory
+    await _superseded(memory, fact.id, "Dr. Iyer teaches Networks now")
+
+    assert await rules.replace_for_superseded("alice", fact.id) == []
+
+    assert {r.id for r in await repos.constraints.list_active("alice")} == {rule.id, unlinked.id}
+
+
+@pytest.mark.asyncio
+async def test_replace_for_superseded__another_users_memory_id__nothing_deleted(
+    repos, rules, memory
+):
+    rule, remembered = await _linked(repos, rules, memory)
+    await _superseded(memory, remembered.id)
+
+    assert await rules.replace_for_superseded("bob", remembered.id) == []
+
+    assert [r.id for r in await repos.constraints.list_active("alice")] == [rule.id]

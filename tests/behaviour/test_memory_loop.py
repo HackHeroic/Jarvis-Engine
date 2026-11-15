@@ -144,7 +144,6 @@ async def test_loop__two_part_question__both_memories_in_the_note(jarvis, script
 # --- corrected -----------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="M2")
 @pytest.mark.asyncio
 async def test_loop__correction__one_rule_and_old_memory_not_in_the_note(
     jarvis, scripted, monkeypatch

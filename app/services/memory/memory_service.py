@@ -121,6 +121,13 @@ class RememberOutcome(BaseModel):
     memory: Memory | None = Field(
         description="The memory as stored now; None when nothing was written."
     )
+    superseded_id: str | None = Field(
+        default=None,
+        description=(
+            "Id of the memory this one replaced (it now points here); set only when the"
+            " action is superseded."
+        ),
+    )
 
 
 def _has_words(text: str) -> bool:
@@ -621,7 +628,9 @@ class MemoryService:
 
         ``new`` gets an id derived from (user, old), so a retry finds the replacement
         it already stored instead of adding a second. The link is guarded: if ``old``
-        stopped being active meanwhile, ``new`` simply stands as a created memory.
+        stopped being active meanwhile, ``new`` simply stands as a created memory (and
+        names no memory as replaced). A supersede names ``old`` (``superseded_id``), so
+        the caller can let go of what rested on it (``StatedRules.replace_for_superseded``).
         """
         replacement_id = str(uuid.uuid5(_SUPERSEDE_IDS, f"{user_id}:{old.id}"))
         try:
@@ -638,7 +647,7 @@ class MemoryService:
             )
         except errors.StaleVersionError:
             return RememberOutcome(action="created", memory=stored)
-        return RememberOutcome(action="superseded", memory=stored)
+        return RememberOutcome(action="superseded", memory=stored, superseded_id=old.id)
 
     async def _get(self, user_id: str, memory_id: str) -> Memory:
         """The user's memory, whatever its status; NotFoundError if absent or another user's."""
