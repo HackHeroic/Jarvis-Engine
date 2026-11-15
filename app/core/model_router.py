@@ -191,6 +191,7 @@ MODEL_ROUTING: dict[str, ModelRole] = {
     "practice_generation": ModelRole.PRIMARY,
     # A task workspace's outline or checklist: structured generation, like the quiz.
     "workspace_outline": ModelRole.PRIMARY,
+    "workspace_composition": ModelRole.PRIMARY,
     # Heavy structured generation (per-slot minute arithmetic, multi-day offsets),
     # and a wrong slot becomes a hard block in the scheduler.
     "calendar_parsing": ModelRole.PRIMARY,

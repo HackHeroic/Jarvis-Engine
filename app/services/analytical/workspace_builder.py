@@ -14,10 +14,12 @@ documents linked to the task change (``DocumentLinker``, ``DocumentService.delet
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Optional
 
+from app.core import config
 from app.core.config import CLAUDE_MODEL, SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.core.model_router import PreCloudLLMRedactor, metered_web_search
 from app.domain import errors
@@ -30,17 +32,28 @@ from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
 from app.schemas.workspace import StudyAsset, TaskWorkspace
-from app.services.analytical.task_kind import classify_task
-from app.services.analytical.workspace.materials import MaterialChunk, fetch_chunks_for_task
+from app.services.analytical.task_kind import classify_task, is_programming_topic
+from app.services.analytical.workspace.composer import (
+    ComposerTask,
+    compose_workspace,
+    composed_links,
+)
+from app.services.analytical.workspace.materials import (
+    MaterialChunk,
+    excerpt_assets,
+    fetch_chunks_for_task,
+)
 from app.services.analytical.workspace.recipes import RecipeContext, recipe_for
 from app.services.analytical.workspace.web import (
     WEB_RESULTS_UNAVAILABLE,
+    SearchWeb,
     WebSearchUnavailableError,
     found_links,
     link_type,
 )
 from app.services.analytical.workspace.woop import woop_card
 from app.services.documents.service import DocumentService
+from app.services.memory.memory_service import MemoryService
 from app.services.user_preferences import get_learning_style
 from app.db.supabase_py import build_supabase_client
 
@@ -185,9 +198,13 @@ async def build_task_workspace(
     tasks: TaskRepository | None,
     goals: GoalRepository | None = None,
     materials: DocumentRepository | None = None,
+    memory: MemoryService | None = None,
     bus: EventBus,
 ) -> TaskWorkspace:
-    """Assemble the workspace the task's kind calls for (its recipe). Target <5s.
+    """Assemble the task's workspace: composed for it by the model (``composer``), from
+    the task, its material and what Jarvis remembers about the user (``memory``); or,
+    when the model cannot answer or ``WORKSPACE_COMPOSER`` is off, the fixed recipe of
+    the task's kind.
 
     The task is read once, the user's own, through ``tasks`` (the composition root's
     repository): its title, keywords, goal, criteria, length, deadline and if-then plan.
@@ -208,13 +225,48 @@ async def build_task_workspace(
     kind = classify_task(title, keywords, task.goal_id)
     recipe = recipe_for(kind)
     criteria = _criteria(task, title)
+    composing = config.WORKSPACE_COMPOSER
 
-    material, learning_style = await asyncio.gather(
+    material, learning_style, known = await asyncio.gather(
         fetch_chunks_for_task(user_id, task_id, title, keywords, documents=materials)
-        if recipe.reads_documents
+        if composing or recipe.reads_documents
         else _no_material(),
         get_learning_style(user_id, _get_supabase()),
+        _known_about_user(memory, user_id, title) if composing else _nothing_known(),
     )
+    card = await woop_card(user_id, task, title, goals)
+    if composing:
+        composed = await _composed_workspace(
+            ComposerTask(
+                title=title,
+                completion_criteria=criteria,
+                duration_minutes=task.duration_minutes,
+                deadline_hint=task.deadline_hint,
+                goal=card.wish if card is not None else "",
+                learning_style=learning_style,
+                user_prompt=user_prompt,
+                known_about_user=known,
+            ),
+            material,
+            programming=is_programming_topic(title, keywords, task.goal_id),
+            search_web=partial(_search_web, bus=bus),
+        )
+        if composed is not None:
+            return TaskWorkspace(
+                task_id=task_id,
+                task_title=title,
+                primary_objective=f"{title} {' '.join(keywords)}".strip(),
+                task_kind=composed.kind,
+                approach=composed.approach,
+                completion_criteria=criteria,
+                duration_minutes=task.duration_minutes,
+                deadline_hint=task.deadline_hint,
+                surfaced_assets=composed.assets,
+                woop_card=card,
+                notices=composed.notices,
+            )
+        if not recipe.reads_documents:
+            material = []  # the fallback recipe for an errand shows no excerpts
     ctx = RecipeContext(
         task_title=title,
         topic_keywords=keywords,
@@ -237,9 +289,74 @@ async def build_task_workspace(
         duration_minutes=task.duration_minutes,
         deadline_hint=task.deadline_hint,
         surfaced_assets=surfaced,
-        woop_card=await woop_card(user_id, task, title, goals),
+        woop_card=card,
         notices=[WEB_RESULTS_UNAVAILABLE] if ctx.web_unavailable else [],
     )
+
+
+@dataclass(frozen=True)
+class _ComposedWorkspace:
+    """A composed workspace ready to return: its assets in order, and what to say is missing."""
+
+    kind: str
+    approach: str
+    assets: list[StudyAsset]
+    notices: list[str]
+
+
+async def _composed_workspace(
+    task: ComposerTask,
+    material: list[MaterialChunk],
+    *,
+    programming: bool,
+    search_web: SearchWeb,
+) -> _ComposedWorkspace | None:
+    """The workspace the model composes for the task (``composer``): the excerpts of the
+    material it used, its blocks, then the links of the one search it asked for. None
+    when it could not compose one; the caller then builds the kind's fixed recipe.
+
+    One PRIMARY-role call, then at most one web search (after it: the search is the
+    model's own choice). A search that cannot run leaves the notice, not a failure.
+    """
+    composed = await compose_workspace(task, material)
+    if composed is None:
+        return None
+    links: list[StudyAsset] = []
+    notices: list[str] = []
+    if composed.search is not None:
+        try:
+            links = await composed_links(
+                composed.search, task.title, programming=programming, search_web=search_web
+            )
+        except WebSearchUnavailableError:
+            notices.append(WEB_RESULTS_UNAVAILABLE)
+    excerpts = excerpt_assets(material) if composed.material_used else []
+    return _ComposedWorkspace(
+        kind=composed.kind,
+        approach=composed.approach,
+        assets=[*excerpts, *composed.assets, *links],
+        notices=notices,
+    )
+
+
+async def _known_about_user(
+    memory: MemoryService | None, user_id: str, task_title: str
+) -> tuple[str, ...]:
+    """What Jarvis remembers that bears on the task: the standing profile and the
+    memories nearest the task's title, in words. Best effort: nothing when there is no
+    memory service or it cannot answer (logged by type)."""
+    if memory is None:
+        return ()
+    try:
+        recall = await memory.recall(user_id, task_title)
+    except Exception as exc:
+        logger.warning("The workspace was composed without memories (%s)", type(exc).__name__)
+        return ()
+    return tuple(m.content.strip() for m in recall.all() if m.content and m.content.strip())
+
+
+async def _nothing_known() -> tuple[str, ...]:
+    return ()
 
 
 def _criteria(task: Task, title: str) -> str:
@@ -356,10 +473,11 @@ async def get_or_build_task_workspace(
     documents: DocumentService | None = None,
     materials: DocumentRepository | None = None,
     tasks: TaskRepository | None = None,
+    memory: MemoryService | None = None,
 ) -> TaskWorkspace:
     """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
 
-    ``tasks``, ``goals``, ``materials`` and ``bus`` are the composition root's (see
+    ``tasks``, ``goals``, ``materials``, ``memory`` and ``bus`` are the composition root's (see
     ``build_task_workspace``, whose NotFoundError and PersistenceError pass through).
     ``documents`` (the composition root's DocumentService) lists the task's linked
     documents, read fresh on every request after the cache, so a document deleted or a
@@ -371,7 +489,7 @@ async def get_or_build_task_workspace(
     if ws is None:
         ws = await build_task_workspace(
             user_id=user_id, task_id=task_id, user_prompt=user_prompt,
-            tasks=tasks, goals=goals, materials=materials, bus=bus,
+            tasks=tasks, goals=goals, materials=materials, memory=memory, bus=bus,
         )
         if not ws.notices:
             # A workspace missing its web results is not cached: once search is back,

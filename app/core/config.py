@@ -254,6 +254,11 @@ CHROMA_DATABASE: str = os.getenv("CHROMA_DATABASE", "Jarvis-Vector-Db")
 # match pasted into the prompt misleads the model — so err strict.
 RAG_MAX_COSINE_DISTANCE: float = float(os.getenv("JARVIS_RAG_MAX_COSINE_DISTANCE", "0.6"))
 
+# The workspace is composed for each task by the model (what would help with this task,
+# for this user), with the fixed recipe of the task's kind as the fallback when the model
+# cannot answer. False builds every workspace from the recipes.
+WORKSPACE_COMPOSER: bool = os.getenv("JARVIS_WORKSPACE_COMPOSER", "true").lower() == "true"
+
 # A task's workspace shows material from a document NOT linked to the task only when a
 # chunk is at least this close to the task (its title and topic keywords), as cosine
 # similarity under the same embedder; the search cut-off is 1 minus this. Stricter than

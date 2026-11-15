@@ -143,6 +143,13 @@ class TaskWorkspace(BaseModel):
             " checklist), admin (a checklist of what to have ready)."
         ),
     )
+    approach: str = Field(
+        default="",
+        description=(
+            "How to spend this session on the task, in a sentence or two, when the workspace"
+            " was composed for it; empty when it was built from the fixed recipe of its kind."
+        ),
+    )
     completion_criteria: str = Field(
         default="",
         description=(
@@ -174,4 +181,78 @@ class TaskWorkspace(BaseModel):
             "The caller's documents linked to this task (\"From your documents\"), each with"
             " whether its file can be opened. Read fresh on every request, never cached."
         ),
+    )
+
+
+# --- A workspace the model composes for one task (``workspace.composer``) ----------------
+
+BLOCK_TYPES = Literal[
+    "questions", "flashcards", "outline", "checklist", "steps", "key_points",
+    "worked_example", "note",
+]
+MAX_COMPOSED_BLOCKS = 4
+
+
+class WorkspaceItem(BaseModel):
+    """One line of a block: a question, a card, a heading, a step or a point."""
+
+    text: str = Field(description="The question, card front, section heading, step or point.")
+    answer: str = Field(
+        default="",
+        description="For a question or card: the answer. For a heading or point: one line "
+        "of explanation. Otherwise empty.",
+    )
+    hint: str = Field(default="", description="For a question: a short nudge. Otherwise empty.")
+
+
+class WorkspaceBlock(BaseModel):
+    """One piece of help the model chose for the task."""
+
+    type: BLOCK_TYPES = Field(
+        description="questions: things to answer or solve, with answers. flashcards: quick "
+        "recall cards. outline: sections to write. checklist: things to have or verify. "
+        "steps: what to do in order, smallest first. key_points: what to hold in mind. "
+        "worked_example: one example worked through, in body. note: a short explanation, "
+        "in body."
+    )
+    title: str = Field(description="A short, specific title for this block.")
+    why: str = Field(description="One short phrase: why this helps with this task.")
+    items: list[WorkspaceItem] = Field(
+        default_factory=list, description="The block's lines; empty for worked_example and note."
+    )
+    body: str = Field(
+        default="", description="Markdown, for worked_example and note; otherwise empty."
+    )
+
+
+class WorkspaceSearch(BaseModel):
+    """The one web search worth making for the task."""
+
+    query: str = Field(description="What to search the web for, specific to this task.")
+    want: Literal["video", "article", "practice_problems", "documentation", "example"] = Field(
+        description="The kind of result that would help most."
+    )
+
+
+class WorkspaceComposition(BaseModel):
+    """What the model decided this task's workspace should hold."""
+
+    kind: Literal["practice", "study", "write", "build", "admin"] = Field(
+        description="The kind of work the task is."
+    )
+    approach: str = Field(
+        description="One or two sentences to the user: how to spend this session on this "
+        "task, given its length and what you know about them."
+    )
+    material_is_relevant: bool = Field(
+        default=True,
+        description="False when the material given is not about this task; then it is not used.",
+    )
+    blocks: list[WorkspaceBlock] = Field(
+        description="One to three blocks, the most useful first, each specific to the task."
+    )
+    search: WorkspaceSearch | None = Field(
+        default=None,
+        description="One web search that would really help, or null when none would "
+        "(an errand, or the blocks are enough).",
     )

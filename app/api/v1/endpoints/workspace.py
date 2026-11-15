@@ -55,6 +55,7 @@ async def get_task_workspace(
             documents=container.documents if container is not None else None,
             materials=container.repos.documents if container is not None else None,
             tasks=container.repos.tasks if container is not None else None,
+            memory=container.memory_service if container is not None else None,
         )
     except errors.JarvisError:
         raise  # already says what went wrong, with its own status

@@ -338,3 +338,21 @@ def _web_search_cooldown_cleared():
     web_search_cooldown.reset()
     yield
     web_search_cooldown.reset()
+
+
+@pytest.fixture(autouse=True)
+def _workspace_recipes_only(monkeypatch):
+    """Workspaces are built from the fixed recipes unless a test turns the composer on
+    (``compose_workspaces``): the recipe tests then exercise the fallback path alone,
+    with no composition call ahead of it."""
+    import app.core.config as config
+
+    monkeypatch.setattr(config, "WORKSPACE_COMPOSER", False)
+
+
+@pytest.fixture
+def compose_workspaces(monkeypatch):
+    """Turn the workspace composer on for this test, as the live app has it."""
+    import app.core.config as config
+
+    monkeypatch.setattr(config, "WORKSPACE_COMPOSER", True)
