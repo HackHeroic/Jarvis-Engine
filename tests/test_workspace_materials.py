@@ -95,7 +95,7 @@ async def test_materials__linked_document__excerpts_named_after_the_file_with_so
     await _keep(repos, ALICE, "dbms", SYLLABUS)
     await _keep(repos, ALICE, "other", "Other.pdf")
     await _link(repos, ALICE, "dbms_task", "dbms")
-    monkeypatch.setattr(wb, "generate_practice_assets", _no_quiz)
+    install_scripted_model()  # no quiz: this test is about the excerpts
 
     ws = await _build("dbms_task", repos)
 
@@ -106,10 +106,6 @@ async def test_materials__linked_document__excerpts_named_after_the_file_with_so
         (f"{SYLLABUS}: excerpt 2", "Functional dependencies and closures",
          {"source_id": "dbms", "file_name": SYLLABUS}),
     ]
-
-
-async def _no_quiz(*_args, **_kwargs):
-    return []
 
 
 @pytest.mark.asyncio

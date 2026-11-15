@@ -370,7 +370,6 @@ async def test_workspace_route__web_search_answered__one_web_search_usage_on_the
     monkeypatch.setattr(wb, "_write_cached_workspace", nothing)
     monkeypatch.setattr(wb, "fetch_chunks_for_task", no_chunks)
     monkeypatch.setattr(wb, "get_learning_style", reader)
-    monkeypatch.setattr(wb, "generate_practice_assets", no_chunks)  # one search: the links
     monkeypatch.setattr(app.state, "container", container, raising=False)
 
     transport = httpx.ASGITransport(app=app)

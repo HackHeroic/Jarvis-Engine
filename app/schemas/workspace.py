@@ -80,6 +80,31 @@ class QuizReply(BaseModel):
     )
 
 
+class OutlineSection(BaseModel):
+    """One section of a piece of writing's outline."""
+
+    heading: str = Field(description="The section's heading, a few words.")
+    note: str = Field(default="", description="One short line on what goes in the section.")
+
+
+class TaskOutline(BaseModel):
+    """What the model answers for a writing, building or admin task: an outline and/or a
+    checklist, shaped by the kind of task (see ``workspace/outline.py``)."""
+
+    title: str = Field(default="", description="A short title for the outline or checklist.")
+    sections: List[OutlineSection] = Field(
+        default_factory=list,
+        description="For a piece of writing: its sections, in order. Empty for other work.",
+    )
+    checklist: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Short imperative items, in order. For building, the first is the smallest"
+            " first step."
+        ),
+    )
+
+
 class WoopCard(BaseModel):
     """Full MCII (Mental Contrasting with Implementation Intentions) card.
 
@@ -93,13 +118,30 @@ class WoopCard(BaseModel):
     plan: str = Field(description="If-then behavioral response (Plan stage)")
 
 
+# The kinds of work a workspace is shaped for (``TaskKind`` in
+# app/services/analytical/task_kind.py has the same values).
+TASK_KINDS = Literal["practice", "study", "write", "build", "admin"]
+
+
 class TaskWorkspace(BaseModel):
-    """Proactive workspace assembled when user opens a scheduled task."""
+    """Proactive workspace assembled when user opens a scheduled task.
+
+    Every field added since workspaces were first cached has a default, so a cached
+    workspace built before it still loads.
+    """
 
     task_id: str = Field(description="Task identifier")
     task_title: str = Field(description="Display title of the task")
     primary_objective: str = Field(
         description="Derived from title + topic_keywords; main learning goal",
+    )
+    task_kind: TASK_KINDS = Field(
+        default="study",
+        description=(
+            "The kind of work the task is, which decides what the workspace holds: practice"
+            " (problems), study (excerpts, a quiz), write (an outline), build (a step"
+            " checklist), admin (a checklist of what to have ready)."
+        ),
     )
     surfaced_assets: List[StudyAsset] = Field(
         default_factory=list,
