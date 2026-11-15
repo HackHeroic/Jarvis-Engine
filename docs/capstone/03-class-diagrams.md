@@ -236,6 +236,7 @@ classDiagram
         +datetime | None scheduled_start
         +datetime | None scheduled_end
         +str | None deadline_hint
+        +datetime | None not_before
     }
     class TaskEvent {
         <<value object>>

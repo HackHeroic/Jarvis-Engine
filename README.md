@@ -73,7 +73,7 @@ Then start the frontend (`npm install && npm run dev` in jarvis-frontend) and op
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # offline: never touches the network (2116 passed, 2 xfailed, 2 deselected at e2a5899)
+.venv/bin/python -m pytest tests/ -q        # offline: never touches the network (2203 passed, 2 xfailed, 2 deselected at 8759bf0)
 .venv/bin/python scripts/live_e2e.py        # 18 live checks against real Supabase and Claude (backend must be running)
 ```
 
@@ -89,4 +89,4 @@ This seeds about three weeks of history for the user `demo`. Start the backend a
 
 ## Not built
 
-Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. Workspace web links need Gemini's web search. `docs/PROJECT_STATUS.md` has the full list.
+Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. Workspace web links come from Claude's web search (Gemini's as the fallback). `docs/PROJECT_STATUS.md` has the full list.

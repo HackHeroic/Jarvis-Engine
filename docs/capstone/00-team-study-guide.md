@@ -19,15 +19,15 @@ Everything here was checked against the code on branch `main` (commit `c956a8f`)
 
 **Tips.**
 - Keep the code open next to this guide. When a section names a file, open it and find the class.
-- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 88 seconds; at `e2a5899` the result is `2116 passed, 2 xfailed, 2 deselected`).
+- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 91 seconds; at `8759bf0` the result is `2203 passed, 2 xfailed, 2 deselected`).
 - Section 11 defines every term. When a word is new, look it up there.
 - Do not claim anything listed in section 9 as working.
 
 **Numbers to quote** (measured at `c956a8f`):
-- Tests: **2116 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2116 passed, 2 xfailed, 2 deselected**, in 94 test files.
+- Tests: **2203 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2203 passed, 2 xfailed, 2 deselected**, in 94 test files.
 - The chat router `app/api/v1/endpoints/chat.py` is **56 lines**.
 - PEARL reads the last **28 days** (`FOCUS_WINDOW_DAYS`).
-- The API has **43 paths and 49 operations** (42 and 48 at `c956a8f`; the documents work added `GET /documents/{source_id}/file`); there are **19 migration files**.
+- The API has **43 paths and 49 operations** (42 and 48 at `c956a8f`; the documents work added `GET /documents/{source_id}/file`); there are **20 migration files**.
 - The formal documents cite `path:line` at commit `e76bff9`. Four later commits (`e0e154f`, `7a414bb`, `be76c48`, `c956a8f`) fixed problems found by clicking through the app; the documents note each change where it alters a claim, and this guide covers them in D25, D29, D30 and D31. The documents work (D32: kept files, linking by meaning) moved lines in the files it touched, and the citations into those files were moved with them.
 
 ---
@@ -213,7 +213,7 @@ The other trigger, `PatternRuleTrigger`, also runs from an event: when PEARL pub
 **Six things to try before you read on** (all read-only, no server needed):
 1. Open `app/container.py`. Find the one `if` that picks the Supabase or the in-memory repository family.
 2. Open `app/domain/anticipation.py`. In `Trigger.run`, find the line where consent is evaluated, and the line where a denied action returns without storing anything.
-3. Open `supabase/migrations/20261115000001_accept_draft_reslots_missed.sql`. Find the two row locks and their order.
+3. Open `supabase/migrations/20261115000007_user_tasks_not_before.sql`. Find the two row locks and their order.
 4. Read `ConsentPolicy.default` in the same domain file. Say in your own words what each of the four rules decides.
 5. Run `.venv/bin/python -m pytest tests/test_layering.py tests/test_design_conformance.py -q`. These two files are the proof that the code matches the design.
 6. Run `.venv/bin/python -m pytest "tests/test_draft_service.py::test_accept__concurrent_double_click__exactly_one_succeeds" -q`, then read the test.
@@ -283,7 +283,7 @@ sequenceDiagram
     DS-->>C2: 409 invalid_state_transition
 ```
 
-- **Where to see it.** `supabase/migrations/20261115000001_accept_draft_reslots_missed.sql`, `app/services/draft_service.py`, `app/services/draft_actions.py`.
+- **Where to see it.** `supabase/migrations/20261115000007_user_tasks_not_before.sql`, `app/services/draft_service.py`, `app/services/draft_actions.py`.
 - **The test that pins it.** `tests/test_draft_service.py::test_accept__concurrent_double_click__exactly_one_succeeds`; `tests/test_migrations.py::test_migrations__accept_draft__locks_the_user_before_the_draft`; `tests/behaviour/test_chat_turns.py::test_chat__brain_dump__proposes_a_draft_and_writes_no_tasks`.
 
 ### D6. A draft version, and 409 `stale_version`
@@ -577,7 +577,7 @@ sequenceDiagram
 
 **C10. A working implementation that matches the design.**
 - *Looking for:* it runs end to end, and the code is what the diagrams say.
-- *How Jarvis meets it:* 2116 offline tests at `e2a5899` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
+- *How Jarvis meets it:* 2203 offline tests at `8759bf0` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
 - *Best example:* the demo's terminal step (doc 10, minute 8:45): the concurrent-accept test, the SQL lock-order test, `test_layering.py` and `test_design_conformance.py`, all passing.
 - *Detail:* `10-demo-and-contributions.md`.
 
@@ -642,7 +642,7 @@ State these plainly. Never present them as working.
 4. **Two strict xfails**: TMT priorities tie for deadlines more than about 16 hours away; a task the model leaves without an if-then plan gets none.
 5. A failed decomposition can still produce a plan from the user's pending tasks.
 6. `validate_goal` rejects goals shorter than 5 characters ("DSA") and asks for clarification.
-7. **Workspace links need Gemini.** The task workspace's web links, and its practice links when the task has no document chunks, come only from Gemini's grounded web search, which fails while the Gemini credits are depleted. The workspace then shows the task, its completion criteria and the notice "Web results are unavailable right now, so no links are shown"; after a failed search it does not search again for 5 minutes (`WEB_SEARCH_COOLDOWN_S`).
+7. **Workspace links need a web search that answers.** The task workspace's web links, and its practice links when the task has no document chunks, come from Claude's web search tool (the same key as chat), with Gemini's grounded search as the fallback. Only links the search returned are shown. When neither answers, the workspace shows the task, its criteria, the user's documents and a notice, and waits 5 minutes before trying again.
 8. Rearranging a draft does not re-solve it (`needs_resolve: true` is returned).
 9. `auto_low_risk` mode changes nothing on its own today: no built action is `low_risk` (D18).
 10. The Supabase family is tested offline against a fake; only the live script uses the real database. A hands-on browser pass was never done (headless renders and API reads only).
@@ -714,7 +714,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 32. **Why CP-SAT and not let the model schedule?** A model makes overlaps and ignores constraints. CP-SAT returns a schedule that meets every hard constraint, or proves none exists; it is capped at 10 s and keeps the best schedule found.
 33. **Why the local model first?** Privacy: the prompt never leaves the machine. Claude is the cloud tier for schema-valid structured output in the demo; Gemini is the last resort (ADR-10).
 34. **Is the demo data fake?** The history is seeded, the inference is live. `scripts/seed_demo_user.py` writes three weeks of history through the real services under a simulated clock; patterns, the focus profile and the brief are computed live. A test checks that every seeded row has a shape the live app writes.
-35. **How do you prove it works end to end?** 2116 offline tests at `e2a5899` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
+35. **How do you prove it works end to end?** 2203 offline tests at `8759bf0` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
 36. **If you had another week?** From the build ledgers: repositories for sessions and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
 
 ---

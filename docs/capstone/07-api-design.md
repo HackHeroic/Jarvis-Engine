@@ -427,7 +427,7 @@ The edit responses: `DraftRejectResponse {status: "rejected", draft_id}` (`draft
 | `message` | string | user-facing text without blame |
 | `replan_triggered` | boolean | always `false`: no task route starts a re-plan |
 
-`TaskListResponse` (`tasks.py:59`) is `{tasks: Task[], count}`. Each row is the `Task` entity (`app/domain/entities.py:275`): `id`, `user_id`, `task_id`, `goal_id`, `plan_id`, `title`, `duration_minutes`, `difficulty_weight`, `status`, `dependencies`, `scheduled_start`, `scheduled_end`, `deadline_hint`. Columns the entity does not model are not returned.
+`TaskListResponse` (`tasks.py:59`) is `{tasks: Task[], count}`. Each row is the `Task` entity (`app/domain/entities.py:275`): `id`, `user_id`, `task_id`, `goal_id`, `plan_id`, `title`, `duration_minutes`, `difficulty_weight`, `status`, `dependencies`, `scheduled_start`, `scheduled_end`, `deadline_hint`, `not_before`. Columns the entity does not model are not returned.
 
 ---
 
@@ -579,7 +579,7 @@ Every route first requires the database (`require_supabase`). Check-ins go throu
 | `POST /reasoning/decompose-goal` | Break a goal into tasks of at most 25 minutes (local model first, cloud fallback) | `{"user_prompt": string}` (embedded body) | `ExecutionGraph {goal_metadata: GoalMetadata, decomposition: TaskChunk[] (≥1), cognitive_load_estimate: {str: number}}` (`app/schemas/decomposition.py:150`) | 503 `llm_output_parse` (fewer than 5 tasks, or unparseable; `app/api/v1/endpoints/reasoning.py:150-162`); 503 `llm_*` |
 | `POST /schedule/generate-schedule` | A deterministic OR-Tools schedule for an `ExecutionGraph` | `ScheduleRequest {graph, daily_context: TimeSlot[], horizon_minutes = 2880, plan_start?, max/min_daily_deep_work_minutes?, max/min_task_duration_minutes?}` (`schedule.py:23`) | `GenerateScheduleResponse {status: FEASIBLE \| OPTIMAL, schedule: {task_id: ScheduledTask}, goal_metadata, horizon_start}` (`app/schemas/schedule.py:15, 24`) | 422 `schedule_infeasible` "Schedule infeasible; consider reducing scope or extending deadline." (`run_schedule`, `app/services/planning/scheduling.py:327-329`) |
 
-`TaskChunk` fields (`decomposition.py:41`): `task_id`, `title`, `duration_minutes` (1–25), `difficulty_weight` (0–1), `dependencies`, `completion_criteria`, `implementation_intention?` (`{obstacle_trigger, behavioral_response}`), `deadline_hint?`. `ScheduledTask`: `start_min`, `end_min`, `tmt_score`, `title?`.
+`TaskChunk` fields (`decomposition.py:41`): `task_id`, `title`, `duration_minutes` (1–25), `difficulty_weight` (0–1), `dependencies`, `completion_criteria`, `implementation_intention?` (`{obstacle_trigger, behavioral_response}`), `deadline_hint?`, `not_before?` (the earliest start, when the goal says when to do the work). `ScheduledTask`: `start_min`, `end_min`, `tmt_score`, `title?`.
 
 ### 5.11 System
 

@@ -1,6 +1,6 @@
 # 08 — Database schema
 
-Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 19 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (now part of `main`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
+Jarvis keeps its state in one Supabase Postgres database (PostgreSQL 17 per `supabase/config.toml`, with the `vector` extension). The schema is built by the 20 files in `supabase/migrations/`, applied in filename order; all of them are applied to the live project. It holds 19 tables. One root table, `user_profiles`, owns every row: each of the other 18 tables carries a `user_id` that is a foreign key to it, and every table has row-level security with one owner-only policy. Five tables were added for the capstone design (`user_profiles`, `goals`, `task_events`, `proactive_suggestions`, `llm_usage_events`). The other 14 are older tables that the capstone migration brought under the same rules: NOT NULL `user_id`, foreign keys, CHECK constraints that match the domain enums. Two SQL functions carry the invariants that application code cannot guarantee on its own. `accept_draft()` accepts a draft and writes its tasks in one transaction. `match_memories()` runs a filtered pgvector similarity search. This document is generated from the migration files and checked against the code at commit `e76bff9` (now part of `main`), not from memory. No migration changed between `5c6ffd3`, where it was first written, and `e76bff9`: the plan 3 restructure changed only how the application reaches the tables (§4). Each claim names the file it comes from, and §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -259,7 +259,7 @@ erDiagram
 
 ## 3. Table specifications
 
-Each table lists every column with its final type, nullability and default after all 19 migrations. It also lists the CHECKs, keys, indexes and triggers. The *Origin* line names the migration that created the table. For brevity it says "baseline" for `20260101000000_baseline_legacy_tables.sql` and "capstone" for `20261114000001_capstone_lld.sql`.
+Each table lists every column with its final type, nullability and default after all 20 migrations. It also lists the CHECKs, keys, indexes and triggers. The *Origin* line names the migration that created the table. For brevity it says "baseline" for `20260101000000_baseline_legacy_tables.sql` and "capstone" for `20261114000001_capstone_lld.sql`.
 
 ### 3.1 `user_profiles` — the user root
 
@@ -312,6 +312,7 @@ Primary key `(user_id, id)`. Triggers: `ensure_user_profile`. RLS: `owner_all`.
 | `difficulty_weight` | `float8` | NO | `0.5` | `user_tasks_difficulty_weight_range` CHECK `between 0 and 1` |
 | `dependencies` | `jsonb` | yes | `'[]'` | JSON array of `task_id`s (soft, §5) |
 | `deadline_hint` | `text` | yes | — | free text |
+| `not_before` | `timestamptz` | yes | — | the earliest the task may start ("tomorrow evening"); the solver never places it earlier, and a re-plan keeps it |
 | `quality_score` | `int` | yes | — | dead: nothing reads or writes it; mastery reads the `quality` of `completed` events instead (§10) |
 | `reschedule_count` | `int` | yes | `0` | dead: Skip stopped writing it in plan 2, and mastery counts `skipped` events instead (§10) |
 | `completed_at` | `timestamptz` | yes | — | dead: nothing reads or writes it |
@@ -673,7 +674,7 @@ Since plan 3, `draft_schedules`, `behavioral_constraints`, `user_memories`, `hab
 | `UserProfile` (229) | `user_profiles` | `SupabaseProfileRepository` | 1:1. `created_at` and `updated_at` have no field. |
 | `Goal` (245) | `goals` | `SupabaseGoalRepository.get` (read only) | No application code writes a goal. Rows come only from the `ensure_goal` trigger. `created_at` has no field. |
 | `GoalDeadlineUpdate` (257) | `user_plan_updates` | `SupabaseGoalRepository` (`latest_context`, `add_deadline_update`) | 7 fields ↔ 8 columns: the entity has no `id`. |
-| `Task` (275) | `user_tasks` | `SupabaseTaskRepository` (reads; status compare-and-set; `bring_back`); inserts only through `accept_draft()` | 13 fields ↔ 24 columns. Unmapped: `topic_keywords`, `created_at`, `completion_criteria`, `implementation_intention`, `quality_score`, `reschedule_count`, `completed_at`, `scheduled_hour`, `actual_duration_minutes`, `original_duration_minutes`, `original_deadline_hint`. A stored `pacing_pushed` reads as `skipped` (`_mapping._LEGACY_TASK_STATUSES`, line 51). |
+| `Task` (275) | `user_tasks` | `SupabaseTaskRepository` (reads; status compare-and-set; `bring_back`); inserts only through `accept_draft()` | 14 fields ↔ 25 columns. Unmapped: `topic_keywords`, `created_at`, `completion_criteria`, `implementation_intention`, `quality_score`, `reschedule_count`, `completed_at`, `scheduled_hour`, `actual_duration_minutes`, `original_duration_minutes`, `original_deadline_hint`. A stored `pacing_pushed` reads as `skipped` (`_mapping._LEGACY_TASK_STATUSES`, line 51). |
 | `TaskEvent` (314) | `task_events` | `SupabaseTaskEventRepository` | 1:1, all 8 columns. |
 | `DraftSchedule` (333) | `draft_schedules` | `SupabaseDraftRepository`, reached only through `DraftService` | 10 fields ↔ 10 columns. `version` is a computed property, not a column (§3.5). An unset `created_at` is left out of the insert so the column default stamps it (`_mapping.draft_to_row`, line 258). |
 | `BehavioralConstraint` (386) | `behavioral_constraints` | `SupabaseConstraintRepository` | 8 fields ↔ 11 columns. Unmapped: `structured_override`, `valid_from`, `valid_until`. The validity window is read from the raw row (`supabase_repos._applies_at`, line 500). |
@@ -747,7 +748,7 @@ All seven functions are `SECURITY INVOKER`, the default: none declares `SECURITY
 
 ### 6.1 `accept_draft(p_draft_id uuid, p_user_id text, p_rows jsonb) returns integer`
 
-Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `20261115000001_accept_draft_reslots_missed.sql` (v2, the live version). `plpgsql`, `set search_path = public`. Called only by `SupabaseDraftRepository.accept_atomic` (`supabase_repos.py:426`, the call at line 427), which `DraftService.accept` reaches (`app/services/draft_service.py:185`, the call at line 213). The REST accept, the chat accept (both through `app/services/draft_actions.py`) and the morning brief's `ApplyDraftAction` (`app/services/anticipation/actions.py:73`) all go through `DraftService.accept`. A stale `expected_version` is refused in `DraftService.accept` before the call (§3.5); the function itself never sees the version, so an edit that lands between that check and the call is not caught.
+Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `20261115000001_accept_draft_reslots_missed.sql` (v2) and again by `20261115000007_user_tasks_not_before.sql` (the live version: v2 with `not_before` added to its column list). `plpgsql`, `set search_path = public`. Called only by `SupabaseDraftRepository.accept_atomic` (`supabase_repos.py:426`, the call at line 427), which `DraftService.accept` reaches (`app/services/draft_service.py:185`, the call at line 213). The REST accept, the chat accept (both through `app/services/draft_actions.py`) and the morning brief's `ApplyDraftAction` (`app/services/anticipation/actions.py:73`) all go through `DraftService.accept`. A stale `expected_version` is refused in `DraftService.accept` before the call (§3.5); the function itself never sees the version, so an edit that lands between that check and the call is not caught.
 
 **Contract.** The function accepts an open draft and replaces the user's pending tasks with `p_rows` in one transaction. It returns how many tasks it inserted. On any error it rolls everything back.
 
@@ -760,7 +761,7 @@ Defined in `20261114000001_capstone_lld.sql` §12 and replaced by `2026111500000
 2. `SELECT status, expires_at FROM draft_schedules WHERE id = p_draft_id AND user_id = p_user_id FOR UPDATE`: the draft lock. A missing draft, or another user's draft, raises `DRAFT_NOT_FOUND`.
 3. The draft must be open: status `pending` or `modified`, and `expires_at` NULL or in the future. Otherwise the function raises `DRAFT_NOT_OPEN`.
 4. **Delete, with the re-slot rule (v2):** delete this user's rows where `status = 'pending'`, **or** `status = 'missed'` and `task_id` is one of the `task_id`s in `p_rows`. A passed slot can therefore come back under its own id. Other missed rows stay, and so do completed and skipped rows, which keep their ids. A plan that reuses a completed or skipped task's id therefore hits `user_tasks_user_id_task_id_key`, and the whole call fails.
-5. Insert each element of `p_rows` through an explicit column list (`v_columns`): `user_id, plan_id, task_id, goal_id, title, status, duration_minutes, difficulty_weight, dependencies, deadline_hint, completion_criteria, implementation_intention, topic_keywords, scheduled_start, scheduled_end, created_at`.
+5. Insert each element of `p_rows` through an explicit column list (`v_columns`): `user_id, plan_id, task_id, goal_id, title, status, duration_minutes, difficulty_weight, dependencies, deadline_hint, not_before, completion_criteria, implementation_intention, topic_keywords, scheduled_start, scheduled_end, created_at`.
    - Keys outside the list, such as `id`, are dropped.
    - A column the row leaves out takes its real table default. `select *` from `jsonb_populate_recordset` would set it to NULL instead.
    - `user_id` is always overwritten with `p_user_id`, so a row cannot be written for another user.
@@ -889,7 +890,7 @@ A draft past its `expires_at` keeps status `pending`. Expiry is checked when som
 
 ## 8. Migration history
 
-All 19 files are idempotent: running the whole set twice succeeds (`tests/test_migrations.py::test_migrations__statements_are_idempotent`; the local PostgreSQL 18 runs are recorded in `_schema_notes.md`). There is no `20261115000005` file: no such file exists in the git history.
+All 20 files are idempotent: running the whole set twice succeeds (`tests/test_migrations.py::test_migrations__statements_are_idempotent`; the local PostgreSQL 18 runs are recorded in `_schema_notes.md`). There is no `20261115000005` file: no such file exists in the git history.
 
 | # | File | What it changed | Why |
 |---|---|---|---|
@@ -912,6 +913,7 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 | 17 | `20261115000003_session_summaries.sql` | `chat_sessions.summary`, `summary_through`, `summary_updated_at` + CHECKs; `set_chat_session_updated_at()` | Conversations that remember: compaction and "since we last spoke" (plan 2, decision 9) |
 | 18 | `20261115000004_suggestion_consent_kind.sql` | `proactive_suggestions.consent_kind` + CHECK | The typed reason behind a consent decision (plan 2, decision 12) |
 | 19 | `20261115000006_session_summary_reach.sql` | `chat_sessions.summary_covered_through` + CHECK; trigger function restated | Without it, every later summary re-sent the newest turns, and the daily rescan could not tell a fully summarised conversation from one with unsummarised turns |
+| 20 | `20261115000007_user_tasks_not_before.sql` | `user_tasks.not_before`; `accept_draft()` restated with the column in its list | Work asked for at a time ("tomorrow evening") was drafted as early as it fit; the earliest start has to survive the accept and later re-plans |
 
 ---
 

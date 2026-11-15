@@ -214,10 +214,10 @@ Pinned by `tests/test_errors.py::test_error_envelope__unhandled_exception__hides
 
 | # | Scenario | What the user sees | What the system does | Where | Pinned by |
 |---|---|---|---|---|---|
-| D1 | Double click on Accept (REST) | First 200 `accepted`; second 409 `invalid_state_transition`; tasks written once | Sequential: fail-fast `transition`. Concurrent: the SQL function serialises on row locks and the second sees `accepted` (section 4.1) | `draft_actions.py:87`; `draft_service.py:198-213`; `supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:51-65` | `tests/test_draft_endpoints.py::test_accept_endpoint__second_call__409_envelope`; `tests/test_repository_contracts.py::test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds`; `tests/test_draft_service.py::test_accept__concurrent_double_click__exactly_one_succeeds` |
+| D1 | Double click on Accept (REST) | First 200 `accepted`; second 409 `invalid_state_transition`; tasks written once | Sequential: fail-fast `transition`. Concurrent: the SQL function serialises on row locks and the second sees `accepted` (section 4.1) | `draft_actions.py:87`; `draft_service.py:198-213`; `supabase/migrations/20261115000007_user_tasks_not_before.sql:54-68` | `tests/test_draft_endpoints.py::test_accept_endpoint__second_call__409_envelope`; `tests/test_repository_contracts.py::test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds`; `tests/test_draft_service.py::test_accept__concurrent_double_click__exactly_one_succeeds` |
 | D2 | "Looks good" in chat after the REST accept | "That plan is already locked in, sir." — nothing written | `InvalidStateTransition` caught; the draft is re-read to say what really happened | `app/orchestrator/graph.py:617-618` (`_closed_draft_reply`, `:705`) | `tests/behaviour/test_chat_turns.py::test_chat__plan_already_accepted_in_the_review_ui__looks_good_says_already_locked_in`; Live 4 |
 | D3 | "Scrap it" after the plan was accepted | "That plan is already locked in, sir, so there was nothing to discard." | The resumed turn reads the draft's status (D11), so the thread is in the accepted phase; `classify_intent` sends "scrap it" (like a second "looks good") to `draft_action`, where `reject_draft` raises `InvalidStateTransition` instead of reporting a discard | `app/services/draft_actions.py:131-141`; `_classify_intent` (`app/orchestrator/graph.py`) | `tests/behaviour/test_chat_turns.py::test_chat__scrap_it_after_accepting_in_the_review_ui__never_claims_a_discard` |
-| D4 | Stale (expired) draft | 409; ask for a fresh plan | `accept_draft` treats `expires_at < now()` as not open (`DRAFT_NOT_OPEN`); drafts expire 24 h after creation (database default, and `DRAFT_TTL` stamped by both repository families) | `supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:63-65`; `_mapping.py:48, 254`; `supabase/migrations/20260329000002_phase1_missing_tables.sql:20` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__expired__raises`; `tests/test_drafts_one_path.py::test_draft_ttl__one_constant__24h_and_no_dead_twin_in_config` |
+| D4 | Stale (expired) draft | 409; ask for a fresh plan | `accept_draft` treats `expires_at < now()` as not open (`DRAFT_NOT_OPEN`); drafts expire 24 h after creation (database default, and `DRAFT_TTL` stamped by both repository families) | `supabase/migrations/20261115000007_user_tasks_not_before.sql:66-68`; `_mapping.py:48, 254`; `supabase/migrations/20260329000002_phase1_missing_tables.sql:20` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__expired__raises`; `tests/test_drafts_one_path.py::test_draft_ttl__one_constant__24h_and_no_dead_twin_in_config` |
 | D5 | Late accept, some slots already passed | 200 with `moved: true` and a note that the times were moved | The draft's own tasks are re-solved from now under every rule (`DraftPlanner.reslot_from_now`), the new schedule stored on the draft, then accepted | `draft_actions.py:61-99` | `tests/test_accept_on_time.py::test_rest_accept__three_hours_late__moved_from_now_and_nothing_swept`, `::test_rest_accept__moved__the_draft_shows_its_new_times` |
 | D6 | Late accept, every slot passed | 409 `draft_outdated`: "Every time in this plan has already gone by, so I didn't put it in place. Ask me for a fresh plan and I'll fit it around now." | Nothing written | `draft_service.py:55-58, 207-209` | `tests/test_draft_service.py::test_accept__every_slot_already_started__draft_outdated_and_nothing_written` |
 | D7 | Late accept, the rest no longer fits | 422 `schedule_infeasible`; the draft stays open | Nothing written | `draft_actions.py:47-50, 96-97` | `tests/test_accept_on_time.py::test_rest_accept__the_rest_no_longer_fits__422_and_the_draft_stays_open` |
@@ -262,7 +262,7 @@ Pinned by `tests/test_errors.py::test_error_envelope__unhandled_exception__hides
 
 **Problem.** Before the capstone, accept was "delete pending tasks, then insert the new ones" in two calls, and a double click inserted every task twice; between the two calls a failure could lose the tasks.
 
-**Mechanism.** One Postgres function, `public.accept_draft(p_draft_id, p_user_id, p_rows)` (`supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:16-106`), called once through the repository (`supabase_repos.py:426-453`). A PL/pgSQL function runs in one transaction, so its writes land together or not at all. In order:
+**Mechanism.** One Postgres function, `public.accept_draft(p_draft_id, p_user_id, p_rows)` (`supabase/migrations/20261115000007_user_tasks_not_before.sql:19-109`), called once through the repository (`supabase_repos.py:426-453`). A PL/pgSQL function runs in one transaction, so its writes land together or not at all. In order:
 
 1. **Lock the user** — `select ... from user_profiles where user_id = p_user_id for no key update` (`:51-54`). One accept at a time per user. Without it, two accepts of two *different* drafts would lock different rows, both pass the status check, and both plans would end up pending (`:39-41`).
 2. **Lock the draft** — `select status, expires_at ... for update` (`:56-59`).
@@ -471,9 +471,9 @@ From `Jarvis-Engine/` on branch `main`:
 # Local day and timezone rules, the streak
 .venv/bin/python -m pytest tests/test_local_time.py tests/test_local_day_fixes.py tests/behaviour/test_local_day.py -q
 
-# Everything (expect at e2a5899: 2116 passed, 2 xfailed, 2 deselected)
+# Everything (expect at 8759bf0: 2203 passed, 2 xfailed, 2 deselected)
 .venv/bin/python -m pytest tests/ -q
 
 # Read the accept_draft function and its lock order
-sed -n '39,106p' supabase/migrations/20261115000001_accept_draft_reslots_missed.sql
+sed -n '42,109p' supabase/migrations/20261115000007_user_tasks_not_before.sql
 ```

@@ -175,12 +175,12 @@ sequenceDiagram
 | 5–6 | `DraftService.accept`: the draft must be open, schedulable and not wholly in the past. | `draft_service.py:185-212` | `tests/test_draft_service.py::test_accept__concurrent_double_click__exactly_one_succeeds` |
 | 7–8 | One repository call per request. | `draft_service.py:213`; `app/infrastructure/persistence/supabase_repos.py:426-431` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__concurrent_calls__exactly_one_succeeds` |
 | 9–10 | Each becomes one RPC to the database function. | `supabase_repos.py:432-435` | (as above, both repository families) |
-| Note | Lock order: the user's profile row first (`FOR NO KEY UPDATE`, so inserts that reference it are not blocked), then the draft row. The function also updates the user's other drafts, so draft-then-user would let two accepts deadlock. | `supabase/migrations/20261115000001_accept_draft_reslots_missed.sql:39-59` | `tests/test_migrations.py::test_migrations__accept_draft__locks_the_user_before_the_draft` |
-| 11 | Inside the transaction: `DRAFT_NOT_FOUND` / `DRAFT_NOT_OPEN` checks, delete the user's pending tasks (and missed tasks this plan re-slots under their own id), insert each row with only the allowed columns and the caller's `user_id` forced, mark the draft accepted, mark every other open draft superseded. | `…accept_draft_reslots_missed.sql:60-105` | `tests/test_migrations.py::test_migrations__accept_draft__supersedes_the_users_other_open_drafts`, `::test_migrations__accept_draft_v2__deletes_reslotted_missed_rows`; `tests/test_repository_contracts.py::test_drafts__accept_atomic__two_open_drafts__the_other_is_superseded` |
+| Note | Lock order: the user's profile row first (`FOR NO KEY UPDATE`, so inserts that reference it are not blocked), then the draft row. The function also updates the user's other drafts, so draft-then-user would let two accepts deadlock. | `supabase/migrations/20261115000007_user_tasks_not_before.sql:42-62` | `tests/test_migrations.py::test_migrations__accept_draft__locks_the_user_before_the_draft` |
+| 11 | Inside the transaction: `DRAFT_NOT_FOUND` / `DRAFT_NOT_OPEN` checks, delete the user's pending tasks (and missed tasks this plan re-slots under their own id), insert each row with only the allowed columns and the caller's `user_id` forced, mark the draft accepted, mark every other open draft superseded. | `…user_tasks_not_before.sql:63-108` | `tests/test_migrations.py::test_migrations__accept_draft__supersedes_the_users_other_open_drafts`, `::test_migrations__accept_draft_v2__deletes_reslotted_missed_rows`; `tests/test_repository_contracts.py::test_drafts__accept_atomic__two_open_drafts__the_other_is_superseded` |
 | 12–13 | The row count comes back. | `supabase_repos.py:449-453` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__writes_rows_and_marks_accepted` |
 | 14 | After the commit: one `scheduled` (or `rescheduled`) task event per slotted task, best effort, then `DraftAccepted` on the event bus, whose listener links the written tasks to the user's documents (`DocumentLinkListener`, best effort, logged on failure). | `draft_service.py:214-225, 264-331` | `tests/test_triggers.py::test_brief__accept__tasks_written_and_rescheduled_events` |
 | 15–16 | `200 {status: "accepted", task_count, moved}`. | `draft_actions.py:92-94`; `drafts.py:130-136` | Live 2 |
-| Note | The second call was blocked on the profile row; once call 1 commits, it reads `accepted`. | `…accept_draft_reslots_missed.sql:63-65` | — |
+| Note | The second call was blocked on the profile row; once call 1 commits, it reads `accepted`. | `…user_tasks_not_before.sql:66-68` | — |
 | 17–18 | `DRAFT_NOT_OPEN` maps to `InvalidStateTransition` (a 23505 unique violation would map to `ConflictError`, anything else to `PersistenceError` 503 with the draft left open). | `supabase_repos.py:436-448` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__second_call__raises_invalid_state_transition_and_no_duplicates` |
 | 19–21 | The route catches only `StaleVersionError`, `ValidationError` and `PersistenceError`; `InvalidStateTransition` reaches the global handler, which writes the envelope with status 409. | `drafts.py:114-129`; `app/api/error_handlers.py:124, 197-199`; `app/domain/errors.py:46-53` | `tests/test_draft_endpoints.py::test_accept_endpoint__second_call__409_envelope`; Live 3 |
 
@@ -792,9 +792,9 @@ stateDiagram-v2
 | Checked in Python | `entities.py:370-385` (`DraftSchedule.transition`) | `tests/test_domain.py` |
 | propose | `draft_service.py:111-123` | `tests/test_planning_graph.py::test_create_draft__stores_tasks_and_sets_draft_id` |
 | edit (a closed draft is refused before anything is written) | `draft_service.py:147-176` | `tests/test_draft_endpoints.py::test_edit_routes__accepted_draft__409_and_draft_stays_accepted` |
-| accept, and supersede of the other open drafts, in SQL | `…accept_draft_reslots_missed.sql:63-65, 94-103` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__two_open_drafts__the_other_is_superseded` |
+| accept, and supersede of the other open drafts, in SQL | `…user_tasks_not_before.sql:66-68, 97-106` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__two_open_drafts__the_other_is_superseded` |
 | reject / discard / expire (compare-and-set, 3 tries) | `draft_service.py:178-183, 232-240`; `supabase_repos.py:399-424` | `tests/test_draft_endpoints.py::test_reject_endpoint__accepted_draft__409_envelope` |
-| expiry after 24 h counts as closed in the SQL check | `_mapping.py:48, 254`; `…accept_draft_reslots_missed.sql:63` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__expired__raises` |
+| expiry after 24 h counts as closed in the SQL check | `_mapping.py:48, 254`; `…user_tasks_not_before.sql:66` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__expired__raises` |
 
 ### Task status (`_Move` table, `app/services/task_service.py:66-84`)
 
@@ -813,7 +813,7 @@ stateDiagram-v2
 
 | Move | Code | Pinned by |
 |---|---|---|
-| written, replaced, re-slotted (row deleted and re-inserted, `rescheduled` event on accept) | `…accept_draft_reslots_missed.sql:67-92`; `draft_service.py:300-331` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__reslots_missed_row_with_same_task_id` |
+| written, replaced, re-slotted (row deleted and re-inserted, `rescheduled` event on accept) | `…user_tasks_not_before.sql:70-95`; `draft_service.py:300-331` | `tests/test_repository_contracts.py::test_drafts__accept_atomic__reslots_missed_row_with_same_task_id` |
 | complete (from pending, missed or skipped) | `task_service.py:74-79, 109-126` | `tests/test_task_service.py::test_complete__missed_task__allowed_and_status_completed`, `::test_complete__skipped_task__allowed_and_status_completed` |
 | skip (from pending only) | `:80, 128-140` | `tests/test_task_service.py::test_skip__completed_task__returns_none_no_event` |
 | slot passed (sweep, 30-minute grace, held to the slot it read) | `:84, 170-217` | `tests/test_task_service.py::test_sweep__accept_reslots_task_mid_sweep__new_slot_never_marked_missed` |
@@ -927,10 +927,10 @@ for f in /tmp/d06_*.mmd; do npx -y @mermaid-js/mermaid-cli -i "$f" -o "${f%.mmd}
 .venv/bin/python -m pytest -q tests/test_llm_providers.py tests/test_claude_provider.py \
   tests/test_model_router.py tests/test_prompt_layout.py tests/test_usage_ledger.py \
   tests/test_layering.py                                                                      # S8
-.venv/bin/python -m pytest -q tests/                  # everything (at e2a5899: 2116 passed, 2 xfailed, 2 deselected)
+.venv/bin/python -m pytest -q tests/                  # everything (at 8759bf0: 2203 passed, 2 xfailed, 2 deselected)
 
 # 3. Spot-check any reference: e.g. the lock order of accept_draft and the transition tables.
-sed -n 39,65p supabase/migrations/20261115000001_accept_draft_reslots_missed.sql
+sed -n '42,68p' supabase/migrations/20261115000007_user_tasks_not_before.sql
 sed -n 111,224p app/domain/entities.py
 
 # 4. Live: with the backend running against real Supabase and the model chain

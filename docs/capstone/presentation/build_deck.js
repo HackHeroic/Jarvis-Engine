@@ -1277,8 +1277,8 @@ async function s20() {
   const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Proof" });
   head(s, "21  ·  PROOF", "Checked, not claimed");
   const stats = [
-    ["2,116", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
-    ["358", "frontend tests pass", "18 vitest files", C.accent2, HEX.gold],
+    ["2,203", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
+    ["381", "frontend tests pass", "20 vitest files", C.accent2, HEX.gold],
     ["18", "live end-to-end steps", "real Supabase and Claude; all passed on the final code", C.accent3, HEX.dusk],
     ["15", "class diagrams verified", "against the code, by a test", C.accent6, HEX.sageLight],
   ];
@@ -1307,9 +1307,9 @@ async function s20() {
     text(s, [mono(g, { fontSize: 12 }), { text: "   " + d, options: { fontSize: 13, color: C.text2 } }], { x: x + 0.2, y, w: CW / 2 - 0.5, h: 0.54, valign: "middle" });
   });
   s.addNotes(
-    "The offline suite at backend commit e2a5899: 2,116 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 88 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
-      "The frontend has 358 vitest tests in 18 files at frontend commit 990899c. " +
-      "scripts/live_e2e.py drives the running backend against real Supabase and Claude in 18 steps as a throwaway user and deletes its rows; it was re-run on e2a5899 and every step passed with no traceback in the server log, and its cached-prompt step read 1,398 tokens. Run it again on demo day. " +
+    "The offline suite at backend commit 8759bf0: 2,203 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 91 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
+      "The frontend has 381 vitest tests in 20 files at frontend commit 073644b. " +
+      "scripts/live_e2e.py drives the running backend against real Supabase and Claude in 18 steps as a throwaway user and deletes its rows; it was re-run on 8759bf0 and every step passed with no traceback in the server log, and its cached-prompt step read 1,398 tokens. Run it again on demo day. " +
       "The guards that keep the design honest are the layering test, the design-conformance test over the class diagrams, the SSE golden files and the repository contract suite."
   );
 }
@@ -1345,8 +1345,8 @@ async function s22() {
   head(s, "23  ·  HONEST LIMITS", "What is not built, said out loud");
   const w = (CW - 0.3) / 2;
   const cols = [
-    ["NOT BUILT", C.accent1, "X", HEX.terra, ["Ask-back clarifying questions", "PreTaskPrep and DeadlineRisk triggers", "Research summariser", "Habit reviews have no creator yet", "Real authentication"]],
-    ["KNOWN LIMITS", C.accent2, "TriangleAlert", HEX.gold, ["Locks are per process: one worker", "PII gate is regex only", "6 legacy table calls, allow-listed", "Version check has a small window", "Web links need search credits"]],
+    ["NOT BUILT", C.accent1, "X", HEX.terra, ["Ask-back clarifying questions", "PreTaskPrep and DeadlineRisk triggers", "Research summariser", "CognitiveModule registry", "Real authentication"]],
+    ["KNOWN LIMITS", C.accent2, "TriangleAlert", HEX.gold, ["Locks are per process: one worker", "PII gate is regex only", "6 legacy table calls, allow-listed", "Version check has a small window", "Document links are by meaning: fuzzy"]],
   ];
   for (let c = 0; c < 2; c++) {
     const [title, col, ic, hex, items] = cols[c];
@@ -1364,7 +1364,7 @@ async function s22() {
     "We state these openly (10-demo-and-contributions.md section 5, PROJECT_STATUS sections 4 and 10). Not built: ask-back, the PreTaskPrep and DeadlineRisk triggers, a research summariser (it returns a result count), the CognitiveModule registry, and real authentication; the caller is a user_id query parameter behind the CurrentUser seam a JWT would replace. " +
       "Known limits: the turn, model and anticipation locks are per process, which is correct for the one process Jarvis runs as; anything that could corrupt data is guarded in Postgres instead. " +
       "The PII gate is regex only, six legacy call sites still make raw table calls on a tested allow-list, and the draft version check has a small window before accept_draft runs. " +
-      "Two more found while clicking through the app: nothing creates a habit review tracker yet, so the Habits page is empty for every user (L14), and the workspace's web links come only from Gemini's grounded search, so without search credits a workspace shows the task, its criteria and the user's own documents but no links. An uploaded file is now kept in private storage and opens in the in-app viewer."
+      "Found while clicking through the app and since fixed: the Habits page was empty (each learned rule now gets a spaced check-in), an uploaded file was not kept (it is now stored privately and opens in the viewer), and workspace links needed Gemini (they now come from Claude's web search). Still a limit: documents are linked to tasks by meaning, so a link can be missed or a near-miss made."
   );
 }
 

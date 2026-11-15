@@ -101,7 +101,7 @@ app/
 │                              module_framework, or_tools/
 ├── schemas/                   chat_stream, errors, draft, schedule, upload, decomposition, …
 └── db/supabase_py.py          the one Supabase client builder (HTTP/1.1)
-supabase/migrations/           19 migration files — the schema's source of truth
+supabase/migrations/           20 migration files — the schema's source of truth
 scripts/                       seed_demo_user.py, live_e2e.py
 tests/                         88 test files; behaviour/ drives the real turn over a fake DB
 ```
@@ -156,7 +156,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 - **Supabase (Postgres)** is the store; `supabase/migrations/` is the source of truth. RLS is on for every table, the backend uses the service-role key, and every repository query filters by `user_id`. Tables, keys, functions and the class → table map: [08 — Database schema](capstone/08-database-schema.md); how to apply: [schema notes](capstone/_schema_notes.md).
 - **The Supabase client** (`app/db/supabase_py.py`) speaks pooled HTTP/1.1. `ConnectRetryTransport` sends a request again, once, only when it provably did no work on the server: a connection that could not be made, or a dropped kept-alive connection on a read (`GET`/`HEAD`). A write that lost its connection, a read timeout or an HTTP error is raised as it came (a 503).
-- **Migrations, in order:** `20260101000000_baseline_legacy_tables`, `20260329000000_chat_sessions`, `20260329000001_phase1_memory_system`, `20260329000002_phase1_missing_tables`, `20260331000000_chat_sessions_pinned`, `20260401000000_user_tasks_missing_columns`, `20260501000001_pearl_scheduled_hour`, `20260501000002_task_workspaces`, `20260808000000_user_tasks_actual_duration`, `20260813000000_user_tasks_status_missed_pacing`, `20260813000001_draft_schedules_schedule`, `20261114000001_capstone_lld`, `20261114000002_user_tasks_original_duration`, `20261115000000_skip_writes_skipped`, `20261115000001_accept_draft_reslots_missed`, `20261115000002_memory_lifecycle_and_vectors`, `20261115000003_session_summaries`, `20261115000004_suggestion_consent_kind`, `20261115000006_session_summary_reach`. There is no `…0005`. Plan 3 added no migration.
+- **Migrations, in order:** `20260101000000_baseline_legacy_tables`, `20260329000000_chat_sessions`, `20260329000001_phase1_memory_system`, `20260329000002_phase1_missing_tables`, `20260331000000_chat_sessions_pinned`, `20260401000000_user_tasks_missing_columns`, `20260501000001_pearl_scheduled_hour`, `20260501000002_task_workspaces`, `20260808000000_user_tasks_actual_duration`, `20260813000000_user_tasks_status_missed_pacing`, `20260813000001_draft_schedules_schedule`, `20261114000001_capstone_lld`, `20261114000002_user_tasks_original_duration`, `20261115000000_skip_writes_skipped`, `20261115000001_accept_draft_reslots_missed`, `20261115000002_memory_lifecycle_and_vectors`, `20261115000003_session_summaries`, `20261115000004_suggestion_consent_kind`, `20261115000006_session_summary_reach`, `20261115000007_user_tasks_not_before`. There is no `…0005`. Plan 3 added no migration.
 - **SQLite** (`data/checkpoints.sqlite`, override `JARVIS_CHECKPOINT_DB`): LangGraph checkpoints, one thread per `user_id:session_id`; live per-turn objects are scrubbed before a write; a daily sweep keeps the newest 20 per thread (`CHECKPOINT_KEEP_PER_THREAD`, `app/core/config.py:167`).
 - **ChromaDB (cloud):** document chunks only. Memories are in Postgres.
 
@@ -164,7 +164,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 ## 7. Tests
 
-**2116 passed, 2 xfailed, 2 deselected**, about 88 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `e2a5899`. 94 test files.
+**2203 passed, 2 xfailed, 2 deselected**, about 91 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `8759bf0`. 94 test files.
 
 - **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
 - **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.
@@ -181,7 +181,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 2. Run `.venv/bin/python scripts/live_e2e.py` (default `--base-url http://localhost:8000`). It costs ten chat turns, roughly 25–30 model calls.
 3. Pass means the table ends `ALL PASSED` (exit 0; a SKIP is allowed and means the step had nothing to say) and the server log shows no traceback.
 
-Last run: all 18 steps passed at `e2a5899` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
+Last run: all 18 steps passed at `8759bf0` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
 
 ---
 
@@ -204,7 +204,7 @@ The full script and the viva questions are in [10 — Demo and contributions](ca
 4. **TMT ties past ~16 h** and **no default if-then plan** (the two strict xfails, §7).
 5. **A failed decomposition can still produce a plan** from the user's pending tasks: `fuse_tasks` runs after `decompose_goal` with no route on its error (`app/modules/planning_graph.py:989-993`), and a solved plan clears the error (`:710`).
 6. **`validate_goal` rejects goals under 5 characters** ("DSA") and asks for clarification (`app/modules/planning_graph.py:428`).
-7. **Web search is Gemini-only** (`gemini_web_search`, `app/services/analytical/workspace_builder.py:21, 40`). The workspace's web links, and its practice links when the task has no document chunks, come only from Gemini's grounded search, which fails while the Gemini credits are depleted. The workspace then shows the task, its completion criteria and the notice "Web results are unavailable right now, so no links are shown", and a failed search is not tried again for 5 minutes (`WEB_SEARCH_COOLDOWN_S`, `web_search_cooldown`). With no Gemini key, research links come back empty too. A search is metered on the composition root's bus, and refused without one (`metered_web_search`, `app/core/model_router.py:106-157`).
+7. **Web search runs outside the provider chain** (`_search_web`, `app/services/analytical/workspace_builder.py`). The workspace's web links, and its practice links when the task has no document chunks, come from Claude's server-side web search (`app/models/brain/claude_web_search.py`), with Gemini's grounded search as the fallback. Only links the search itself returned are kept, so a link recalled from memory is never shown. When neither search answers, the workspace shows the task, its criteria, the user's documents and a notice, and the search is not retried for 5 minutes (`WEB_SEARCH_COOLDOWN_S`). Each answered search is metered into the usage ledger under the provider that answered.
 8. **The PII gate is regex only** (email and US-format phone, `app/orchestrator/hooks.py`), applied to the prompt, the system prompt and the history before any cloud send.
 9. **Bringing a missed task back records no event** (it is not an outcome; `TaskService.bring_back`, `app/services/task_service.py:154`), and `task_completion_signals` is a table nothing reads or writes.
 10. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 6 allow-listed raw-table leftovers); only its cache read and write run on a worker thread. Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
