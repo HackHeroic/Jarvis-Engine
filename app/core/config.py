@@ -327,6 +327,18 @@ SUMMARY_SUPPRESS_SIMILARITY: float = 0.45
 # at {user_id}/{source_id}. The bucket is created on first use, limited to the largest
 # upload ingestion accepts (MAX_CHAT_UPLOAD_BYTES).
 DOCUMENT_BUCKET: str = "jarvis-documents"
+# A document is linked to a task when one of its phrases (a topic, or its file name's
+# subject) is at least this close to the task's title (cosine similarity, the memory
+# embedder all-MiniLM-L6-v2). Measured on 4 documents (an ML syllabus of ten topics, DBMS
+# notes, OS notes, an academic transcript) against 48 task titles: 192 pairs, 20 of them
+# a document that is material for the task. The weakest true match but one scored 0.557
+# ("ML quiz prep: SVMs" against "Support vector machines"), the strongest unrelated pair
+# but one 0.476 ("Decide which trees to plant in the garden" against "Decision trees"),
+# so the cut sits between them. Two pairs fall on the wrong side of any single cut: "Train
+# a small neural net in PyTorch" (0.478, missed) and "Data structures: binary trees"
+# against "Decision trees" (0.610, linked). All the topics joined into one string, the
+# old way, scored at most 0.528 for a true match: none reached the old cut of 0.65.
+DOCUMENT_LINK_SIMILARITY: float = 0.52
 
 
 def is_feature_enabled(flag: str) -> bool:

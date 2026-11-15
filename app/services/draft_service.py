@@ -220,6 +220,7 @@ class DraftService:
                 user_id=user_id,
                 draft_id=draft_id,
                 task_count=written,
+                task_ids=[row["task_id"] for row in rows],
             )
         )
         return written

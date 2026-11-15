@@ -100,6 +100,7 @@ async def test_accept__open_draft__persists_and_publishes_draft_accepted(repos):
     assert (await repos.drafts.get(U1, draft.id)).status is DraftStatus.ACCEPTED
     [event] = recorder.events
     assert (event.user_id, event.draft_id, event.task_count) == (U1, draft.id, 2)
+    assert event.task_ids == ["g_t1", "g_t2"]  # what it wrote, for the document linker
 
 
 @pytest.mark.asyncio

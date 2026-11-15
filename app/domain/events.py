@@ -53,6 +53,9 @@ class DraftAccepted(DomainEvent):
 
     draft_id: str = Field(description="Draft that was accepted.")
     task_count: int = Field(description="Number of tasks written by the accept.")
+    task_ids: list[str] = Field(
+        default_factory=list, description="The ids of the tasks the accept wrote."
+    )
 
 
 class PatternDetected(DomainEvent):

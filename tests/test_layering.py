@@ -459,7 +459,6 @@ _RAW_TABLE_CALLS_ALLOWED: dict[str, str] = {
     "api/v1/endpoints/sessions.py": f"{_PLAN_3_CUT} chat_sessions",
     "api/v1/endpoints/ingestion.py": f"{_PLAN_3_CUT} pending_calendar_updates",
     "services/extraction/orchestrator.py": f"{_PLAN_3_CUT} pending_calendar_updates",
-    "services/extraction/task_material_linker.py": f"{_PLAN_3_CUT} task_materials",
 }
 _RAW_TABLE_DIRS = ["api", "services", "core", "modules", "orchestrator"]
 
@@ -528,6 +527,5 @@ def test_layering__allow_lists__are_exactly_the_documented_leftovers():
         "api/v1/endpoints/sessions.py",
         "api/v1/endpoints/ingestion.py",
         "services/extraction/orchestrator.py",
-        "services/extraction/task_material_linker.py",
     }
     assert all(reason.strip() for reason in _RAW_TABLE_CALLS_ALLOWED.values())

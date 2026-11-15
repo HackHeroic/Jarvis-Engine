@@ -2,8 +2,8 @@
 
 Workspaces are now PERSISTED in `task_workspaces` table with a 24h TTL.
 get_or_build_task_workspace() is the public entry — checks cache, returns if fresh,
-else rebuilds via build_task_workspace() and upserts. Cache invalidates when
-task_material_linker links a new document to this task.
+else rebuilds via build_task_workspace() and upserts. The cache is dropped when the
+documents linked to the task change (``DocumentLinker``, ``DocumentService.delete``).
 """
 
 import asyncio

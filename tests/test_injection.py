@@ -26,7 +26,7 @@ from tests.behaviour.conftest import (  # noqa: F401 - jarvis and llm are fixtur
     llm,
     said,
 )
-from tests.fakes import FakeDBClient, planning_services
+from tests.fakes import BagOfWordsEmbedder, FakeDBClient, planning_services
 
 ROOT = Path(__file__).resolve().parent.parent
 IST = ZoneInfo("Asia/Kolkata")
@@ -567,30 +567,25 @@ async def _accepted(repos, rows: list[dict]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_link_document_to_tasks__reads_the_users_tasks_through_the_task_repository(
-    monkeypatch,
-):
-    from unittest.mock import MagicMock
-
-    import app.services.extraction.task_material_linker as linker
+async def test_document_linker__reads_the_users_tasks_and_writes_links_through_the_ports():
+    from app.domain.entities import IngestedDocument
+    from app.services.documents.linker import DocumentLinker
 
     repos = RepositoryFactory.in_memory()
     await _accepted(repos, [
         {"task_id": "graphs_t1", "title": "graphs", "goal_id": "dsa"},
         {"task_id": "essay_t1", "title": "essay", "goal_id": "english"},
     ])
-    links = MagicMock()  # task_materials has no repository yet: the link rows go here
-    monkeypatch.setattr(  # one dimension per word: "graphs" matches only the graphs task
-        linker, "_get_embedding_function",
-        lambda: lambda texts: [[float("graphs" in t), float("essay" in t)] for t in texts],
-    )
+    linker = DocumentLinker(repos.documents, repos.tasks, BagOfWordsEmbedder(), threshold=0.5)
+    document = IngestedDocument(user_id=U, source_id="doc-1", document_topics=["graphs"])
+    await repos.documents.save(U, document)
 
-    matched = await linker.link_document_to_tasks(
-        U, ["graphs"], "doc-1", tasks=repos.tasks, supabase_client=links
-    )
+    matched = await linker.link_document(U, document)
 
     assert matched == ["graphs_t1"]
-    links.table.assert_called_once_with("task_materials")  # never user_tasks
+    assert [l.task_id for l in await repos.documents.links_for_documents(U, ["doc-1"])] == [
+        "graphs_t1"
+    ]
 
 
 @pytest.mark.asyncio
@@ -599,11 +594,16 @@ async def test_process_ingestion__document_names_a_deadline__stored_for_the_matc
 ):
     import app.services.extraction.orchestrator as orchestrator
     from app.schemas.context import IntentType
+    from app.services.documents.linker import DocumentLinker
+    from app.services.documents.service import DocumentService
     from app.services.extraction.knowledge_ingester import KnowledgeIngestionResult
 
     repos = RepositoryFactory.in_memory()
     await _accepted(repos, [{"task_id": "graphs_t1", "title": "graphs", "goal_id": "dsa"}])
-    seen_tasks = []
+    documents = DocumentService(
+        repos.documents, repos.document_files, repos.tasks,
+        linker=DocumentLinker(repos.documents, repos.tasks, BagOfWordsEmbedder(), threshold=0.5),
+    )
 
     async def ingest(**_kwargs):
         return KnowledgeIngestionResult(
@@ -612,20 +612,16 @@ async def test_process_ingestion__document_names_a_deadline__stored_for_the_matc
             deadlines=["2099-01-15"],
         )
 
-    async def link(*, tasks, **_kwargs):
-        seen_tasks.append(tasks)
-        return ["graphs_t1"]
-
     monkeypatch.setattr(orchestrator, "ingest_knowledge", ingest)
-    monkeypatch.setattr(orchestrator, "link_document_to_tasks", link)
 
-    await orchestrator.process_ingestion(
+    result = await orchestrator.process_ingestion(
         payload="Graphs problem set, due 15 January 2099", user_id=U,
         intent_override=IntentType.KNOWLEDGE_INGESTION, tasks=repos.tasks, goals=repos.goals,
         db_client=FakeDBClient(),  # the document row is kept in the database
+        documents=documents,
     )
 
-    assert seen_tasks == [repos.tasks]
+    assert result.knowledge_result["linked_task_ids"] == ["graphs_t1"]
     assert await repos.goals.latest_context(U, "dsa") == "Finish the graphs problem set"
 
 
@@ -640,6 +636,8 @@ _CONTAINER_BUILT_SERVICES = (
     "app/services/anticipation/scheduler.py",
     "app/services/anticipation/service.py",
     "app/services/anticipation/triggers.py",
+    "app/services/documents/service.py",
+    "app/services/documents/linker.py",
 )
 
 

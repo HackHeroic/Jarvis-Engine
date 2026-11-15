@@ -69,10 +69,12 @@ class AnticipationSettings:
 
 @dataclass(frozen=True)
 class DocumentSettings:
-    """The documents: where an uploaded file is kept, and how big it may be."""
+    """The documents: where an uploaded file is kept, how big it may be, and how close a
+    document must be to a task to be linked to it."""
 
     bucket: str  # the private Supabase Storage bucket
     max_file_bytes: int  # the largest upload ingestion accepts; the bucket's limit
+    link_similarity: float  # a document phrase this close to a task title links them
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,7 @@ class Settings:
             documents=DocumentSettings(
                 bucket=cfg.DOCUMENT_BUCKET,
                 max_file_bytes=cfg.MAX_CHAT_UPLOAD_BYTES,
+                link_similarity=cfg.DOCUMENT_LINK_SIMILARITY,
             ),
         )
 

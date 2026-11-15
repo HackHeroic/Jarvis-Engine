@@ -76,9 +76,9 @@ class _FailingFiles:
 async def test_add__with_a_file__record_and_file_kept(repos):
     service = _service(repos)
 
-    stored = await service.add(U, _doc("ingestion_aaa", file_name="ML.pdf"), file=PDF)
+    linked = await service.add(U, _doc("ingestion_aaa", file_name="ML.pdf"), file=PDF)
 
-    assert stored is not None and stored.source_id == "ingestion_aaa"
+    assert linked == []  # no linker, no links
     assert await repos.document_files.read(U, "ingestion_aaa") == PDF
     assert (await repos.documents.get(U, "ingestion_aaa")).file_name == "ML.pdf"
 
@@ -88,15 +88,14 @@ async def test_add__file_store_fails__record_kept_warning_logged_never_raises(re
     service = DocumentService(repos.documents, _FailingFiles(), repos.tasks)
 
     with caplog.at_level(logging.WARNING):
-        stored = await service.add(U, _doc("ingestion_aaa"), file=PDF)
+        await service.add(U, _doc("ingestion_aaa"), file=PDF)
 
-    assert stored is not None
     assert await repos.documents.get(U, "ingestion_aaa") is not None
     assert "kept without its file" in caplog.text and "PersistenceError" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_add__record_store_fails__no_file_kept_and_none(caplog):
+async def test_add__record_store_fails__no_file_kept_no_link(caplog):
     repos = RepositoryFactory.in_memory()
 
     class _NoRecords:
@@ -106,7 +105,7 @@ async def test_add__record_store_fails__no_file_kept_and_none(caplog):
     service = DocumentService(_NoRecords(), repos.document_files, repos.tasks)
 
     with caplog.at_level(logging.WARNING):
-        assert await service.add(U, _doc("ingestion_aaa"), file=PDF) is None
+        assert await service.add(U, _doc("ingestion_aaa"), file=PDF) == []
 
     assert await repos.document_files.stored_ids(U) == frozenset()
     assert "record could not be stored" in caplog.text

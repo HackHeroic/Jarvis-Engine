@@ -17,6 +17,7 @@ from app.core.model_router import build_chain
 from app.core.settings import Settings
 from app.domain.anticipation import ConsentPolicy
 from app.domain.events import (
+    DraftAccepted,
     EventBus,
     LLMCallCompleted,
     PatternDetected,
@@ -39,6 +40,7 @@ from app.services.anticipation.triggers import (
     PatternRuleTrigger,
 )
 from app.services.analytical.workspace_builder import invalidate_workspaces
+from app.services.documents.linker import DocumentLinker, DocumentLinkListener
 from app.services.documents.service import DocumentService
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
@@ -101,6 +103,7 @@ class AppContainer:
     conversation_memory: ConversationMemoryService
     stated_rules: StatedRules
     documents: DocumentService
+    document_linker: DocumentLinker
     settings: Settings
 
     @classmethod
@@ -166,6 +169,16 @@ class AppContainer:
         draft_service = DraftService(
             repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
         )
+        # Documents and tasks find each other by meaning, both ways: a new document is
+        # linked to the open tasks it fits when it is kept, and an accepted plan's tasks
+        # to the documents they fit once the accept has committed (DraftAccepted). A
+        # change to a task's documents drops its cached workspace.
+        document_linker = DocumentLinker(
+            repos.documents, repos.tasks, embedder,
+            threshold=settings.documents.link_similarity,
+            on_links_changed=invalidate_workspaces,
+        )
+        events.subscribe(DraftAccepted, DocumentLinkListener(document_linker))
         # The first move. Each action kind is registered with the factory, so an
         # accepted suggestion can be rebuilt from its payload; the triggers with the
         # service. A skip window PEARL finds is offered as a rule right away.
@@ -242,12 +255,12 @@ class AppContainer:
             conversation_memory=conversation_memory,
             # A stated rule and the memory of stating it: letting go of one lets go of both.
             stated_rules=StatedRules(repos.constraints, memory_service),
-            # The user's documents across their record, links and file; a change to a
-            # task's documents drops that task's cached workspace.
+            # The user's documents across their record, links and file.
             documents=DocumentService(
                 repos.documents, repos.document_files, repos.tasks,
-                on_links_changed=invalidate_workspaces,
+                linker=document_linker, on_links_changed=invalidate_workspaces,
             ),
+            document_linker=document_linker,
             settings=settings,
         )
 

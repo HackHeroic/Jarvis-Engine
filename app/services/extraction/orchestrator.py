@@ -22,7 +22,6 @@ from app.services.extraction.calendar_extractor import extract_calendar_slots
 from app.services.extraction.knowledge_ingester import ingest_knowledge
 from app.services.documents.service import DocumentService
 from app.services.documents.uploads import content_type_for
-from app.services.extraction.task_material_linker import link_document_to_tasks
 from app.utils.docling_helper import read_document_with_provenance
 
 SEMANTIC_ROUTER_SYSTEM_PROMPT = (
@@ -127,12 +126,13 @@ async def process_ingestion(
         intent_override: When provided, skip SLM classification and use this intent (for Control Policy).
         constraints: The user's rules (the container's repository): read as calendar
             context, written for a stated preference. None (no database): neither.
-        tasks: The user's tasks (the container's repository): a document is linked to
-            the ones it matches. None: no links.
+        tasks: The user's tasks (the container's repository): the goal of the first task
+            a document was linked to gets the deadlines it names. None: no goal.
         goals: The goals' deadline updates (the container's repository): a deadline the
             document names is stored for the goal of the tasks it matched. None: not stored.
         documents: The container's DocumentService: a document read for knowledge is
-            kept through it (its record, and the uploaded file itself). None: not kept.
+            kept through it (its record, the uploaded file itself, and its links to the
+            user's open tasks). None: not kept, and linked to nothing.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -239,29 +239,17 @@ async def process_ingestion(
                 deadline_mentioned=bool(kr.deadlines),
                 created_at=datetime.now(timezone.utc).isoformat(),
             )
-        # Task–Material Linking via embedding similarity (same source_id as ChromaDB)
+        # Keep the document for the documents page: its record, for an upload the file
+        # itself, and links to the user's open tasks it is material for (best effort:
+        # its chunks are stored whatever happens here).
         matched: list[str] = []
-        if user_id and kr.document_topics and tasks is not None:
-            matched = await link_document_to_tasks(
-                user_id=user_id,
-                document_topics=kr.document_topics,
-                source_id=source_id,
-                tasks=tasks,
-                source_type="chunk",
-                supabase_client=supabase,
-            )
-            if matched:
-                base_result.knowledge_result["linked_task_ids"] = matched
-
-        # Keep the document for the documents page: its record and, for an upload, the
-        # file itself (best effort: its chunks are stored whatever happens here).
         if user_id and documents is not None:
             kept_file = (
                 StoredFile(content=file_bytes, content_type=content_type_for(media_type, file_bytes))
                 if file_bytes
                 else None
             )
-            await documents.add(
+            matched = await documents.add(
                 user_id,
                 IngestedDocument(
                     user_id=user_id,
@@ -273,6 +261,8 @@ async def process_ingestion(
                 ),
                 file=kept_file,
             )
+            if matched:
+                base_result.knowledge_result["linked_task_ids"] = matched
 
         # Store deadlines as the goal's deadline updates (goal-level persistence)
         if user_id and kr.deadlines and goals is not None:

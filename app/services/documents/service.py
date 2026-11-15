@@ -14,20 +14,16 @@ never fails the ingestion that read it.
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from app.domain import errors
 from app.domain.entities import IngestedDocument, StoredFile, TaskMaterialLink
 from app.domain.ports import DocumentFileStore, DocumentRepository, TaskRepository
 from app.schemas.documents import DocumentOut, LinkedDocument, LinkedTask
+from app.services.documents.linker import DocumentLinker, WorkspacesChanged
 from app.services.documents.uploads import download_name
 
 logger = logging.getLogger(__name__)
-
-# Told to the workspace cache when the documents linked to some tasks changed:
-# (user_id, task_ids). The composition root passes the workspace builder's invalidation.
-WorkspacesChanged = Callable[[str, list[str]], Awaitable[None]]
 
 _LIST_FAILED = "Could not load your documents."
 _DELETE_FAILED = "Could not delete the document."
@@ -54,22 +50,25 @@ class DocumentService:
         files: DocumentFileStore,
         tasks: TaskRepository,
         *,
+        linker: DocumentLinker | None = None,
         on_links_changed: WorkspacesChanged | None = None,
     ) -> None:
         self._documents = documents
         self._files = files
         self._tasks = tasks
+        self._linker = linker
         self._on_links_changed = on_links_changed
 
     async def add(
         self, user_id: str, document: IngestedDocument, *, file: StoredFile | None = None
-    ) -> IngestedDocument | None:
-        """Keep a newly ingested document: its record, then its file when one was uploaded.
+    ) -> list[str]:
+        """Keep a newly ingested document: its record, its file when one was uploaded, and
+        links to the user's open tasks it is material for (``DocumentLinker``).
 
         Best effort, never raising: the document's chunks are already stored, so a store
         that fails here is logged (by its exception type) and the rest goes on without
-        it. Returns the record as stored, or None when it could not be stored (then no
-        file is kept: a file with no record could never be listed or opened).
+        it. When the record cannot be stored nothing else is kept: a file or a link with
+        no record could never be listed or opened. Returns the ids of the tasks linked.
         """
         try:
             stored = await self._documents.save(user_id, document)
@@ -78,16 +77,25 @@ class DocumentService:
                 "Document %s was read but its record could not be stored (%s)",
                 document.source_id, type(exc).__name__,
             )
-            return None
+            return []
         if file is not None:
             try:
-                await self._files.save(user_id, document.source_id, file)
+                await self._files.save(user_id, stored.source_id, file)
             except Exception as exc:
                 logger.warning(
                     "Document %s was kept without its file: the file store failed (%s)",
-                    document.source_id, type(exc).__name__,
+                    stored.source_id, type(exc).__name__,
                 )
-        return stored
+        if self._linker is None:
+            return []
+        try:
+            return await self._linker.link_document(user_id, stored)
+        except Exception as exc:
+            logger.warning(
+                "Document %s was kept but linked to no task: linking failed (%s)",
+                stored.source_id, type(exc).__name__,
+            )
+            return []
 
     async def list_documents(self, user_id: str) -> list[DocumentOut]:
         """The user's documents, newest first, each with whether its file is kept and the
