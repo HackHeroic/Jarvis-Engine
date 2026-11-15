@@ -271,6 +271,14 @@ MEMORY_RETENTION_FLOOR: float = 0.1
 MEMORY_PROFILE_TOKENS: int = 200
 MEMORY_RECALL_TOKENS: int = 300
 MEMORY_RECALL_MIN_SIMILARITY: float = 0.3
+# A message asking about several things is looked up whole and clause by clause (split on
+# "?", ";", "," and "and"; clauses under three words are no clause), at most
+# MEMORY_RECALL_MAX_PARTS clauses: one embedding averages the meanings of a two-part
+# question, and the memory for each part can fall under the bar. A memory from
+# MEMORY_RECALL_WORD_MATCH_SIMILARITY up counts as relevant too when it shares a telling
+# word with the message ("Thursdays" in "anything about Thursdays?").
+MEMORY_RECALL_MAX_PARTS: int = 3
+MEMORY_RECALL_WORD_MATCH_SIMILARITY: float = 0.2
 
 # The largest chat turn the stream accepts (ChatStreamRequest): a message of at most
 # MAX_CHAT_PROMPT_CHARS characters, and an upload that decodes to at most

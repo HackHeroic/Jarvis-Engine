@@ -294,3 +294,226 @@ def test_estimate_tokens__three_and_a_half_characters_a_token():
     assert estimate_tokens("") == 0
     assert estimate_tokens("abcdefg") == 2
     assert estimate_tokens("abcdefgh") == 3
+
+
+# --- each part of a question -----------------------------------------------------------
+# A question about two things averages their meaning in one embedding, and the memory
+# for each part can fall under the bar. Recall looks for the whole message and for each
+# of its clauses, and keeps a memory found a little under the bar when it shares a
+# telling word with the message.
+
+
+def _axis(index: int, similarity: float = 1.0) -> list[float]:
+    """A unit vector at cosine ``similarity`` to axis ``index``, the rest of its length
+    on the last axis (a direction no memory points along)."""
+    vector = [0.0] * _DIMS
+    vector[index] = similarity
+    vector[-1] = math.sqrt(max(0.0, 1.0 - similarity**2))
+    return vector
+
+
+def _mixed(**on_axis: float) -> list[float]:
+    """A unit vector with the given cosine to each named axis (``a0=0.6``), the rest of
+    its length on the last axis."""
+    vector = [0.0] * _DIMS
+    for name, similarity in on_axis.items():
+        vector[int(name[1:])] = similarity
+    vector[-1] = math.sqrt(max(0.0, 1.0 - sum(v * v for v in vector)))
+    return vector
+
+
+class _MappedEmbedder(TextEmbedder):
+    """Embeds each text it knows as its chosen vector, and records every call."""
+
+    dimensions = _DIMS
+
+    def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.vectors = vectors
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(list(texts))
+        return [self.vectors[text] for text in texts]
+
+
+def test_query_parts__two_questions_joined_by_and__whole_then_each_part():
+    from app.services.memory.memory_service import _query_parts
+
+    assert _query_parts("When is my gym, and what should I know about Thursdays?", 3) == [
+        "When is my gym, and what should I know about Thursdays?",
+        "When is my gym",
+        "what should I know about Thursdays",
+    ]
+
+
+def test_query_parts__single_clause__whole_only():
+    from app.services.memory.memory_service import _query_parts
+
+    assert _query_parts("What do you know about Dr. Rao?", 3) == ["What do you know about Dr. Rao?"]
+    # A fragment under three words is no clause of its own: one clause is the whole.
+    assert _query_parts("Thanks, what do you know about Dr. Rao?", 3) == [
+        "Thanks, what do you know about Dr. Rao?"
+    ]
+
+
+def test_query_parts__three_questions_with_no_and__whole_then_each_part():
+    from app.services.memory.memory_service import _query_parts
+
+    query = "When does the mess close? Who teaches Computer Networks; what is due on Friday?"
+    assert _query_parts(query, 3) == [
+        query, "When does the mess close", "Who teaches Computer Networks", "what is due on Friday",
+    ]
+
+
+def test_query_parts__more_clauses_than_the_cap__first_ones_once_each():
+    from app.services.memory.memory_service import _query_parts
+
+    query = (
+        "when is my gym? When is my gym? who teaches networks, what is due friday,"
+        " and where is lunch"
+    )
+    assert _query_parts(query, 3) == [
+        query, "when is my gym", "who teaches networks", "what is due friday",
+    ]
+    assert _query_parts("gym timing? thursday quizzes?", 3) == ["gym timing? thursday quizzes?"]
+
+
+@pytest.mark.asyncio
+async def test_recall__three_part_question__memory_for_each_part_is_relevant(memories):
+    query = "When does the mess close? Who teaches Computer Networks, and what is due on Friday?"
+    parts = ["When does the mess close", "Who teaches Computer Networks", "what is due on Friday"]
+    mess = await _add(memories, "Hostel mess closes at 9 PM", embedding=_axis(0))
+    rao = await _add(memories, "Computer Networks is taught by Dr. Rao", embedding=_axis(1))
+    friday = await _add(memories, "The OS assignment is due every Friday", embedding=_axis(2))
+    await _add(memories, "The mess serves dosa on Sundays", embedding=_axis(0, 0.95),
+               status=MemoryStatus.DISMISSED)  # close to a part, but let go of
+    embedder = _MappedEmbedder({
+        query: _mixed(a0=0.15, a1=0.15, a2=0.15),  # the whole: under both bars for each
+        parts[0]: _mixed(a0=0.6),
+        parts[1]: _mixed(a1=0.6),
+        parts[2]: _mixed(a2=0.6),
+    })
+    service = MemoryService(memories, embedder, clock=lambda: NOW)
+
+    recall = await service.recall("alice", query, now=NOW)
+
+    assert sorted(m.id for m in recall.relevant) == sorted([mess.id, rao.id, friday.id])
+    assert embedder.calls == [[query, *parts]]  # one embedding batch, no model call
+
+
+@pytest.mark.asyncio
+async def test_recall__two_part_question__memory_for_each_part_is_relevant(memories):
+    query = "When is the mess open, and what should I know about Thursdays?"
+    rao = await _add(
+        memories, "Computer Networks professor is Dr. Rao, who gives surprise quizzes on Thursdays",
+        embedding=_axis(0),
+    )
+    mess = await _add(memories, "Hostel mess closes at 9 PM", embedding=_axis(1))
+    embedder = _MappedEmbedder({
+        query: _mixed(a0=0.1, a1=0.1),
+        "When is the mess open": _mixed(a1=0.5),
+        "what should I know about Thursdays": _mixed(a0=0.45),
+    })
+    service = MemoryService(memories, embedder, clock=lambda: NOW)
+
+    recall = await service.recall("alice", query, now=NOW)
+
+    contents = [m.content for m in recall.relevant]
+    assert any("Thursdays" in c for c in contents) and any("mess" in c for c in contents)
+    assert [m.id for m in recall.relevant] == [mess.id, rao.id]  # 0.5 ranks over 0.45
+
+
+@pytest.mark.asyncio
+async def test_recall__rare_word_shared_with_a_memory_below_the_bar__still_relevant(memories):
+    query = "anything about Thursdays?"
+    quizzes = await _add(memories, "Dr. Rao gives surprise quizzes on Thursdays",
+                         embedding=_at_similarity(0.25))   # under 0.3, a word in common
+    await _add(memories, "Hostel mess closes at 9 PM",
+               embedding=_at_similarity(0.25))             # under 0.3, no word in common
+    await _add(memories, "Thursday evenings are for the chess club",
+               embedding=_at_similarity(0.15))             # a word in common, under 0.2
+    await _add(memories, "Knows about a lot of anything",
+               embedding=_at_similarity(0.25))             # only stop words in common
+    embedder = _MappedEmbedder({query: _at_similarity(1.0)})
+    service = MemoryService(memories, embedder, clock=lambda: NOW)
+
+    recall = await service.recall("alice", query, now=NOW)
+
+    assert [m.id for m in recall.relevant] == [quizzes.id]
+
+
+@pytest.mark.asyncio
+async def test_recall__short_parts_with_no_and__found_by_their_words(memories):
+    """"gym timing? thursday quizzes?": no clause is three words long, so the whole is
+    the one embedding, and the memory it lands a little under the bar for is kept by the
+    words it shares ("thursday", "quizzes")."""
+    query = "gym timing? thursday quizzes?"
+    quizzes = await _add(memories, "Dr. Rao gives surprise quizzes on Thursdays",
+                         embedding=_at_similarity(0.22))
+    await _add(memories, "Hostel mess closes at 9 PM", embedding=_at_similarity(0.22))
+    embedder = _MappedEmbedder({query: _at_similarity(1.0)})
+    service = MemoryService(memories, embedder, clock=lambda: NOW)
+
+    recall = await service.recall("alice", query, now=NOW)
+
+    assert [m.id for m in recall.relevant] == [quizzes.id]
+    assert embedder.calls == [[query]]
+
+
+@pytest.mark.asyncio
+async def test_recall__same_memory_matched_by_two_parts__listed_once_at_its_best(memories):
+    query = "When is my gym session, and how long is my gym session?"
+    gym = await _add(memories, "Gym sessions last an hour", embedding=_axis(0))
+    other = await _add(memories, "Sessions with the tutor are on Mondays", embedding=_axis(1))
+    embedder = _MappedEmbedder({
+        query: _mixed(a0=0.35, a1=0.5),
+        "When is my gym session": _mixed(a0=0.4),
+        "how long is my gym session": _mixed(a0=0.7),
+    })
+    service = MemoryService(memories, embedder, clock=lambda: NOW)
+
+    recall = await service.recall("alice", query, now=NOW)
+
+    # Found by all three, listed once, ranked by its best (0.7 over the tutor's 0.5).
+    assert [m.id for m in recall.relevant] == [gym.id, other.id]
+
+
+class _ReversedNearest:
+    """The memory repository, answering ``nearest`` in the reverse order: a store whose
+    order differs must not change the note."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def nearest(self, *args, **kwargs):
+        return list(reversed(await self._inner.nearest(*args, **kwargs)))
+
+
+@pytest.mark.asyncio
+async def test_recall__same_inputs__same_note_bytes(memories):
+    from zoneinfo import ZoneInfo
+
+    from app.services.memory.context import render_context_note
+
+    query = "When is the mess open, and what should I know about Thursdays?"
+    await _add(memories, "Prefers studying in the mornings", "preference")
+    for i, axis in enumerate((0, 0, 1, 1)):  # equal similarities: ties broken by id
+        await _add(memories, f"Memory {i} about the mess and Thursdays", embedding=_axis(axis))
+    vectors = {
+        query: _mixed(a0=0.25, a1=0.25),
+        "When is the mess open": _mixed(a1=0.5),
+        "what should I know about Thursdays": _mixed(a0=0.5),
+    }
+    zone = ZoneInfo("Asia/Kolkata")
+
+    notes = []
+    for store in (memories, _ReversedNearest(memories), memories):
+        service = MemoryService(store, _MappedEmbedder(vectors), clock=lambda: NOW)
+        recall = await service.recall("alice", query, now=NOW)
+        notes.append(render_context_note(recall, now=NOW, zone=zone).encode())
+
+    assert len(set(notes)) == 1
+    assert notes[0].count(b"about the mess and Thursdays") == 4

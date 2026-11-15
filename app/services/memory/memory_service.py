@@ -38,7 +38,7 @@ from app.domain.entities import (
     memory_moves_to,
 )
 from app.domain.errors import EmbeddingUnavailableError
-from app.domain.ports import MemoryRepository, Sweep, TextEmbedder
+from app.domain.ports import MemoryMatch, MemoryRepository, Sweep, TextEmbedder
 from app.services.memory.context import Recall, estimate_tokens, render_memory_line
 
 logger = logging.getLogger(__name__)
@@ -64,11 +64,26 @@ _ACTIVE = frozenset({MemoryStatus.ACTIVE})
 _SUPERSEDE_IDS = uuid.UUID("6f1d3c2a-6b0e-4f6a-9a51-2f0c8e7d4b19")
 # A letter or digit in any script: text without one has nothing in it to remember.
 _WORD = re.compile(r"[^\W_]")
+_WORD_RUNS = re.compile(r"[^\W_]+")
 # Recall's always-on profile: these types, in this order, from this sure up.
 _PROFILE_TYPES = ("constraint", "preference", "goal")
 _PROFILE_MIN_CONFIDENCE = 0.6
-# How many of the nearest memories recall considers for the message.
+# How many of the nearest memories recall considers for each part of the message.
 _RECALL_CANDIDATES = 12
+# Where a message splits into the clauses recall looks up on their own.
+_CLAUSE_BREAK = re.compile(r"[?;,]|\band\b", re.IGNORECASE)
+# A clause of fewer words is a fragment ("thanks"), not a question of its own.
+_CLAUSE_MIN_WORDS = 3
+_LETTERS = re.compile(r"[^\W\d_]+")
+# Words of four letters or more that say nothing about which memory is meant.
+_STOP_WORDS = frozenset(
+    "about above after again also anything anyone been before being below could does "
+    "doing done during each else every everything from have having here into just know "
+    "like make more most much need only other over please remember should some someone "
+    "something such tell than that their them then there these they thing things think "
+    "this those through under until very want were what when where which while will "
+    "with would your yours".split()
+)
 # How many drop_suppressed answers are kept (oldest dropped first).
 _KEPT_CACHE_SIZE = 256
 # The most memories a turn's snapshot reads: its newest active ones, and the ids of its
@@ -110,6 +125,37 @@ class RememberOutcome(BaseModel):
 
 def _has_words(text: str) -> bool:
     return _WORD.search(text) is not None
+
+
+def _query_parts(query: str, max_parts: int) -> list[str]:
+    """What recall looks up for ``query``: the whole of it, then each of its clauses.
+
+    Clauses are split on "?", ";", "," and the word "and", trimmed; a clause under three
+    words is dropped, and so is one said twice (case aside); at most ``max_parts`` are
+    kept, the first ones. A query with fewer than two clauses is only itself.
+    """
+    clauses: list[str] = []
+    seen: set[str] = set()
+    for piece in _CLAUSE_BREAK.split(query):
+        clause = piece.strip(" \t\r\n.!:")
+        key = clause.casefold()
+        if len(_WORD_RUNS.findall(clause)) >= _CLAUSE_MIN_WORDS and key not in seen:
+            seen.add(key)
+            clauses.append(clause)
+    if len(clauses) < 2:
+        return [query]
+    return [query, *clauses[:max_parts]]
+
+
+def _content_words(text: str) -> frozenset[str]:
+    """The telling words of ``text``: four letters or more, no stop word, case-folded,
+    a trailing "s" dropped ("Thursdays" and "thursday" are one word)."""
+    words = set()
+    for word in _LETTERS.findall(text.casefold()):
+        stem = word[:-1] if word.endswith("s") else word
+        if len(word) >= 4 and word not in _STOP_WORDS and stem not in _STOP_WORDS:
+            words.add(stem)
+    return frozenset(words)
 
 
 def _in_use_at(memory: Memory, now: datetime, retention_floor: float) -> bool:
@@ -383,17 +429,23 @@ class MemoryService:
 
         The profile: active constraints, preferences and goals at least 0.6 sure, in
         that type order and newest (last confirmed, else created) first, added while
-        their lines fit MEMORY_PROFILE_TOKENS. Then the relevant memories: the 12
-        nearest active ones from MEMORY_RECALL_MIN_SIMILARITY up, less the profile,
-        ranked by similarity x (0.5 + 0.5 x strength now) x confidence, added while
-        their lines fit MEMORY_RECALL_TOKENS. A line too long for what is left of a
-        budget is skipped, not the end of it. Ties go by id, so the order never depends
-        on the store's. Superseded, expired and below-floor memories never appear, nor
-        any memory the user let go of or another user's.
+        their lines fit MEMORY_PROFILE_TOKENS. Then the relevant memories, looked up for
+        the whole message and for each of its clauses (``_query_parts``, at most
+        MEMORY_RECALL_MAX_PARTS): the 12 nearest active ones for each, a memory found
+        by several kept once at its highest similarity. One counts from
+        MEMORY_RECALL_MIN_SIMILARITY up, or from MEMORY_RECALL_WORD_MATCH_SIMILARITY up
+        when it shares a telling word with the message (``_content_words``). Less the
+        profile, they are ranked by similarity x (0.5 + 0.5 x strength now) x
+        confidence and added while their lines fit MEMORY_RECALL_TOKENS. A line too
+        long for what is left of a budget is skipped, not the end of it. Ties go by id,
+        so the order never depends on the store's. Superseded, expired and below-floor
+        memories never appear, nor any memory the user let go of or another user's.
 
-        A ``trivial`` message, or one with no words, gets the profile only, without an
-        embedding call. An embedder that is down leaves the profile only, logged. The
-        profile comes from ``snapshot`` when the caller has one (no read of its own).
+        One embedding batch (every part at once) and one similarity read per part; no
+        model call. A ``trivial`` message, or one with no words, gets the profile only,
+        without an embedding call. An embedder that is down leaves the profile only,
+        logged. The profile comes from ``snapshot`` when the caller has one (no read of
+        its own).
         """
         now = now if now is not None else self._clock()
         types = frozenset(_PROFILE_TYPES)
@@ -416,24 +468,37 @@ class MemoryService:
         if trivial or not _has_words(query):
             return Recall(profile=profile, relevant=[], tokens=profile_tokens)
 
+        parts = _query_parts(query, self._settings.recall_max_parts)
         try:
-            embedding = await self._embed(query)
+            vectors = await asyncio.to_thread(self._embedder.embed, parts)
         except EmbeddingUnavailableError:
             logger.warning("Recall without relevant memories: the text embedder is unavailable")
             return Recall(profile=profile, relevant=[], tokens=profile_tokens)
-        matches = await self._memories.nearest(
-            user_id,
-            embedding,
-            statuses=_ACTIVE,
-            limit=_RECALL_CANDIDATES,
-            min_similarity=self._settings.recall_min_similarity,
-        )
+        floor = min(self._settings.recall_word_match_similarity,
+                    self._settings.recall_min_similarity)
+        found = await asyncio.gather(*(
+            self._memories.nearest(
+                user_id, vector, statuses=_ACTIVE, limit=_RECALL_CANDIDATES,
+                min_similarity=floor,
+            )
+            for vector in vectors
+        ))
+        best: dict[str, MemoryMatch] = {}
+        for match in (match for matches in found for match in matches):
+            held = best.get(match.memory.id)
+            if held is None or match.similarity > held.similarity:
+                best[match.memory.id] = match
+        asked_about = _content_words(query)
         shown = {m.id for m in profile}
         candidates = [
             match
-            for match in matches
+            for match in best.values()
             if match.memory.id not in shown
             and _in_use_at(match.memory, now, self._settings.retention_floor)
+            and (
+                match.similarity >= self._settings.recall_min_similarity
+                or asked_about & _content_words(match.memory.content)
+            )
         ]
         candidates.sort(
             key=lambda match: (

@@ -131,7 +131,6 @@ async def test_loop__said_in_one_chat__in_the_context_note_of_a_new_chat(
     assert RAO in memories and MESS in memories
 
 
-@pytest.mark.xfail(strict=True, reason="M1")
 @pytest.mark.asyncio
 async def test_loop__two_part_question__both_memories_in_the_note(jarvis, scripted):
     await jarvis.say(TWO_FACTS)

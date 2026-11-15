@@ -25,6 +25,8 @@ class MemorySettings:
     dedupe_similarity: float  # this close to an active or faded memory: reinforce it
     profile_tokens: int  # the standing profile's share of the context note
     recall_min_similarity: float  # a memory counts as relevant from here up
+    recall_max_parts: int  # a message's clauses looked up on their own, at most
+    recall_word_match_similarity: float  # from here up, relevant when a word is shared
     recall_tokens: int  # the relevant memories' share of the context note
     retention_floor: float  # below this strength a memory leaves recall
     suppress_similarity: float  # this close to a let-go memory: never stored again
@@ -98,6 +100,8 @@ class Settings:
                 dedupe_similarity=cfg.MEMORY_DEDUPE_SIMILARITY,
                 profile_tokens=cfg.MEMORY_PROFILE_TOKENS,
                 recall_min_similarity=cfg.MEMORY_RECALL_MIN_SIMILARITY,
+                recall_max_parts=cfg.MEMORY_RECALL_MAX_PARTS,
+                recall_word_match_similarity=cfg.MEMORY_RECALL_WORD_MATCH_SIMILARITY,
                 recall_tokens=cfg.MEMORY_RECALL_TOKENS,
                 retention_floor=cfg.MEMORY_RETENTION_FLOOR,
                 suppress_similarity=cfg.MEMORY_SUPPRESS_SIMILARITY,
