@@ -442,12 +442,15 @@ def is_goal_clear(state: PlanningState) -> bool:
 # read it back. The user's matching documents and the time travel in a context note
 # instead.
 DECOMPOSITION_SYSTEM_PROMPT = (
-    "You are a task decomposition expert. Break the user's goal into 5-8 concrete, "
-    "actionable micro-tasks of 15-25 minutes each. Each task must have clear completion "
-    "criteria. Every task must also carry an implementation_intention, an if-then plan for "
+    "You are a task decomposition expert. Break the user's goal into concrete, actionable "
+    "micro-tasks of 15-25 minutes each: 5-8 of them unless the goal states how long the "
+    "work should take. Each task must have clear completion criteria. Every task must also carry an implementation_intention, an if-then plan for "
     "the obstacle most likely to stall it: obstacle_trigger is the concrete 'If ...' "
     "situation and behavioral_response is the concrete 'then ...' action the user takes.\n\n"
     "SIZING AND ORDER:\n"
+    "- When the goal states the time to spend ('one hour', '90 minutes', 'two hours'), "
+    "the durations add up to that time, within five minutes, in as few tasks as that "
+    "takes: 'one hour' is three tasks of 20 minutes, never five to eight tasks.\n"
     "- duration_minutes is 15 to 25, never more: 25 minutes is the ceiling for one block of "
     "sustained attention. Split anything bigger.\n"
     "- Give each task a short title that starts with a verb ('Solve three graph problems', "
