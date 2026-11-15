@@ -281,9 +281,40 @@ async def test_seed__report__about_three_weeks_and_ninety_tasks():
     assert report["days"] == 21
     assert 80 <= report["tasks"] <= 100
     assert report["memories"] == 3
+    assert report["rules"] == 3
+    assert report["check_ins"] == {"due": 2, "upcoming": 1}
     assert 8 <= report["plate"] <= 10  # 8 ahead or due today, and up to two evening blocks
     assert report["events_by_type"]["scheduled"] == report["tasks"] + report["plate"]
     assert "deadline_missed" not in report["events_by_type"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("today", A_WEEK_OF_RUN_DAYS, ids=lambda d: f"{d:%a}")
+async def test_seed__habits_page__two_rules_due_for_a_check_in_and_one_not_yet(today):
+    """On the demo morning the real RuleCheckIns (on the real clock's stand-in, the
+    morning of ``today``) lists the seeded rules: the lunch rule, which slipped two days
+    ago (answered 2), and the rule never asked about yet are due; the rule that held
+    twice comes back tomorrow, six days after its second check-in."""
+    from app.services.analytical.rule_check_ins import RuleCheckIns
+
+    fake = FakeSupabase()
+    repos, _ = await _seed(today, repos=RepositoryFactory.supabase(fake))
+    morning = datetime.combine(today, time(7, 5), IST)
+    check_ins = RuleCheckIns(repos.habit_trackers, repos.constraints, repos.profiles,
+                             clock=lambda: morning)
+
+    listed = await check_ins.list_for_user(DEMO)
+
+    due = {c.rule_text: c for c in listed.due_trackers}
+    (later,) = listed.upcoming_trackers
+    assert set(due) == {"Keep 1 to 2 PM free for lunch", "No study before 9 AM"}
+    assert due["Keep 1 to 2 PM free for lunch"].last_reviewed_at is not None
+    assert due["No study before 9 AM"].last_reviewed_at is None
+    assert (later.rule_text, later.next_due_on, later.interval_days) == (
+        "No work after 10:30 PM", today + timedelta(days=1), 6
+    )
+    assert all(c.source == "said" for c in listed.due_trackers + listed.upcoming_trackers)
+    assert len(fake.rows["habit_trackers"]) == 3  # one per rule, none started by the read
 
 
 # --- idempotent, repeatable, offline -------------------------------------------------
@@ -359,6 +390,7 @@ def test_seed__success__ends_with_the_operator_note(capsys):
     assert f"{yesterday:%a %d %b}" in note
     assert "skip_time_window:9" in note and "deadline_crunch" in note
     assert re.search(r"learned peak hour: (7|8) PM", note, flags=re.IGNORECASE)
+    assert "Habits page: 2 rule check-ins due today, 1 not due yet." in note
     assert "seed on the demo day; rerun with --reset to refresh" in note.lower()
 
 
@@ -398,7 +430,7 @@ class _TableLog(FakeSupabase):
 
 def test_reset__deletes_only_the_demo_users_rows__usage_first_profile_last():
     tables = ("llm_usage_events", "task_events", "user_tasks", "draft_schedules",
-              "user_memories", "user_profiles")
+              "user_memories", "habit_trackers", "behavioral_constraints", "user_profiles")
     fake = _TableLog({
         table: [{"user_id": DEMO, "n": 1}, {"user_id": "someone-else", "n": 2}]
         for table in tables
@@ -625,6 +657,8 @@ DEMO_LEFTOVERS = {
         {"column": ("user_memories", "pattern_key")},
         {"column": ("user_memories", "provenance")},
         {"column": ("proactive_suggestions", "consent_kind")},
+        {"column": ("behavioral_constraints", "source")},
+        {"column": ("habit_trackers", "constraint_id")},
         {"function": "accept_draft"},
         {"function": "match_memories"},
     ],

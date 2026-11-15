@@ -11,6 +11,10 @@ only write the row and event shapes the app itself writes:
   23:59 ``TaskService.sweep_passed_slots`` sets aside whatever was left untouched;
 - three things the user said are remembered by ``MemoryService.remember`` on their
   own dates;
+- three rules the user stated are stored by ``store_behavioral_constraint`` on their
+  own dates, each starting its check-ins (``RuleCheckIns``), and the user answers the
+  check-ins due on the days the Habits page asked; on the demo day two rules are due
+  for a check-in and one is not due until tomorrow;
 - the evening before the demo the user accepts a plan for the days ahead (the current
   plate, ``_UPCOMING``): tasks due over the next two to four days, two of them hard,
   one due today, and an evening block or two they never get to, which the slot sweep
@@ -78,6 +82,7 @@ from app.domain.entities import (
 )
 from app.domain.events import EventBus
 from app.domain.ports import (
+    ConstraintRepository,
     DraftRepository,
     ProfileRepository,
     TaskEventRepository,
@@ -87,8 +92,10 @@ from app.infrastructure.embedding import MiniLMEmbedder
 from app.infrastructure.persistence.factory import Repositories
 from app.orchestrator.hooks import ActionHooks
 from app.schemas.decomposition import TaskChunk
+from app.services.analytical.rule_check_ins import RuleCheckIns
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
+from app.services.extraction.behavioral_store import store_behavioral_constraint
 from app.services.memory.memory_service import MemoryCandidate, MemoryService
 from app.services.memory.patterns import PatternService
 from app.services.planning.local_time import local_today
@@ -112,6 +119,7 @@ RESLOT_AT = time(18, 0)  # a 09:00 DSA slot left untouched finds a new slot next
 PLATE_AT = time(21, 0)  # the evening before the demo: the plan for the days ahead
 EVENING_BLOCKS = (time(21, 15), time(21, 45))  # planned that evening, never got to
 PLATE_STARTS = (time(11, 0), time(11, 30), time(14, 0), time(14, 30))  # each day, as planned
+CHECK_IN_AT = time(20, 50)  # the user answers the Habits page's check-ins (before PLATE_AT)
 YESTERDAYS_SET_ASIDE = 3  # at most this many of yesterday's tasks wait for a new slot
 
 DONE, SKIPPED, UNTOUCHED = "done", "skipped", "untouched"
@@ -130,6 +138,8 @@ _RESET_ORDER = (
     "user_tasks",
     "draft_schedules",
     "user_memories",
+    "habit_trackers",
+    "behavioral_constraints",
     "user_profiles",
 )
 
@@ -137,7 +147,6 @@ _RESET_ORDER = (
 _CASCADE_ONLY = (
     "goals",
     "proactive_suggestions",
-    "behavioral_constraints",
     "chat_messages",
     "chat_sessions",
 )
@@ -147,12 +156,29 @@ _SCHEMA_PROBES = (
     ("task_events", "id,task_id,event_type,occurred_at,scheduled_start,scheduled_end,metadata"),
     ("user_memories", "status,pattern_key,provenance,strength_as_of"),
     ("proactive_suggestions", "consent_kind"),
+    ("behavioral_constraints", "id,raw_text,source,created_at"),
+    ("habit_trackers", "id,constraint_id,last_done_at,quality_last,next_interval_days"),
 )
 # Bounds for "any scheduled task" in the already-seeded check.
 _ALL_TIME = (datetime(2000, 1, 1, tzinfo=timezone.utc), datetime(2100, 1, 1, tzinfo=timezone.utc))
 # An outcome stamped between the run's real start and end (give or take this) was
 # written on the real clock, not the seed's.
 _CLOCK_SLACK = timedelta(minutes=1)
+
+# The rules the user stated, and how they answered Jarvis's check-ins on them ("Still how
+# you work?", 0-5): (days before today it was said, the rule, ((days before today,
+# answer), ...)). Every one is read off its clock words with no model call, and none
+# moves a slot the history or the plate uses (13:00-14:00 was always free). The first
+# check-in is due the day after a rule is said; SM-2 then spaces them (1 day, 6 days),
+# and an answer under 3 brings the rule back the next day. On the demo day:
+_RULES = (
+    # held twice: the next check-in is six days after the second, tomorrow
+    (7, "No work after 10:30 PM", ((6, 5), (5, 5))),
+    # held once, then slipped: back the day after, due since yesterday
+    (6, "Keep 1 to 2 PM free for lunch", ((5, 4), (2, 2))),
+    # never asked yet: due since the day after it was said
+    (3, "No study before 9 AM", ()),
+)
 
 # (days before today, memory type, what the user said). Recent enough to stay above
 # the retention floor today, so the You page shows them.
@@ -352,6 +378,8 @@ class SeedServices:
     clock: SimClock
     patterns: PatternService
     task_events: TaskEventRepository
+    constraints: ConstraintRepository
+    check_ins: RuleCheckIns
 
 
 def build_seed_services(
@@ -374,6 +402,9 @@ def build_seed_services(
             detectors=default_pattern_detectors(), clock=clock,
         ),
         task_events=repos.task_events,
+        constraints=repos.constraints,
+        check_ins=RuleCheckIns(repos.habit_trackers, repos.constraints, repos.profiles,
+                               clock=clock),
     )
 
 
@@ -557,10 +588,11 @@ async def seed_history(
 ) -> dict:
     """Write ``days`` days of history before ``today`` through the live services.
 
-    Returns ``{"days", "tasks", "plate", "events_by_type", "memories", "patterns"}``:
-    history tasks written, tasks on the current plate (accepted the evening before
-    today), the stored events counted by type, memories created and the keys of the
-    patterns PEARL remembered.
+    Returns ``{"days", "tasks", "plate", "events_by_type", "memories", "patterns",
+    "rules", "check_ins"}``: history tasks written, tasks on the current plate (accepted
+    the evening before today), the stored events counted by type, memories created, the
+    keys of the patterns PEARL remembered, rules stored, and the rules' check-ins as the
+    Habits page lists them today (``{"due", "upcoming"}``).
     """
     _require_demo(user_id)
     await s.profiles.get_or_create(user_id)
@@ -575,6 +607,12 @@ async def seed_history(
     calendar = [today - timedelta(days=days - i) for i in range(days)]
     plan = _plan_days(calendar, rng)
     said = {today - timedelta(days=back): (kind, text) for back, kind, text in _SAID}
+    rules_said = {today - timedelta(days=back): text for back, text, _ in _RULES}
+    answers: dict[date, list[tuple[str, int]]] = {}
+    for _, text, rule_answers in _RULES:
+        for back, quality in rule_answers:
+            answers.setdefault(today - timedelta(days=back), []).append((text, quality))
+    rule_ids: dict[str, str] = {}  # each rule's id, by its words
     used_tokens: set[str] = set()
     due_friday: dict[date, list[str]] = {}  # OS chunk task ids, by their Friday deadline
     reslot: list[dict] = []  # DSA chunks the sweep set aside, for a new slot the next day
@@ -593,6 +631,22 @@ async def seed_history(
         )
         if outcome.action == "created":
             memories += 1
+
+    async def state_rule(text: str) -> None:
+        stored = await store_behavioral_constraint(
+            s.constraints, text, user_id=user_id, check_ins=s.check_ins, learned_at=s.clock()
+        )
+        if stored["status"] != "stored":
+            raise SeedProblem(f"The rule {text!r} could not be stored.")
+        rule_ids[text] = stored["id"]
+
+    async def answer_check_in(text: str, quality: int) -> None:
+        """Answer the rule's check-in, as the Habits page offers it: only when it is due."""
+        listed = await s.check_ins.list_for_user(user_id)
+        due = next((c for c in listed.due_trackers if c.constraint_id == rule_ids.get(text)), None)
+        if due is None:
+            raise SeedProblem(f"The check-in on {text!r} was not due on {s.clock():%a %d %b}.")
+        await s.check_ins.review(user_id, due.id, quality)
 
     for day in calendar:
         slots = _new_slots(day, plan[day], _run_token(rng, used_tokens), zone, due_friday)
@@ -613,6 +667,12 @@ async def seed_history(
             ]
         if day in said:
             agenda.append((local(day, SAID_AT), lambda said_today=said[day]: say(*said_today)))
+        if day in rules_said:
+            agenda.append((local(day, SAID_AT), lambda text=rules_said[day]: state_rule(text)))
+        agenda += [
+            (local(day, CHECK_IN_AT), lambda text=text, q=quality: answer_check_in(text, q))
+            for text, quality in answers.get(day, ())
+        ]
         for at, act in sorted(agenda, key=lambda item: item[0]):
             s.clock.set(at)
             await act()
@@ -637,6 +697,7 @@ async def seed_history(
     changes = await s.patterns.observe(user_id)
 
     events = await s.task_events.list_for_user(user_id)
+    check_ins = await s.check_ins.list_for_user(user_id)
     return {
         "days": days,
         "tasks": tasks_written,
@@ -644,6 +705,10 @@ async def seed_history(
         "events_by_type": dict(sorted(Counter(e.event_type.value for e in events).items())),
         "memories": memories,
         "patterns": sorted(change.pattern.pattern_key for change in changes),
+        "rules": len(rule_ids),
+        "check_ins": {
+            "due": len(check_ins.due_trackers), "upcoming": len(check_ins.upcoming_trackers)
+        },
     }
 
 
@@ -872,15 +937,19 @@ def _format(report: dict) -> str:
         f" {report['memories']} memories",
         f"  current plate: {report.get('plate', 0)} tasks accepted yesterday evening",
         f"  events: {events}",
+        f"  rules: {report.get('rules', 0)}",
     ])
 
 
 def _operator_note(report: dict, today: date) -> str:
     """What the operator needs before the demo: how fresh it is and what the app will show."""
+    check_ins = report.get("check_ins", {})
     return "\n".join([
         f"Seeded through yesterday ({today - timedelta(days=1):%a %d %b}).",
         f"Patterns the detectors found: {', '.join(report['patterns']) or 'none'}.",
         f"Learned peak hour: {_clock_hour(report['learned_peak_hour'])}.",
+        f"Habits page: {check_ins.get('due', 0)} rule check-ins due today,"
+        f" {check_ins.get('upcoming', 0)} not due yet.",
         "Seed on the demo day; rerun with --reset to refresh.",
     ])
 
