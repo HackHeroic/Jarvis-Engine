@@ -4,6 +4,8 @@
 
 **Why:** Today every task gets the same recipe. "Course project: write the README" was given a quiz, labelled "From your syllabus", built from an unrelated marks transcript (the model itself wrote "the supplied materials contain no README instructions"). A writing task can also be handed LeetCode links. This is the gap between a planner and Jarvis: the workspace should show it understood the task.
 
+**Companion plan:** `2026-11-16-documents-that-drive-the-plan.md` (packages F to K) covers where uploaded files live (this chat, a project, general) and turning an exam timetable plus a syllabus into a calibrated study plan. This plan only covers what a single task's workspace shows.
+
 **Already done (2026-11-16):** quizzes and excerpts render as formatted markdown (`jarvis-frontend/components/app/Markdown.tsx`). Do not redo it; reuse that component.
 
 **Architecture:** One backend module builds the workspace: `app/services/analytical/workspace_builder.py` (`build_task_workspace`). It fetches material chunks, runs a web search, generates practice assets, and returns `TaskWorkspace` (`app/schemas/workspace.py`). The frontend page is `jarvis-frontend/app/(app)/workspace/[taskId]/page.tsx`. The five packages below are independent unless a "needs" line says otherwise, so each can be one person's work.
