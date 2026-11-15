@@ -743,6 +743,19 @@ def build_test_container(supabase: FakeSupabase | None = None) -> "AppContainer"
     )
 
 
+async def accept_tasks(repos: Any, user_id: str, rows: list[dict]) -> None:
+    """Give the user these tasks the only way user_tasks is ever written: by accepting a
+    draft (``repos`` is either repository family). A row needs at least ``task_id`` and
+    ``title``; the rest defaults to a pending 25-minute task of middling difficulty."""
+    draft = await repos.drafts.create(
+        user_id, tasks=[], horizon_start=None, goal_id=None, schedule=None
+    )
+    await repos.drafts.accept_atomic(user_id, draft.id, [
+        {"status": "pending", "duration_minutes": 25, "difficulty_weight": 0.5, **row}
+        for row in rows
+    ])
+
+
 def planning_services(repos: Any, *, drafts: Any = None, events: Any = None) -> Any:
     """The planning sub-graph's ``PlanningServices`` over ``repos``, wired as the
     composition root wires them (``drafts`` defaults to a ``DraftService`` over the same

@@ -449,10 +449,7 @@ def test_routes__no_raw_model_proxy__the_lm_studio_route_is_gone():
 # only shrink: an entry that no longer calls a table is a failure too.
 _PLAN_3_CUT = "Plan 3 cut (Task 6): no repository yet for"
 _RAW_TABLE_CALLS_ALLOWED: dict[str, str] = {
-    "services/analytical/workspace_builder.py": (
-        "task_workspaces cache (decision 10); its user_tasks reads need topic_keywords and"
-        " implementation_intention, which the Task entity does not carry"
-    ),
+    "services/analytical/workspace_builder.py": "task_workspaces cache (decision 10)",
     "services/user_preferences.py": "learning_style read (decision 10)",
     "services/chat_history.py": f"{_PLAN_3_CUT} chat_sessions / chat_messages",
     "api/v1/endpoints/sessions.py": f"{_PLAN_3_CUT} chat_sessions",

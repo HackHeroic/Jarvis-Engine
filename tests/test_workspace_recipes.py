@@ -10,9 +10,10 @@ import pytest
 
 import app.services.analytical.workspace_builder as wb
 from app.domain.events import NullEventBus
+from app.infrastructure.persistence.factory import RepositoryFactory
 from app.schemas.workspace import TaskOutline
 from app.services.analytical.workspace.materials import MaterialChunk
-from tests.fakes import FakeSupabase, install_scripted_model
+from tests.fakes import accept_tasks, install_scripted_model
 
 U = "alice"
 SYLLABUS = "DBMS-Syllabus-CS304.pdf"
@@ -56,7 +57,7 @@ class _Env:
         self.fetches = 0
         self.answer = "https://example.org/guide | A guide"
         self.material: list[MaterialChunk] = []
-        self._db = FakeSupabase()
+        self._repos = RepositoryFactory.in_memory()
 
         async def search(user_prompt: str, system_prompt: str, *, bus) -> str:
             self.searches.append(user_prompt)
@@ -74,14 +75,13 @@ class _Env:
         monkeypatch.setattr(wb, "_search_web", search)
         monkeypatch.setattr(wb, "fetch_chunks_for_task", fetch)
         monkeypatch.setattr(wb, "get_learning_style", reader)
-        monkeypatch.setattr(wb, "_get_supabase", lambda: self._db)
+        monkeypatch.setattr(wb, "_get_supabase", lambda: None)
 
     async def build(self, title: str, keywords: list[str] | None = None, goal_id: str | None = None):
-        self._db.rows["user_tasks"] = [{
-            "user_id": U, "task_id": "t1", "title": title, "topic_keywords": keywords or [],
-            "goal_id": goal_id, "created_at": "2026-11-16T08:00:00+00:00",
-        }]
-        return await wb.build_task_workspace(U, "t1", bus=NullEventBus())
+        await accept_tasks(self._repos, U, [
+            {"task_id": "t1", "title": title, "topic_keywords": keywords or [], "goal_id": goal_id},
+        ])
+        return await wb.build_task_workspace(U, "t1", tasks=self._repos.tasks, bus=NullEventBus())
 
 
 @pytest.fixture

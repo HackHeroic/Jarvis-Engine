@@ -350,9 +350,10 @@ async def test_workspace_route__web_search_answered__one_web_search_usage_on_the
 
     import app.services.analytical.workspace_builder as wb
     from app.main import app
-    from tests.fakes import build_test_container
+    from tests.fakes import accept_tasks, build_test_container
 
     container = build_test_container()
+    await accept_tasks(container.repos, U, [{"task_id": "graphs_t1", "title": "Graph algorithms"}])
     usage_seen = _UsageRecorder(container.events)
     queries = _stub_web_search(monkeypatch)
 

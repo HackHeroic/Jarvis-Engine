@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
 import app.core.config as _cfg
 from app.domain.entities import LLMLocation
@@ -490,6 +491,17 @@ def web_search_down(monkeypatch):
     monkeypatch.setattr(_llm.litellm, "acompletion", failing_completion)
 
 
+@pytest_asyncio.fixture
+async def offline_tasks():
+    """The user's tasks, as accepting a draft writes them: one, graphs_task_1."""
+    from app.infrastructure.persistence.factory import RepositoryFactory
+    from tests.fakes import accept_tasks
+
+    repos = RepositoryFactory.in_memory()
+    await accept_tasks(repos, "alice", [{"task_id": "graphs_task_1", "title": "Graph algorithms"}])
+    return repos.tasks
+
+
 @pytest.fixture
 def offline_workspace(monkeypatch):
     """A workspace build with no database and no ingested materials."""
@@ -509,9 +521,11 @@ def offline_workspace(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_workspace__web_search_fails__says_web_results_are_unavailable_and_shows_no_links(
-    web_search_down, offline_workspace
+    web_search_down, offline_workspace, offline_tasks
 ):
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.build_task_workspace(
+        "alice", "graphs_task_1", tasks=offline_tasks, bus=_NO_LEDGER
+    )
 
     assert ws.notices == [offline_workspace.WEB_RESULTS_UNAVAILABLE]
     assert "web results are unavailable" in ws.notices[0].lower()
@@ -520,7 +534,7 @@ async def test_workspace__web_search_fails__says_web_results_are_unavailable_and
 
 @pytest.mark.asyncio
 async def test_workspace__web_search_fails__degraded_workspace_is_not_cached(
-    web_search_down, offline_workspace, monkeypatch
+    web_search_down, offline_workspace, offline_tasks, monkeypatch
 ):
     written: list = []
 
@@ -533,19 +547,25 @@ async def test_workspace__web_search_fails__degraded_workspace_is_not_cached(
     monkeypatch.setattr(offline_workspace, "_read_cached_workspace", no_cache)
     monkeypatch.setattr(offline_workspace, "_write_cached_workspace", record_write)
 
-    ws = await offline_workspace.get_or_build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.get_or_build_task_workspace(
+        "alice", "graphs_task_1", bus=_NO_LEDGER, tasks=offline_tasks
+    )
 
     assert ws.notices and written == []
 
 
 @pytest.mark.asyncio
-async def test_workspace__web_search_answers__links_surface_without_a_notice(offline_workspace, monkeypatch):
+async def test_workspace__web_search_answers__links_surface_without_a_notice(
+    offline_workspace, offline_tasks, monkeypatch
+):
     async def search(**_kwargs):
         return "https://www.youtube.com/watch?v=abc | Graphs in 10 minutes"
 
     monkeypatch.setattr(offline_workspace, "gemini_web_search", search)
 
-    ws = await offline_workspace.build_task_workspace("alice", "graphs_task_1", bus=_NO_LEDGER)
+    ws = await offline_workspace.build_task_workspace(
+        "alice", "graphs_task_1", tasks=offline_tasks, bus=_NO_LEDGER
+    )
 
     assert ws.notices == []
     assert "https://www.youtube.com/watch?v=abc" in [a.content_or_url for a in ws.surfaced_assets]

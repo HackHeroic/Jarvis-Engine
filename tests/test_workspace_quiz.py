@@ -155,7 +155,7 @@ async def test_workspace_route__quiz__metadata_quiz_questions_is_a_list(monkeypa
 
     import app.services.analytical.workspace_builder as wb
     from app.main import app
-    from tests.fakes import build_test_container
+    from tests.fakes import accept_tasks, build_test_container
 
     async def nothing(*_args, **_kwargs):
         return None
@@ -175,7 +175,11 @@ async def test_workspace_route__quiz__metadata_quiz_questions_is_a_list(monkeypa
     monkeypatch.setattr(wb, "fetch_chunks_for_task", material)
     monkeypatch.setattr(wb, "get_learning_style", reader)
     monkeypatch.setattr(wb, "gemini_web_search", one_link)
-    monkeypatch.setattr(app.state, "container", build_test_container(), raising=False)
+    container = build_test_container()
+    await accept_tasks(container.repos, "alice", [
+        {"task_id": "dbms_t1", "title": "Revise DBMS normalisation"},
+    ])
+    monkeypatch.setattr(app.state, "container", container, raising=False)
     install_scripted_model(practice_generation=_reply(3))
 
     transport = httpx.ASGITransport(app=app)

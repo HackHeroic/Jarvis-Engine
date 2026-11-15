@@ -20,32 +20,34 @@ from typing import Optional
 
 from app.core.config import CLAUDE_MODEL, SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.core.model_router import PreCloudLLMRedactor, metered_web_search
+from app.domain import errors
+from app.domain.entities import Task
 from app.domain.errors import LLMUnavailableError
 from app.domain.events import EventBus
-from app.domain.ports import DocumentRepository, GoalRepository
+from app.domain.ports import DocumentRepository, GoalRepository, TaskRepository
 from app.models.brain.claude_web_search import claude_web_search
 from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.schemas.workspace import StudyAsset, TaskWorkspace, WoopCard
+from app.schemas.workspace import StudyAsset, TaskWorkspace
 from app.services.analytical.task_kind import classify_task
-from app.services.analytical.workspace.materials import (  # noqa: F401  (re-exported)
-    MaterialChunk,
-    fetch_chunks_for_task,
-)
-from app.services.analytical.workspace.quiz import generate_quiz  # noqa: F401  (re-exported)
+from app.services.analytical.workspace.materials import MaterialChunk, fetch_chunks_for_task
 from app.services.analytical.workspace.recipes import RecipeContext, recipe_for
-from app.services.analytical.workspace.web import (  # noqa: F401  (re-exported)
+from app.services.analytical.workspace.web import (
     WEB_RESULTS_UNAVAILABLE,
     WebSearchUnavailableError,
     found_links,
     link_type,
 )
+from app.services.analytical.workspace.woop import woop_card
 from app.services.documents.service import DocumentService
 from app.services.user_preferences import get_learning_style
 from app.db.supabase_py import build_supabase_client
 
 WORKSPACE_TTL_HOURS = 24
+
+_NO_TASK_STORE = "Could not reach the database."
+_NO_SUCH_TASK = "That task does not exist."
 
 
 # After the web search fails (no key, no quota, the provider is down) it is not tried
@@ -180,62 +182,44 @@ async def build_task_workspace(
     task_id: str,
     user_prompt: Optional[str] = None,
     *,
+    tasks: TaskRepository | None,
     goals: GoalRepository | None = None,
     materials: DocumentRepository | None = None,
     bus: EventBus,
 ) -> TaskWorkspace:
     """Assemble the workspace the task's kind calls for (its recipe). Target <5s.
 
-    ``goals`` (the composition root's repository) gives the WOOP card its wish and
-    outcome; None leaves them at the task's title. ``materials`` (the composition root's
-    document repository) gives the task's linked documents and their names; None means
-    no material. Web searches are metered onto ``bus``, the composition root's, which is
-    required (``metered_web_search``).
+    The task is read once, the user's own, through ``tasks`` (the composition root's
+    repository): its title, keywords, goal, criteria, length, deadline and if-then plan.
+    NotFoundError when the user has no such task (another user's included);
+    PersistenceError when the task store cannot answer, or there is none. ``goals``
+    gives the WOOP card its wish and outcome; None leaves them at the task's title.
+    ``materials`` (the document repository) gives the task's linked documents and their
+    names; None means no material. Web searches are metered onto ``bus``, the
+    composition root's, which is required (``metered_web_search``).
     """
-    supabase = _get_supabase()
-    task_title = ""
-    topic_keywords: list[str] = []
-    goal_id: str | None = None
-
-    if supabase:
-        try:
-            task_result = (
-                supabase.table("user_tasks")
-                .select("title, topic_keywords, goal_id")
-                .eq("user_id", user_id)
-                .eq("task_id", task_id)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            if task_result.data and len(task_result.data) > 0:
-                t = task_result.data[0]
-                task_title = t.get("title", "") or ""
-                kw = t.get("topic_keywords")
-                topic_keywords = list(kw) if isinstance(kw, (list, tuple)) else []
-                goal_id = t.get("goal_id") or None
-        except Exception as e:
-            print(f"[Workspace] fetch task error: {e}")
-            task_title = task_id
-
-    if not task_title:
-        task_title = task_id
-
-    primary_objective = f"{task_title} {' '.join(topic_keywords)}".strip() or task_id
-    kind = classify_task(task_title, topic_keywords, goal_id)
+    if tasks is None:
+        raise errors.PersistenceError(_NO_TASK_STORE)
+    task = await tasks.get(user_id, task_id)
+    if task is None:
+        raise errors.NotFoundError(_NO_SUCH_TASK, details={"task_id": task_id})
+    title = task.title.strip() or task_id
+    keywords = task.topic_keywords
+    kind = classify_task(title, keywords, task.goal_id)
     recipe = recipe_for(kind)
+    criteria = _criteria(task, title)
 
     material, learning_style = await asyncio.gather(
-        fetch_chunks_for_task(user_id, task_id, task_title, topic_keywords, documents=materials)
+        fetch_chunks_for_task(user_id, task_id, title, keywords, documents=materials)
         if recipe.reads_documents
         else _no_material(),
-        get_learning_style(user_id, supabase),
+        get_learning_style(user_id, _get_supabase()),
     )
     ctx = RecipeContext(
-        task_title=task_title,
-        topic_keywords=topic_keywords,
-        goal_id=goal_id,
-        completion_criteria="",
+        task_title=title,
+        topic_keywords=keywords,
+        goal_id=task.goal_id,
+        completion_criteria=criteria,
         learning_style=learning_style,
         user_prompt=user_prompt,
         material=material,
@@ -243,60 +227,27 @@ async def build_task_workspace(
         style_search=partial(perform_learning_style_search, bus=bus),
     )
     surfaced = await recipe.assets(ctx)
-    notices = [WEB_RESULTS_UNAVAILABLE] if ctx.web_unavailable else []
-
-    # Build WOOP card from task's implementation_intention + goal metadata
-    woop_card = None
-    task_data = None
-    try:
-        sb = _get_supabase()
-        if sb:
-            task_result = sb.table("user_tasks").select("implementation_intention, goal_id").eq("task_id", task_id).eq("user_id", user_id).limit(1).execute()
-            if task_result.data:
-                task_data = task_result.data[0]
-                intention = task_data.get("implementation_intention") or {}
-                if isinstance(intention, str):
-                    try:
-                        intention = json.loads(intention)
-                    except (json.JSONDecodeError, TypeError):
-                        intention = {}
-                obstacle = intention.get("obstacle_trigger", "")
-                plan = intention.get("behavioral_response", "")
-                if obstacle and plan:
-                    # Fetch goal metadata for Wish + Outcome stages
-                    goal_id = task_data.get("goal_id", "")
-                    wish = task_title
-                    outcome = ""
-                    if goal_id and goals is not None:
-                        # goal_metadata is stored inside the update's context_snippet
-                        snippet = await goals.latest_context(user_id, goal_id) or {}
-                        if isinstance(snippet, str):
-                            try:
-                                snippet = json.loads(snippet)
-                            except (json.JSONDecodeError, TypeError):
-                                snippet = {}
-                        if isinstance(snippet, dict):
-                            wish = snippet.get("planning_goal", task_title)
-                            meta = snippet.get("goal_metadata") or {}
-                            if isinstance(meta, str):
-                                try:
-                                    meta = json.loads(meta)
-                                except (json.JSONDecodeError, TypeError):
-                                    meta = {}
-                            outcome = meta.get("outcome_visualization", "") if isinstance(meta, dict) else ""
-                    woop_card = WoopCard(wish=wish, outcome=outcome, obstacle=obstacle, plan=plan)
-    except Exception as e:
-        logger.warning(f"WOOP card construction failed (non-fatal): {e}")
 
     return TaskWorkspace(
         task_id=task_id,
-        task_title=task_title,
-        primary_objective=primary_objective,
+        task_title=title,
+        primary_objective=f"{title} {' '.join(keywords)}".strip(),
         task_kind=kind.value,
+        completion_criteria=criteria,
+        duration_minutes=task.duration_minutes,
+        deadline_hint=task.deadline_hint,
         surfaced_assets=surfaced,
-        woop_card=woop_card,
-        notices=notices,
+        woop_card=await woop_card(user_id, task, title, goals),
+        notices=[WEB_RESULTS_UNAVAILABLE] if ctx.web_unavailable else [],
     )
+
+
+def _criteria(task: Task, title: str) -> str:
+    """The task's completion criteria, or "" when it has none worth showing: a carried-
+    over task gets the filler "Finish: <title>" (``task_rows.to_task_chunk``), which only
+    says the title again."""
+    criteria = (task.completion_criteria or "").strip()
+    return "" if criteria in ("", f"Finish: {title}", f"Finish: {task.title}") else criteria
 
 
 async def _no_material() -> list[MaterialChunk]:
@@ -337,8 +288,11 @@ async def _read_cached_workspace(user_id: str, task_id: str) -> Optional[TaskWor
             ws_json = json.loads(ws_json)
         if isinstance(ws_json, dict):
             return TaskWorkspace.model_validate(ws_json)
-    except Exception as e:
-        logger.debug(f"Workspace cache read failed (non-fatal — table may not exist yet): {e}")
+    except Exception as exc:
+        logger.debug(
+            "Workspace cache read failed (non-fatal — table may not exist yet): %s",
+            type(exc).__name__,
+        )
     return None
 
 
@@ -361,8 +315,11 @@ async def _write_cached_workspace(user_id: str, task_id: str, ws: TaskWorkspace)
             .upsert(payload, on_conflict="user_id,task_id")
             .execute()
         )
-    except Exception as e:
-        logger.debug(f"Workspace cache write failed (non-fatal — table may not exist yet): {e}")
+    except Exception as exc:
+        logger.debug(
+            "Workspace cache write failed (non-fatal — table may not exist yet): %s",
+            type(exc).__name__,
+        )
 
 
 async def invalidate_workspace_cache(user_id: str, task_id: str) -> None:
@@ -398,11 +355,12 @@ async def get_or_build_task_workspace(
     bus: EventBus,
     documents: DocumentService | None = None,
     materials: DocumentRepository | None = None,
+    tasks: TaskRepository | None = None,
 ) -> TaskWorkspace:
     """Cache-aware workspace fetch. Builds + persists if missing/stale/refresh=True.
 
-    ``goals``, ``materials`` and ``bus`` are the composition root's (see
-    ``build_task_workspace``).
+    ``tasks``, ``goals``, ``materials`` and ``bus`` are the composition root's (see
+    ``build_task_workspace``, whose NotFoundError and PersistenceError pass through).
     ``documents`` (the composition root's DocumentService) lists the task's linked
     documents, read fresh on every request after the cache, so a document deleted or a
     file kept since shows as it is now; None leaves the list empty.
@@ -413,7 +371,7 @@ async def get_or_build_task_workspace(
     if ws is None:
         ws = await build_task_workspace(
             user_id=user_id, task_id=task_id, user_prompt=user_prompt,
-            goals=goals, materials=materials, bus=bus,
+            tasks=tasks, goals=goals, materials=materials, bus=bus,
         )
         if not ws.notices:
             # A workspace missing its web results is not cached: once search is back,

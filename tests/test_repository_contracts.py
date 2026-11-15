@@ -158,7 +158,7 @@ def _row(task_id: str, *, status: str = "pending", start: datetime | None = None
         "difficulty_weight": 0.5,
         "dependencies": [],
         "deadline_hint": None,
-        "completion_criteria": "Explain it back",  # a column the Task entity ignores
+        "completion_criteria": "Explain it back",
     }
     if start is not None:
         row["scheduled_start"] = start.isoformat()
@@ -451,6 +451,25 @@ async def test_tasks__list_for_user__newest_first_bounded_and_status_filtered(re
     bounded = await repos.tasks.list_for_user(U1)
     assert len(bounded) == TASK_LIST_LIMIT
     assert {t.task_id for t in bounded} == {f"bulk_{i:03}" for i in range(TASK_LIST_LIMIT)}
+
+
+@pytest.mark.asyncio
+async def test_tasks__get__carries_its_planned_criteria_keywords_and_if_then_plan(repos):
+    intention = {"obstacle_trigger": "Phone", "behavioral_response": "Put it in the drawer"}
+    await _seed_tasks(repos, U1, [
+        {**_row("planned"), "topic_keywords": ["graphs", "bfs"], "implementation_intention": intention},
+        {**_row("bare"), "completion_criteria": None},
+    ])
+
+    planned, bare = await repos.tasks.get(U1, "planned"), await repos.tasks.get(U1, "bare")
+
+    assert (planned.completion_criteria, planned.topic_keywords, planned.implementation_intention) == (
+        "Explain it back", ["graphs", "bfs"], intention,
+    )
+    assert (bare.completion_criteria, bare.topic_keywords, bare.implementation_intention) == (
+        None, [], None,
+    )
+    assert await repos.tasks.get(U2, "planned") is None
 
 
 @pytest.mark.asyncio

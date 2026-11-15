@@ -143,6 +143,19 @@ class TaskWorkspace(BaseModel):
             " checklist), admin (a checklist of what to have ready)."
         ),
     )
+    completion_criteria: str = Field(
+        default="",
+        description=(
+            "What the user does to show the task is done, as it was planned; empty when the"
+            " task has none (never the title again)."
+        ),
+    )
+    duration_minutes: Optional[int] = Field(
+        default=None, description="The task's planned length in minutes."
+    )
+    deadline_hint: Optional[str] = Field(
+        default=None, description="The deadline the task was planned against, as written."
+    )
     surfaced_assets: List[StudyAsset] = Field(
         default_factory=list,
         description="RAG chunks, curated links, and generated practice assets",

@@ -13,7 +13,7 @@ from app.domain.events import NullEventBus
 from app.infrastructure.persistence.factory import RepositoryFactory
 from app.services.analytical.workspace import materials
 from app.services.analytical.workspace.quiz import generate_quiz
-from tests.fakes import FakeKnowledgeCollection, install_scripted_model, knowledge_chunk
+from tests.fakes import FakeKnowledgeCollection, accept_tasks, install_scripted_model, knowledge_chunk
 
 ALICE, BOB = "alice", "bob"
 SYLLABUS = "DBMS-Syllabus-CS304.pdf"
@@ -51,9 +51,10 @@ def offline(monkeypatch):
     monkeypatch.setattr(wb, "gemini_web_search", one_link)
 
 
-async def _build(task_id: str, repos):
+async def _build(task_id: str, title: str, repos):
+    await accept_tasks(repos, ALICE, [{"task_id": task_id, "title": title}])
     return await wb.build_task_workspace(
-        ALICE, task_id, materials=repos.documents, bus=NullEventBus()
+        ALICE, task_id, tasks=repos.tasks, materials=repos.documents, bus=NullEventBus()
     )
 
 
@@ -74,12 +75,14 @@ async def test_materials__no_linked_document_and_nothing_relevant__no_chunks_and
     chunks = await wb.fetch_chunks_for_task(
         ALICE, "readme_task", "Course project: write the README", documents=repos.documents
     )
-    ws = await _build("readme_task", repos)
+    readme = await _build("readme_task", "Course project: write the README", repos)
+    revise = await _build("dbms_task", "Revise DBMS normalisation", repos)  # a quiz-kind task
 
     assert chunks == []
     assert chroma.query_knowledge(ALICE, "Course project: write the README") != []  # general bar
-    assert [a for a in ws.surfaced_assets if a.asset_type in ("pdf_chunk", "generated_quiz")] == []
-    assert "practice_generation" not in model.tasks
+    for ws in (readme, revise):
+        assert [a for a in ws.surfaced_assets if a.asset_type in ("pdf_chunk", "generated_quiz")] == []
+    assert "practice_generation" not in model.tasks  # no material, so no quiz was asked for
 
 
 @pytest.mark.asyncio
@@ -97,7 +100,7 @@ async def test_materials__linked_document__excerpts_named_after_the_file_with_so
     await _link(repos, ALICE, "dbms_task", "dbms")
     install_scripted_model()  # no quiz: this test is about the excerpts
 
-    ws = await _build("dbms_task", repos)
+    ws = await _build("dbms_task", "Revise DBMS normalisation", repos)
 
     excerpts = [a for a in ws.surfaced_assets if a.asset_type == "pdf_chunk"]
     assert [(a.title, a.content_or_url, a.metadata) for a in excerpts] == [
