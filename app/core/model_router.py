@@ -104,13 +104,19 @@ def build_chain(cfg: ModuleType, hooks: ActionHooks, bus: EventBus) -> FallbackC
 
 
 async def metered_web_search(
-    search: Callable[[], Awaitable[str]], *, bus: EventBus, pii_redactions: int = 0
+    search: Callable[[], Awaitable[str]],
+    *,
+    bus: EventBus,
+    pii_redactions: int = 0,
+    provider: str = "gemini",
+    model: str | None = None,
 ) -> str:
     """Run a grounded web search and meter it into the usage ledger like any chain call.
 
-    Web search is Gemini-only and runs outside the provider chain, so no
-    ``MeteredProvider`` sees it. An answered search publishes ``LLMCallCompleted``
-    (provider ``gemini``, task ``web_search``) on ``bus`` (the composition root's, which
+    Web search runs outside the provider chain (Claude's server-side search tool, or
+    Gemini's grounding), so no ``MeteredProvider`` sees it. An answered search publishes
+    ``LLMCallCompleted`` (``provider`` and ``model`` as given, Gemini's by default; task
+    ``web_search``) on ``bus`` (the composition root's, which
     the usage ledger listens on), with the tokens the transport reported (zero when it
     reported none) and this turn's attribution. An empty answer — the search failed or
     never ran — publishes nothing: no answer, and no billed tokens anyone could see.
@@ -143,8 +149,8 @@ async def metered_web_search(
         session_id=current_session_var.get(),
         task="web_search",
         role=MODEL_ROUTING["web_search"].value,
-        provider="gemini",
-        model=_cfg.GEMINI_MODEL,
+        provider=provider,
+        model=model or _cfg.GEMINI_MODEL,
         location=LLMLocation.CLOUD,
         input_tokens=tally.input_tokens,
         output_tokens=tally.output_tokens,

@@ -79,6 +79,12 @@ def _default_client(cfg: ModuleType) -> anthropic.AsyncAnthropic:
     return _shared_client
 
 
+def shared_client(cfg: ModuleType) -> anthropic.AsyncAnthropic:
+    """The process-wide client, for a Claude call made outside the provider chain (the
+    web search, which uses a server tool the chain's request has no place for)."""
+    return _default_client(cfg)
+
+
 class ClaudeProvider(LLMProvider):
     """Claude via the Messages API; one model (``CLAUDE_MODEL``) serves every role.
 

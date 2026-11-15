@@ -354,10 +354,10 @@ _LLM_TRANSPORT_FILES = frozenset(
 _LEGACY_LLM_CALLS_ALLOWED: dict[tuple[str, str], str] = {}
 
 
-# Grounded web search: Gemini only, outside the provider chain (no other provider can
-# search). One helper calls it — after the PII gate, metered into the usage ledger,
+# Web search: Claude's search tool, then Gemini's grounding, outside the provider chain
+# (its request has no place for a search tool). One helper calls it — after the PII gate, metered into the usage ledger,
 # failing honestly — and nothing else may.
-_WEB_SEARCH_CALLS = frozenset({"gemini_web_search", "run_deep_research"})
+_WEB_SEARCH_CALLS = frozenset({"claude_web_search", "gemini_web_search", "run_deep_research"})
 
 _WEB_SEARCH_CALLS_ALLOWED: dict[tuple[str, str], str] = {
     ("services/analytical/workspace_builder.py", "_search_web"): (

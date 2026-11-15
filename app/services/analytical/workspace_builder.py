@@ -14,11 +14,12 @@ from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from app.core.config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from app.core.config import CLAUDE_MODEL, SUPABASE_SERVICE_KEY, SUPABASE_URL
 from app.core.model_router import PreCloudLLMRedactor, metered_web_search
 from app.domain.errors import LLMUnavailableError
 from app.domain.events import EventBus
 from app.domain.ports import GoalRepository
+from app.models.brain.claude_web_search import claude_web_search
 from app.models.brain.litellm_conf import gemini_web_search
 from app.orchestrator.hooks import get_hooks
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
@@ -64,16 +65,18 @@ web_search_cooldown = _WebSearchCooldown()
 
 
 async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) -> str:
-    """Run the grounded web search, raising ``WebSearchUnavailableError`` when it fails.
+    """Search the web, raising ``WebSearchUnavailableError`` when no search answers.
 
-    Still Gemini-only: no other provider in the LLM chain has search grounding, so a
-    fallback model would only invent links. ``gemini_web_search`` answers an empty
-    string when the key is missing or the call fails.
+    Claude's server-side search first (the key that serves chat), then Gemini's
+    grounded search. Only a model that can search is asked: one that cannot would
+    invent links. Each answers an empty string when its key is missing or the call
+    fails, and a search nobody answered starts the cooldown.
 
     The query carries user text (a task title, the chat message) and goes to the
     cloud outside the provider chain, so the chain's PII gate is run here first. A
     gate that denies the send, or wants to ask, means no search is made. An answered
-    search is metered onto ``bus``, the composition root's (``metered_web_search``).
+    search is metered onto ``bus``, the composition root's (``metered_web_search``),
+    under the provider that answered it.
     """
     if web_search_cooldown.is_down():
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
@@ -83,12 +86,21 @@ async def _search_web(user_prompt: str, system_prompt: str, *, bus: EventBus) ->
         system_prompt, redacted_in_system = await redactor.redact(system_prompt)
     except LLMUnavailableError as exc:
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE) from exc
+    redactions = redacted_in_prompt + redacted_in_system
     # Metered into the usage ledger like a chain call: the chain never sees a search.
     raw = await metered_web_search(
-        lambda: gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt),
+        lambda: claude_web_search(user_prompt=user_prompt, system_prompt=system_prompt),
         bus=bus,
-        pii_redactions=redacted_in_prompt + redacted_in_system,
+        pii_redactions=redactions,
+        provider="claude",
+        model=CLAUDE_MODEL,
     )
+    if not raw or not raw.strip():
+        raw = await metered_web_search(
+            lambda: gemini_web_search(user_prompt=user_prompt, system_prompt=system_prompt),
+            bus=bus,
+            pii_redactions=redactions,
+        )
     if not raw or not raw.strip():
         web_search_cooldown.mark_down()
         raise WebSearchUnavailableError(WEB_RESULTS_UNAVAILABLE)
