@@ -68,12 +68,21 @@ class AnticipationSettings:
 
 
 @dataclass(frozen=True)
+class DocumentSettings:
+    """The documents: where an uploaded file is kept, and how big it may be."""
+
+    bucket: str  # the private Supabase Storage bucket
+    max_file_bytes: int  # the largest upload ingestion accepts; the bucket's limit
+
+
+@dataclass(frozen=True)
 class Settings:
     tasks: TaskSettings
     memory: MemorySettings
     conversation: ConversationSettings
     focus: FocusSettings
     anticipation: AnticipationSettings
+    documents: DocumentSettings
 
     @classmethod
     def from_config(cls, cfg: ModuleType) -> "Settings":
@@ -114,6 +123,10 @@ class Settings:
                 tick_seconds=cfg.ANTICIPATION_TICK_SECONDS,
                 manual_cooldown_seconds=cfg.ANTICIPATION_MANUAL_COOLDOWN_SECONDS,
                 morning_brief_window_hours=cfg.MORNING_BRIEF_WINDOW_HOURS,
+            ),
+            documents=DocumentSettings(
+                bucket=cfg.DOCUMENT_BUCKET,
+                max_file_bytes=cfg.MAX_CHAT_UPLOAD_BYTES,
             ),
         )
 

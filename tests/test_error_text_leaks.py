@@ -270,9 +270,9 @@ async def test_chat_stream__graph_crashes__error_frame_is_the_envelope_without_e
 def test_documents__database_fails__503_fixed_message_secret_only_in_the_log(
     app, client, monkeypatch, caplog, method, path, message
 ):
-    monkeypatch.setattr(
-        app.state, "db_client", FakeDBClient(_BrokenSupabase("ingested_documents"))
-    )
+    broken = _BrokenSupabase("ingested_documents")
+    monkeypatch.setattr(app.state, "db_client", FakeDBClient(broken))
+    monkeypatch.setattr(app.state, "container", build_test_container(broken), raising=False)
     monkeypatch.setattr("app.utils.chroma_client.get_chroma_client", _broken_chroma)
 
     resp = getattr(client, method)(path, params={"user_id": "u1"})

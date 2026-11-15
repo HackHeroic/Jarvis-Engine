@@ -38,6 +38,8 @@ from app.services.anticipation.triggers import (
     MorningBriefTrigger,
     PatternRuleTrigger,
 )
+from app.services.analytical.workspace_builder import invalidate_workspaces
+from app.services.documents.service import DocumentService
 from app.services.draft_service import DraftService
 from app.services.energy import HeuristicEnergyEstimator, HistoryEnergyEstimator
 from app.services.memory.conversation_memory import (
@@ -98,6 +100,7 @@ class AppContainer:
     user_model_service: UserModelService
     conversation_memory: ConversationMemoryService
     stated_rules: StatedRules
+    documents: DocumentService
     settings: Settings
 
     @classmethod
@@ -121,13 +124,17 @@ class AppContainer:
         ``install_chain=False`` builds the chain without making it the process-wide
         one (a test that scripts its own model).
         """
+        settings = Settings.from_config(cfg)
         if supabase_client is not None:
-            repos = RepositoryFactory.supabase(supabase_client)
+            repos = RepositoryFactory.supabase(
+                supabase_client,
+                document_bucket=settings.documents.bucket,
+                max_file_bytes=settings.documents.max_file_bytes,
+            )
         else:
             logger.warning("running on in-memory repositories — nothing is persisted")
             repos = RepositoryFactory.in_memory()
 
-        settings = Settings.from_config(cfg)
         events = EventBus()
         usage_ledger = UsageLedger(repos.usage)
         events.subscribe(LLMCallCompleted, usage_ledger)
@@ -235,6 +242,12 @@ class AppContainer:
             conversation_memory=conversation_memory,
             # A stated rule and the memory of stating it: letting go of one lets go of both.
             stated_rules=StatedRules(repos.constraints, memory_service),
+            # The user's documents across their record, links and file; a change to a
+            # task's documents drops that task's cached workspace.
+            documents=DocumentService(
+                repos.documents, repos.document_files, repos.tasks,
+                on_links_changed=invalidate_workspaces,
+            ),
             settings=settings,
         )
 

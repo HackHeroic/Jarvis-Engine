@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app.core.jarvis_logger import JARVIS_LOGGER as logger
-from app.domain.entities import GoalDeadlineUpdate
+from app.domain.entities import GoalDeadlineUpdate, IngestedDocument, StoredFile
 from app.domain.errors import PersistenceError
 from app.domain.ports import ConstraintRepository, GoalRepository, TaskRepository
 from app.schemas.context import (
@@ -20,6 +20,8 @@ from app.services.extraction.action_item_handler import propose_action_item
 from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar, store_behavioral_constraint
 from app.services.extraction.calendar_extractor import extract_calendar_slots
 from app.services.extraction.knowledge_ingester import ingest_knowledge
+from app.services.documents.service import DocumentService
+from app.services.documents.uploads import content_type_for
 from app.services.extraction.task_material_linker import link_document_to_tasks
 from app.utils.docling_helper import read_document_with_provenance
 
@@ -111,6 +113,7 @@ async def process_ingestion(
     constraints: Optional[ConstraintRepository] = None,
     tasks: Optional[TaskRepository] = None,
     goals: Optional[GoalRepository] = None,
+    documents: Optional[DocumentService] = None,
 ) -> IngestionPipelineResult:
     """Run the full autonomous extraction pipeline.
 
@@ -119,8 +122,8 @@ async def process_ingestion(
         file_bytes: Optional raw PDF/image bytes.
         media_type: Optional "pdf" or "image" when file_bytes provided.
         user_id: Optional user identifier for behavioral context and storage.
-        db_client: Optional Supabase client for the pending calendar, the document
-            record and its task links (rows with no repository yet: Plan 3 cut Task 6).
+        db_client: Optional Supabase client for the pending calendar (rows with no
+            repository yet: Plan 3 cut Task 6) and its task links.
         intent_override: When provided, skip SLM classification and use this intent (for Control Policy).
         constraints: The user's rules (the container's repository): read as calendar
             context, written for a stated preference. None (no database): neither.
@@ -128,6 +131,8 @@ async def process_ingestion(
             the ones it matches. None: no links.
         goals: The goals' deadline updates (the container's repository): a deadline the
             document names is stored for the goal of the tasks it matched. None: not stored.
+        documents: The container's DocumentService: a document read for knowledge is
+            kept through it (its record, and the uploaded file itself). None: not kept.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -248,48 +253,26 @@ async def process_ingestion(
             if matched:
                 base_result.knowledge_result["linked_task_ids"] = matched
 
-        # Record in ingested_documents for document management UI
-        if user_id and supabase:
-            # Upload original file to S3 for later preview (non-fatal)
-            s3_key: str | None = None
-            if file_bytes and user_id:
-                try:
-                    import boto3
-                    from app.core.config import AWS_BUCKET_NAME, AWS_REGION
-
-                    s3 = boto3.client(
-                        "s3",
-                        region_name=AWS_REGION,
-                    )
-                    s3_key = f"documents/{user_id}/{source_id}/{file_name or 'document'}"
-                    s3.put_object(
-                        Bucket=AWS_BUCKET_NAME,
-                        Key=s3_key,
-                        Body=file_bytes,
-                        ContentType=media_type or "application/octet-stream",
-                    )
-                    print(f"[Orchestrator] Uploaded to S3: {s3_key}")
-                except Exception as e:
-                    print(f"[Orchestrator] S3 upload failed (non-fatal): {e}")
-
-            try:
-                upsert_row: dict = {
-                    "user_id": user_id,
-                    "source_id": source_id,
-                    "file_name": file_name,
-                    "media_type": media_type,
-                    "document_topics": kr.document_topics or [],
-                    "chunk_count": kr.stored_chunk_count or 0,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-                if s3_key is not None:
-                    upsert_row["s3_key"] = s3_key
-                supabase.table("ingested_documents").upsert(
-                    upsert_row,
-                    on_conflict="user_id,source_id",
-                ).execute()
-            except Exception as e:
-                print(f"[Orchestrator] Insert ingested_documents failed: {e}")
+        # Keep the document for the documents page: its record and, for an upload, the
+        # file itself (best effort: its chunks are stored whatever happens here).
+        if user_id and documents is not None:
+            kept_file = (
+                StoredFile(content=file_bytes, content_type=content_type_for(media_type, file_bytes))
+                if file_bytes
+                else None
+            )
+            await documents.add(
+                user_id,
+                IngestedDocument(
+                    user_id=user_id,
+                    source_id=source_id,
+                    file_name=file_name,
+                    media_type=media_type,
+                    document_topics=kr.document_topics or [],
+                    chunk_count=kr.stored_chunk_count or 0,
+                ),
+                file=kept_file,
+            )
 
         # Store deadlines as the goal's deadline updates (goal-level persistence)
         if user_id and kr.deadlines and goals is not None:
@@ -318,7 +301,7 @@ async def process_ingestion(
                             context_snippet=context_snippet,
                         ))
                     except Exception as e:
-                        print(f"[Orchestrator] Storing a deadline update failed: {type(e).__name__}")
+                        logger.warning(f"Storing a deadline update failed: {type(e).__name__}")
 
     elif classification.intent == IntentType.BEHAVIORAL_CONSTRAINT:
         if constraints is not None and user_id:

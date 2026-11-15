@@ -71,6 +71,7 @@ async def ingest_document(state: KnowledgeState) -> dict:
             constraints=repos.constraints if repos is not None else None,
             tasks=repos.tasks if repos is not None else None,
             goals=repos.goals if repos is not None else None,
+            documents=container.documents if container is not None else None,
         )
         return {"ingestion_result": result.model_dump() if hasattr(result, "model_dump") else {"status": "ok"}}
     except Exception as e:

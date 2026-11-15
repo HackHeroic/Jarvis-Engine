@@ -21,9 +21,12 @@ from tests.fakes import FakeDBClient, FakeSupabase, build_test_container
 ROOT = Path(__file__).resolve().parent.parent
 ENDPOINTS = ROOT / "app" / "api" / "v1" / "endpoints"
 
-# The one route with no JSON body: the chat stream (server-sent events). Nothing else may
-# go untyped.
-UNTYPED_ROUTES = frozenset({("POST", "/api/v1/chat/stream")})
+# The routes with no JSON body: the chat stream (server-sent events) and a document's
+# file (its own bytes). Nothing else may go untyped.
+UNTYPED_ROUTES = frozenset({
+    ("POST", "/api/v1/chat/stream"),
+    ("GET", "/api/v1/documents/{source_id}/file"),
+})
 
 
 def _routes() -> list[APIRoute]:

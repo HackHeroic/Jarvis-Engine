@@ -102,6 +102,9 @@ REMOVED_DEAD_CODE = [
     ("app.core.config", "LM_STUDIO_NATIVE_URL"),
     ("app.core.config", "AWS_ACCESS_KEY_ID"),
     ("app.core.config", "AWS_SECRET_ACCESS_KEY"),
+    # The S3 upload that never ran (boto3 was never installed): files go to Supabase Storage.
+    ("app.core.config", "AWS_REGION"),
+    ("app.core.config", "AWS_BUCKET_NAME"),
 ]
 
 

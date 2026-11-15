@@ -533,6 +533,12 @@ async def invalidate_workspace_cache(user_id: str, task_id: str) -> None:
         pass
 
 
+async def invalidate_workspaces(user_id: str, task_ids: list[str]) -> None:
+    """Drop the cached workspaces of these tasks: the documents linked to them changed."""
+    for task_id in task_ids:
+        await invalidate_workspace_cache(user_id, task_id)
+
+
 async def get_or_build_task_workspace(
     user_id: str,
     task_id: str,

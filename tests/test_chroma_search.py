@@ -211,7 +211,7 @@ def api(monkeypatch):
     from fastapi.testclient import TestClient
 
     from app.main import app
-    from tests.fakes import FakeDBClient, FakeSupabase
+    from tests.fakes import FakeDBClient, FakeSupabase, build_test_container
 
     col = _FakeCollection(
         [
@@ -225,6 +225,7 @@ def api(monkeypatch):
     )
     db = FakeSupabase({"ingested_documents": [{"user_id": "bob", "source_id": "src-b"}]})
     monkeypatch.setattr(app.state, "db_client", FakeDBClient(db), raising=False)
+    monkeypatch.setattr(app.state, "container", build_test_container(db), raising=False)
     return TestClient(app, raise_server_exceptions=False), col
 
 

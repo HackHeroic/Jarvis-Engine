@@ -323,10 +323,10 @@ SINCE_LAST_SPOKE_TOKENS: int = 250
 # match. Unsplit, the same run-on sentences scored as low as 0.42.
 SUMMARY_SUPPRESS_SIMILARITY: float = 0.45
 
-# AWS S3 (document storage). The credentials are boto3's to read from the environment
-# (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, loaded from .env above); the app reads only these.
-AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")
-AWS_BUCKET_NAME: str = os.getenv("AWS_BUCKET_NAME", "jarvis-dev-0-storage")
+# Uploaded files (DocumentFileStore): kept in this private Supabase Storage bucket, each
+# at {user_id}/{source_id}. The bucket is created on first use, limited to the largest
+# upload ingestion accepts (MAX_CHAT_UPLOAD_BYTES).
+DOCUMENT_BUCKET: str = "jarvis-documents"
 
 
 def is_feature_enabled(flag: str) -> bool:

@@ -183,9 +183,8 @@ async def process_full_pipeline(
     if request.file_base64 and request.media_type:
         file_bytes = _decoded(request.file_base64)
     db_client = getattr(http_request.app.state, "db_client", None)
-    # Rules, tasks and goals are read and stored through the container's repositories,
-    # and only with a database: without one the container is in-memory and nothing
-    # would last.
+    # Rules, tasks, goals and documents are read and stored through the container, and
+    # only with a database: without one the container is in-memory and nothing would last.
     container = container_of(http_request)
     has_db = getattr(db_client, "supabase", None) is not None
     repos = container.repos if container is not None and has_db else None
@@ -199,6 +198,7 @@ async def process_full_pipeline(
         constraints=repos.constraints if repos is not None else None,
         tasks=repos.tasks if repos is not None else None,
         goals=repos.goals if repos is not None else None,
+        documents=container.documents if repos is not None else None,
     )
 
 
