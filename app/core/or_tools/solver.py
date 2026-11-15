@@ -18,7 +18,11 @@ from typing import Optional
 
 from ortools.sat.python import cp_model
 
-from app.core.or_tools.constraints import energy_objective_terms, merge_time_windows
+from app.core.or_tools.constraints import (
+    add_earliest_starts,
+    energy_objective_terms,
+    merge_time_windows,
+)
 from app.domain.entities import HOURS_PER_DAY
 
 MINUTES_PER_DAY = 1440
@@ -171,6 +175,7 @@ class JarvisScheduler:
         dependencies: list[str],
         difficulty_weight: float = 1.0,
         energy_weight: int = 0,
+        earliest_start: int = 0,
     ) -> None:
         """Add a schedulable task with variable start/end.
 
@@ -182,6 +187,8 @@ class JarvisScheduler:
             difficulty_weight: Cognitive load 0–1; used for soft-block qualification.
             energy_weight: How strongly the task leans toward high-focus hours once
                 ``set_focus_penalties`` is called; 0 (the default) never leans.
+            earliest_start: The minute before which the task may not start (its "not
+                before"); 0, the default, is no constraint.
         """
         start_var = self.model.new_int_var(
             0, self.horizon, f"start_{task_id}"
@@ -199,6 +206,7 @@ class JarvisScheduler:
             "duration": duration,
             "difficulty_weight": difficulty_weight,
             "energy_weight": energy_weight,
+            "earliest_start": earliest_start,
         }
 
     def build_dependencies(self) -> None:
@@ -289,6 +297,7 @@ class JarvisScheduler:
                     self.model.add_no_overlap([t["interval"], soft_iv])
 
         self.build_dependencies()
+        add_earliest_starts(self.model, self.tasks)
         self._build_daily_load_constraints()
 
         # TMT-weighted objective: minimize makespan AND early start for high-priority

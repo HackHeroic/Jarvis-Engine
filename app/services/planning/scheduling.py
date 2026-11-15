@@ -23,7 +23,12 @@ from app.domain.errors import ScheduleInfeasibleError
 from app.schemas.context import Availability, TimeSlot
 from app.schemas.decomposition import ExecutionGraph
 from app.schemas.schedule import GenerateScheduleResponse, ScheduledTask
-from app.services.planning.local_time import day_start_on, logical_day_start, user_zone
+from app.services.planning.local_time import (
+    day_start_on,
+    logical_day_start,
+    resolve_not_before,
+    user_zone,
+)
 from app.utils.deadline_parser import parse_deadline_to_date
 from app.utils.pacing import compute_adaptive_daily_cap
 
@@ -152,6 +157,22 @@ def _minutes_already_past(horizon_start: datetime, now: datetime, horizon_minute
     return min(rounded, horizon_minutes)
 
 
+def _not_before_minute(
+    not_before: Optional[str], horizon_start: datetime, zone: ZoneInfo, now: datetime
+) -> int:
+    """The minute of the horizon a task's ``not_before`` holds it until; 0 for none.
+
+    Read on the user's clock (``resolve_not_before``). One already past (before now,
+    or before the horizon starts) is no constraint, and neither is one that cannot be
+    read. One past the horizon's end is returned as it is: the solve is then
+    INFEASIBLE, and the planner's horizon ladder widens the horizon until it fits.
+    """
+    moment = resolve_not_before(not_before, zone)
+    if moment is None or moment <= now:
+        return 0
+    return max(0, math.ceil((moment - horizon_start).total_seconds() / 60))
+
+
 MINUTES_PER_DAY = 1440
 # Local time: minute 0 is 08:00 in the user's zone, so 960 is their midnight.
 SLEEP_START = 960  # midnight (intra-day: 0=8 AM, 960=midnight)
@@ -202,6 +223,9 @@ def run_schedule(
     the caller's to place and is left as given; its past is blocked only when the
     caller asks (``block_past=True``: the planner fixes one horizon per turn, then
     solves against now).
+
+    A chunk's ``not_before`` is a hard lower bound on its start (see
+    ``_not_before_minute``); one beyond this horizon makes it INFEASIBLE.
     """
     now = datetime.now(timezone.utc)
     resolved_horizon_start = horizon_start or current_horizon_start(zone)
@@ -290,8 +314,10 @@ def run_schedule(
         # FULL_FOCUS: no block added
 
 
-    # TMT scores and task mapping (per-chunk delay from deadline_hint)
+    # TMT scores and task mapping (per-chunk delay from deadline_hint), and each
+    # task's earliest start (its not_before)
     tmt_scores: dict[str, float] = {}
+    clock_zone = zone or user_zone()
     for chunk in graph.decomposition:
         duration = clamped_durations[chunk.task_id]
         delay_h = _delay_hours_for_chunk(chunk, resolved_horizon_start)
@@ -310,6 +336,9 @@ def run_schedule(
             chunk.dependencies,
             difficulty_weight=chunk.difficulty_weight,
             energy_weight=_energy_weight(chunk.difficulty_weight, delay_h) if energy_on else 0,
+            earliest_start=_not_before_minute(
+                chunk.not_before, resolved_horizon_start, clock_zone, now
+            ),
         )
 
     result, status_or_empty = scheduler.solve()

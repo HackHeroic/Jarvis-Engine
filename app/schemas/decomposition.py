@@ -13,6 +13,19 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+# Where each part of the day starts on the user's clock: the not_before of work the
+# user asks to do "tomorrow evening". The one table; the decomposition prompt and the
+# not_before field's description both read it.
+DAY_PART_START_HOURS: Dict[str, int] = {
+    "morning": 8,
+    "afternoon": 12,
+    "evening": 18,
+    "night": 20,
+}
+DAY_PART_STARTS_TEXT = ", ".join(
+    f"{part} {hour:02d}:00" for part, hour in DAY_PART_START_HOURS.items()
+)
+
 
 class ImplementationIntention(BaseModel):
     """WOOP 'Plan' stage: a deterministic If-Then trigger that bypasses
@@ -106,6 +119,18 @@ class TaskChunk(BaseModel):
             "chunk (e.g., '2026-03-07' or 'before Friday exam').  Fed into "
             "the Phase 2 TMT priority formula: Motivation = (Expectancy * "
             "Value) / (Impulsiveness * Delay)."
+        ),
+    )
+    not_before: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional earliest start, set only when the user says when to do the work "
+            "('tomorrow evening', 'on Saturday', 'after 6 PM'): the start of that window "
+            "as a local date or date-time in the user's zone, YYYY-MM-DD or "
+            "YYYY-MM-DDTHH:MM (a part of the day starts at "
+            f"{DAY_PART_STARTS_TEXT}). The scheduler never starts the chunk "
+            "earlier. Null when no time is stated. A deadline ('by Friday') is never a "
+            "not_before. A value with a UTC offset is read as that instant."
         ),
     )
 

@@ -191,3 +191,45 @@ def test_build_task_rows__horizon_start__scheduled_start_is_an_offset_aware_inst
     assert datetime.fromisoformat(row["scheduled_end"]) - datetime.fromisoformat(
         row["scheduled_start"]
     ) == timedelta(minutes=25)
+
+
+# --- resolve_not_before -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-11-17T18:00", datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        ("2026-11-17T18:00:00", datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        ("2026-11-17 18:00", datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        # A date is where the planner's day starts on it.
+        ("2026-11-21", datetime(2026, 11, 21, 8, 0, tzinfo=IST)),
+        # A stored timestamptz is the instant it names, on the user's clock.
+        ("2026-11-17T12:30:00+00:00", datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        ("2026-11-17T12:30:00Z", datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        (datetime(2026, 11, 17, 12, 30, tzinfo=timezone.utc), datetime(2026, 11, 17, 18, 0, tzinfo=IST)),
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("tomorrow evening", None),
+        ("2026-13-40", None),
+    ],
+)
+def test_resolve_not_before__each_spelling__the_instant_on_the_users_clock(value, expected):
+    from app.services.planning.local_time import resolve_not_before
+
+    resolved = resolve_not_before(value, IST)
+
+    assert resolved == expected
+    if resolved is not None:
+        assert resolved.utcoffset() == timedelta(hours=5, minutes=30)
+
+
+def test_resolve_not_before__fixed_offset_zone__wall_time_on_that_offset():
+    from app.services.planning.local_time import resolve_not_before
+
+    offset = timezone(timedelta(hours=5, minutes=30))
+
+    assert resolve_not_before("2026-11-17T18:00", offset).isoformat() == (
+        "2026-11-17T18:00:00+05:30"
+    )

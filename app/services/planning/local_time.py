@@ -14,7 +14,7 @@ The caller passes "now": the scheduler takes it from its own clock.
 """
 
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import app.core.config as config
@@ -109,3 +109,31 @@ def local_today(zone: ZoneInfo | None = None) -> date:
 def end_of_local_day(day: date, zone: ZoneInfo) -> datetime:
     """The last second of ``day`` on the user's clock: when a date-only deadline passes."""
     return datetime.combine(day, time(23, 59, 59), tzinfo=zone)
+
+
+def resolve_not_before(
+    value: str | datetime | None, zone: tzinfo, day_start_hour: int | None = None
+) -> datetime | None:
+    """The instant a task's "not before" names, offset-aware; None when it names none.
+
+    A date (``YYYY-MM-DD``) is ``day_start_hour`` (default ``DAY_START_HOUR``) on that
+    date in ``zone``, where the planner's day starts; a date-time without an offset
+    (``YYYY-MM-DDTHH:MM``) is wall time in ``zone``; one with an offset (a stored
+    ``timestamptz``) is that instant. ``zone`` is the user's zone, or a fixed offset
+    when that is all a caller has. A value that is none of these is logged and read as
+    no constraint, never a failed plan.
+    """
+    if isinstance(value, datetime):
+        return _local(value, zone)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        if len(text) == len("YYYY-MM-DD"):
+            day = date.fromisoformat(text)
+            hour = config.DAY_START_HOUR if day_start_hour is None else day_start_hour
+            return datetime.combine(day, time(hour, 0), tzinfo=zone)
+        return _local(datetime.fromisoformat(text), zone)
+    except ValueError:
+        logger.warning("Unreadable not_before %r ignored", text[:40])
+        return None

@@ -688,3 +688,118 @@ def test_generate_schedule__infeasible__422_schedule_infeasible_envelope():
     assert error["message"] == (
         "Schedule infeasible; consider reducing scope or extending deadline."
     )
+
+
+# --- not before: a task's earliest start ------------------------------------------------
+# Planned at 08:00 on Monday 16 Nov (IST), minute 0 is that 08:00: tomorrow 18:00 is
+# minute 1440 + 600.
+
+TOMORROW_6PM_MINUTE = 1440 + 600
+
+
+def _not_before_graph(*tasks: tuple[str, str | None]):
+    """An ExecutionGraph of 25-minute tasks, each (task_id, not_before)."""
+    from app.schemas.decomposition import ExecutionGraph, GoalMetadata, TaskChunk
+
+    chunks = [TaskChunk(task_id=tid, title=tid, duration_minutes=25, difficulty_weight=0.5,
+                        dependencies=[], completion_criteria="done", not_before=not_before)
+              for tid, not_before in tasks]
+    return ExecutionGraph(goal_metadata=GoalMetadata(), decomposition=chunks,
+                          cognitive_load_estimate={"intrinsic_load": 0.5})
+
+
+def test_scheduler__earliest_start__task_never_starts_before_it():
+    scheduler = JarvisScheduler(horizon_minutes=2880)
+    scheduler.add_task("held", 25, 50, [], earliest_start=600)
+    scheduler.add_task("free", 25, 50, [])
+
+    result, _ = scheduler.solve()
+
+    assert result != "INFEASIBLE"
+    assert result["held"]["start"] == 600  # as early as it may, never earlier
+    assert result["free"]["start"] == 0
+
+
+def test_scheduler__earliest_start_past_the_horizon__infeasible():
+    scheduler = JarvisScheduler(horizon_minutes=1440)
+    scheduler.add_task("held", 25, 50, [], earliest_start=1430)
+
+    result, _ = scheduler.solve()
+
+    assert result == "INFEASIBLE"
+
+
+def test_run_schedule__not_before_tomorrow_evening__starts_at_or_after_it(before_the_horizon):
+    from app.services.planning import scheduling as sep
+
+    graph = _not_before_graph(
+        ("sql_1", "2026-11-17T18:00"), ("sql_2", "2026-11-17T18:00"), ("other", None),
+    )
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880)
+
+    assert resp.schedule["sql_1"].start_min >= TOMORROW_6PM_MINUTE
+    assert resp.schedule["sql_2"].start_min >= TOMORROW_6PM_MINUTE
+    assert resp.schedule["other"].start_min == 0  # a task with no not_before is not held
+
+
+def test_run_schedule__not_before_with_an_offset__read_as_that_instant(before_the_horizon):
+    from app.services.planning import scheduling as sep
+
+    # 12:30 UTC is 18:00 in India: a stored timestamptz, as a carried-over task has it.
+    graph = _not_before_graph(("stored", "2026-11-17T12:30:00+00:00"))
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880)
+
+    assert resp.schedule["stored"].start_min == TOMORROW_6PM_MINUTE
+
+
+def test_run_schedule__not_before_a_date__from_the_start_of_that_day(before_the_horizon):
+    from app.services.planning import scheduling as sep
+
+    resp = sep.run_schedule(_not_before_graph(("wed", "2026-11-18")), [], horizon_minutes=4320)
+
+    assert resp.schedule["wed"].start_min == 2 * 1440  # 08:00 on Wednesday
+
+
+def test_run_schedule__not_before_already_past__no_constraint(clock):
+    from datetime import datetime
+
+    from app.services.planning import scheduling as sep
+
+    clock.freeze(datetime(2026, 11, 16, 14, 2, tzinfo=IST), sep)
+    graph = _not_before_graph(("past", "2026-11-16T09:00"), ("long_past", "2026-11-10"))
+    unheld = _not_before_graph(("past", None), ("long_past", None))
+
+    resp = sep.run_schedule(graph, [], horizon_minutes=2880)
+
+    # Only now (14:02, minute 362, blocked to 365) holds them: the same plan as none.
+    assert resp.schedule == sep.run_schedule(unheld, [], horizon_minutes=2880).schedule
+    assert min(t.start_min for t in resp.schedule.values()) == 365
+
+
+def test_run_schedule__not_before_past_the_horizon__infeasible_until_it_widens(
+    before_the_horizon,
+):
+    from app.domain.errors import ScheduleInfeasibleError
+    from app.services.planning import scheduling as sep
+
+    friday_evening = "2026-11-20T18:00"  # minute 4 * 1440 + 600
+
+    with pytest.raises(ScheduleInfeasibleError):
+        sep.run_schedule(_not_before_graph(("fri", friday_evening)), [], horizon_minutes=2880)
+    resp = sep.run_schedule(_not_before_graph(("fri", friday_evening)), [], horizon_minutes=7200)
+
+    assert resp.schedule["fri"].start_min == 4 * 1440 + 600
+
+
+def test_run_schedule__unreadable_not_before__ignored_and_logged(before_the_horizon, caplog):
+    from app.services.planning import scheduling as sep
+
+    with caplog.at_level("WARNING", logger="app.services.planning.local_time"):
+        resp = sep.run_schedule(
+            _not_before_graph(("vague", "tomorrow evening")), [], horizon_minutes=2880
+        )
+
+    assert resp.schedule["vague"].start_min == 0
+    assert "not_before" in caplog.text

@@ -1,4 +1,4 @@
-"""Sleep windows, precedence, and buffer logic."""
+"""Sleep windows, precedence, earliest starts, and buffer logic."""
 
 from __future__ import annotations
 
@@ -27,6 +27,20 @@ def merge_time_windows(windows: Iterable[tuple[int, int]]) -> list[tuple[int, in
         else:
             merged.append((start, end))
     return merged
+
+
+def add_earliest_starts(model: cp_model.CpModel, tasks: dict[str, dict]) -> None:
+    """Hold every task with an ``earliest_start`` from starting before it.
+
+    ``earliest_start`` is a minute from the horizon's start (the task's "not before");
+    0 or absent is no constraint. One beyond the latest start the horizon allows
+    (``earliest_start + duration > horizon``) leaves the model INFEASIBLE, which the
+    caller answers by widening the horizon.
+    """
+    for task in tasks.values():
+        earliest = task.get("earliest_start", 0)
+        if earliest > 0:
+            model.add(task["start"] >= earliest)
 
 
 def energy_objective_terms(
