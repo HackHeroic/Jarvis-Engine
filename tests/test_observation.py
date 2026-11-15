@@ -357,3 +357,39 @@ def test_rule_text__no_memory_that_is_this_rule_alone__the_users_words(habits, m
     said = _said(habits, memories)
 
     assert [rule_text(habit, said) for habit in habits] == habits
+
+
+@pytest.mark.parametrize("cleaned", [
+    "Goes to the gym every weekday at 7 AM",
+    "Goes to the gym at 7 AM on weekdays",
+])
+def test_turn_memories__correction_in_the_users_words__covered_by_the_cleaned_memory(cleaned):
+    """A correction ("I moved my gym to 7 AM on weekdays, not 6 PM anymore") and the
+    memory extracted from it are one thing said: no second memory in the raw words,
+    whichever way the model worded the memory, and the rule takes the cleaned words."""
+    from types import SimpleNamespace
+
+    from app.schemas.memory import ExtractedMemory
+
+    habit = "I moved my gym to 7 AM on weekdays, not 6 PM anymore"
+    dump = SimpleNamespace(
+        memories=[ExtractedMemory(type="constraint", content=cleaned, confidence=0.95)],
+        inline_habits=[habit],
+    )
+
+    assert [m.content for m in observation.turn_memories(dump)] == [cleaned]
+    assert observation.rule_text(habit, dump) == cleaned
+
+
+def test_turn_memories__habit_about_something_else__kept_as_its_own_memory():
+    from types import SimpleNamespace
+
+    from app.schemas.memory import ExtractedMemory
+
+    dump = SimpleNamespace(
+        memories=[ExtractedMemory(type="constraint", content="Goes to the gym every weekday at 7 AM",
+                                  confidence=0.95)],
+        inline_habits=["No calls during lunch on weekdays"],
+    )
+
+    assert len(observation.turn_memories(dump)) == 2

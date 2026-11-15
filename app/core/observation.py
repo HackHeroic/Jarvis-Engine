@@ -66,7 +66,7 @@ _WORDS = re.compile(r"[a-z0-9]+")
 # Words that say nothing about which fact it is.
 _FILLER = frozenset(
     "a an and the to of in on at for my me i im i'm is am are be it this that so from now "
-    "any all do does please user users".split()
+    "any all do does please user users go goes every each".split()
 )
 # A standing scheduling rule: a word that forbids or reserves time ("only" and "always"
 # are left out: "I only work well after 9 pm" describes a peak, and blocking it would
@@ -162,7 +162,10 @@ async def _to_completion(write: Coroutine[Any, Any, RememberOutcome]) -> Remembe
 
 
 def _fact_words(text: str) -> set[str]:
-    return {w for w in _WORDS.findall(text.lower()) if w not in _FILLER}
+    """The words that say which fact it is, a plural counted as its singular
+    ("weekdays" and "weekday" are one word)."""
+    words = {w for w in _WORDS.findall(text.lower()) if w not in _FILLER}
+    return {w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w for w in words}
 
 
 def _covered(habit: str, memories: list[ExtractedMemory]) -> bool:
