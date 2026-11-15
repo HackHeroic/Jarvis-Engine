@@ -133,7 +133,7 @@ The places where this vocabulary is not yet followed are listed in §8.
 | Route | Bound | Order |
 |---|---|---|
 | `GET /tasks/` | 500 (`TASK_LIST_LIMIT`, `app/domain/ports.py:51`) | newest `created_at` first |
-| `GET /habits/tracker/due` | 500 trackers read (`TRACKER_LIST_LIMIT`, `ports.py:53`) | newest first |
+| `GET /habits/tracker/due` | one check-in per rule in effect; 500 trackers read (`TRACKER_LIST_LIMIT`, `ports.py:53`) | due: the one waiting longest first; not due yet: the soonest first |
 | `GET /habits/constraints` | the rules in effect (`list_active`), read newest first so the cap drops the oldest | newest first |
 | `GET /memories/` | none beyond the 1000-row cap | oldest first |
 | `GET /anticipation/suggestions` | 100 (`_LIST_LIMIT`, `app/services/anticipation/service.py:70`) | newest first |
@@ -184,6 +184,8 @@ The places where this vocabulary is not yet followed are listed in §8.
 | `POST /memories/{id}/confirm` | **Not idempotent**: each call reinforces the memory again (observation count, strength) | `MemoryService.confirm` |
 | `POST /anticipation/suggestions/{id}/accept`, `/dismiss` | 409 once the suggestion is no longer pending | `move_suggestion` compare-and-set on the status |
 | `POST /anticipation/run` | Once a day per trigger: the second run reports `already_done` with the existing suggestion. A manual repeat within 10 s returns the first run's outcome. | `AnticipationService.run_trigger`; `ANTICIPATION_MANUAL_COOLDOWN_SECONDS` (`app/core/config.py:194`) |
+| `GET /habits/tracker/due` | Not read-only: the first read starts a tracker for each rule without one. Repeated or concurrent reads start **one tracker per rule**; later reads write nothing. | The repository reads before it inserts (`habit_trackers` has no unique key on `(user_id, constraint_id)`), and `RuleCheckIns` holds a per-user lock around it in the one server process |
+| `POST /habits/tracker/{id}/complete` | **Not idempotent**: each call is another check-in and moves the next one | `RuleCheckIns.review` |
 | `POST /chat/stream` | Turns on one conversation run one at a time. A turn that waits more than 120 s ends in an `error` frame with code `conflict`. | `app/services/turn_locks.py:24` (`TURN_LOCK_WAIT_SECONDS = 120.0`) |
 
 ### 2.6 Status codes
@@ -526,16 +528,16 @@ Every route first requires the database (503). Another user's memory is a 404.
 
 ### 5.7 Habits and rules
 
-Every route first requires the database (`require_supabase`) and goes through the container's repositories (`app/api/v1/endpoints/habits.py:1-7`).
+Every route first requires the database (`require_supabase`). Check-ins go through the container's `RuleCheckIns` (`app/services/analytical/rule_check_ins.py`), rules through its `ConstraintRepository` and `StatedRules` (`app/api/v1/endpoints/habits.py:1-7`). A habit tracker follows one rule: a check-in asks "Still how you work?", and SM-2 spaces the next one out while the rule holds (1 day, 6 days, then the interval times the easiness); an answer under 3 brings it back the next day. The response models are in `app/schemas/habits.py`.
 
 | Method + path | Purpose | Request | Response | Errors |
 |---|---|---|---|---|
-| `POST /habits/tracker/{tracker_id}/complete?user_id=` (CU) | Record an SM-2 review | `TrackerCompleteRequest {quality: 0–5}` | `TrackerCompleteResponse {next_review_date, next_interval_days}` (`habits.py:32`) | 404 `not_found` "That tracker does not exist."; 503 |
-| `GET /habits/tracker/due?user_id=` (CU) | Trackers due today or earlier, by dates in the user's zone | — | `DueTrackersResponse {due_trackers: HabitTracker[]}` (`habits.py:39`) | 503 |
+| `POST /habits/tracker/{tracker_id}/complete?user_id=` (CU) | Answer a check-in on one of the user's rules (an SM-2 review) | `TrackerCompleteRequest {quality: 0–5}` | `CheckInReviewed {next_review_date (UTC), next_interval_days ≥ 1, next_due_on (a date on the user's clock)}` | 404 `not_found` "That tracker does not exist." (another user's too); 503 |
+| `GET /habits/tracker/due?user_id=` (CU) | Every rule in effect with its check-in, split by whether it is due today or earlier, by dates in the user's zone. A rule with no tracker gets one here, counting from when it was learned (its first check-in is due the day after), so this read may write once per rule. A tracker whose rule is gone is never listed. | — | `RuleCheckInList {timezone, today, due_trackers: RuleCheckIn[], upcoming_trackers: RuleCheckIn[]}`, each `RuleCheckIn {id (the tracker), constraint_id (the rule), rule_text, source: said \| inferred, learned_at \| null, last_reviewed_at \| null, next_due_on, interval_days}` | 503 |
 | `GET /habits/constraints?user_id=` | The user's rules in effect, newest first: the same list the You page shows (a rule past its validity window is in neither) | — | `ConstraintListResponse {constraints: ConstraintOut[]}`, each `{id, raw_text, constraint_type, created_at}` (`habits.py:47, 67`) | 503 `persistence_unavailable` |
-| `DELETE /habits/constraints/{constraint_id}?user_id=` | Delete a rule. A rule stated in chat takes the memory of stating it with it (forgotten). | — | `ConstraintDeleteResponse {status: "deleted", id}` (`habits.py:73`) | 404 `not_found`; 503 |
+| `DELETE /habits/constraints/{constraint_id}?user_id=` | Delete a rule and its check-ins (the tracker goes first). A rule stated in chat takes the memory of stating it with it (forgotten). | — | `ConstraintDeleteResponse {status: "deleted", id}` (`habits.py:73`) | 404 `not_found`; 503 |
 
-**Use case:** UC3 (teach a rule); letting a rule go again (UC5/UC8 from the You page).
+**Use case:** UC3 (teach a rule, and confirm it still holds); letting a rule go again (UC5/UC8 from the You page or the Habits page).
 
 ### 5.8 Documents and ingestion
 

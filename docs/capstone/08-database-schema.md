@@ -399,19 +399,19 @@ Indexes: `idx_behavioral_user (user_id)`. RLS: `owner_all`.
 
 ### 3.7 `habit_trackers` — SM-2 spaced-repetition state
 
-*Origin:* baseline (003); capstone §5, §8. Entity: `HabitTracker`, through `HabitTrackerRepository` (§4). The application reads and updates trackers (`sm2_engine`); no application code creates one.
+*Origin:* baseline (003); capstone §5, §8. Entity: `HabitTracker`, through `HabitTrackerRepository` (§4). One tracker follows one rule (`constraint_id`): `RuleCheckIns` (`app/services/analytical/rule_check_ins.py`) starts it when the rule is stored, or on the first read of the check-ins for an older rule, reviews it through `sm2_engine`, and deletes it just before the rule is deleted. Before its first review a tracker's `last_done_at` is when its rule was learned and `quality_last` is NULL, so its first check-in is due one interval (1 day) later. Nothing in the table makes `(user_id, constraint_id)` unique, and there was no DDL access to add a key: `add_for_constraint` reads before it inserts, and a second row a race could leave is read as one (§10).
 
 | Column | Type | Null | Default | Constraints / notes |
 |---|---|---|---|---|
 | `id` | `uuid` | NO | `gen_random_uuid()` | **PK** |
 | `user_id` | `text` | NO | — | FK `habit_trackers_user_id_fkey` → `user_profiles` CASCADE |
 | `habit_id` | `text` | yes | — | free text; soft |
-| `constraint_id` | `uuid` | yes | — | FK `habit_trackers_constraint_id_fkey` *(generated)* → `behavioral_constraints (id)` SET NULL |
+| `constraint_id` | `uuid` | yes | — | FK `habit_trackers_constraint_id_fkey` *(generated)* → `behavioral_constraints (id)` SET NULL. The application deletes the tracker before its rule (`StatedRules._delete`), so SET NULL only catches a delete made outside it; such a tracker is never listed |
 | `repetitions` | `int` | NO | `0` | |
 | `quality_last` | `int` | yes | — | |
 | `ef` | `numeric(5,3)` | NO | `2.5` | `habit_trackers_ef_floor` CHECK `ef >= 1.3` (the SM-2 floor) |
 | `next_interval_days` | `int` | NO | `1` | |
-| `last_done_at` | `timestamptz` | yes | — | |
+| `last_done_at` | `timestamptz` | yes | — | the last review; before the first one (`quality_last` NULL), when the tracker's rule was learned |
 | `created_at` | `timestamptz` | NO | `now()` | |
 | `updated_at` | `timestamptz` | NO | `now()` | `set_updated_at` trigger |
 
@@ -677,7 +677,7 @@ Since plan 3, `draft_schedules`, `behavioral_constraints`, `user_memories`, `hab
 | `TaskEvent` (314) | `task_events` | `SupabaseTaskEventRepository` | 1:1, all 8 columns. |
 | `DraftSchedule` (333) | `draft_schedules` | `SupabaseDraftRepository`, reached only through `DraftService` | 10 fields ↔ 10 columns. `version` is a computed property, not a column (§3.5). An unset `created_at` is left out of the insert so the column default stamps it (`_mapping.draft_to_row`, line 258). |
 | `BehavioralConstraint` (386) | `behavioral_constraints` | `SupabaseConstraintRepository` | 8 fields ↔ 11 columns. Unmapped: `structured_override`, `valid_from`, `valid_until`. The validity window is read from the raw row (`supabase_repos._applies_at`, line 500). |
-| `HabitTracker` (412) | `habit_trackers` | `SupabaseHabitTrackerRepository` (`get`, `list_for_user`, `record_review`) | 9 fields ↔ 11 columns; `created_at` and `updated_at` are unmapped. |
+| `HabitTracker` (412) | `habit_trackers` | `SupabaseHabitTrackerRepository` (`get`, `list_for_user`, `record_review`, `add_for_constraint` (read, then insert), `delete_for_constraint`), reached through `RuleCheckIns` | 9 fields ↔ 11 columns; `created_at` and `updated_at` are unmapped. |
 | `Memory` (482) | `user_memories` | `SupabaseMemoryRepository` | 20 fields ↔ 25 columns. **Renamed:** field `origin` ↔ column `source` (`_mapping._MEMORY_COLUMN_FOR`, line 66). Unmapped: `source_id`, `last_accessed`, `last_reinforced`, `updated_at`; `embedding` is passed beside the entity, never inside it. |
 | `Suggestion` (649) | `proactive_suggestions` | `SupabaseSuggestionRepository` | 13 fields ↔ 14 columns; `resolved_at` is unmapped. `ConsentDecision` (635) is a value object stored in `consent_behavior` + `consent_kind` + `consent_reason`. |
 | `LLMUsageEvent` (724) | `llm_usage_events` | `SupabaseUsageRepository` | 13 fields ↔ 14 columns: the entity has no `id`. The ledger only appends and summarises. |
@@ -712,7 +712,7 @@ Since plan 3, `draft_schedules`, `behavioral_constraints`, `user_memories`, `hab
 | Memory supersedes Memory | 0..1 → 0..1 | FK `superseded_by` → `user_memories (id)` |
 | Memory learned in a session / message | 0..1 → * | **soft**: `source_session_id`, `source_message_id` |
 | BehavioralConstraint ↔ the Memory of stating it (or the pattern memory it was adopted from) | * → 0..1 | **soft**: `structured_semantics.memory_id` (`RULE_MEMORY_KEY`, `app/services/memory/stated_rules.py:30`; set for an adopted rule at `app/services/anticipation/actions.py:236`) |
-| HabitTracker tracks a BehavioralConstraint | * → 0..1 | FK `habit_trackers.constraint_id` → `behavioral_constraints (id)`, SET NULL |
+| HabitTracker tracks a BehavioralConstraint | * → 0..1 (one per rule, kept in code) | FK `habit_trackers.constraint_id` → `behavioral_constraints (id)`, SET NULL |
 | Suggestion holds a ProactiveAction (Command) | 1 → 1 | embedded JSON `action` (§10) |
 | Suggestion's action → DraftSchedule / Memory | * → 0..1 | **soft**: `action.draft_id`, `action.memory_id` |
 | ConversationSession contains ChatMessages | 1 → * | FK `chat_messages.session_id`, CASCADE |
@@ -921,6 +921,7 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 |---|---|---|
 | **`task_events`** | **Append-only.** No code in `app/` updates or deletes a row. Rows go only through the profile's CASCADE and the demo seed's reset. Learning, mastery and the streak read the *latest* outcome per `(task_id, scheduled_start)` (`task_service.latest_outcome_per_slot`, line 45). Reads are ordered newest first, so PostgREST's 1000-row cap (`supabase/config.toml` `max_rows`) can drop only the oldest rows. Callers narrow every read by `since`, `types` or `task_ids` (a plan 2 ruling; the port allows an unnarrowed read). | `supabase_repos.SupabaseTaskEventRepository` (append, append_many, list_for_user) |
 | **`user_tasks`** | Holds the current state only. The pending set is deleted and rewritten on every accept, so row ids change and `task_id` stays. The history lives in `task_events`. | `accept_draft()`; `TaskService` |
+| **Habit trackers** | One per rule. Started when the rule is stored (best effort) or on the first read of the check-ins; reviewed in place (`record_review`); deleted just before the rule, by every path that deletes a rule (`StatedRules._delete`: delete a rule, forget or dismiss the memory it rests on). A rule past its validity window keeps its tracker, unlisted. | `RuleCheckIns` (`app/services/analytical/rule_check_ins.py`) |
 | **Forgotten memories** | **Tombstone, not delete.** `DELETE /memories/{id}` sets `status = 'forgotten'` and `content = ''`. It keeps `embedding` and `pattern_key`, so the same fact said or noticed again is recognised and not stored again. Linked rules are deleted (`StatedRules.forget_memory`). Not covered: the user's own words stay in `chat_messages`, which a forget does not rewrite. A summary holding the fact is filtered before it is shown, and written back without it by the next background compaction. | `MemoryService.forget` (`memory_service.py:304`); `SummaryFilter` (`app/services/memory/summary_text.py:145`) |
 | **Dismissed / faded memories** | `dismissed` hides the memory for good but keeps its text. The daily `MemoryDecaySweep` stores the decayed `strength` as of now (`strength_as_of`) and marks memories below `MEMORY_RETENTION_FLOOR` (0.1) `faded`, except `constraint` memories. A faded memory comes back when it is mentioned. | `MemoryService.fade_stale` |
 | **Session summaries and coverage markers** | `summary_through` is where the verbatim window starts. It never moves back: `set_summary` is a compare-and-set in the UPDATE's own filter (`summary_through <= through`, or NULL). `summary_covered_through` is how far the summary reaches, which is past the window start once an idle summary also covered the newest 8 turns. Compaction runs after a turn once more than 16 messages are past `summary_through` (`COMPACT_AFTER_MESSAGES`, `COMPACT_KEEP_RECENT = 8`). `SessionSummarySweep` summarises conversations idle for 30 minutes. A summary write leaves `updated_at` alone (§6.4). | `SupabaseConversationRepository.set_summary` (`supabase_repos.py:1074`); `app/core/config.py:292–294` |
@@ -930,7 +931,7 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 | **Workspace cache** | `task_workspaces` rows expire after 24 h. They are rebuilt on a miss or after expiry, and busted when a document is linked to the task. | `workspace_builder.py` |
 | **Deleting a user** | Deleting the `user_profiles` row cascades to all 17 CASCADE tables (`chat_messages` also through `chat_sessions`, `task_materials` also through `ingested_documents`) and nulls `llm_usage_events.user_id`. | FKs, §2 |
 | **Capstone wipe** | On its first application only, `20261114000001` §0 truncated 14 legacy user tables (`restart identity cascade`). A guard skips the wipe on any re-run: if `user_profiles` already exists, nothing is truncated. | capstone §0 |
-| **Demo seed `--reset`** (`scripts/seed_demo_user.py`) | Refuses any user but `demo`, and refuses while a backend answers. Deletes, scoped by `user_id`, in this order: `llm_usage_events` first (the profile's cascade would only set them to NULL), `task_events`, `user_tasks`, `draft_schedules`, `user_memories`, then `user_profiles`, whose cascade takes every other user table. It then checks that no row of the user is left in those six tables or in `goals`, `proactive_suggestions`, `behavioral_constraints`, `chat_messages` and `chat_sessions`, and fails if one is (`_RESET_ORDER`, `_CASCADE_ONLY`, lines 127–143; `reset_user`, line 759). The LangGraph checkpoint file (`data/checkpoints.sqlite`) is outside Postgres and is not touched. | the script |
+| **Demo seed `--reset`** (`scripts/seed_demo_user.py`) | Refuses any user but `demo`, and refuses while a backend answers. Deletes, scoped by `user_id`, in this order: `llm_usage_events` first (the profile's cascade would only set them to NULL), `task_events`, `user_tasks`, `draft_schedules`, `user_memories`, `habit_trackers`, `behavioral_constraints`, then `user_profiles`, whose cascade takes every other user table. It then checks that no row of the user is left in those eight tables or in `goals`, `proactive_suggestions`, `chat_messages` and `chat_sessions`, and fails if one is (`_RESET_ORDER`, `_CASCADE_ONLY`, lines 135–152; `reset_user`, line 824). The LangGraph checkpoint file (`data/checkpoints.sqlite`) is outside Postgres and is not touched. | the script |
 
 ---
 
@@ -972,14 +973,14 @@ All 19 files are idempotent: running the whole set twice succeeds (`tests/test_m
 | `behavioral_constraints.structured_override` | no reader or writer |
 | `proactive_suggestions.resolved_at` | never read or written |
 | `goals.deadline`, `goals.status` | only their defaults; `GoalRepository.get` would read them, and no application code calls it |
-| `user_profiles.display_name` | only the demo seed writes it (`scripts/seed_demo_user.py:571`); `PATCH /you/settings` forbids it (`SettingsUpdate`, `extra="forbid"`, `app/api/v1/endpoints/you.py:83`) |
+| `user_profiles.display_name` | only the demo seed writes it (`scripts/seed_demo_user.py:603`); `PATCH /you/settings` forbids it (`SettingsUpdate`, `extra="forbid"`, `app/api/v1/endpoints/you.py:83`) |
 | `user_memories.source_id`, `.last_accessed`, `.last_reinforced` | no entity field, and no reader or writer since the v1 `MemoryStore` was deleted in plan 3 |
 | every column of `task_completion_signals` | no reader or writer since plan 3 (§3.19) |
 
 **Other known gaps** (from `_schema_notes.md`, "Known gaps", and the plan ledgers):
 - **`goal_id` disagreement.** `build_task_rows` takes a task's `goal_id` from the chunk when present, and only for a chunk without one from the text before the first underscore (`task_rows.py:192`, `_goal_id_of` at line 55). `draft_schedules.goal_id` is the full slug, so older plans could create two goals.
 - **No constraint on `user_memories.content` length.** The entity caps it at 2000 characters (`entities.py:489`); the column has no length CHECK.
-- **No application code creates a habit tracker.** `HabitTrackerRepository` reads and updates rows (`get`, `list_for_user`, `record_review`); none of its methods inserts one, and neither the API, the services nor the demo seed write `habit_trackers`. So `GET /api/v1/habits/tracker/due` is empty for every user, the demo user included.
+- **One habit tracker per rule is enforced in code, not by a key.** `habit_trackers` has no unique key on `(user_id, constraint_id)`, and the change that started creating trackers had no DDL access. `add_for_constraint` reads before it inserts, and `RuleCheckIns` holds a per-user lock around it within the one server process; two processes racing could still insert a second row, which the list reads as one (the tracker answered last) and which goes with the rule. A migration adding `unique (user_id, constraint_id) where constraint_id is not null` would close it.
 
 ---
 

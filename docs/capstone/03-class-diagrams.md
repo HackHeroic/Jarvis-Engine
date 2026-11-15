@@ -109,6 +109,7 @@ classDiagram
     class ConversationMemoryService
     class UserModelService
     class StatedRules
+    class RuleCheckIns
     class Settings
     class Sweep {
         <<interface>>
@@ -160,6 +161,8 @@ classDiagram
     AppContainer "1" *-- "1" ConversationMemoryService : conversation_memory
     AppContainer "1" *-- "1" UserModelService : user_model_service
     AppContainer "1" *-- "1" StatedRules : stated_rules
+    AppContainer "1" *-- "1" RuleCheckIns : rule_check_ins
+    StatedRules "1" o-- "0..1" RuleCheckIns : _check_ins
     AppContainer "1" *-- "1" DocumentService : documents
     AppContainer "1" *-- "1" DocumentLinker : document_linker
     DocumentService "1" o-- "0..1" DocumentLinker : _linker
@@ -182,6 +185,7 @@ classDiagram
 | `MemoryService o-- TextEmbedder`, `PlanningServices o--` its services, `AnticipationService o-- ConsentPolicy` / `ActionFactory` | Aggregation | Injected through the constructor and shared: the same `MemoryService` is held by `PlanningServices`, `ConversationMemoryService`, `UserModelService`, `StatedRules` and two actions | `app/container.py:153`, `188-196`, `204-207` |
 | `EventBus o-- "*" EventListener` | Aggregation | The bus keeps references to listeners it did not create; a listener (the usage ledger) is also a container field | `app/domain/events.py:88-93`, `app/container.py:143` |
 | `FallbackChainProvider *-- "1..*" LLMProvider` | Composition | The factory builds each wrapped provider for this chain only; the chain keeps them in a private tuple | `app/infrastructure/llm/factory.py:51-56`, `chain.py:44-45` |
+| `StatedRules o-- "0..1" RuleCheckIns` | Aggregation | The container's one `RuleCheckIns` is handed to `StatedRules` (to end a rule's check-ins before deleting it) and to the action factory (to start them for an adopted rule); `None` in tests that build `StatedRules` alone | `app/container.py`, `app/services/memory/stated_rules.py` (`_delete`) |
 | `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | The lifespan hands it the container's service and sweep list; the container outlives the scheduler's loop | `app/main.py:155-160`, `scheduler.py:38-41` |
 | `ChatTurnService o-- "0..1" AppContainer` | Aggregation | One service object per request (`for_app`), all sharing the one container; `None` when the lifespan built none | `app/services/chat_turn/service.py:243-258` |
 | `ChatTurn --> ChatTurnService` | Association | A back-reference the turn uses to reach the graph and container | `app/services/chat_turn/service.py:59` |
@@ -1777,6 +1781,7 @@ classDiagram
 | Triggers `o--` ports, `PatternService`, `ActionFactory` | Aggregation | Constructor-injected, shared with the service and container | `triggers.py:99-118`, `315-325` |
 | `AnticipationService *-- "*" Trigger : _triggers` | Composition | The container creates each trigger only to register it; the service is its only holder | `app/container.py:208-216`, `service.py:189-191` |
 | `AnticipationService *-- UserLocks : _locks` | Composition | Created in its constructor; serialises one user's trigger runs | `service.py:180` |
+| `StatedRules o-- "0..1" RuleCheckIns` | Aggregation | The container's one `RuleCheckIns` is handed to `StatedRules` (to end a rule's check-ins before deleting it) and to the action factory (to start them for an adopted rule); `None` in tests that build `StatedRules` alone | `app/container.py`, `app/services/memory/stated_rules.py` (`_delete`) |
 | `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | Handed in by the lifespan; the container owns them | `app/main.py:155-160` |
 | `AnticipationListener *-- PerUserSingleFlight : _flight` | Composition | Created in its constructor; one background run per user | `triggers.py:412-415` |
 | `Sweep <\|.. four sweeps` | Realization | Each owns the data it maintains: tasks, memories, conversation summaries, the checkpoint file | `task_service.py:310`, `memory_service.py:609`, `conversation_memory.py:602`, `checkpoint.py:271` |
@@ -2444,6 +2449,7 @@ Every class drawn above, and the module it is imported from. The conformance tes
 | `SinceLastSpoke` | `app.services.memory.since_last_spoke` |
 | `SummaryFilter` | `app.services.memory.summary_text` |
 | `StatedRules` | `app.services.memory.stated_rules` |
+| `RuleCheckIns` | `app.services.analytical.rule_check_ins` |
 
 ---
 

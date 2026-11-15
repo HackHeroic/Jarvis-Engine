@@ -74,7 +74,7 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `task_events` | `TaskEvent` | `SupabaseTaskEventRepository` |
 | `draft_schedules` | `DraftSchedule` | `SupabaseDraftRepository`, reached only through `DraftService` |
 | `behavioral_constraints` | `BehavioralConstraint` | `SupabaseConstraintRepository` (`behavioral_store` and the adopted-rule action call it) |
-| `habit_trackers` | `HabitTracker` | `SupabaseHabitTrackerRepository.record_review` (SM-2 reviews); nothing in the app creates a tracker |
+| `habit_trackers` | `HabitTracker` | `SupabaseHabitTrackerRepository`: `add_for_constraint` (one per rule, read then insert), `record_review` (SM-2 check-ins), `delete_for_constraint` (before the rule goes), all through `RuleCheckIns` (2026-11-15) |
 | `proactive_suggestions` | `Suggestion` | `SupabaseSuggestionRepository` |
 | `llm_usage_events` | `LLMUsageEvent` | `SupabaseUsageRepository` |
 | `user_memories` | `Memory` | `SupabaseMemoryRepository` |

@@ -90,7 +90,7 @@ app/
 │   │                          stated_rules, constraint_bridge, context, since_last_spoke
 │   ├── draft_service.py, draft_actions.py, task_service.py, user_model_service.py,
 │   │   energy.py, usage_ledger.py, chat_history.py, turn_locks.py, background.py
-│   ├── analytical/            workspace_builder, sm2_engine, mastery_tracker,
+│   ├── analytical/            workspace_builder, sm2_engine, rule_check_ins, mastery_tracker,
 │   │                          missed_deadlines, habit_translator, horizon_expander, …
 │   ├── extraction/            ingestion orchestrator, calendar, knowledge, linker
 │   └── documents/             document type registry and pipeline
@@ -120,6 +120,7 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 | Drafts | Propose, read (with `schedule` and a computed `version`), edit, rearrange, reject, discard, accept; accept is atomic and idempotent; a stale `expected_version` is a 409 `stale_version`; a draft whose slots have partly passed is re-solved from now | `app/services/draft_service.py:93`, `app/services/draft_actions.py:61`, `app/api/v1/endpoints/drafts.py` |
 | Task outcomes | Complete and Skip write one task event each; the slot sweep marks passed slots `missed`; passed deadlines are `deadline_missed`; a missed task can be brought back | `app/services/task_service.py:87` |
 | Rules | A stated rule and the memory of stating it are linked; letting go of one lets go of both; plans read only rules that apply now | `app/services/memory/stated_rules.py:62`, `app/core/user_model.py:77` |
+| Rule check-ins | Jarvis checks in on every rule it learned ("Still how you work?", 0–5), spaced out by SM-2 while the rule holds and back the next day after an answer under 3. Every way a rule is stored starts its tracker (first due the next day); a rule older than its tracker gets one when the list is read, counting from when it was learned; deleting a rule deletes its tracker first. `GET /habits/tracker/due` lists every rule, due and not due yet | `app/services/analytical/rule_check_ins.py`, `app/api/v1/endpoints/habits.py` |
 | Memory | Remember, recall (pgvector `match_memories`), confirm, dismiss, forget (sticks), decay; provenance said / inferred | `app/services/memory/memory_service.py:179` |
 | Conversations | Recent window, background compaction into a summary, "since we last spoke" | `app/services/memory/conversation_memory.py:184` |
 | PEARL | Four detectors over the outcome history (skip window, peak hour, deadline crunch, repeated skip); runs after every outcome, one run per user at a time | `app/services/memory/patterns.py:399`, `app/container.py:70` |
@@ -127,7 +128,7 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 | You page | Patterns, rules, memories in use, focus profile, privacy receipt (30 days), `streak_days`, settings (autonomy mode, wake time, timezone) | `app/services/user_model_service.py:166`, `app/api/v1/endpoints/you.py` |
 | LLM chain | Local Gemma (auto-detected PRIMARY + FAST) → Claude → Gemini; regex PII redaction before any cloud send; retries with backoff; timeouts; every call metered into `llm_usage_events`; one PRIMARY local call at a time | `app/infrastructure/llm/`, `app/core/model_router.py:204-211` |
 | Documents | Docling → ChromaDB ingestion, user-scoped document search, timetable extraction with approval. Docling runs on a worker thread, one document at a time, at most 120 s (503 `document_read_timeout`, `read_document` in `app/utils/docling_helper.py`). `POST /ingestion/process` keeps the upload's `file_name`. The uploaded file itself is kept in a private Supabase Storage bucket (`jarvis-documents`, at `{user_id}/{source_id}`, best effort) and opens from `GET /documents/{source_id}/file`; the list says `has_file` and names linked tasks with titles. Documents and tasks are linked topic by topic (cosine ≥ 0.52 between a topic, or the file name's subject, and a task title): a new document to the user's pending tasks, and an accepted plan's tasks to the user's documents (`DocumentLinkListener` on `DraftAccepted`, after the commit). A task's workspace lists its `linked_documents`. A short text message that mentions the user's notes is answered from the stored documents; only pasted material of 400+ characters is ingested (`PASTED_MATERIAL_MIN_CHARS`, `app/orchestrator/graph.py`) | `app/services/extraction/`, `app/services/documents/{service,linker}.py`, `app/api/v1/endpoints/documents.py`, `ingestion.py` |
-| Also | Workspace builder (RAG + web links + practice; after a failed web search it waits 5 minutes before searching again, `WEB_SEARCH_COOLDOWN_S`), SM-2 review of existing habit trackers (none are created, §4), mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
+| Also | Workspace builder (RAG + web links + practice; after a failed web search it waits 5 minutes before searching again, `WEB_SEARCH_COOLDOWN_S`), mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
 
 ---
 
@@ -140,7 +141,6 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 - **From the restructure (dropped tasks):** the `CognitiveModule` registry with derived routing (routing is still `INTENT_TO_MODULE`), and repositories for chat sessions and messages and pending-calendar rows.
 - **Auth:** `CurrentUser` reads `user_id` from the query string; it is the seam a JWT would replace (`app/api/deps.py:16`).
 - **Planned analytics:** DKT, RL and SARIMAX are stubs in `app/models/` and need real usage data first.
-- **Creating habit review trackers:** `HabitTrackerRepository` has `get`, `list_for_user` and `record_review`, and `sm2_engine.record_completion` only reviews an existing tracker. Nothing creates one (no route, no service, not the demo seed), so `GET /api/v1/habits/tracker/due` is empty and the Habits page says "No habits due for review" for every user, the demo user included.
 
 ---
 
@@ -208,7 +208,7 @@ The full script and the viva questions are in [10 — Demo and contributions](ca
 8. **The PII gate is regex only** (email and US-format phone, `app/orchestrator/hooks.py`), applied to the prompt, the system prompt and the history before any cloud send.
 9. **Bringing a missed task back records no event** (it is not an outcome; `TaskService.bring_back`, `app/services/task_service.py:154`), and `task_completion_signals` is a table nothing reads or writes.
 10. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 6 allow-listed raw-table leftovers); only its cache read and write run on a worker thread. Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
-11. **Nothing creates habit trackers** (§4). An upload whose file could not be stored (the store down at that moment) keeps its chunks and record but has no file to open (`has_file: false`).
+11. **One check-in tracker per rule is enforced in code, not by the database** (no unique key, no DDL access): the repository reads before it inserts and `RuleCheckIns` serialises it per user within one process, so two processes racing could leave a second tracker (listed once). An upload whose file could not be stored (the store down at that moment) keeps its chunks and record but has no file to open (`has_file: false`).
 12. **A chat upload is limited by its step, not the reader.** The knowledge module's `ingest_document` step has its own 60 s limit (`app/modules/knowledge_graph.py`), so in a chat turn a slow parse ends there, before the reader's 120 s limit; the REST ingestion routes answer 503 `document_read_timeout` at 120 s.
 
 ---

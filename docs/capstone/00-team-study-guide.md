@@ -509,6 +509,14 @@ sequenceDiagram
 - **Where to see it.** `app/domain/ports.py` (`DocumentRepository`, `DocumentFileStore`); `app/infrastructure/persistence/supabase_storage.py`; `app/services/documents/`; `app/container.py` (the listener's subscription); `app/core/config.py` (`DOCUMENT_BUCKET`, `DOCUMENT_LINK_SIMILARITY` with its measurements).
 - **The test that pins it.** `tests/test_repository_contracts.py::test_document_files__save_read_delete__round_trip_with_its_content_type` (both families); `tests/test_documents.py::test_file_route__kept__raw_bytes_inline_with_its_type`, `::test_process_ingestion__file_store_down__ingestion_still_succeeds_and_logs`; `tests/test_document_linking.py::test_real_model__ml_syllabus__linked_to_the_ml_tasks_only`, `::test_real_model__academic_transcript__linked_to_nothing`, `::test_accept__linking_fails__accept_stands_and_a_warning_names_the_error`.
 
+### D33. Jarvis checks in on the rules it learned (spaced repetition)
+- **The problem.** The Habits page read `GET /habits/tracker/due` and could rate a review with SM-2, but nothing ever created a tracker (`HabitTrackerRepository` could only read and review), so the page was empty for every user, the demo user included.
+- **What we chose.** A tracker follows one rule (`HabitTracker.constraint_id`), and a review is a check-in: "Still how you work?", rated 0–5. That is infer → confirm → adapt applied to the rules themselves: a rule that keeps holding is asked about less and less often (SM-2: 1 day, 6 days, then the interval times the easiness), and an answer under 3 brings it back the next day. `RuleCheckIns` (`app/services/analytical/rule_check_ins.py`) owns it. Every way a rule is stored starts its check-ins (`store_behavioral_constraint` for chat and ingestion, `AdoptRuleAction` for a rule adopted from a pattern), best effort so a rule is never lost for its tracker; `StatedRules` ends them just before any rule is deleted. A rule with no tracker yet (every rule from before this change) gets one when the list is read. A tracker counts from when its rule was learned, held as its `last_done_at` with no rating: the first check-in is the day after a rule is said, and a week-old rule is due at once, so the page is never empty by construction. `GET /habits/tracker/due` answers every rule, split into due and not due yet, each with the rule's words, who said it, when it was learned, the last check-in and the next one's day on the user's clock.
+- **What we rejected, and why.** *A unique key on `(user_id, constraint_id)`:* we have no DDL access, so the repository reads before it inserts, and a per-user lock in `RuleCheckIns` keeps two page loads (React's strict mode loads twice) from starting two; the list reads one tracker per rule whatever the table holds. *Leaning on the foreign key:* `habit_trackers.constraint_id` is `ON DELETE SET NULL`, so deleting a rule would leave its tracker with no rule; the tracker is deleted first, in the service. *Due at once for a new rule:* asking "still true?" the moment a rule is said is noise; due the day after matches SM-2's first interval. *A repository decorator that adds a tracker on every rule insert:* it would hide a write to a second table inside a repository; the calls are explicit in the services that store and delete rules.
+- **What it costs us.** Reading the list may write (the trackers it starts), once per rule. A race between two server processes could still leave a second tracker for a rule (listed once; deleting the rule deletes both). A rule past its validity window keeps its tracker, unlisted.
+- **Where to see it.** `app/services/analytical/rule_check_ins.py`; `app/domain/ports.py` (`HabitTrackerRepository.add_for_constraint`, `delete_for_constraint`); `app/services/memory/stated_rules.py` (`_delete`); `app/schemas/habits.py`; `jarvis-frontend/app/(app)/habits/page.tsx`; `scripts/seed_demo_user.py` (`_RULES`).
+- **The test that pins it.** `tests/behaviour/test_rule_check_ins.py::test_rule_taught_in_chat__checked_on_the_next_day_spaced_out_and_gone_with_the_rule`; `tests/test_rule_check_ins.py::test_check_ins__two_reads_at_once__one_tracker_per_rule`, `::test_check_ins__rule_without_a_tracker__started_on_read_counting_from_when_learned`, `::test_check_ins__memory_of_a_rule_forgotten__the_rule_and_its_tracker_go`; `tests/test_repository_contracts.py::test_trackers__add_for_constraint__one_per_user_and_rule_counting_from_started_at` (both families); `tests/test_seed_demo_user.py::test_seed__habits_page__two_rules_due_for_a_check_in_and_one_not_yet`.
+
 ---
 
 ## 6. The ten criteria, one by one
@@ -626,7 +634,6 @@ State these plainly. Never present them as working.
 - **Real authentication**: `CurrentUser` reads `user_id` from the query string.
 - **DKT, RL, SARIMAX**: stubs in `app/models/`; they need real usage data first.
 - No `TelemetryListener`; `DeadlineMissed` is published but nothing in production listens (`DraftAccepted` has one listener, `DocumentLinkListener`, D32).
-- **Creating habit review trackers (SM-2).** The Habits page reads `GET /api/v1/habits/tracker/due`, but `HabitTrackerRepository` only reads and reviews trackers, and `sm2_engine.record_completion` reviews an existing one. No route, service or the demo seed creates a tracker, so the page says "No habits due for review" for every user, the demo user included.
 
 **Known limits**
 1. **One process.** Turn locks, the PRIMARY lock, per-user anticipation locks, the day memo, single-flight runs, the document-read lock, the web-search cooldown and the scheduler loop live in memory. A second worker could interleave turns, make a second brief, or run two heavy model calls. Data-corrupting cases are still guarded in the database (the accept transaction, CAS, unique keys).
@@ -644,6 +651,7 @@ State these plainly. Never present them as working.
 13. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 6 allow-listed raw-table leftovers). Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
 15. **A kept file is best effort** (D32). A document uploaded while the file store could not be reached, and every document uploaded before files were kept, has no file to open (`has_file: false`). Linking by meaning is a measured threshold: on the 192 calibration pairs it missed one true link and made one wrong one.
 14. **A slow upload in chat ends at the step's limit**: 60 s for the knowledge step, before the reader's own 120 s (D29).
+16. **One check-in tracker per rule is enforced in code, not by the database** (D33). The repository reads before it inserts and a per-user lock serialises it within one server process; two processes racing could leave a second tracker, which is listed once.
 
 Sources: `docs/PROJECT_STATUS.md` §4 and §10, `.claude/CLAUDE.md` "Not built", `10-demo-and-contributions.md` §5.
 
@@ -767,7 +775,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 | Repository | An object that stores and loads one kind of entity, hiding the database. |
 | RLS | Row-level security in Postgres. On for every table; bypassed by the service-role key the backend uses. |
 | Single-flight | At most one run of a job per user at a time; extra requests join or ask for one more run. |
-| SM-2 | A spaced-repetition algorithm; used by the habit trackers. |
+| SM-2 | A spaced-repetition algorithm; it spaces Jarvis's check-ins on each rule (D33). |
 | SSE | Server-sent events: the server streams many messages over one HTTP response. |
 | Strategy | A pattern where interchangeable algorithms share one interface. |
 | Suggestion | A stored proactive proposal, with a status (`pending`, `accepted`, `auto_applied`, `dismissed`, `expired`). |
