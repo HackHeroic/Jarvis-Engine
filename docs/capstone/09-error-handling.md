@@ -471,7 +471,7 @@ From `Jarvis-Engine/` on branch `main`:
 # Local day and timezone rules, the streak
 .venv/bin/python -m pytest tests/test_local_time.py tests/test_local_day_fixes.py tests/behaviour/test_local_day.py -q
 
-# Everything (expect at c956a8f: 1991 passed, 2 xfailed, 2 deselected)
+# Everything (expect at e2a5899: 2116 passed, 2 xfailed, 2 deselected)
 .venv/bin/python -m pytest tests/ -q
 
 # Read the accept_draft function and its lock order

@@ -19,12 +19,12 @@ Everything here was checked against the code on branch `main` (commit `c956a8f`)
 
 **Tips.**
 - Keep the code open next to this guide. When a section names a file, open it and find the class.
-- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 83 seconds; at `c956a8f` the result is `1991 passed, 2 xfailed, 2 deselected`).
+- Run the offline tests once. They never touch the network: `.venv/bin/python -m pytest tests/ -q` (about 88 seconds; at `e2a5899` the result is `2116 passed, 2 xfailed, 2 deselected`).
 - Section 11 defines every term. When a word is new, look it up there.
 - Do not claim anything listed in section 9 as working.
 
 **Numbers to quote** (measured at `c956a8f`):
-- Tests: **1991 passed, 2 xfailed, 2 deselected**, in 92 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2116 passed, 2 xfailed, 2 deselected**, in 94 test files.
+- Tests: **2116 passed, 2 xfailed, 2 deselected**, in 94 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2116 passed, 2 xfailed, 2 deselected**, in 94 test files.
 - The chat router `app/api/v1/endpoints/chat.py` is **56 lines**.
 - PEARL reads the last **28 days** (`FOCUS_WINDOW_DAYS`).
 - The API has **43 paths and 49 operations** (42 and 48 at `c956a8f`; the documents work added `GET /documents/{source_id}/file`); there are **19 migration files**.
@@ -569,7 +569,7 @@ sequenceDiagram
 
 **C10. A working implementation that matches the design.**
 - *Looking for:* it runs end to end, and the code is what the diagrams say.
-- *How Jarvis meets it:* 1991 offline tests at `c956a8f` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
+- *How Jarvis meets it:* 2116 offline tests at `e2a5899` (real CP-SAT, real services, both repository families, a scripted model); an 18-step live check against real Supabase and real models; the layering test and the design-conformance test turn "matches the design" into a check.
 - *Best example:* the demo's terminal step (doc 10, minute 8:45): the concurrent-accept test, the SQL lock-order test, `test_layering.py` and `test_design_conformance.py`, all passing.
 - *Detail:* `10-demo-and-contributions.md`.
 
@@ -706,7 +706,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 32. **Why CP-SAT and not let the model schedule?** A model makes overlaps and ignores constraints. CP-SAT returns a schedule that meets every hard constraint, or proves none exists; it is capped at 10 s and keeps the best schedule found.
 33. **Why the local model first?** Privacy: the prompt never leaves the machine. Claude is the cloud tier for schema-valid structured output in the demo; Gemini is the last resort (ADR-10).
 34. **Is the demo data fake?** The history is seeded, the inference is live. `scripts/seed_demo_user.py` writes three weeks of history through the real services under a simulated clock; patterns, the focus profile and the brief are computed live. A test checks that every seeded row has a shape the live app writes.
-35. **How do you prove it works end to end?** 1991 offline tests at `c956a8f` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
+35. **How do you prove it works end to end?** 2116 offline tests at `e2a5899` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
 36. **If you had another week?** From the build ledgers: repositories for sessions and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
 
 ---

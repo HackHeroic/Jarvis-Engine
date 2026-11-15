@@ -927,7 +927,7 @@ for f in /tmp/d06_*.mmd; do npx -y @mermaid-js/mermaid-cli -i "$f" -o "${f%.mmd}
 .venv/bin/python -m pytest -q tests/test_llm_providers.py tests/test_claude_provider.py \
   tests/test_model_router.py tests/test_prompt_layout.py tests/test_usage_ledger.py \
   tests/test_layering.py                                                                      # S8
-.venv/bin/python -m pytest -q tests/                  # everything (at c956a8f: 1991 passed, 2 xfailed, 2 deselected)
+.venv/bin/python -m pytest -q tests/                  # everything (at e2a5899: 2116 passed, 2 xfailed, 2 deselected)
 
 # 3. Spot-check any reference: e.g. the lock order of accept_draft and the transition tables.
 sed -n 39,65p supabase/migrations/20261115000001_accept_draft_reslots_missed.sql

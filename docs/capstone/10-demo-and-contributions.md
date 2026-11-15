@@ -187,7 +187,7 @@ Answers are short on purpose; open the file named to go deeper.
 | # | Question | Answer | Open |
 |---|---|---|---|
 | 33 | Why one error envelope? | Every error is a `JarvisError` with a stable code and HTTP status, rendered as `{"error": {code, message, details, request_id}}` by global handlers, and the same shape inside the stream's `error` frame; exception text never reaches a client. | `app/domain/errors.py`; `app/api/error_handlers.py`; `tests/test_api_contract.py::test_endpoints__raise_no_http_exception` |
-| 34 | What do the offline tests prove, and what does the live script add? | The offline suite (1991 passed, 2 xfailed, 2 deselected at `c956a8f`) runs the real services, the real CP-SAT and both repository families over fakes and a scripted model, with network blocked. The live script drives the running backend against real Supabase and Claude as a throwaway user. | `tests/`; `scripts/live_e2e.py` |
+| 34 | What do the offline tests prove, and what does the live script add? | The offline suite (2116 passed, 2 xfailed, 2 deselected at `e2a5899`) runs the real services, the real CP-SAT and both repository families over fakes and a scripted model, with network blocked. The live script drives the running backend against real Supabase and Claude as a throwaway user. | `tests/`; `scripts/live_e2e.py` |
 | 35 | Where does the design fall short? | Section 5: ask-back, PreTaskPrep and DeadlineRisk not built; process-local guards; no authentication; regex PII; six legacy raw-table leftovers; two orchestrator branches never taken. | Section 5 |
 | 36 | If you had another week? | From the ledgers' parked items: repositories for sessions and calendar rows (removing the raw-table allow-list), a `local_day` unique index for the once-a-day brief, a version on the chat accept, real authentication, and a real PII gateway. | `.superpowers/sdd/…/progress.md` |
 
@@ -266,7 +266,7 @@ curl -s "localhost:8000/api/v1/tasks/?user_id=demo&status=pending"
 .venv/bin/python -m pytest -q tests/test_layering.py tests/test_design_conformance.py tests/test_draft_service.py tests/test_migrations.py \
   tests/test_triggers.py tests/test_consent.py tests/test_memory_service.py tests/test_patterns.py \
   tests/test_claude_provider.py tests/test_prompt_layout.py tests/test_seed_demo_user.py
-.venv/bin/python -m pytest -q tests/                   # 1991 passed, 2 xfailed, 2 deselected at c956a8f
+.venv/bin/python -m pytest -q tests/                   # 2116 passed, 2 xfailed, 2 deselected at e2a5899
 (cd ../jarvis-frontend && npm test)                    # the frontend suite (vitest)
 
 # The whole loop, live (costs model calls; throwaway e2e- user, rows deleted).

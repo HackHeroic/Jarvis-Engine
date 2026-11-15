@@ -164,7 +164,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 ## 7. Tests
 
-**1991 passed, 2 xfailed, 2 deselected**, about 83 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `c956a8f`. 92 test files.
+**2116 passed, 2 xfailed, 2 deselected**, about 88 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `e2a5899`. 94 test files.
 
 - **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
 - **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.
@@ -181,7 +181,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 2. Run `.venv/bin/python scripts/live_e2e.py` (default `--base-url http://localhost:8000`). It costs ten chat turns, roughly 25–30 model calls.
 3. Pass means the table ends `ALL PASSED` (exit 0; a SKIP is allowed and means the step had nothing to say) and the server log shows no traceback.
 
-Last run: all 18 steps passed at `c956a8f` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
+Last run: all 18 steps passed at `e2a5899` on 2026-11-15, with no traceback in the server log and 1,398 tokens read from the prompt cache on the second reply.
 
 ---
 
