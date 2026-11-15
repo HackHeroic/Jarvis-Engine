@@ -10,7 +10,7 @@ rows. The two exceptions are ``ProfileRepository.list_user_ids`` (enumerates use
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Collection
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Literal
 from zoneinfo import ZoneInfo
@@ -28,16 +28,19 @@ from app.domain.entities import (
     Goal,
     GoalDeadlineUpdate,
     HabitTracker,
+    IngestedDocument,
     LLMLocation,
     LLMUsageEvent,
     Memory,
     MemoryStatus,
+    StoredFile,
     Suggestion,
     SuggestionExpiry,
     SuggestionStatus,
     Task,
     TaskEvent,
     TaskEventType,
+    TaskMaterialLink,
     TaskStatus,
     UserProfile,
 )
@@ -54,6 +57,8 @@ TRACKER_LIST_LIMIT = 500
 RECENT_SESSIONS_LIMIT = 100
 # The longest summary a conversation may store (chat_sessions' CHECK).
 SESSION_SUMMARY_MAX_CHARS = 4000
+# The most documents one ``DocumentRepository.list_for_user`` read returns: the newest.
+DOCUMENT_LIST_LIMIT = 200
 
 
 class TaskRepository(ABC):
@@ -576,6 +581,82 @@ class ConversationRepository(ABC):
 
         At most RECENT_SESSIONS_LIMIT of them: the most recently active.
         """
+
+
+class DocumentRepository(ABC):
+    """The user's uploaded documents (their records) and the tasks each is linked to.
+
+    A document's text lives in the knowledge store and its file in a ``DocumentFileStore``;
+    this port keeps the record (``ingested_documents``) and the links (``task_materials``).
+    """
+
+    @abstractmethod
+    async def save(self, user_id: str, document: IngestedDocument) -> IngestedDocument:
+        """Store the record and return it as stored (``id`` and ``created_at`` filled in).
+
+        A record the user already has with the same ``source_id`` is replaced. Raises
+        ValidationError, before anything is written, if the record is another user's.
+        """
+
+    @abstractmethod
+    async def get(self, user_id: str, source_id: str) -> IngestedDocument | None:
+        """Return the user's document with this source_id, or None."""
+
+    @abstractmethod
+    async def list_for_user(self, user_id: str) -> list[IngestedDocument]:
+        """Return the user's newest DOCUMENT_LIST_LIMIT documents, newest first."""
+
+    @abstractmethod
+    async def delete(self, user_id: str, source_id: str) -> bool:
+        """Delete the user's document and its task links; return whether it existed."""
+
+    @abstractmethod
+    async def link(self, user_id: str, links: list[TaskMaterialLink]) -> None:
+        """Store the links, each (task_id, source_id) pair once: a repeat replaces it.
+
+        Raises ValidationError, before anything is written, if a link is another user's.
+        No links, no write.
+        """
+
+    @abstractmethod
+    async def links_for_documents(
+        self, user_id: str, source_ids: Collection[str]
+    ) -> list[TaskMaterialLink]:
+        """Return the user's links of these documents, in no particular order; no ids, []."""
+
+    @abstractmethod
+    async def links_for_task(self, user_id: str, task_id: str) -> list[TaskMaterialLink]:
+        """Return the user's links of this task, in no particular order."""
+
+
+class DocumentFileStore(ABC):
+    """The files the user uploaded, kept as they came, one per document.
+
+    A file is filed under its owner and its document: ``(user_id, source_id)``. Each of
+    the two must be one path segment (non-empty, no ``/`` or ``\\``, not ``.`` or
+    ``..``), or the call raises ValidationError. A store that cannot be reached raises
+    PersistenceError. The calls are blocking I/O in a remote store: an implementation
+    runs them off the event loop.
+    """
+
+    @abstractmethod
+    async def save(self, user_id: str, source_id: str, file: StoredFile) -> None:
+        """Keep ``file`` (its bytes and content type) as the document's file, replacing
+        one already kept for it."""
+
+    @abstractmethod
+    async def read(self, user_id: str, source_id: str) -> StoredFile | None:
+        """Return the document's file with the content type it was saved with; None
+        when none was kept."""
+
+    @abstractmethod
+    async def delete(self, user_id: str, source_id: str) -> bool:
+        """Remove the document's file; return whether one was kept."""
+
+    @abstractmethod
+    async def stored_ids(self, user_id: str) -> frozenset[str]:
+        """The source_ids of every document of the user's that has a file kept: one
+        listing of the user's files, however many documents they have."""
 
 
 class UsageRepository(ABC):

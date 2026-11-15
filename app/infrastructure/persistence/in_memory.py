@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
@@ -28,25 +29,31 @@ from app.domain.entities import (
     Goal,
     GoalDeadlineUpdate,
     HabitTracker,
+    IngestedDocument,
     LLMUsageEvent,
     Memory,
     MemoryStatus,
+    StoredFile,
     Suggestion,
     SuggestionExpiry,
     SuggestionStatus,
     Task,
     TaskEvent,
     TaskEventType,
+    TaskMaterialLink,
     TaskStatus,
     UserProfile,
     made_that_day,
 )
 from app.domain.ports import (
+    DOCUMENT_LIST_LIMIT,
     RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
     TRACKER_LIST_LIMIT,
     ConstraintRepository,
     ConversationRepository,
+    DocumentFileStore,
+    DocumentRepository,
     DraftRepository,
     GoalRepository,
     HabitTrackerRepository,
@@ -70,6 +77,7 @@ from app.infrastructure.persistence._mapping import (
     day_bounds,
     draft_closed,
     embedding_values,
+    file_key_part,
     is_uuid,
     new_draft,
     normalized,
@@ -79,6 +87,8 @@ from app.infrastructure.persistence._mapping import (
     memory_id_taken,
     pattern_key_taken,
     prepare_deadline_update,
+    prepare_document,
+    prepare_links,
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
@@ -114,6 +124,10 @@ class InMemoryStore:
     chat_messages: list[ChatMessage] = field(default_factory=list)
     # Each memory's embedding, keyed by (user_id, memory id); held apart, as no read returns it.
     memory_embeddings: dict[tuple[str, str], list[float]] = field(default_factory=dict)
+    # Uploaded documents' records, their task links, and their files by (user_id, source_id).
+    documents: list[IngestedDocument] = field(default_factory=list)
+    task_materials: list[TaskMaterialLink] = field(default_factory=list)
+    document_files: dict[tuple[str, str], StoredFile] = field(default_factory=dict)
     # Serialises draft status changes, as the row lock does in the database.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -878,3 +892,119 @@ class InMemoryConversationRepository(ConversationRepository):
         ]
         found.sort(key=lambda s: (utc(s.updated_at), s.id), reverse=True)
         return [normalized(s) for s in found[:RECENT_SESSIONS_LIMIT]]
+
+
+class InMemoryDocumentRepository(DocumentRepository):
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    def _index(self, user_id: str, source_id: str) -> int | None:
+        return next(
+            (
+                i
+                for i, d in enumerate(self._store.documents)
+                if d.user_id == user_id and d.source_id == source_id
+            ),
+            None,
+        )
+
+    async def save(self, user_id: str, document: IngestedDocument) -> IngestedDocument:
+        stored = prepare_document(user_id, document)
+        index = self._index(user_id, document.source_id)
+        previous = self._store.documents[index] if index is not None else None
+        stored = stored.model_copy(update={
+            # The row keeps its id; an unset stamp is the column default (now).
+            "id": previous.id if previous is not None else str(uuid4()),
+            "created_at": stored.created_at or now_utc(),
+        })
+        if index is None:
+            self._store.documents.append(stored)
+        else:
+            self._store.documents[index] = stored
+        return stored.model_copy(deep=True)
+
+    async def get(self, user_id: str, source_id: str) -> IngestedDocument | None:
+        index = self._index(user_id, source_id)
+        return self._store.documents[index].model_copy(deep=True) if index is not None else None
+
+    async def list_for_user(self, user_id: str) -> list[IngestedDocument]:
+        mine = [
+            (i, d) for i, d in enumerate(self._store.documents) if d.user_id == user_id
+        ]
+        # Newest first; of equal stamps, the later stored first.
+        mine.sort(key=lambda pair: (pair[1].created_at or now_utc(), pair[0]), reverse=True)
+        return [d.model_copy(deep=True) for _, d in mine[:DOCUMENT_LIST_LIMIT]]
+
+    async def delete(self, user_id: str, source_id: str) -> bool:
+        self._store.task_materials[:] = [
+            link
+            for link in self._store.task_materials
+            if not (link.user_id == user_id and link.source_id == source_id)
+        ]
+        index = self._index(user_id, source_id)
+        if index is None:
+            return False
+        del self._store.documents[index]
+        return True
+
+    async def link(self, user_id: str, links: list[TaskMaterialLink]) -> None:
+        for link in prepare_links(user_id, links):
+            link = link.model_copy(update={"linked_at": link.linked_at or now_utc()})
+            index = next(
+                (
+                    i
+                    for i, held in enumerate(self._store.task_materials)
+                    if held.user_id == user_id
+                    and held.task_id == link.task_id
+                    and held.source_id == link.source_id
+                ),
+                None,
+            )
+            if index is None:
+                self._store.task_materials.append(link)
+            else:
+                self._store.task_materials[index] = link
+
+    async def links_for_documents(
+        self, user_id: str, source_ids: Collection[str]
+    ) -> list[TaskMaterialLink]:
+        wanted = set(source_ids)
+        return [
+            link.model_copy(deep=True)
+            for link in self._store.task_materials
+            if link.user_id == user_id and link.source_id in wanted
+        ]
+
+    async def links_for_task(self, user_id: str, task_id: str) -> list[TaskMaterialLink]:
+        return [
+            link.model_copy(deep=True)
+            for link in self._store.task_materials
+            if link.user_id == user_id and link.task_id == task_id
+        ]
+
+
+class InMemoryDocumentFileStore(DocumentFileStore):
+    """Files held in the process: gone at restart, like the rest of this family."""
+
+    def __init__(self, store: InMemoryStore) -> None:
+        self._store = store
+
+    @staticmethod
+    def _key(user_id: str, source_id: str) -> tuple[str, str]:
+        return file_key_part(user_id, "user id"), file_key_part(source_id, "document id")
+
+    async def save(self, user_id: str, source_id: str, file: StoredFile) -> None:
+        self._store.document_files[self._key(user_id, source_id)] = file.model_copy(deep=True)
+
+    async def read(self, user_id: str, source_id: str) -> StoredFile | None:
+        held = self._store.document_files.get(self._key(user_id, source_id))
+        return held.model_copy(deep=True) if held is not None else None
+
+    async def delete(self, user_id: str, source_id: str) -> bool:
+        return self._store.document_files.pop(self._key(user_id, source_id), None) is not None
+
+    async def stored_ids(self, user_id: str) -> frozenset[str]:
+        file_key_part(user_id, "user id")
+        return frozenset(
+            source_id for owner, source_id in self._store.document_files if owner == user_id
+        )

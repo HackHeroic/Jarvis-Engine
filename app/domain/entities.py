@@ -435,6 +435,50 @@ class HabitTracker(BaseModel):
     )
 
 
+class IngestedDocument(BaseModel):
+    """A document the user uploaded: its record. Its text is in the knowledge store (as
+    chunks carrying ``source_id``) and its file, when one was kept, in the file store."""
+
+    id: str | None = Field(default=None, description="Storage row id; None until persisted.")
+    user_id: str = Field(description="Owner of the document.")
+    source_id: str = Field(
+        description="The document's id, unique per user (ingestion_<12 hex>); its chunks carry it."
+    )
+    file_name: str | None = Field(default=None, description="The uploaded file's own name.")
+    media_type: str | None = Field(
+        default=None, description="The kind it was uploaded as: 'pdf', 'image', 'png', 'jpeg'."
+    )
+    document_topics: list[str] = Field(
+        default_factory=list, description="The topics read from it (1 to 5 short phrases)."
+    )
+    chunk_count: int = Field(default=0, ge=0, description="How many chunks its text became.")
+    created_at: datetime | None = Field(
+        default=None, description="When it was ingested; stamped by the store when unset."
+    )
+
+
+class TaskMaterialLink(BaseModel):
+    """One of the user's documents, linked to one of their tasks as material for it."""
+
+    user_id: str = Field(description="Owner of the task and the document.")
+    task_id: str = Field(description="The task the document is material for.")
+    source_id: str = Field(description="The document (IngestedDocument.source_id).")
+    source_type: str = Field(default="chunk", description="What is linked: the document's chunks.")
+    document_topics: list[str] = Field(
+        default_factory=list, description="The document's topics when the link was made."
+    )
+    linked_at: datetime | None = Field(
+        default=None, description="When the link was made; stamped by the store when unset."
+    )
+
+
+class StoredFile(BaseModel):
+    """An uploaded file as it was kept: its bytes and the content type it was stored with."""
+
+    content: bytes = Field(description="The file's bytes, exactly as uploaded.")
+    content_type: str = Field(description="Its MIME type (application/pdf, image/png...).")
+
+
 class Memory(BaseModel):
     """Something Jarvis knows about the user, with a lifecycle and a strength that decays."""
 

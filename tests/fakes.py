@@ -2,6 +2,7 @@
 
 `FakeSupabase` implements the slice of the supabase-py chained query builder
 that the stores actually call: ``table(name).insert(row).execute()``,
+``.upsert(rows, on_conflict="a,b").execute()``,
 ``.select("*").eq(k, v)...execute()``, ``.update(d).eq(...).execute()``,
 ``.delete().eq(...).execute()``, plus ``.order()`` / ``.limit()``, the
 ``.neq()`` / ``.in_()`` / ``.gte()`` / ``.lte()`` / ``.lt()`` / ``.gt()`` filters,
@@ -10,6 +11,9 @@ that the stores actually call: ``table(name).insert(row).execute()``,
 columns every ``select`` names (``FakeSupabase.selects``) and enforces the
 unique keys a repository maps to an error on a plain write: user_memories' primary
 key and its ``(user_id, pattern_key) where pattern_key is not null`` index.
+``FakeSupabase.storage`` is a ``FakeStorage``: the slice of storage3's sync API the
+file store calls (buckets, upload, download, info, remove, list), raising storage3's
+own ``StorageApiError`` with the status strings the live service sends.
 
 It is deliberately a real (if tiny) implementation rather than a MagicMock:
 a MagicMock returns a canned payload regardless of the filters passed, so it
@@ -27,7 +31,10 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+
+from storage3.exceptions import StorageApiError
 
 from app.domain.ports import TextEmbedder
 from app.utils.embedding import cosine_similarity
@@ -128,6 +135,13 @@ class _Query:
         self._op, self._payload = "insert", payload
         return self
 
+    def upsert(self, payload: dict | list[dict], on_conflict: str = "") -> "_Query":
+        """Insert each row, or merge it into the row holding the same ``on_conflict``
+        columns (PostgREST's merge-duplicates): the columns it names replace that row's."""
+        self._op, self._payload = "upsert", payload
+        self._conflict = tuple(c.strip() for c in on_conflict.split(",") if c.strip())
+        return self
+
     def select(self, *columns: str) -> "_Query":
         self._op = "select"
         names = tuple(name.strip() for spec in columns for name in spec.split(","))
@@ -205,7 +219,32 @@ class _Query:
             predicate(row) for predicate in self._predicates
         )
 
+    def _upsert(self) -> _Result:
+        incoming = self._payload if isinstance(self._payload, list) else [self._payload]
+        stored_rows = []
+        for row in incoming:
+            row = json.loads(json.dumps(row))  # sent as JSON, as the real client does
+            held = next(
+                (
+                    r for r in self._rows
+                    if self._conflict and all(r.get(c) == row.get(c) for c in self._conflict)
+                ),
+                None,
+            )
+            if held is None:
+                held = {
+                    "id": str(uuid.uuid4()),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    **_COLUMN_DEFAULTS.get(self._table, {}),
+                }
+                self._rows.append(held)
+            held.update(copy.deepcopy(row))
+            stored_rows.append(copy.deepcopy(held))
+        return _Result(stored_rows)
+
     def execute(self) -> _Result:
+        if self._op == "upsert":
+            return self._upsert()
         if self._op == "insert":
             incoming = (
                 self._payload if isinstance(self._payload, list) else [self._payload]
@@ -260,6 +299,119 @@ class _RpcCall:
         return self._run()
 
 
+class _FakeBucketFiles:
+    """One bucket's file API (storage3's ``SyncBucketProxy``)."""
+
+    def __init__(self, storage: "FakeStorage", bucket: str) -> None:
+        self._storage = storage
+        self._bucket = bucket
+
+    def _objects(self) -> dict[str, dict]:
+        self._storage.check_up()
+        if self._bucket not in self._storage.buckets:
+            raise StorageApiError("Bucket not found", "Bucket not found", "404")
+        return self._storage.objects.setdefault(self._bucket, {})
+
+    def _held(self, path: str) -> dict:
+        held = self._objects().get(path)
+        if held is None:
+            raise StorageApiError("Object not found", "not_found", "404")
+        return held
+
+    def upload(self, path: str, file: bytes, file_options: dict | None = None) -> Any:
+        options = file_options or {}
+        objects = self._objects()
+        limit = self._storage.buckets[self._bucket].get("file_size_limit")
+        if limit is not None and len(file) > limit:
+            raise StorageApiError(
+                "The object exceeded the maximum allowed size", "Payload too large", "413"
+            )
+        if path in objects and str(options.get("upsert", "false")).lower() != "true":
+            raise StorageApiError("The resource already exists", "Duplicate", "409")
+        objects[path] = {
+            "content": bytes(file),
+            "content_type": options.get("content-type", "text/plain;charset=UTF-8"),
+            "id": str(uuid.uuid4()),
+        }
+        return SimpleNamespace(path=path, Key=f"{self._bucket}/{path}")
+
+    def download(self, path: str) -> bytes:
+        return self._held(path)["content"]
+
+    def info(self, path: str) -> dict:
+        held = self._held(path)
+        return {
+            "id": held["id"], "name": path, "bucket_id": self._bucket,
+            "content_type": held["content_type"], "size": len(held["content"]),
+            "metadata": {"mimetype": held["content_type"], "size": len(held["content"])},
+        }
+
+    def remove(self, paths: list[str]) -> list[dict]:
+        objects = self._objects()
+        return [{"name": p} for p in paths if objects.pop(p, None) is not None]
+
+    def list(self, path: str | None = None, options: dict | None = None) -> list[dict]:
+        """The folder's direct entries by name: files with an id, sub-folders without."""
+        options = options or {}
+        self._storage.listings += 1
+        prefix = f"{path.rstrip('/')}/" if path else ""
+        entries: dict[str, dict] = {}
+        for key, held in self._objects().items():
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix):]
+            name, _, deeper = rest.partition("/")
+            entries[name] = {"name": name, "id": None if deeper else held["id"]}
+        ordered = [entries[name] for name in sorted(entries)]
+        offset = options.get("offset", 0)
+        return ordered[offset : offset + options.get("limit", 100)]
+
+
+class FakeStorage:
+    """Supabase Storage (storage3's ``SyncStorageClient``) over dicts.
+
+    ``down = True`` makes every call fail as an unreachable store does. ``calls`` counts
+    the folder listings, so a test can see one listing serve a whole page.
+    """
+
+    def __init__(self) -> None:
+        self.buckets: dict[str, dict] = {}
+        self.objects: dict[str, dict[str, dict]] = {}
+        self.down = False
+        self.listings = 0
+
+    def check_up(self) -> None:
+        if self.down:
+            raise ConnectionError("[SSL] could not reach storage.internal")
+
+    def get_bucket(self, id: str) -> SimpleNamespace:
+        self.check_up()
+        if id not in self.buckets:
+            raise StorageApiError("Bucket not found", "Bucket not found", "404")
+        return SimpleNamespace(**self.buckets[id])
+
+    def create_bucket(self, id: str, name: str | None = None, options: dict | None = None) -> dict:
+        self.check_up()
+        if id in self.buckets:
+            raise StorageApiError("The resource already exists", "Duplicate", "409")
+        options = options or {}
+        self.buckets[id] = {
+            "id": id, "name": name or id, "public": bool(options.get("public", False)),
+            "file_size_limit": options.get("file_size_limit"),
+        }
+        return {"name": id}
+
+    def update_bucket(self, id: str, options: dict) -> dict:
+        self.check_up()
+        if id not in self.buckets:
+            raise StorageApiError("Bucket not found", "Bucket not found", "404")
+        self.buckets[id].update(options)
+        return {"message": "Successfully updated"}
+
+    def from_(self, id: str) -> _FakeBucketFiles:
+        return _FakeBucketFiles(self, id)
+
+
 class FakeSupabase:
     """Chainable in-memory Supabase stand-in. No network, no MagicMock."""
 
@@ -275,6 +427,8 @@ class FakeSupabase:
         # The most rows one read returns, after order and limit, as [api] max_rows
         # in supabase/config.toml makes PostgREST do; None means no cap.
         self.max_rows: int | None = 1000
+        # Supabase Storage, for the uploaded files.
+        self.storage = FakeStorage()
 
     def table(self, name: str) -> _Query:
         return _Query(self.rows.setdefault(name, []), name, self.selects, self.max_rows)

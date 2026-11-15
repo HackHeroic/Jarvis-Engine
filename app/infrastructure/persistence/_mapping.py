@@ -27,6 +27,7 @@ from app.domain.entities import (
     DraftStatus,
     GoalDeadlineUpdate,
     HabitTracker,
+    IngestedDocument,
     LLMLocation,
     LLMUsageEvent,
     Memory,
@@ -34,6 +35,7 @@ from app.domain.entities import (
     OPEN_DRAFT_STATUSES,  # noqa: F401  (re-exported to the repositories)
     SuggestionStatus,
     Task,
+    TaskMaterialLink,
     TaskStatus,
     UserProfile,
 )
@@ -516,3 +518,37 @@ def checked_review(
             "That review cannot be stored.", details={"fields": bad}
         ) from exc
     return {name: getattr(normalized(checked), name) for name in fields}
+
+
+# --- documents ---------------------------------------------------------------------
+
+
+def prepare_document(user_id: str, document: IngestedDocument) -> IngestedDocument:
+    """``document`` checked as the user's and normalised (UTC); ValidationError if not theirs."""
+    if document.user_id != user_id:
+        raise errors.ValidationError("This document belongs to a different user.")
+    return normalized(document)
+
+
+def prepare_links(user_id: str, links: list[TaskMaterialLink]) -> list[TaskMaterialLink]:
+    """``links`` checked as the user's, each (task_id, source_id) pair once (the last
+    wins, as a repeated upsert would); ValidationError, before any write, if one is not."""
+    if any(link.user_id != user_id for link in links):
+        raise errors.ValidationError("This link belongs to a different user.")
+    unique = {(link.task_id, link.source_id): normalized(link) for link in links}
+    return list(unique.values())
+
+
+def file_key_part(value: str, what: str) -> str:
+    """``value`` as one segment of a file's key (``DocumentFileStore``); ValidationError
+    when it is empty, ``.`` or ``..``, or holds a slash, a backslash or a control
+    character, any of which could reach another user's files."""
+    if (
+        not value
+        or value in (".", "..")
+        or "/" in value
+        or "\\" in value
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+    ):
+        raise errors.ValidationError(f"That is not a valid {what}.", details={"field": what})
+    return value

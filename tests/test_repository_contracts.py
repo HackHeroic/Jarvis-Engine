@@ -28,20 +28,26 @@ from app.domain.entities import (
     Goal,
     GoalDeadlineUpdate,
     HabitTracker,
+    IngestedDocument,
     LLMLocation,
     LLMUsageEvent,
     Memory,
     MemorySource,
     MemoryStatus,
+    StoredFile,
     Suggestion,
     SuggestionStatus,
     TaskEvent,
     TaskEventType,
+    TaskMaterialLink,
     TaskStatus,
 )
 from app.domain.ports import (
+    DOCUMENT_LIST_LIMIT,
     TASK_LIST_LIMIT,
     ConstraintRepository,
+    DocumentFileStore,
+    DocumentRepository,
     DraftRepository,
     GoalRepository,
     HabitTrackerRepository,
@@ -289,6 +295,8 @@ def test_factory__both_families__implement_every_port():
         "memories": MemoryRepository,
         "goals": GoalRepository,
         "habit_trackers": HabitTrackerRepository,
+        "documents": DocumentRepository,
+        "document_files": DocumentFileStore,
     }
     for family in (RepositoryFactory.in_memory(), RepositoryFactory.supabase(FakeSupabase())):
         for name, port in ports.items():
@@ -1970,6 +1978,234 @@ async def test_conversations__recent_sessions__since_newest_first(repos, seed_ch
     assert old not in {s.id for s in recent}
 
 
+# --- Documents (ingested_documents / task_materials) and their files -----------------
+
+
+def _document(user_id: str, source_id: str, **fields) -> IngestedDocument:
+    return IngestedDocument(user_id=user_id, source_id=source_id, **fields)
+
+
+def _link(user_id: str, task_id: str, source_id: str, **fields) -> TaskMaterialLink:
+    return TaskMaterialLink(user_id=user_id, task_id=task_id, source_id=source_id, **fields)
+
+
+@pytest.mark.asyncio
+async def test_documents__save_then_get__stored_with_id_and_stamp_user_scoped(repos):
+    saved = await repos.documents.save(U1, _document(
+        U1, "ingestion_aaa", file_name="ML syllabus.pdf", media_type="pdf",
+        document_topics=["Gradient descent", "Neural networks"], chunk_count=7,
+    ))
+
+    assert saved.id and saved.created_at is not None
+    got = await repos.documents.get(U1, "ingestion_aaa")
+    assert got == saved
+    assert (got.file_name, got.media_type, got.chunk_count) == ("ML syllabus.pdf", "pdf", 7)
+    assert got.document_topics == ["Gradient descent", "Neural networks"]
+    assert await repos.documents.get(U2, "ingestion_aaa") is None
+
+
+@pytest.mark.asyncio
+async def test_documents__save_same_source_twice__one_record_replaced_keeping_its_id(repos):
+    first = await repos.documents.save(U1, _document(U1, "ingestion_aaa", chunk_count=1))
+
+    second = await repos.documents.save(U1, _document(
+        U1, "ingestion_aaa", file_name="notes.pdf", chunk_count=4
+    ))
+
+    assert second.id == first.id
+    listed = await repos.documents.list_for_user(U1)
+    assert [(d.source_id, d.file_name, d.chunk_count) for d in listed] == [
+        ("ingestion_aaa", "notes.pdf", 4)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_documents__save_another_users_record__validation_error_nothing_written(repos):
+    with pytest.raises(errors.ValidationError):
+        await repos.documents.save(U1, _document(U2, "ingestion_aaa"))
+
+    assert await repos.documents.list_for_user(U1) == []
+    assert await repos.documents.list_for_user(U2) == []
+
+
+@pytest.mark.asyncio
+async def test_documents__list_for_user__newest_first_only_theirs(repos):
+    for hours, source_id in ((0, "old"), (2, "newest"), (1, "middle")):
+        await repos.documents.save(U1, _document(
+            U1, source_id, created_at=T0 + timedelta(hours=hours)
+        ))
+    await repos.documents.save(U2, _document(U2, "theirs", created_at=T0 + timedelta(hours=9)))
+
+    assert [d.source_id for d in await repos.documents.list_for_user(U1)] == [
+        "newest", "middle", "old"
+    ]
+    assert DOCUMENT_LIST_LIMIT >= 100
+
+
+@pytest.mark.asyncio
+async def test_documents__link_twice__one_link_per_task_and_document(repos):
+    await repos.documents.save(U1, _document(U1, "doc-1"))
+
+    await repos.documents.link(U1, [_link(U1, "t1", "doc-1", document_topics=["Graphs"])])
+    await repos.documents.link(U1, [
+        _link(U1, "t1", "doc-1", document_topics=["Graphs", "Trees"]),
+        _link(U1, "t2", "doc-1"),
+    ])
+
+    links = await repos.documents.links_for_documents(U1, ["doc-1"])
+    assert sorted((l.task_id, tuple(l.document_topics)) for l in links) == [
+        ("t1", ("Graphs", "Trees")), ("t2", ()),
+    ]
+    assert [l.source_id for l in await repos.documents.links_for_task(U1, "t2")] == ["doc-1"]
+
+
+@pytest.mark.asyncio
+async def test_documents__links__user_scoped_and_another_users_link_refused(repos):
+    await repos.documents.save(U1, _document(U1, "doc-1"))
+    await repos.documents.save(U2, _document(U2, "doc-1"))
+    await repos.documents.link(U2, [_link(U2, "t1", "doc-1")])
+
+    with pytest.raises(errors.ValidationError):
+        await repos.documents.link(U1, [_link(U1, "t9", "doc-1"), _link(U2, "t1", "doc-1")])
+
+    assert await repos.documents.links_for_documents(U1, ["doc-1"]) == []  # nothing written
+    assert await repos.documents.links_for_task(U1, "t1") == []
+    assert [l.user_id for l in await repos.documents.links_for_task(U2, "t1")] == [U2]
+    assert await repos.documents.links_for_documents(U1, []) == []
+    await repos.documents.link(U1, [])  # no links, no write
+
+
+@pytest.mark.asyncio
+async def test_documents__delete__record_and_its_links_gone_other_users_untouched(repos):
+    for user in (U1, U2):
+        await repos.documents.save(user, _document(user, "doc-1"))
+        await repos.documents.link(user, [_link(user, "t1", "doc-1")])
+    await repos.documents.save(U1, _document(U1, "doc-2"))
+    await repos.documents.link(U1, [_link(U1, "t1", "doc-2")])
+
+    assert await repos.documents.delete(U1, "doc-1") is True
+    assert await repos.documents.delete(U1, "doc-1") is False
+
+    assert await repos.documents.get(U1, "doc-1") is None
+    assert [l.source_id for l in await repos.documents.links_for_task(U1, "t1")] == ["doc-2"]
+    assert await repos.documents.get(U2, "doc-1") is not None
+    assert len(await repos.documents.links_for_task(U2, "t1")) == 1
+
+
+_PDF = StoredFile(content=b"%PDF-1.4 syllabus", content_type="application/pdf")
+
+
+@pytest.mark.asyncio
+async def test_document_files__save_read_delete__round_trip_with_its_content_type(repos):
+    await repos.document_files.save(U1, "ingestion_aaa", _PDF)
+
+    assert await repos.document_files.read(U1, "ingestion_aaa") == _PDF
+    assert await repos.document_files.read(U2, "ingestion_aaa") is None
+    assert await repos.document_files.stored_ids(U1) == frozenset({"ingestion_aaa"})
+    assert await repos.document_files.stored_ids(U2) == frozenset()
+
+    assert await repos.document_files.delete(U1, "ingestion_aaa") is True
+    assert await repos.document_files.delete(U1, "ingestion_aaa") is False
+    assert await repos.document_files.read(U1, "ingestion_aaa") is None
+    assert await repos.document_files.stored_ids(U1) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_document_files__save_again__replaces_the_file(repos):
+    await repos.document_files.save(U1, "doc", _PDF)
+    png = StoredFile(content=b"\x89PNG...", content_type="image/png")
+
+    await repos.document_files.save(U1, "doc", png)
+
+    assert await repos.document_files.read(U1, "doc") == png
+
+
+@pytest.mark.asyncio
+async def test_document_files__stored_ids__every_file_of_the_user_only(repos):
+    for source_id in ("a", "b", "c"):
+        await repos.document_files.save(U1, source_id, _PDF)
+    await repos.document_files.save(U2, "z", _PDF)
+
+    assert await repos.document_files.stored_ids(U1) == frozenset({"a", "b", "c"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("user_id", "source_id"), [
+    ("demo/../alice", "doc"), ("demo", "../alice/doc"), ("demo", "a/b"), ("..", "doc"),
+    ("demo", ""), ("", "doc"), ("demo", "a\\b"), ("demo", "doc\n"),
+])
+async def test_document_files__a_key_part_that_is_not_one_segment__validation_error(
+    repos, user_id, source_id
+):
+    with pytest.raises(errors.ValidationError):
+        await repos.document_files.save(user_id, source_id, _PDF)
+    with pytest.raises(errors.ValidationError):
+        await repos.document_files.read(user_id, source_id)
+
+
+# --- Supabase Storage only: the bucket and its failures ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supabase_files__first_use__private_bucket_created_with_the_size_limit():
+    client = FakeSupabase()
+    files = RepositoryFactory.supabase(
+        client, document_bucket="docs", max_file_bytes=1024
+    ).document_files
+
+    await files.save(U1, "doc", _PDF)
+
+    assert client.storage.buckets["docs"]["public"] is False
+    assert client.storage.buckets["docs"]["file_size_limit"] == 1024
+    assert client.storage.objects["docs"][f"{U1}/doc"]["content_type"] == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_supabase_files__existing_public_or_small_bucket__made_private_and_raised():
+    client = FakeSupabase()
+    client.storage.create_bucket("docs", options={"public": True, "file_size_limit": 10})
+    files = RepositoryFactory.supabase(
+        client, document_bucket="docs", max_file_bytes=1024
+    ).document_files
+
+    await files.save(U1, "doc", _PDF)  # 17 bytes: over the old limit, under the new
+
+    assert client.storage.buckets["docs"]["public"] is False
+    assert client.storage.buckets["docs"]["file_size_limit"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_supabase_files__stored_ids__one_listing_however_many_files():
+    client = FakeSupabase()
+    files = RepositoryFactory.supabase(client).document_files
+    for n in range(5):
+        await files.save(U1, f"doc-{n}", _PDF)
+    client.storage.listings = 0
+
+    ids = await files.stored_ids(U1)
+
+    assert len(ids) == 5 and client.storage.listings == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", [
+    lambda f: f.save(U1, "doc", _PDF),
+    lambda f: f.read(U1, "doc"),
+    lambda f: f.delete(U1, "doc"),
+    lambda f: f.stored_ids(U1),
+])
+async def test_supabase_files__store_unreachable__persistence_error_chained(call):
+    client = FakeSupabase()
+    client.storage.down = True
+    files = RepositoryFactory.supabase(client).document_files
+
+    with pytest.raises(errors.PersistenceError) as info:
+        await call(files)
+
+    assert isinstance(info.value.__cause__, ConnectionError)
+    assert "storage.internal" not in info.value.message
+
+
 # --- Supabase family only: transport failures ---------------------------------
 
 
@@ -1978,6 +2214,10 @@ class _UnreachableClient:
 
     def table(self, name: str):
         raise ConnectionError("connection refused: secret-host:5432")
+
+    @property
+    def storage(self):
+        raise ConnectionError("connection refused: secret-host:443")
 
     def rpc(self, name: str, params: dict):
         raise ConnectionError("connection refused: secret-host:5432")
@@ -2006,6 +2246,11 @@ class _UnreachableClient:
         lambda r: r.memories.nearest(U1, _vec(1.0, 0.0), statuses=ACTIVE),
         lambda r: r.conversations.messages(U1, str(uuid4())),
         lambda r: r.conversations.set_summary(U1, str(uuid4()), "Summary.", T0),
+        lambda r: r.documents.list_for_user(U1),
+        lambda r: r.documents.save(U1, _document(U1, "doc-1")),
+        lambda r: r.documents.link(U1, [_link(U1, "t1", "doc-1")]),
+        lambda r: r.document_files.stored_ids(U1),
+        lambda r: r.document_files.read(U1, "doc-1"),
     ],
 )
 async def test_supabase_repos__transport_error__raises_persistence_error_chained(call):

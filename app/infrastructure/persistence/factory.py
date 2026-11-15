@@ -10,6 +10,8 @@ from typing import Any
 from app.domain.ports import (
     ConstraintRepository,
     ConversationRepository,
+    DocumentFileStore,
+    DocumentRepository,
     DraftRepository,
     GoalRepository,
     HabitTrackerRepository,
@@ -23,6 +25,8 @@ from app.domain.ports import (
 from app.infrastructure.persistence.in_memory import (
     InMemoryConstraintRepository,
     InMemoryConversationRepository,
+    InMemoryDocumentFileStore,
+    InMemoryDocumentRepository,
     InMemoryDraftRepository,
     InMemoryGoalRepository,
     InMemoryHabitTrackerRepository,
@@ -37,6 +41,7 @@ from app.infrastructure.persistence.in_memory import (
 from app.infrastructure.persistence.supabase_repos import (
     SupabaseConstraintRepository,
     SupabaseConversationRepository,
+    SupabaseDocumentRepository,
     SupabaseDraftRepository,
     SupabaseGoalRepository,
     SupabaseHabitTrackerRepository,
@@ -46,6 +51,10 @@ from app.infrastructure.persistence.supabase_repos import (
     SupabaseTaskEventRepository,
     SupabaseTaskRepository,
     SupabaseUsageRepository,
+)
+from app.infrastructure.persistence.supabase_storage import (
+    DOCUMENT_BUCKET,
+    SupabaseDocumentFileStore,
 )
 
 
@@ -64,14 +73,22 @@ class Repositories:
     conversations: ConversationRepository
     goals: GoalRepository
     habit_trackers: HabitTrackerRepository
+    documents: DocumentRepository
+    document_files: DocumentFileStore
 
 
 class RepositoryFactory:
     """Builds the Supabase family or the in-memory family."""
 
     @staticmethod
-    def supabase(client: Any) -> Repositories:
-        """Build the Supabase family over a supabase-py ``Client`` (or a stand-in for one)."""
+    def supabase(
+        client: Any, *, document_bucket: str = DOCUMENT_BUCKET, max_file_bytes: int | None = None
+    ) -> Repositories:
+        """Build the Supabase family over a supabase-py ``Client`` (or a stand-in for one).
+
+        Uploaded files go to Supabase Storage over the same client: the bucket
+        ``document_bucket``, limited to ``max_file_bytes`` (None: the project's limit).
+        """
         return Repositories(
             tasks=SupabaseTaskRepository(client),
             task_events=SupabaseTaskEventRepository(client),
@@ -84,6 +101,10 @@ class RepositoryFactory:
             conversations=SupabaseConversationRepository(client),
             goals=SupabaseGoalRepository(client),
             habit_trackers=SupabaseHabitTrackerRepository(client),
+            documents=SupabaseDocumentRepository(client),
+            document_files=SupabaseDocumentFileStore(
+                client, bucket=document_bucket, max_file_bytes=max_file_bytes
+            ),
         )
 
     @staticmethod
@@ -102,4 +123,6 @@ class RepositoryFactory:
             conversations=InMemoryConversationRepository(store),
             goals=InMemoryGoalRepository(store),
             habit_trackers=InMemoryHabitTrackerRepository(store),
+            documents=InMemoryDocumentRepository(store),
+            document_files=InMemoryDocumentFileStore(store),
         )

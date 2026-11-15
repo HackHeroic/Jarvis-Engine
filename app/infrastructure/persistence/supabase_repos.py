@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import date, datetime
+from collections.abc import Collection
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -28,6 +29,7 @@ from app.domain.entities import (
     Goal,
     GoalDeadlineUpdate,
     HabitTracker,
+    IngestedDocument,
     LLMUsageEvent,
     Memory,
     MemoryStatus,
@@ -37,16 +39,19 @@ from app.domain.entities import (
     Task,
     TaskEvent,
     TaskEventType,
+    TaskMaterialLink,
     TaskStatus,
     UserProfile,
     made_that_day,
 )
 from app.domain.ports import (
+    DOCUMENT_LIST_LIMIT,
     RECENT_SESSIONS_LIMIT,
     TASK_LIST_LIMIT,
     TRACKER_LIST_LIMIT,
     ConstraintRepository,
     ConversationRepository,
+    DocumentRepository,
     DraftRepository,
     GoalRepository,
     HabitTrackerRepository,
@@ -88,6 +93,8 @@ from app.infrastructure.persistence._mapping import (
     now_utc,
     pattern_key_taken,
     prepare_deadline_update,
+    prepare_document,
+    prepare_links,
     prepare_new,
     prepare_new_memory,
     suggestion_changed,
@@ -524,6 +531,92 @@ class SupabaseGoalRepository(_SupabaseRepository, GoalRepository):
     async def add_deadline_update(self, user_id: str, update: GoalDeadlineUpdate) -> None:
         stored = prepare_deadline_update(user_id, update)
         await self._run(lambda q: q.insert(deadline_update_to_row(stored)), table=self._updates)
+
+
+_DOCUMENT_SELECT = (
+    "id, user_id, source_id, file_name, media_type, document_topics, chunk_count, created_at"
+)
+_LINK_SELECT = "user_id, task_id, source_id, source_type, document_topics, linked_at"
+
+
+def _without_unset(row: dict, *columns: str) -> dict:
+    """``row`` without those of ``columns`` that are None: the table's defaults fill them."""
+    return {k: v for k, v in row.items() if not (k in columns and v is None)}
+
+
+class SupabaseDocumentRepository(_SupabaseRepository, DocumentRepository):
+    """``ingested_documents`` and the links of ``task_materials``.
+
+    ``task_materials`` references ``ingested_documents`` (user_id, source_id) with
+    ON DELETE CASCADE; ``delete`` still removes the links first, so it does not lean on
+    the cascade.
+    """
+
+    table = "ingested_documents"
+    _links = "task_materials"
+
+    async def save(self, user_id: str, document: IngestedDocument) -> IngestedDocument:
+        stored = prepare_document(user_id, document)
+        row = _without_unset(to_row(stored), "id", "created_at")
+        rows = await self._run(
+            lambda q: q.upsert(row, on_conflict="user_id,source_id")
+        )
+        return _read(IngestedDocument, rows[0]) if rows else stored
+
+    async def get(self, user_id: str, source_id: str) -> IngestedDocument | None:
+        rows = await self._run(
+            lambda q: q.select(_DOCUMENT_SELECT)
+            .eq("user_id", user_id)
+            .eq("source_id", source_id)
+            .limit(1)
+        )
+        return _read(IngestedDocument, rows[0]) if rows else None
+
+    async def list_for_user(self, user_id: str) -> list[IngestedDocument]:
+        rows = await self._run(
+            lambda q: q.select(_DOCUMENT_SELECT)
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(DOCUMENT_LIST_LIMIT)
+        )
+        return [_read(IngestedDocument, r) for r in rows]
+
+    async def delete(self, user_id: str, source_id: str) -> bool:
+        await self._run(
+            lambda q: q.delete().eq("user_id", user_id).eq("source_id", source_id),
+            table=self._links,
+        )
+        rows = await self._run(
+            lambda q: q.delete().eq("user_id", user_id).eq("source_id", source_id)
+        )
+        return bool(rows)
+
+    async def link(self, user_id: str, links: list[TaskMaterialLink]) -> None:
+        rows = [_without_unset(to_row(link), "linked_at") for link in prepare_links(user_id, links)]
+        if not rows:
+            return
+        await self._run(
+            lambda q: q.upsert(rows, on_conflict="user_id,task_id,source_id"), table=self._links
+        )
+
+    async def links_for_documents(
+        self, user_id: str, source_ids: Collection[str]
+    ) -> list[TaskMaterialLink]:
+        wanted = sorted(set(source_ids))
+        if not wanted:
+            return []
+        rows = await self._run(
+            lambda q: q.select(_LINK_SELECT).eq("user_id", user_id).in_("source_id", wanted),
+            table=self._links,
+        )
+        return [_read(TaskMaterialLink, r) for r in rows]
+
+    async def links_for_task(self, user_id: str, task_id: str) -> list[TaskMaterialLink]:
+        rows = await self._run(
+            lambda q: q.select(_LINK_SELECT).eq("user_id", user_id).eq("task_id", task_id),
+            table=self._links,
+        )
+        return [_read(TaskMaterialLink, r) for r in rows]
 
 
 class SupabaseHabitTrackerRepository(_SupabaseRepository, HabitTrackerRepository):
