@@ -18,7 +18,7 @@ class ProactiveExtractionSchema(BaseModel):
     deadlines: list[str] = Field(default_factory=list)
     document_topics: list[str] = Field(
         default_factory=list,
-        description="1-5 granular topic tags e.g. Probability, Statistics, Calculus limits",
+        description="3-10 specific topic tags: the main units and their key subtopics, e.g. SQL joins, Nested queries, Normalisation",
     )
 
 
@@ -27,7 +27,7 @@ PROACTIVE_EXTRACTION_PROMPT = """Analyze this document. Is it actionable? (e.g.,
 If yes, extract:
 - action_items: list of actionable items (e.g. "Solve Math DPP Chapter 4", "Complete Assignment 2")
 - deadlines: any mentioned dates/deadlines
-- document_topics: 1-5 granular topic tags that describe the document content (e.g. "Probability", "Statistics", "Calculus limits"). These will be used to match the document to the user's existing study tasks.
+- document_topics: 3-10 specific topic tags: the main units AND their key subtopics, each a short noun phrase (e.g. "SQL joins", "Nested queries", "Normalisation", "Two-phase locking"). A task is matched to the document by these tags, so prefer the specific subtopic a task would name over a broad heading.
 
 If not actionable, return empty lists. Return valid JSON only."""
 
