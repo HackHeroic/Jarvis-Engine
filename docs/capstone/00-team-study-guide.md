@@ -24,11 +24,11 @@ Everything here was checked against the code on branch `main` (commit `c956a8f`)
 - Do not claim anything listed in section 9 as working.
 
 **Numbers to quote** (measured at `c956a8f`):
-- Tests: **1991 passed, 2 xfailed, 2 deselected**, in 92 test files. Older documents and commits said 1833 and 1974; those were earlier commits.
+- Tests: **1991 passed, 2 xfailed, 2 deselected**, in 92 test files. Older documents and commits said 1833 and 1974; those were earlier commits. After the documents work (D32): **2116 passed, 2 xfailed, 2 deselected**, in 94 test files.
 - The chat router `app/api/v1/endpoints/chat.py` is **56 lines**.
 - PEARL reads the last **28 days** (`FOCUS_WINDOW_DAYS`).
-- The API has **42 paths and 48 operations**; there are **19 migration files**.
-- The formal documents cite `path:line` at commit `e76bff9`. Four later commits (`e0e154f`, `7a414bb`, `be76c48`, `c956a8f`) fixed problems found by clicking through the app; the documents note each change where it alters a claim, and this guide covers them in D25, D29, D30 and D31.
+- The API has **43 paths and 49 operations** (42 and 48 at `c956a8f`; the documents work added `GET /documents/{source_id}/file`); there are **19 migration files**.
+- The formal documents cite `path:line` at commit `e76bff9`. Four later commits (`e0e154f`, `7a414bb`, `be76c48`, `c956a8f`) fixed problems found by clicking through the app; the documents note each change where it alters a claim, and this guide covers them in D25, D29, D30 and D31. The documents work (D32: kept files, linking by meaning) moved lines in the files it touched, and the citations into those files were moved with them.
 
 ---
 
@@ -228,7 +228,7 @@ Each decision uses the same shape: **The problem → What we chose → What we r
 - **The problem.** Before the capstone, endpoints built Supabase queries inline, there were nine places that created a Supabase client, services imported from endpoint files, and two "god files" (`chat.py` at 1,618 lines, `control_policy.py` at 1,939). Nothing could be tested without the network, and no class diagram could match the code (spec §2).
 - **What we chose.** Four layers plus a composition root. A **port** is an abstract class in `app/domain/ports.py` (for example `TaskRepository`, `LLMProvider`). An **adapter** is a class in `app/infrastructure/` that implements it (for example `SupabaseTaskRepository`, `ClaudeProvider`). Services depend only on ports.
 - **What we rejected, and why.** Services calling Supabase or LiteLLM directly: library error types leak upward, tests need the network, and a vendor change touches every caller (`05-design-patterns.md` §11.5).
-- **What it costs us.** More files and one more level of indirection. A few leftovers remain, each on a tested allow-list: 8 files with raw table calls, and `core/model_router.py` importing infrastructure.
+- **What it costs us.** More files and one more level of indirection. A few leftovers remain, each on a tested allow-list: 6 files with raw table calls, and `core/model_router.py` importing infrastructure.
 - **Where to see it.** `app/domain/ports.py`, `app/infrastructure/`, `app/container.py`.
 - **The test that pins it.** `tests/test_layering.py::test_domain__imports_nothing_from_outer_layers`, `::test_layering__allow_lists__are_exactly_the_documented_leftovers` (the allow-lists can only shrink).
 
@@ -237,14 +237,14 @@ Each decision uses the same shape: **The problem → What we chose → What we r
 - **What we chose.** Every port is an `abc.ABC`. An adapter subclasses it. A class that forgets a method cannot be created.
 - **What we rejected, and why.** `typing.Protocol`: structural typing, so nothing in the code says a class implements the port, and an incomplete class passes until a call fails.
 - **What it costs us.** Adapters must subclass explicitly. One small exception exists: the `Redactor` port inside `app/infrastructure/llm/decorators.py` is a Protocol.
-- **Where to see it.** `app/domain/ports.py` (17 ABCs).
+- **Where to see it.** `app/domain/ports.py` (19 ABCs).
 - **The test that pins it.** `tests/test_domain.py::test_ports__instantiated_directly__raise_type_error`; `tests/test_design_conformance.py` checks that every `<<interface>>` in doc 03 is an ABC and every arrow a real subclass.
 
 ### D3. Repository pattern: two families, one contract suite
 - **The problem.** Services must store tasks, drafts, events, rules, memories and more without knowing Supabase exists, and tests must run offline. Some old queries forgot the `user_id` filter (an IDOR bug, see D27).
-- **What we chose.** One repository port per aggregate (11 in all). Every per-user method takes `user_id` first. Two families implement every port: `Supabase*Repository` (`app/infrastructure/persistence/supabase_repos.py`) and `InMemory*Repository` (`in_memory.py`). `RepositoryFactory.supabase` / `.in_memory` build a whole family at once, so families are never mixed. **The same contract tests run against both families.**
+- **What we chose.** One repository port per aggregate (12 in all, plus `DocumentFileStore` for uploaded files, D32). Every per-user method takes `user_id` first. Two families implement every port: `Supabase*Repository` (`app/infrastructure/persistence/supabase_repos.py`) and `InMemory*Repository` (`in_memory.py`). `RepositoryFactory.supabase` / `.in_memory` build a whole family at once, so families are never mixed. **The same contract tests run against both families.**
 - **What we rejected, and why.** Active Record (`task.save()`): the entity would import the driver and break the domain rule. A generic `Repository[T]` with `get/add/update`: it would offer writes the domain forbids (tasks only change status; drafts need an atomic accept; task events are append-only). Local Postgres for tests (ADR-4): no Docker on the build machine.
-- **What it costs us.** The Supabase family is tested offline against `FakeSupabase` (`tests/fakes.py`), not a real database; only `scripts/live_e2e.py` touches the real one. Chat sessions, documents, calendar rows and task materials have no repository yet.
+- **What it costs us.** The Supabase family is tested offline against `FakeSupabase` (`tests/fakes.py`), not a real database; only `scripts/live_e2e.py` touches the real one. Chat sessions and calendar rows have no repository yet.
 - **Where to see it.** `app/domain/ports.py`, `app/infrastructure/persistence/`.
 - **The test that pins it.** `tests/test_repository_contracts.py::test_factory__both_families__implement_every_port`; the fixture runs each contract test once per family (`params=["in_memory", "supabase_fake"]`).
 
@@ -501,6 +501,14 @@ sequenceDiagram
 - **Where to see it.** The three files above.
 - **The test that pins it.** `tests/behaviour/test_chat_turns.py::test_chat__question_that_mentions_my_notes_with_no_file__answered_not_ingested`, `::test_chat__long_notes_pasted_as_text__still_read_as_material_to_keep`; `tests/test_voice_plan_facts.py::test_voice_parts__plan_drafted__carries_real_counts_and_names_the_new_work`, `::test_voice_prompt__examples_carry_no_task_count_to_copy`. Rule (1) has no test of its own (it changes prompt text only).
 
+### D32. Keeping uploaded files, and linking documents to tasks by meaning
+- **The problem.** The Documents page could not open an upload: only its chunks and a row were kept, because the pipeline's S3 upload needed `boto3`, which was never installed, and it failed without a word. And a document was linked to a task only at upload, only to tasks that already existed, by embedding all its topics joined into one string against each task title at 0.65; measured on the real sentence model, that blend never reached 0.65 for a single true match (best 0.528 of 20), so almost nothing was ever linked, and a plan made after the upload was never linked at all.
+- **What we chose.** (1) A `DocumentFileStore` port (`save`, `read`, `delete`, `stored_ids`) with a Supabase Storage adapter (`app/infrastructure/persistence/supabase_storage.py`) and an in-memory one, built by `RepositoryFactory` like the repositories, under the same contract suite; the records and links got a `DocumentRepository` the same way. The file goes in one private bucket, `jarvis-documents`, created on first use with the upload limit (10 MB), at a key computed from the document itself: `{user_id}/{source_id}`. Keeping the file is best effort and logged. `DocumentService` (`app/services/documents/service.py`) is the one place that knows a document's record, links, file and chunks, so the documents routes are routing only. (2) `DocumentLinker` (`app/services/documents/linker.py`) compares each topic, and the subject in the file name, with a task's title on its own, and links when the best one reaches 0.52 (`DOCUMENT_LINK_SIMILARITY`): the middle of the measured gap between the strongest unrelated pair but one (0.476) and the weakest true pair but one (0.557), on 192 document/task pairs. It runs both ways: a new document against the user's pending tasks, and the tasks an accepted plan wrote against the user's documents, by `DocumentLinkListener` on `DraftAccepted`.
+- **What we rejected, and why.** *Supabase Storage over S3:* the project already holds the Supabase URL and service key and installs the client, so there is no new dependency, account or secret; and Supabase is already the store the rest of Jarvis depends on. *A deterministic key over a stored one:* a new `storage_key` column needs a migration and we have no DDL access; `{user_id}/{source_id}` needs no column, puts a user's files in one folder so the Documents page asks the store once for all of them, and can never drift from the row. *Linking after the accept, not inside it:* `accept_draft()` is one SQL transaction; an embedding call inside it would hold it open and could fail it, and a link is never worth losing the user's plan. So the link runs after the commit, through the event the accept already publishes, and a failure is logged. *A higher threshold:* the one wrong link scores 0.610 ("Data structures: binary trees" against "Decision trees"); a cut above it would also drop four true links that 0.52 keeps (0.557 to 0.609).
+- **What it costs us.** Two stores to keep in step (a row and a file); the order is record first, then file, then links, and a file with no record is never written. Files uploaded before this change were never kept (`has_file: false`). The listener works inline, so an accept answers after one embedding call when the user has documents. At 0.52 the calibration set still has one miss ("Train a small neural net in PyTorch", 0.478) and one wrong link. The workspace builder still reads `task_materials` itself for a task's chunks (it stays on the allow-list).
+- **Where to see it.** `app/domain/ports.py` (`DocumentRepository`, `DocumentFileStore`); `app/infrastructure/persistence/supabase_storage.py`; `app/services/documents/`; `app/container.py` (the listener's subscription); `app/core/config.py` (`DOCUMENT_BUCKET`, `DOCUMENT_LINK_SIMILARITY` with its measurements).
+- **The test that pins it.** `tests/test_repository_contracts.py::test_document_files__save_read_delete__round_trip_with_its_content_type` (both families); `tests/test_documents.py::test_file_route__kept__raw_bytes_inline_with_its_type`, `::test_process_ingestion__file_store_down__ingestion_still_succeeds_and_logs`; `tests/test_document_linking.py::test_real_model__ml_syllabus__linked_to_the_ml_tasks_only`, `::test_real_model__academic_transcript__linked_to_nothing`, `::test_accept__linking_fails__accept_stands_and_a_warning_names_the_error`.
+
 ---
 
 ## 6. The ten criteria, one by one
@@ -543,7 +551,7 @@ sequenceDiagram
 
 **C7. API design.**
 - *Looking for:* consistent resource paths, typed requests and responses, status codes, errors, idempotency.
-- *How Jarvis meets it:* 42 paths and 48 operations; every JSON route has a typed `response_model`; one error envelope for every 4xx and 5xx; state changes are `POST` to a verb (`/drafts/{id}/accept`) because each is a move in a state machine; an idempotency table; the SSE frame catalogue.
+- *How Jarvis meets it:* 43 paths and 49 operations; every JSON route has a typed `response_model`; one error envelope for every 4xx and 5xx; state changes are `POST` to a verb (`/drafts/{id}/accept`) because each is a move in a state machine; an idempotency table; the SSE frame catalogue.
 - *Best example:* `POST /api/v1/drafts/{id}/accept`: 200, 409 `invalid_state_transition`, 409 `stale_version`, 409 `draft_outdated`, 422 `schedule_infeasible`, 503.
 - *Detail:* `07-api-design.md`.
 
@@ -598,7 +606,7 @@ Not built, so never claim them: the `CognitiveModule` registry, `Step`/`StepExec
 | **O** Open/closed | Add behaviour by adding a class, not by editing callers. | A new `PatternDetector` with `proposes_rule = True` is offered as a rule with no trigger edit; a new cloud provider goes in through `extra_cloud` in `LLMProviderFactory.build`. | Adding a chat module still means editing `INTENT_TO_MODULE` (`app/orchestrator/routing.py`) and the graph's edge map. The planned `CognitiveModule` registry was dropped. |
 | **L** Liskov substitution | Any implementation of a port can replace another. | Both repository families pass the same contract suite; `NullEventBus` honours `publish` by doing nothing. | `FallbackChainProvider` widens `LLMProvider` with `skip_local` and `has_available`, so `route_llm_call` depends on the concrete chain type. |
 | **I** Interface segregation | A client depends only on what it uses. | The planning sub-graph gets `PlanningServices`, a 7-field record, not the container; `Sweep`, `TextEmbedder`, `EnergyEstimator` have one abstract method each. | **The clearest gap:** the turn state `JarvisState` has 44 keys and carries the whole container, so inside a turn any node can reach any service (a service locator in practice). `TaskRepository` mixes reads and writes. |
-| **D** Dependency inversion | Policy depends on abstractions; one root wires concretes. | `TaskService` takes `TaskRepository`, `TaskEventRepository` and the bus in its constructor; `MorningBriefTrigger` takes the `DraftPlanner` port. | 8 files still make raw table calls; `get_chain`, `get_hooks` and the module registry are still process-wide lookups. |
+| **D** Dependency inversion | Policy depends on abstractions; one root wires concretes. | `TaskService` takes `TaskRepository`, `TaskEventRepository` and the bus in its constructor; `MorningBriefTrigger` takes the `DraftPlanner` port. | 6 files still make raw table calls; `get_chain`, `get_hooks` and the module registry are still process-wide lookups. |
 
 Tests that would fail if a principle broke: `tests/test_chat_turn.py::test_chat_router__routing_and_parsing_only` (S), `tests/test_patterns.py::test_detector__new_strategy__brings_its_own_insight_and_planning_use` (O), `tests/test_repository_contracts.py` (L), `tests/test_layering.py::test_layering__only_container_builds_repositories` (D).
 
@@ -614,12 +622,11 @@ State these plainly. Never present them as working.
 - The **`CognitiveModule` registry** with derived routing; routing is the hand-written `INTENT_TO_MODULE` table.
 - **Research summarise**: it returns "Found N results…" with no model call; `link_to_tasks` returns nothing. The knowledge module's nodes are thin.
 - **Hooks**: 7 handlers are registered, but only `PreCloudLLM` and `PreModuleExecution` are ever called. Aggregation is "first DENY or ASK wins", not deny > ask > allow.
-- **Repositories** for chat sessions and messages, documents, pending-calendar rows and task materials (the 8 raw-table leftovers).
+- **Repositories** for chat sessions and messages and pending-calendar rows (among the 6 raw-table leftovers).
 - **Real authentication**: `CurrentUser` reads `user_id` from the query string.
 - **DKT, RL, SARIMAX**: stubs in `app/models/`; they need real usage data first.
-- No `TelemetryListener`; `DraftAccepted` and `DeadlineMissed` are published but nothing in production listens.
+- No `TelemetryListener`; `DeadlineMissed` is published but nothing in production listens (`DraftAccepted` has one listener, `DocumentLinkListener`, D32).
 - **Creating habit review trackers (SM-2).** The Habits page reads `GET /api/v1/habits/tracker/due`, but `HabitTrackerRepository` only reads and reviews trackers, and `sm2_engine.record_completion` reviews an existing one. No route, service or the demo seed creates a tracker, so the page says "No habits due for review" for every user, the demo user included.
-- **Keeping the uploaded file.** Only its text chunks (ChromaDB) and an `ingested_documents` row are kept. The pipeline's S3 upload fails quietly because `boto3` is not installed, and no code reads `s3_key`. So there is no document viewer: the Documents page shows the name, topics, chunk count and linked tasks.
 
 **Known limits**
 1. **One process.** Turn locks, the PRIMARY lock, per-user anticipation locks, the day memo, single-flight runs, the document-read lock, the web-search cooldown and the scheduler loop live in memory. A second worker could interleave turns, make a second brief, or run two heavy model calls. Data-corrupting cases are still guarded in the database (the accept transaction, CAS, unique keys).
@@ -634,7 +641,8 @@ State these plainly. Never present them as working.
 10. The Supabase family is tested offline against a fake; only the live script uses the real database. A hands-on browser pass was never done (headless renders and API reads only).
 11. Daylight-saving transitions are not handled in multi-day plans.
 12. Some request fields have no length bound (D26).
-13. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 8 allow-listed raw-table leftovers). Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
+13. **The workspace blocks the event loop on its database reads.** `workspace_builder.build_task_workspace` reads the task, its WOOP fields, its materials and the learning style with synchronous Supabase calls (one of the 6 allow-listed raw-table leftovers). Hands-on testing measured about 1.5 s per workspace, during which other requests wait.
+15. **A kept file is best effort** (D32). A document uploaded while the file store could not be reached, and every document uploaded before files were kept, has no file to open (`has_file: false`). Linking by meaning is a measured threshold: on the 192 calibration pairs it missed one true link and made one wrong one.
 14. **A slow upload in chat ends at the step's limit**: 60 s for the knowledge step, before the reader's own 120 s (D29).
 
 Sources: `docs/PROJECT_STATUS.md` §4 and §10, `.claude/CLAUDE.md` "Not built", `10-demo-and-contributions.md` §5.
@@ -660,7 +668,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 
 ### C4. SOLID
 8. **Show the open/closed principle.** Add a `PatternDetector` subclass with `proposes_rule = True` and one line in `default_pattern_detectors`; `PatternRuleTrigger` offers it with no edit (`tests/test_anticipation_design.py::test_pattern_rule__new_detector_that_proposes_rules__offered_without_a_trigger_edit`).
-9. **Where does SOLID fall short?** Interface segregation: `JarvisState` has 44 keys and carries the whole container. Also 8 raw-table leftovers, and adding a module edits the routing table.
+9. **Where does SOLID fall short?** Interface segregation: `JarvisState` has 44 keys and carries the whole container. Also 6 raw-table leftovers, and adding a module edits the routing table.
 
 ### C5. Design patterns
 10. **Why Decorator for the model providers and not subclasses?** Four concerns (redact, retry, meter, timeout), three providers, and the local one needs a different subset. Subclasses would multiply; decorators stack per location.
@@ -699,7 +707,7 @@ Short model answers. Learn the idea, not the words. Open the file named if you n
 33. **Why the local model first?** Privacy: the prompt never leaves the machine. Claude is the cloud tier for schema-valid structured output in the demo; Gemini is the last resort (ADR-10).
 34. **Is the demo data fake?** The history is seeded, the inference is live. `scripts/seed_demo_user.py` writes three weeks of history through the real services under a simulated clock; patterns, the focus profile and the brief are computed live. A test checks that every seeded row has a shape the live app writes.
 35. **How do you prove it works end to end?** 1991 offline tests at `c956a8f` (real services, real CP-SAT, both repository families, a scripted model, network blocked), plus `scripts/live_e2e.py`: 18 steps against real Supabase and real models, as a throwaway user whose rows are deleted at the end.
-36. **If you had another week?** From the build ledgers: repositories for sessions, documents and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
+36. **If you had another week?** From the build ledgers: repositories for sessions and calendar rows; a `local_day` unique index for the once-a-day brief; the version passed into `accept_draft`; real authentication; a real PII gateway.
 
 ---
 

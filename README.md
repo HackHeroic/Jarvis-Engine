@@ -89,4 +89,4 @@ This seeds about three weeks of history for the user `demo`. Start the backend a
 
 ## Not built
 
-Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. Nothing creates habit review trackers, so the Habits page has none to review. An uploaded file is not kept (only its extracted text), so there is no document viewer. Workspace web links need Gemini's web search. `docs/PROJECT_STATUS.md` has the full list.
+Ask-back questions, pre-task prep, deadline-risk alerts, the research summariser and real sign-in are not built. Nothing creates habit review trackers, so the Habits page has none to review. Workspace web links need Gemini's web search. `docs/PROJECT_STATUS.md` has the full list.

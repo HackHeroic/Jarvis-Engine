@@ -66,7 +66,7 @@ Multiplicities are written on the arrow ends (`"1"`, `"0..1"`, `"*"`, `"1..*"`).
 
 ## 2. Overview
 
-The composition root `AppContainer` (`app/container.py:77`) builds every long-lived collaborator once, in `AppContainer.build` (`app/container.py:103-239`). Services receive ports and the event bus through their constructors; nothing below the container picks a concrete class. The overview shows names only; each class appears with its members in a later diagram.
+The composition root `AppContainer` (`app/container.py:81`) builds every long-lived collaborator once, in `AppContainer.build` (`app/container.py:109-265`). Services receive ports and the event bus through their constructors; nothing below the container picks a concrete class. The overview shows names only; each class appears with its members in a later diagram.
 
 ```mermaid
 classDiagram
@@ -116,6 +116,9 @@ classDiagram
     class AnticipationScheduler
     class ChatTurnService
     class ChatTurn
+    class DocumentService
+    class DocumentLinker
+    class DocumentLinkListener
 
     AppContainer ..> RepositoryFactory : build() picks a family
     RepositoryFactory ..> Repositories : creates
@@ -157,6 +160,11 @@ classDiagram
     AppContainer "1" *-- "1" ConversationMemoryService : conversation_memory
     AppContainer "1" *-- "1" UserModelService : user_model_service
     AppContainer "1" *-- "1" StatedRules : stated_rules
+    AppContainer "1" *-- "1" DocumentService : documents
+    AppContainer "1" *-- "1" DocumentLinker : document_linker
+    DocumentService "1" o-- "0..1" DocumentLinker : _linker
+    EventListener <|.. DocumentLinkListener
+    DocumentLinkListener "1" o-- "1" DocumentLinker : _linker
     AppContainer "1" *-- "1" Settings : settings
     AppContainer "1" *-- "3..*" Sweep : sweeps
     AnticipationScheduler "1" o-- "1" AnticipationService : _service
@@ -168,16 +176,16 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `AppContainer *--` every field (`repos`, `events`, `llm`, the services, `consent`, `actions`, `settings`) | Composition | `build` creates each one, the container is the only object that holds the set, and they live exactly as long as the container (the lifespan builds one at startup and shuts it down at exit) | `app/container.py:124-239`, `app/main.py:119`, `app/main.py:179` |
-| `AppContainer *-- "3..*" Sweep : sweeps` | Composition | `build` creates three sweeps; the lifespan appends a fourth (`CheckpointRetentionSweep`) to the same list | `app/container.py:215-219`, `app/main.py:148` |
-| `AppContainer *-- TextEmbedder`, `*-- EnergyEstimator`, `*-- DraftPlanner` | Composition, to the port | The container holds the port type, so its fields depend on abstractions; the realization arrows show which concrete class `build` chose | `app/container.py:86-94`, `142`, `152`, `177` |
-| `MemoryService o-- TextEmbedder`, `PlanningServices o--` its services, `AnticipationService o-- ConsentPolicy` / `ActionFactory` | Aggregation | Injected through the constructor and shared: the same `MemoryService` is held by `PlanningServices`, `ConversationMemoryService`, `UserModelService`, `StatedRules` and two actions | `app/container.py:143`, `168-176`, `184-187` |
-| `EventBus o-- "*" EventListener` | Aggregation | The bus keeps references to listeners it did not create; a listener (the usage ledger) is also a container field | `app/domain/events.py:85-90`, `app/container.py:133` |
+| `AppContainer *--` every field (`repos`, `events`, `llm`, the services, `consent`, `actions`, `settings`) | Composition | `build` creates each one, the container is the only object that holds the set, and they live exactly as long as the container (the lifespan builds one at startup and shuts it down at exit) | `app/container.py:131-265`, `app/main.py:119`, `app/main.py:179` |
+| `AppContainer *-- "3..*" Sweep : sweeps` | Composition | `build` creates three sweeps; the lifespan appends a fourth (`CheckpointRetentionSweep`) to the same list | `app/container.py:235-239`, `app/main.py:148` |
+| `AppContainer *-- TextEmbedder`, `*-- EnergyEstimator`, `*-- DraftPlanner` | Composition, to the port | The container holds the port type, so its fields depend on abstractions; the realization arrows show which concrete class `build` chose | `app/container.py:90-98`, `152`, `162`, `197` |
+| `MemoryService o-- TextEmbedder`, `PlanningServices o--` its services, `AnticipationService o-- ConsentPolicy` / `ActionFactory` | Aggregation | Injected through the constructor and shared: the same `MemoryService` is held by `PlanningServices`, `ConversationMemoryService`, `UserModelService`, `StatedRules` and two actions | `app/container.py:153`, `188-196`, `204-207` |
+| `EventBus o-- "*" EventListener` | Aggregation | The bus keeps references to listeners it did not create; a listener (the usage ledger) is also a container field | `app/domain/events.py:88-93`, `app/container.py:143` |
 | `FallbackChainProvider *-- "1..*" LLMProvider` | Composition | The factory builds each wrapped provider for this chain only; the chain keeps them in a private tuple | `app/infrastructure/llm/factory.py:51-56`, `chain.py:44-45` |
 | `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | The lifespan hands it the container's service and sweep list; the container outlives the scheduler's loop | `app/main.py:155-160`, `scheduler.py:38-41` |
 | `ChatTurnService o-- "0..1" AppContainer` | Aggregation | One service object per request (`for_app`), all sharing the one container; `None` when the lifespan built none | `app/services/chat_turn/service.py:243-258` |
 | `ChatTurn --> ChatTurnService` | Association | A back-reference the turn uses to reach the graph and container | `app/services/chat_turn/service.py:59` |
-| `... ..> ... : creates` | Dependency | The factory method returns the object and keeps no reference | `persistence/factory.py:72-104`, `llm/factory.py:33-56` |
+| `... ..> ... : creates` | Dependency | The factory method returns the object and keeps no reference | `persistence/factory.py:83-125`, `llm/factory.py:33-56` |
 
 ---
 
@@ -326,7 +334,7 @@ classDiagram
 | `X --> UserProfile : user_id` | Association, by id | Every entity is owned by one user; drawn for three of them, the rest are the same | `entities.py:232`, `249`, `279`, `337` |
 | `--> <<enumeration>>` | Association | The field's type is the enumeration | `entities.py:236`, `299`, `320`, `348`, `399` |
 
-Two differences from the spec (§6.1): the spec draws "1 Goal composes 1..* Task"; in the code a `Task` names its goal by `goal_id` and no `Goal` object holds tasks, so it is drawn as an association. `DraftSchedule.tasks` is `list[dict]` (the planner's serialised chunks), not `list[Task]`: tasks become `Task` rows only when a draft is accepted (`DraftRepository.accept_atomic`, `app/domain/ports.py:211-222`).
+Two differences from the spec (§6.1): the spec draws "1 Goal composes 1..* Task"; in the code a `Task` names its goal by `goal_id` and no `Goal` object holds tasks, so it is drawn as an association. `DraftSchedule.tasks` is `list[dict]` (the planner's serialised chunks), not `list[Task]`: tasks become `Task` rows only when a draft is accepted (`DraftRepository.accept_atomic`, `app/domain/ports.py:216-227`).
 
 ### 3.2 Learning, anticipation and conversation entities
 
@@ -478,13 +486,13 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `FocusProfile *-- "24" HourFocus : hours` | Composition | The hour entries are value objects made for one profile; the validator requires exactly 24, index equal to hour | `entities.py:573-584` |
-| `Memory --> Memory : superseded_by` | Association, by id | A replaced memory names the memory that replaced it | `entities.py:491-493` |
+| `FocusProfile *-- "24" HourFocus : hours` | Composition | The hour entries are value objects made for one profile; the validator requires exactly 24, index equal to hour | `entities.py:617-628` |
+| `Memory --> Memory : superseded_by` | Association, by id | A replaced memory names the memory that replaced it | `entities.py:535-537` |
 | `Suggestion ..> ConsentDecision` | Dependency | `Trigger.run` copies the decision into three fields (`consent_behavior`, `consent_reason`, `consent_kind`); the suggestion keeps no `ConsentDecision` object | `app/domain/anticipation.py:400-402` |
 | `Suggestion ..> SuggestionExpiry` | Dependency | Why a suggestion expired is kept inside its `action` JSON under `EXPIRY_KEY`, read by `made_that_day` | `entities.py:66-67`, `204-212` |
-| `ChatMessage --> ConversationSession`, `LLMUsageEvent --> ConversationSession` | Association, by id | Each names its session | `entities.py:673`, `684-686` |
+| `ChatMessage --> ConversationSession`, `LLMUsageEvent --> ConversationSession` | Association, by id | Each names its session | `entities.py:717`, `728-730` |
 
-A remembered `Pattern` and its `Memory` share a `pattern_key` (`entities.py:461-464`, `528-534`); they are separate objects, so no arrow is drawn.
+A remembered `Pattern` and its `Memory` share a `pattern_key` (`entities.py:505-508`, `572-578`); they are separate objects, so no arrow is drawn.
 
 ### 3.3 State transition tables
 
@@ -514,7 +522,7 @@ Each lifecycle is a table in the domain (the State pattern, as data). A move not
 | `DISMISSED` | `FORGOTTEN` |
 | `FORGOTTEN` | nothing — nothing automatic brings back what the user let go of |
 
-**Task outcome moves** (`_Move` records in the service, `app/services/task_service.py:65-84`; plus `TaskRepository.bring_back`, `app/domain/ports.py:115-123`):
+**Task outcome moves** (`_Move` records in the service, `app/services/task_service.py:65-84`; plus `TaskRepository.bring_back`, `app/domain/ports.py:120-128`):
 
 | Move | From | To | Event recorded |
 |---|---|---|---|
@@ -550,6 +558,7 @@ classDiagram
     class DraftAccepted {
         +str draft_id
         +int task_count
+        +list~str~ task_ids
     }
     class PatternDetected
     class LLMCallCompleted
@@ -569,6 +578,7 @@ classDiagram
     class UsageLedger
     class PatternObserver
     class AnticipationListener
+    class DocumentLinkListener
 
     DomainEvent <|-- TaskCompleted
     DomainEvent <|-- TaskSkipped
@@ -586,17 +596,18 @@ classDiagram
     EventListener <|.. UsageLedger
     EventListener <|.. PatternObserver
     EventListener <|.. AnticipationListener
+    EventListener <|.. DocumentLinkListener
 ```
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `DomainEvent <\|-- ...` | Inheritance | Each event extends the concrete base and adds its own fields | `app/domain/events.py:19-67` |
-| `PatternDetected *-- Pattern`, `LLMCallCompleted *-- LLMUsageEvent` | Composition | The value object is part of the event and travels with it | `events.py:61`, `67` |
-| `EventBus o-- "*" EventListener` | Aggregation | Listeners are subscribed from outside and are shared (the container also holds them) | `events.py:85-90` |
-| `EventBus <\|-- NullEventBus` | Inheritance | Null Object: overrides `publish` to drop the event | `events.py:112-116` |
-| `EventListener <\|.. UsageLedger` etc. | Realization | Each implements `handle` | `app/services/usage_ledger.py:33`, `app/services/memory/patterns.py:697`, `app/services/anticipation/triggers.py:401` |
+| `DomainEvent <\|-- ...` | Inheritance | Each event extends the concrete base and adds its own fields | `app/domain/events.py:19-70` |
+| `PatternDetected *-- Pattern`, `LLMCallCompleted *-- LLMUsageEvent` | Composition | The value object is part of the event and travels with it | `events.py:64`, `70` |
+| `EventBus o-- "*" EventListener` | Aggregation | Listeners are subscribed from outside and are shared (the container also holds them) | `events.py:88-93` |
+| `EventBus <\|-- NullEventBus` | Inheritance | Null Object: overrides `publish` to drop the event | `events.py:115-119` |
+| `EventListener <\|.. UsageLedger` etc. | Realization | Each implements `handle` | `app/services/usage_ledger.py:33`, `app/services/memory/patterns.py:697`, `app/services/anticipation/triggers.py:401`, `app/services/documents/linker.py:169` |
 
-Subscriptions made by the container: `LLMCallCompleted → UsageLedger` (`app/container.py:133`), `TaskCompleted`, `TaskSkipped`, `TaskMissed → PatternObserver` (`container.py:149-150`), `PatternDetected → AnticipationListener` (`container.py:198`). `DraftAccepted` and `DeadlineMissed` are published but have no production listener.
+Subscriptions made by the container: `LLMCallCompleted → UsageLedger` (`app/container.py:143`), `TaskCompleted`, `TaskSkipped`, `TaskMissed → PatternObserver` (`container.py:159-160`), `PatternDetected → AnticipationListener` (`container.py:218`), `DraftAccepted → DocumentLinkListener` (`container.py:181`; it links the accepted tasks to the user's documents, after the commit). `DeadlineMissed` is published but has no production listener.
 
 ### 3.5 Error hierarchy
 
@@ -666,7 +677,7 @@ Every arrow is inheritance: each subclass overrides the class attributes `code` 
 
 ### 4.1 The repository ports
 
-Eleven `abc.ABC` ports (`app/domain/ports.py:59-595`). Every per-user method takes `user_id` first and sees only that user's rows; the two documented exceptions are `ProfileRepository.list_user_ids` and `UsageRepository.record` (`ports.py:3-6`). `Repositories` is the record of one family; `RepositoryFactory` builds a whole family at once (Abstract Factory).
+Thirteen `abc.ABC` ports (`app/domain/ports.py:64-676`): twelve repositories and the store for uploaded files. Every per-user method takes `user_id` first and sees only that user's rows; the two documented exceptions are `ProfileRepository.list_user_ids` and `UsageRepository.record` (`ports.py:3-6`). `Repositories` is the record of one family; `RepositoryFactory` builds a whole family at once (Abstract Factory).
 
 ```mermaid
 classDiagram
@@ -755,6 +766,23 @@ classDiagram
         +record(event) None*
         +summary(user_id, since) dict*
     }
+    class DocumentRepository {
+        <<interface>>
+        +save(user_id, document) IngestedDocument*
+        +get(user_id, source_id) IngestedDocument | None*
+        +list_for_user(user_id) list~IngestedDocument~*
+        +delete(user_id, source_id) bool*
+        +link(user_id, links) None*
+        +links_for_documents(user_id, source_ids) list~TaskMaterialLink~*
+        +links_for_task(user_id, task_id) list~TaskMaterialLink~*
+    }
+    class DocumentFileStore {
+        <<interface>>
+        +save(user_id, source_id, file) None*
+        +read(user_id, source_id) StoredFile | None*
+        +delete(user_id, source_id) bool*
+        +stored_ids(user_id) frozenset~str~*
+    }
     class MemoryMatch {
         <<value object>>
         +float similarity
@@ -780,19 +808,21 @@ classDiagram
     Repositories "1" o-- "1" MemoryRepository : memories
     Repositories "1" o-- "1" ConversationRepository : conversations
     Repositories "1" o-- "1" UsageRepository : usage
+    Repositories "1" o-- "1" DocumentRepository : documents
+    Repositories "1" o-- "1" DocumentFileStore : document_files
     MemoryRepository ..> MemoryMatch : nearest() returns
     MemoryMatch "1" *-- "1" Memory : memory
 ```
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `Repositories o-- <port>` (11) | Aggregation | The record is frozen and holds one repository per port, but the container hands each repository on to the services, which keep it after the record is no longer consulted | `app/infrastructure/persistence/factory.py:52-66`, `app/container.py:139-237` |
+| `Repositories o-- <port>` (13) | Aggregation | The record is frozen and holds one repository per port, but the container hands each repository on to the services, which keep it after the record is no longer consulted | `app/infrastructure/persistence/factory.py:61-75`, `app/container.py:149-257` |
 | `RepositoryFactory ..> Repositories` | Dependency | Each static method returns a new record and keeps nothing | `factory.py:72-104` |
-| `MemoryMatch *-- Memory` | Composition | A search result wraps the memory it found | `app/domain/ports.py:391-397` |
+| `MemoryMatch *-- Memory` | Composition | A search result wraps the memory it found | `app/domain/ports.py:396-402` |
 
 ### 4.2 The Supabase family
 
-Each Supabase repository inherits shared plumbing from `_SupabaseRepository` (one table, calls run off the event loop with `asyncio.to_thread`, failures translated to `PersistenceError`; `supabase_repos.py:158-173`) and realizes one port. This is the only place that calls `.table(` for these eleven tables.
+Each Supabase repository inherits shared plumbing from `_SupabaseRepository` (one table, calls run off the event loop with `asyncio.to_thread`, failures translated to `PersistenceError`; `supabase_repos.py:165-180`) and realizes one port. This is the only place that calls `.table(` for these thirteen tables (`SupabaseDocumentRepository` keeps two: `ingested_documents` and `task_materials`). The uploaded files are not in a table: `SupabaseDocumentFileStore` (section 4.4) keeps them in Supabase Storage.
 
 ```mermaid
 classDiagram
@@ -835,6 +865,9 @@ classDiagram
     class UsageRepository {
         <<interface>>
     }
+    class DocumentRepository {
+        <<interface>>
+    }
     class SupabaseTaskRepository
     class SupabaseTaskEventRepository
     class SupabaseDraftRepository
@@ -846,6 +879,7 @@ classDiagram
     class SupabaseMemoryRepository
     class SupabaseConversationRepository
     class SupabaseUsageRepository
+    class SupabaseDocumentRepository
 
     _SupabaseRepository <|-- SupabaseTaskRepository
     _SupabaseRepository <|-- SupabaseTaskEventRepository
@@ -858,6 +892,7 @@ classDiagram
     _SupabaseRepository <|-- SupabaseMemoryRepository
     _SupabaseRepository <|-- SupabaseConversationRepository
     _SupabaseRepository <|-- SupabaseUsageRepository
+    _SupabaseRepository <|-- SupabaseDocumentRepository
     TaskRepository <|.. SupabaseTaskRepository
     TaskEventRepository <|.. SupabaseTaskEventRepository
     DraftRepository <|.. SupabaseDraftRepository
@@ -869,18 +904,19 @@ classDiagram
     MemoryRepository <|.. SupabaseMemoryRepository
     ConversationRepository <|.. SupabaseConversationRepository
     UsageRepository <|.. SupabaseUsageRepository
+    DocumentRepository <|.. SupabaseDocumentRepository
 ```
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `_SupabaseRepository <\|-- Supabase*Repository` (11) | Inheritance | Implementation reuse: `_run` and the client field | `supabase_repos.py:176`, `275`, `319`, `455`, `501`, `529`, `576`, `612`, `718`, `891`, `922` |
-| `<port> <\|.. Supabase*Repository` (11) | Realization | Each class lists its port as its second base (`class SupabaseTaskRepository(_SupabaseRepository, TaskRepository)`) | same lines |
+| `_SupabaseRepository <\|-- Supabase*Repository` (12) | Inheritance | Implementation reuse: `_run` and the client field | `supabase_repos.py:183`, `282`, `326`, `462`, `508`, `547`, `622`, `669`, `705`, `811`, `984`, `1015` |
+| `<port> <\|.. Supabase*Repository` (12) | Realization | Each class lists its port as its second base (`class SupabaseTaskRepository(_SupabaseRepository, TaskRepository)`) | same lines |
 
-Each concrete class sets `table` to its Postgres table (`user_tasks`, `task_events`, `draft_schedules`, `behavioral_constraints`, `goals`, `habit_trackers`, `user_profiles`, `proactive_suggestions`, `user_memories`, `llm_usage_events`, `chat_sessions`; `supabase_repos.py:177-926`). `SupabaseDraftRepository.accept_atomic` calls the `accept_draft()` SQL function, so the task write and the draft's status change are one transaction.
+Each concrete class sets `table` to its Postgres table (`user_tasks`, `task_events`, `draft_schedules`, `behavioral_constraints`, `goals`, `habit_trackers`, `user_profiles`, `proactive_suggestions`, `user_memories`, `llm_usage_events`, `chat_sessions`, and `ingested_documents` with `task_materials` beside it; `supabase_repos.py:184-1019`). `SupabaseDraftRepository.accept_atomic` calls the `accept_draft()` SQL function, so the task write and the draft's status change are one transaction.
 
 ### 4.3 The in-memory family
 
-The in-memory family is used when Supabase is unreachable at startup and in tests. All eleven repositories share one `InMemoryStore` (the stand-in for the database), whose `asyncio.Lock` serialises draft status changes as the row lock does in Postgres (`in_memory.py:118-119`). `tests/test_repository_contracts.py` runs one contract suite against both families.
+The in-memory family is used when Supabase is unreachable at startup and in tests. All twelve repositories, and the in-memory file store, share one `InMemoryStore` (the stand-in for the database), whose `asyncio.Lock` serialises draft status changes as the row lock does in Postgres (`in_memory.py:132-133`). `tests/test_repository_contracts.py` runs one contract suite against both families.
 
 ```mermaid
 classDiagram
@@ -901,6 +937,9 @@ classDiagram
         +list~ConversationSession~ chat_sessions
         +list~ChatMessage~ chat_messages
         +dict memory_embeddings
+        +list~IngestedDocument~ documents
+        +list~TaskMaterialLink~ task_materials
+        +dict document_files
         +Lock lock
     }
     class TaskRepository {
@@ -936,6 +975,9 @@ classDiagram
     class UsageRepository {
         <<interface>>
     }
+    class DocumentRepository {
+        <<interface>>
+    }
     class InMemoryTaskRepository
     class InMemoryTaskEventRepository
     class InMemoryDraftRepository
@@ -947,6 +989,7 @@ classDiagram
     class InMemoryMemoryRepository
     class InMemoryConversationRepository
     class InMemoryUsageRepository
+    class InMemoryDocumentRepository
 
     TaskRepository <|.. InMemoryTaskRepository
     TaskEventRepository <|.. InMemoryTaskEventRepository
@@ -970,12 +1013,110 @@ classDiagram
     InMemoryMemoryRepository "1" o-- "1" InMemoryStore : _store
     InMemoryConversationRepository "1" o-- "1" InMemoryStore : _store
     InMemoryUsageRepository "1" o-- "1" InMemoryStore : _store
+    DocumentRepository <|.. InMemoryDocumentRepository
+    InMemoryDocumentRepository "1" o-- "1" InMemoryStore : _store
 ```
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `<port> <\|.. InMemory*Repository` (11) | Realization | Each class subclasses its port directly | `app/infrastructure/persistence/in_memory.py:121-788` |
-| `InMemory*Repository o-- InMemoryStore : _store` (11) | Aggregation | One store is shared by the whole family, exactly as one database is shared by the Supabase family; it outlives any one repository (a test can pass its own) | `factory.py:89-104`, `in_memory.py:122-123` |
+| `<port> <\|.. InMemory*Repository` (12) | Realization | Each class subclasses its port directly | `app/infrastructure/persistence/in_memory.py:135-802`, `897` |
+| `InMemory*Repository o-- InMemoryStore : _store` (12) | Aggregation | One store is shared by the whole family, exactly as one database is shared by the Supabase family; it outlives any one repository (a test can pass its own) | `factory.py:89-104`, `in_memory.py:136-137` |
+
+### 4.4 Documents: the uploaded files, and the services over them
+
+A document is kept in three places: its record and task links (`DocumentRepository`), its uploaded file (`DocumentFileStore`), and its text as chunks in ChromaDB. `DocumentService` is the one class that knows all three; `DocumentLinker` decides by meaning which documents belong with which tasks, and `DocumentLinkListener` runs it for the tasks an accept wrote. The file store's two adapters are built by `RepositoryFactory` with the repositories (`documents` and `document_files` on `Repositories`, section 4.1).
+
+```mermaid
+classDiagram
+    direction LR
+    class DocumentRepository {
+        <<interface>>
+    }
+    class DocumentFileStore {
+        <<interface>>
+    }
+    class SupabaseDocumentFileStore {
+        -Any _client
+        -str _bucket
+        -int | None _max_file_bytes
+        -_ensure_bucket() None
+    }
+    class InMemoryDocumentFileStore
+    class InMemoryStore
+    class StoredFile {
+        <<value object>>
+        +bytes content
+        +str content_type
+    }
+    class IngestedDocument {
+        <<entity>>
+        +str source_id
+        +str | None file_name
+        +list~str~ document_topics
+        +int chunk_count
+    }
+    class TaskMaterialLink {
+        <<value object>>
+        +str task_id
+        +str source_id
+        +list~str~ document_topics
+    }
+    class DocumentService {
+        +add(user_id, document, file) list~str~
+        +list_documents(user_id) list~DocumentOut~
+        +open_file(user_id, source_id) DocumentFile
+        +delete(user_id, source_id) None
+        +linked_documents(user_id, task_id) list~LinkedDocument~
+    }
+    class DocumentFile {
+        <<value object>>
+        +bytes content
+        +str content_type
+        +str file_name
+    }
+    class DocumentLinker {
+        +link_document(user_id, document) list~str~
+        +link_tasks(user_id, task_ids) list~str~
+        +matches(documents, tasks) list~tuple~
+    }
+    class DocumentLinkListener {
+        +handle(event) None
+    }
+    class EventListener {
+        <<interface>>
+    }
+    class TaskRepository {
+        <<interface>>
+    }
+    class TextEmbedder {
+        <<interface>>
+    }
+
+    DocumentFileStore <|.. SupabaseDocumentFileStore
+    DocumentFileStore <|.. InMemoryDocumentFileStore
+    InMemoryDocumentFileStore "1" o-- "1" InMemoryStore : _store
+    DocumentFileStore ..> StoredFile : save() and read()
+    DocumentRepository ..> IngestedDocument : stores
+    DocumentRepository ..> TaskMaterialLink : stores
+    DocumentService "1" o-- "1" DocumentRepository : _documents
+    DocumentService "1" o-- "1" DocumentFileStore : _files
+    DocumentService "1" o-- "1" TaskRepository : _tasks
+    DocumentService "1" o-- "0..1" DocumentLinker : _linker
+    DocumentService ..> DocumentFile : open_file() returns
+    DocumentLinker "1" o-- "1" DocumentRepository : _documents
+    DocumentLinker "1" o-- "1" TaskRepository : _tasks
+    DocumentLinker "1" o-- "1" TextEmbedder : _embedder
+    EventListener <|.. DocumentLinkListener
+    DocumentLinkListener "1" o-- "1" DocumentLinker : _linker
+```
+
+| Relationship | Kind | Why this kind | Where |
+|---|---|---|---|
+| `DocumentFileStore <\|.. SupabaseDocumentFileStore`, `<\|.. InMemoryDocumentFileStore` | Realization | The Supabase adapter keeps each file in one private Storage bucket at `{user_id}/{source_id}` (created on first use by `_ensure_bucket`, calls run off the event loop); the in-memory one keeps it in the shared store | `app/infrastructure/persistence/supabase_storage.py:47`, `in_memory.py:986` |
+| `DocumentService o--` the two document ports, `TaskRepository`, `DocumentLinker` | Aggregation | Injected by the container; the same repositories are shared with the rest of the family, and the same linker with the listener | `app/services/documents/service.py:44`, `app/container.py` |
+| `DocumentLinker o-- TextEmbedder` | Aggregation | The container's embedder, the one memories use; each topic and the file name's subject are compared with a task title, linked at cosine 0.52 | `app/services/documents/linker.py:71` |
+| `EventListener <\|.. DocumentLinkListener`, `o-- DocumentLinker` | Realization, aggregation | Subscribed to `DraftAccepted`: runs after the atomic accept has committed, and logs a failure instead of raising it into the accept | `app/services/documents/linker.py:169`, `app/container.py:181` |
+| `DocumentService ..> DocumentFile` | Dependency | `open_file` returns the bytes, their content type and a safe name to offer them under, and keeps nothing | `app/services/documents/service.py:36` |
 
 ---
 
@@ -1632,7 +1773,7 @@ classDiagram
 | `Trigger ..>` context, draft, outcome, `ConsentPolicy`, `SuggestionRepository` | Dependency | All arrive as parameters of `run` or are returned by it; a trigger stores none of them | `anticipation.py:353-421` |
 | `SuggestionDraft *-- ProactiveAction : action` | Composition | `build_suggestion` creates the action for this draft; it is serialised into the stored suggestion (`to_payload`) and rebuilt on accept | `anticipation.py:259-270`, `398` |
 | Triggers `o--` ports, `PatternService`, `ActionFactory` | Aggregation | Constructor-injected, shared with the service and container | `triggers.py:99-118`, `315-325` |
-| `AnticipationService *-- "*" Trigger : _triggers` | Composition | The container creates each trigger only to register it; the service is its only holder | `app/container.py:188-196`, `service.py:189-191` |
+| `AnticipationService *-- "*" Trigger : _triggers` | Composition | The container creates each trigger only to register it; the service is its only holder | `app/container.py:208-216`, `service.py:189-191` |
 | `AnticipationService *-- UserLocks : _locks` | Composition | Created in its constructor; serialises one user's trigger runs | `service.py:180` |
 | `AnticipationScheduler o-- AnticipationService`, `o-- Sweep` | Aggregation | Handed in by the lifespan; the container owns them | `app/main.py:155-160` |
 | `AnticipationListener *-- PerUserSingleFlight : _flight` | Composition | Created in its constructor; one background run per user | `triggers.py:412-415` |
@@ -1936,7 +2077,7 @@ classDiagram
 | `ConversationMemoryService *-- SummaryFilter`, `*-- SinceLastSpoke`, `*-- UserLocks` | Composition | All three are created in its constructor and live with it | `app/services/memory/conversation_memory.py:208-214` |
 | `SinceLastSpoke o-- SummaryFilter : _summaries` | Aggregation | It receives the filter its owner created, which the owner also uses | `conversation_memory.py:208-212`, `since_last_spoke.py:60-75` |
 | `SinceLastSpoke o-- "0..1" MemoryService`, `o-- "0..1" SuggestionRepository` | Aggregation, optional | Without them it only checks for blame and counts nothing | `since_last_spoke.py:67-75` |
-| `StatedRules o-- ConstraintRepository`, `o-- MemoryService` | Aggregation | Keeps a stated rule and the memory of stating it together: letting go of one lets go of both | `stated_rules.py:62-67`, `app/container.py:236-237` |
+| `StatedRules o-- ConstraintRepository`, `o-- MemoryService` | Aggregation | Keeps a stated rule and the memory of stating it together: letting go of one lets go of both | `stated_rules.py:62-67`, `app/container.py:256-257` |
 
 ### 8.2 PEARL patterns, the focus profile and energy
 
@@ -2067,13 +2208,13 @@ classDiagram
 
 | Relationship | Kind | Why this kind | Where |
 |---|---|---|---|
-| `PatternService *-- "1..*" PatternDetector` | Composition | `default_pattern_detectors()` creates the four detectors for this service only; it copies them into its own list and indexes them by name | `app/container.py:66-73`, `144-147`, `patterns.py:419-420` |
+| `PatternService *-- "1..*" PatternDetector` | Composition | `default_pattern_detectors()` creates the four detectors for this service only; it copies them into its own list and indexes them by name | `app/container.py:70-77`, `154-157`, `patterns.py:419-420` |
 | `PatternDetector <\|-- four detectors` | Inheritance | The base is abstract (one abstract method, `detect`) with concrete default `insight`, `noticed`, `text_for_key`; a detector owns its key, words and planning use | `patterns.py:148-185`, `187`, `229`, `275`, `315` |
 | `PatternService o--` ports and `EventBus` | Aggregation | Injected; shared with other services | `patterns.py:402-418` |
 | `PatternLook *-- PatternChange`, `*-- PatternView`; views and changes `*-- Pattern` | Composition | Value objects assembled for one look and returned together | `patterns.py:354-397` |
 | `PatternObserver *-- PerUserSingleFlight` | Composition | Created in its constructor: at most one PEARL run per user in flight | `patterns.py:706-708` |
-| `EnergyEstimator <\|.. HeuristicEnergyEstimator`, `HistoryEnergyEstimator` | Realization | Two interchangeable strategies; the container uses the learned one | `app/services/energy.py:31`, `67`, `app/container.py:152-158` |
-| `HistoryEnergyEstimator *-- HeuristicEnergyEstimator : _prior` | Composition | The container creates the heuristic only to be this estimator's prior | `container.py:152-158`, `energy.py:70-83` |
+| `EnergyEstimator <\|.. HeuristicEnergyEstimator`, `HistoryEnergyEstimator` | Realization | Two interchangeable strategies; the container uses the learned one | `app/services/energy.py:31`, `67`, `app/container.py:162-168` |
+| `HistoryEnergyEstimator *-- HeuristicEnergyEstimator : _prior` | Composition | The container creates the heuristic only to be this estimator's prior | `container.py:162-168`, `energy.py:70-83` |
 
 ---
 
@@ -2084,6 +2225,19 @@ Every class drawn above, and the module it is imported from. The conformance tes
 | Class | Module |
 |---|---|
 | `AppContainer` | `app.container` |
+| `IngestedDocument` | `app.domain.entities` |
+| `TaskMaterialLink` | `app.domain.entities` |
+| `StoredFile` | `app.domain.entities` |
+| `DocumentRepository` | `app.domain.ports` |
+| `DocumentFileStore` | `app.domain.ports` |
+| `SupabaseDocumentRepository` | `app.infrastructure.persistence.supabase_repos` |
+| `InMemoryDocumentRepository` | `app.infrastructure.persistence.in_memory` |
+| `SupabaseDocumentFileStore` | `app.infrastructure.persistence.supabase_storage` |
+| `InMemoryDocumentFileStore` | `app.infrastructure.persistence.in_memory` |
+| `DocumentService` | `app.services.documents.service` |
+| `DocumentFile` | `app.services.documents.service` |
+| `DocumentLinker` | `app.services.documents.linker` |
+| `DocumentLinkListener` | `app.services.documents.linker` |
 | `Settings` | `app.core.settings` |
 | `Exception` | `builtins` |
 | `UserProfile` | `app.domain.entities` |
@@ -2301,7 +2455,7 @@ These are the places where the code cannot be drawn faithfully as a class diagra
 | The three cognitive modules (`planning_module`, `research_agent`, `knowledge_module`) | They are `ModuleDefinition` instances, not classes (section 6.2). |
 | `PreCloudLLMRedactor` realizing `Redactor` | `Redactor` is a `typing.Protocol`; the match is structural, so a realization arrow would not be a true `issubclass`. |
 | Process-wide singletons: the hook pipeline (`get_hooks()`, `app/orchestrator/hooks.py:142-150`), the installed LLM chain (`set_chain` / `get_chain`, `app/infrastructure/llm/factory.py:59-79`, `app/core/model_router.py:160-171`), the module registry (`app/modules/__init__.py:9`), the turn-lock registry (`app/services/turn_locks.py:37`) | Module-level state, not fields of any object, so no arrow can show them. `02-architecture.md` lists them as process-local state. |
-| `Settings`' five nested records (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `app/core/settings.py:13-68`) | Plain frozen dataclasses of configuration values, built once by `Settings.from_config`; drawing them adds nothing to the design. All 22 `AppContainer` fields are drawn in the overview. |
+| `Settings`' six nested records (`TaskSettings`, `MemorySettings`, `ConversationSettings`, `FocusSettings`, `AnticipationSettings`, `DocumentSettings`, `app/core/settings.py:13-78`) | Plain frozen dataclasses of configuration values, built once by `Settings.from_config`; drawing them adds nothing to the design. All 24 `AppContainer` fields are drawn in the overview. |
 | Private helpers (`_Move`, `_Backoff`, `_Settled`, `_Brief`, `_Entry`, `_PrimaryHold`), API request/response models, frame models (`PhaseFrame`, `StepFrame`, ...), and the analytical services (`workspace_builder`, `voice_of_jarvis`, the OR-Tools `JarvisScheduler`) | Out of scope for the LLD diagrams; `07-api-design.md` covers the API models and the frame catalogue. |
 | Types | `Literal[...]` is drawn as `str`; generics with a comma (`dict[str, X]`, `tuple[int, int]`) are drawn without parameters, because Mermaid cannot render them. |
 

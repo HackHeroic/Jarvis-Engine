@@ -30,7 +30,7 @@ This document is the high-level design of the Jarvis backend at commit `e76bff9`
 | Core helpers | `app/core/` | `route_llm_call` (`model_router.py:347`), `UserModel` facade, the module framework, the observation loop, settings and config, the CP-SAT `JarvisScheduler` (`app/core/or_tools/solver.py:54`) | domain; `model_router.py` alone may import infrastructure (section 2) |
 | Domain | `app/domain/` | Entities and transition tables (`entities.py`), ports (`ports.py`), events and `EventBus` (`events.py`), anticipation (`Trigger`, `ConsentPolicy`, `ProactiveAction`; `anticipation.py`), the error hierarchy (`errors.py`) | the standard library and Pydantic only |
 | Infrastructure | `app/infrastructure/` | `persistence/`: the Supabase and in-memory repository families and `RepositoryFactory`; `llm/`: the local, Claude and Gemini adapters, the decorators, the fallback chain and `LLMProviderFactory`; `embedding.py`: `MiniLMEmbedder` | domain |
-| Composition root | `app/container.py`, `app/main.py` (lifespan) | `AppContainer.build` (`container.py:103-239`) chooses the repository family, creates the event bus and subscribes its listeners, builds and installs the LLM chain, and wires every service; the lifespan (`main.py:44-182`) opens the checkpointer, compiles the graph, builds the container and starts the scheduler | everything |
+| Composition root | `app/container.py`, `app/main.py` (lifespan) | `AppContainer.build` (`container.py:109-265`) chooses the repository family, creates the event bus and subscribes its listeners, builds and installs the LLM chain, and wires every service; the lifespan (`main.py:44-182`) opens the checkpointer, compiles the graph, builds the container and starts the scheduler | everything |
 | Shared schemas | `app/schemas/` | Request, response and SSE frame models shared by the API and the services (`chat_stream.py`) | domain |
 
 The class-level view of every layer is in `03-class-diagrams.md`.
@@ -52,23 +52,23 @@ The rule, in one sentence: **dependencies point inward, toward the domain; only 
 | `test_layering__plan_2_and_plan_3_code__is_on_no_allow_list` (`:248`) | The code written in Plan 2 (`services/anticipation/`, `services/memory/`, `domain/anticipation.py`, `infrastructure/embedding.py`, `infrastructure/llm/messages.py`, `services/user_model_service.py`) and Plan 3 (`services/chat_turn/`, `services/planning/scheduling.py` and `services.py`, `core/settings.py`, `api/sse.py`, `api/request_limits.py`, `schemas/chat_stream.py`, `errors.py` and `schedule.py`) appears on no allow-list, and every guarded path exists | — |
 | `test_llm_calls__outside_the_transport__go_through_route_llm_call` (`:408`) | Nothing outside the LiteLLM transport and `app/infrastructure/llm/` calls `hybrid_route_query`, `gemini_primary_route` or `local_primary_route` directly (which would skip the chain, the PII gate and the ledger) | `_LEGACY_LLM_CALLS_ALLOWED = {}` (`:354`) |
 | `test_web_search__only_the_shared_search_helper__calls_it` (`:415`) | Only one function calls Gemini web search | `("services/analytical/workspace_builder.py", "_search_web")` — "the shared search helper: PII gate first, metered, WebSearchUnavailableError" (`:362-366`) |
-| `test_layering__no_raw_table_calls_outside_the_allow_list` (`:497`) | No `.table(` call in `api`, `services`, `core`, `modules`, `orchestrator` except the documented leftovers | the 8 entries below |
-| `test_layering__allow_lists__are_exactly_the_documented_leftovers` (`:518`) | Every allow-list above is exactly the set written here: it can only shrink | — |
+| `test_layering__no_raw_table_calls_outside_the_allow_list` (`:493`) | No `.table(` call in `api`, `services`, `core`, `modules`, `orchestrator` except the documented leftovers | the 6 entries below |
+| `test_layering__allow_lists__are_exactly_the_documented_leftovers` (`:514`) | Every allow-list above is exactly the set written here: it can only shrink | — |
 
-The eight raw-table leftovers (`tests/test_layering.py:451-466`), each with the reason the test records:
+The six raw-table leftovers (`tests/test_layering.py:451-462`), each with the reason the test records:
 
 | File | Reason in the allow-list |
 |---|---|
-| `services/analytical/workspace_builder.py` | `task_workspaces` cache (decision 10); its `user_tasks` reads need `topic_keywords` and `implementation_intention`, which the `Task` entity does not carry; `task_materials` has no repository yet |
+| `services/analytical/workspace_builder.py` | `task_workspaces` cache (decision 10); its `user_tasks` reads need `topic_keywords` and `implementation_intention`, which the `Task` entity does not carry; its chunk lookup reads `task_materials` itself (module functions the container does not build) |
 | `services/user_preferences.py` | `learning_style` read (decision 10) |
 | `services/chat_history.py` | Plan 3 cut (Task 6): no repository yet for `chat_sessions` / `chat_messages` |
 | `api/v1/endpoints/sessions.py` | Plan 3 cut: `chat_sessions` |
-| `api/v1/endpoints/documents.py` | Plan 3 cut: `ingested_documents` / `task_materials` |
 | `api/v1/endpoints/ingestion.py` | Plan 3 cut: `pending_calendar_updates` |
-| `services/extraction/orchestrator.py` | Plan 3 cut: `pending_calendar_updates` / `ingested_documents` |
-| `services/extraction/task_material_linker.py` | Plan 3 cut: `task_materials` |
+| `services/extraction/orchestrator.py` | Plan 3 cut: `pending_calendar_updates` |
 
-`tests/test_injection.py` adds two related rules: the old runtime registry (`app.core.runtime`, `set_container`, `get_db`, ...) is gone and imported nowhere (`test_runtime_registry__gone_and_imported_nowhere`, `:65`), and the services the container builds read their settings from the composition root, never from `app.core.config` (`test_container_built_services__import_no_config_module`, `:675`).
+Documents and their task links left the list when they gained a repository (`DocumentRepository`, with `DocumentFileStore` for the uploaded files): the documents routes go through `DocumentService`, and the linking through `DocumentLinker`.
+
+`tests/test_injection.py` adds two related rules: the old runtime registry (`app.core.runtime`, `set_container`, `get_db`, ...) is gone and imported nowhere (`test_runtime_registry__gone_and_imported_nowhere`, `:65`), and the services the container builds read their settings from the composition root, never from `app.core.config` (`test_container_built_services__import_no_config_module`, `:676`).
 
 **What the rule does not enforce.** No test forbids `services → orchestrator` or `services → modules`: `ChatTurnService` imports the checkpointer and state (`app/services/chat_turn/service.py:25-26`), `chat_turn/context.py` imports `is_trivial_input` from the graph (`:10`), and `chat_turn/reply.py` imports `app.modules.conversation` (`:15`). This matches the spec's HLD, where the application layer drives the orchestrator (spec §5, `APP --> ORCH`), but it is a convention, not a checked rule. `app/core/model_router.py` imports `app.orchestrator.hooks` (`:36`), and `UserModel.get_estimated_energy` imports `app.services.energy` inside the method (`app/core/user_model.py:113-119`).
 
@@ -107,7 +107,7 @@ flowchart TB
     end
 
     subgraph DOMAIN["Domain · app/domain (stdlib + Pydantic only)"]
-        PORTS["Ports (ABCs): 11 repositories · LLMProvider · RetryPolicy · TextEmbedder · EnergyEstimator · DraftPlanner · Sweep"]
+        PORTS["Ports (ABCs): 12 repositories · DocumentFileStore · LLMProvider · RetryPolicy · TextEmbedder · EnergyEstimator · DraftPlanner · Sweep"]
         ENT["Entities + transition tables"]
         EVT["Domain events + EventBus"]
         ANT["Trigger · ConsentPolicy · ProactiveAction"]
@@ -208,7 +208,7 @@ sequenceDiagram
 | Finish | The reply is saved; compaction starts in the background; the `complete` payload is validated against `ChatCompletePayload` before it is sent. A `JarvisError` becomes an error frame with its own message; anything else is logged with the request id and sent as `internal_error` | `service.py:184-226` |
 | Clean up | Shielded from cancellation: a client disconnect cancels the pump task and waits for it before the lock is released; the response's background task resets the context variables | `service.py:224-237`, `72-77` |
 
-Planning never writes the user's tasks. It ends in a draft (`DraftService.propose`); tasks are written only when the user accepts, by `DraftService.accept` → `DraftRepository.accept_atomic` → the `accept_draft()` SQL function, one transaction (`app/services/draft_service.py:185-225`, `app/domain/ports.py:211-222`).
+Planning never writes the user's tasks. It ends in a draft (`DraftService.propose`); tasks are written only when the user accepts, by `DraftService.accept` → `DraftRepository.accept_atomic` → the `accept_draft()` SQL function, one transaction (`app/services/draft_service.py:185-226`, `app/domain/ports.py:216-227`).
 
 ### 4.2 The background tick: sweeps, then triggers
 
@@ -251,7 +251,7 @@ sequenceDiagram
 
 | Point | Detail | Where |
 |---|---|---|
-| Sweeps first | `slot_passed` (1 min: a pending task whose slot passed becomes `missed`), `session_summary` (5 min), `memory_decay` (24 h), `checkpoint_retention` (24 h). Each sweep is owned by the subsystem whose data it maintains | `app/services/anticipation/scheduler.py:71-81`, `app/container.py:215-219`, `app/main.py:148` |
+| Sweeps first | `slot_passed` (1 min: a pending task whose slot passed becomes `missed`), `session_summary` (5 min), `memory_decay` (24 h), `checkpoint_retention` (24 h). Each sweep is owned by the subsystem whose data it maintains | `app/services/anticipation/scheduler.py:71-81`, `app/container.py:235-239`, `app/main.py:148` |
 | Failure isolation | A sweep's, a trigger's or a user's failure is logged by exception type (never its text) and the tick carries on; a failing trigger backs off (1 minute, doubling, at most 30) | `scheduler.py:49-97`, `app/services/anticipation/service.py:233-285` |
 | No overlap | Ticks hold `_tick_lock`; one user's trigger runs hold that user's `UserLocks` entry | `scheduler.py:46`, `57`, `service.py:180` |
 | Once a day | `Trigger.already_done` asks `SuggestionRepository.exists_today` on the user's clock; the service also remembers a settled day | `app/domain/anticipation.py:423-427`, `service.py:182-183` |
@@ -260,16 +260,16 @@ sequenceDiagram
 
 ### 4.3 Background observers
 
-Domain events decouple who records an outcome from who learns from it (`app/domain/events.py:78-109`). A listener's failure is logged and never reaches the publisher.
+Domain events decouple who records an outcome from who learns from it (`app/domain/events.py:81-112`). A listener's failure is logged and never reaches the publisher.
 
 | Event | Listener | What it does in the background | Where |
 |---|---|---|---|
-| `LLMCallCompleted` (every metered model call) | `UsageLedger` | Writes `llm_usage_events` in a background task, at most `MAX_IN_FLIGHT_WRITES` = 8 at once (more are counted as dropped) | `app/services/usage_ledger.py:29-63`, `app/container.py:133` |
-| `TaskCompleted`, `TaskSkipped`, `TaskMissed` | `PatternObserver` | Runs PEARL for that user: one run in flight per user, and one more if outcomes arrived meanwhile (`PerUserSingleFlight`) | `app/services/memory/patterns.py:697-724`, `container.py:148-150` |
-| `PatternDetected` | `AnticipationListener` | If the detector says the pattern may become a rule, runs the `pattern_rule` trigger for that user (a forced run) | `app/services/anticipation/triggers.py:401-436`, `container.py:197-198` |
+| `LLMCallCompleted` (every metered model call) | `UsageLedger` | Writes `llm_usage_events` in a background task, at most `MAX_IN_FLIGHT_WRITES` = 8 at once (more are counted as dropped) | `app/services/usage_ledger.py:29-63`, `app/container.py:143` |
+| `TaskCompleted`, `TaskSkipped`, `TaskMissed` | `PatternObserver` | Runs PEARL for that user: one run in flight per user, and one more if outcomes arrived meanwhile (`PerUserSingleFlight`) | `app/services/memory/patterns.py:697-724`, `container.py:158-160` |
+| `PatternDetected` | `AnticipationListener` | If the detector says the pattern may become a rule, runs the `pattern_rule` trigger for that user (a forced run) | `app/services/anticipation/triggers.py:401-436`, `container.py:217-218` |
 | (after each turn) | `ConversationMemoryService.compact_in_background` | Summarises older messages once the window is too long; tracked, never awaited by the turn | `app/services/chat_turn/service.py:205-207` |
 
-Shutdown order (`app/main.py:174-182`): stop the scheduler (a tick may still be recording model calls), then `AppContainer.shutdown` (PEARL runs, pattern proposals and compactions get a short grace, then are cancelled; `container.py:241-247`), then let the usage ledger drain for up to 2 seconds, then close the checkpointer.
+Shutdown order (`app/main.py:174-182`): stop the scheduler (a tick may still be recording model calls), then `AppContainer.shutdown` (PEARL runs, pattern proposals and compactions get a short grace, then are cancelled; `container.py:267-273`), then let the usage ledger drain for up to 2 seconds, then close the checkpointer.
 
 ---
 
@@ -307,7 +307,7 @@ flowchart LR
 | Node | Configuration | Where |
 |---|---|---|
 | FastAPI process | `uvicorn app.main:app --port 8000`; CORS allows `localhost:3000` / `3001` only | `app/main.py:185-214` |
-| Supabase | `SUPABASE_URL`, service key; the backend uses the service-role key, so every repository query filters by `user_id`. Unreachable at startup, the container falls back to the in-memory family and logs that nothing is persisted | `app/core/config.py:19`, `app/container.py:124-128` |
+| Supabase | `SUPABASE_URL`, service key; the backend uses the service-role key, so every repository query filters by `user_id`. Unreachable at startup, the container falls back to the in-memory family and logs that nothing is persisted | `app/core/config.py:19`, `app/container.py:131-139` |
 | LangGraph checkpoints | SQLite file, one thread per `user_id:session_id`; transient keys (container, user model, queues, file content) are scrubbed before saving; pruned daily to the newest 20 per thread | `config.py:164-167`, `app/orchestrator/checkpoint.py:60-73`, `271-299` |
 | LM Studio | `LOCAL_LLM_URL`, default `http://127.0.0.1:1234/v1`; the lifespan detects the loaded Gemma models and turns on `GEMINI_PRIMARY` (cloud-first) when none answers | `config.py:24`, `app/main.py:85-108` |
 | Claude | `CLAUDE_MODEL`, default `claude-sonnet-5-5`; only in the chain when an Anthropic credential is configured | `config.py:51`, `app/infrastructure/llm/factory.py:52-53` |
@@ -331,7 +331,7 @@ Some state lives only in the memory of the one process. None of it is the source
 | Process-wide singletons: hooks, installed LLM chain, module registry, shared Anthropic client, habit translation cache | `app/orchestrator/hooks.py:142`, `app/infrastructure/llm/factory.py:59`, `app/modules/__init__.py:9`, `app/infrastructure/llm/claude.py:60`, `app/services/analytical/habit_translator.py:19` | Built once, read by every request |
 | Per-request context variables: cloud flag, usage attribution, served models | `app/core/model_router.py:39-51`, `app/infrastructure/llm/decorators.py:239-248` | Concurrent requests do not see each other's settings |
 
-**Why this is acceptable.** Jarvis is a personal intelligence served by one process to one person, or a handful during a demo; the deployment above has exactly one uvicorn worker and one event loop. The invariants that matter for correctness are held by Postgres, not by these structures: a draft is accepted in one SQL transaction under a row lock, so a second accept finds it closed (`ports.py:211-222`); suggestion and memory status changes are compare-and-set writes (`ports.py:357-375`, `483-501`); `exists_today` reads the stored suggestions; `(user_id, task_id)` is unique. If the process restarts, the in-memory structures are rebuilt empty and the worst outcome is repeated work (a trigger re-evaluated, a summary retried), never lost or duplicated user data. **What would have to change for more than one process:** the turn locks and the PRIMARY lock would need to move to Postgres advisory locks or a shared lock service, the scheduler would need a single leader (or each tick would need a database claim per user), and the singletons would need to be built per worker (they already are, since each worker runs its own lifespan).
+**Why this is acceptable.** Jarvis is a personal intelligence served by one process to one person, or a handful during a demo; the deployment above has exactly one uvicorn worker and one event loop. The invariants that matter for correctness are held by Postgres, not by these structures: a draft is accepted in one SQL transaction under a row lock, so a second accept finds it closed (`ports.py:216-227`); suggestion and memory status changes are compare-and-set writes (`ports.py:362-380`, `488-506`); `exists_today` reads the stored suggestions; `(user_id, task_id)` is unique. If the process restarts, the in-memory structures are rebuilt empty and the worst outcome is repeated work (a trigger re-evaluated, a summary retried), never lost or duplicated user data. **What would have to change for more than one process:** the turn locks and the PRIMARY lock would need to move to Postgres advisory locks or a shared lock service, the scheduler would need a single leader (or each tick would need a database claim per user), and the singletons would need to be built per worker (they already are, since each worker runs its own lifespan).
 
 ---
 
@@ -411,7 +411,7 @@ Sources: the spec's decision log (`docs/superpowers/specs/2026-11-14-capstone-ll
 | Stay on Supabase cloud; the in-memory family for tests and for running when Supabase is down (ADR-4) | Least change; the in-memory family demonstrates LSP and DIP | Local Postgres: no Docker on this machine, and supabase-py speaks PostgREST |
 | The learned focus profile is a soft solver objective, below TMT and hard rules, behind a flag (ADR-12; Plan 2 ruling to retune its weight) | "Understands you" changes the actual schedule; the flag and tests guard the core loop | A hard constraint (too brittle); brief-only (hollow) |
 | The plan's day is anchored to the user's timezone (Plan 1 ruling) | "Never before 11 AM" must mean 11 AM local | 08:00 UTC |
-| Drop the `CognitiveModule` registry and the sessions / documents / calendar repositories from Plan 3 (Tasks 9 and 6) | Examiner-visible value was in v1 removal, the thin router, one persistence path and the typed API; time was short | Doing all of Plan 3: the cost is the eight raw-table leftovers and a hand-written routing table, both disclosed |
+| Drop the `CognitiveModule` registry and the sessions / documents / calendar repositories from Plan 3 (Tasks 9 and 6) | Examiner-visible value was in v1 removal, the thin router, one persistence path and the typed API; time was short | Doing all of Plan 3: the cost was eight raw-table leftovers (six since documents gained their repository) and a hand-written routing table, both disclosed |
 | Adopt Claude Code's ideas (consent chain with typed reasons, retry with backoff, usage ledger), never its code (ADR-8) | Defensible patterns without an integrity or IP risk | Porting its TypeScript |
 
 ---
@@ -424,11 +424,11 @@ The code wins; these are the differences an examiner reading the spec would noti
 |---|---|
 | `ConsentService` in the services layer (§5) | `ConsentPolicy`, a domain class (`app/domain/anticipation.py:218`), held by `AnticipationService` |
 | `CognitiveModule`, `Step`, `StepExecutor`, `FunctionStep` (§6.2) | `ModuleDefinition`, `ModuleStep`, `ConditionalEdge`, `ModuleRegistry` (`app/core/module_framework.py`); the intent-to-module table is still hand-written (`app/orchestrator/routing.py:12-28`). Dropped by Plan 3 ruling |
-| `TriggerFactory`, `PreTaskPrepTrigger`, `DeadlineRiskTrigger`, `TelemetryListener` (§6.2-6.3) | Not built. Two triggers exist (`MorningBriefTrigger`, `PatternRuleTrigger`); `DraftAccepted` and `DeadlineMissed` have no production listener |
+| `TriggerFactory`, `PreTaskPrepTrigger`, `DeadlineRiskTrigger`, `TelemetryListener` (§6.2-6.3) | Not built. Two triggers exist (`MorningBriefTrigger`, `PatternRuleTrigger`); `DeadlineMissed` has no production listener (`DraftAccepted` has `DocumentLinkListener`) |
 | `LLMProvider` has `complete`, `stream`, `structured` (§6.2) | `complete(req)` returns a schema instance when `req.response_schema` is set; there is no separate `structured` |
 | Hooks aggregate deny > ask > allow regardless of order (§6.3) | `ActionHooks.execute` returns the first DENY or ASK it meets (`app/orchestrator/hooks.py:41-56`) |
 | `JarvisScheduler` and `ChromaArchive` in infrastructure (§5) | `JarvisScheduler` is in `app/core/or_tools/solver.py:54`; there is no `ChromaArchive` class (`app/utils/chroma_client.py` holds the client) |
-| Small role ports such as `TaskReader` / `TaskWriter` (§6.4) | One `TaskRepository` with reads and the status writes (`app/domain/ports.py:59-123`) |
+| Small role ports such as `TaskReader` / `TaskWriter` (§6.4) | One `TaskRepository` with reads and the status writes (`app/domain/ports.py:64-128`) |
 | "1 Goal composes 1..* Task" (§6.1) | `Task.goal_id` names the goal; no `Goal` object holds tasks |
 
 ---

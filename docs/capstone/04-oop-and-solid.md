@@ -51,7 +51,7 @@ This document shows where the four pillars of object-oriented programming (encap
         self._last: ModePolicyRule = rules[-1]
 ```
 
-**Example 3 — a memory validates itself.** Only a forgotten memory may have empty words. `app/domain/entities.py:502-506`:
+**Example 3 — a memory validates itself.** Only a forgotten memory may have empty words. `app/domain/entities.py:546-550`:
 
 ```python
     @model_validator(mode="after")
@@ -63,7 +63,7 @@ This document shows where the four pillars of object-oriented programming (encap
 
 **Would break:** `tests/test_domain.py::test_draft_transition__accepted_to_accepted__raises_invalid_state_transition`, `tests/test_consent.py::test_consent_policy__last_rule_not_mode__value_error`, `tests/test_domain.py::test_memory__blank_content__allowed_only_when_forgotten`.
 
-**Where we fall short:** the entities are ordinary, mutable Pydantic models. Nothing stops code from writing `draft.status = DraftStatus.ACCEPTED` and skipping `transition`; even `draft.status = "accepted?"` is accepted, because `DraftSchedule` sets neither `frozen` nor `validate_assignment` (`app/domain/entities.py:333-383`, checked by hand: the assignment goes through). Why it is still safe in practice: every status that is stored is checked again where it is written (`accept_atomic` re-checks under the row lock, `app/domain/ports.py:211-222`; suggestion and memory status writes are compare-and-set, `ports.py:357-375`, `483-501`). The fix would be `model_config = ConfigDict(frozen=True)` on the entities; it was not done because several services build an entity and then adjust a field before saving it. Similarly, the task outcome table (`_Move`) lives in the service, not the domain (`app/services/task_service.py:65-84`).
+**Where we fall short:** the entities are ordinary, mutable Pydantic models. Nothing stops code from writing `draft.status = DraftStatus.ACCEPTED` and skipping `transition`; even `draft.status = "accepted?"` is accepted, because `DraftSchedule` sets neither `frozen` nor `validate_assignment` (`app/domain/entities.py:333-383`, checked by hand: the assignment goes through). Why it is still safe in practice: every status that is stored is checked again where it is written (`accept_atomic` re-checks under the row lock, `app/domain/ports.py:216-227`; suggestion and memory status writes are compare-and-set, `ports.py:362-380`, `488-506`). The fix would be `model_config = ConfigDict(frozen=True)` on the entities; it was not done because several services build an entity and then adjust a field before saving it. Similarly, the task outcome table (`_Move`) lives in the service, not the domain (`app/services/task_service.py:65-84`).
 
 ---
 
@@ -71,7 +71,7 @@ This document shows where the four pillars of object-oriented programming (encap
 
 **Here:** callers see a small interface that says what is done, never how: a service asks a port for "the user's pending tasks" or "a completion", not for a PostgREST query or an HTTP call to LM Studio.
 
-**Example 1 — the language-model port.** Three methods (`is_available`, `complete`, `stream`), no provider, no transport, no retry; two of them, `app/domain/ports.py:719-725`:
+**Example 1 — the language-model port.** Three methods (`is_available`, `complete`, `stream`), no provider, no transport, no retry; two of them, `app/domain/ports.py:800-806`:
 
 ```python
     @abstractmethod
@@ -158,7 +158,7 @@ class _ProviderDecorator(LLMProvider):
         return self._inner.name
 ```
 
-**Example 3 — implementation from one base, interface from another.** Each Supabase repository inherits shared plumbing (the client, running a query off the event loop, translating failures) and, separately, its port. `app/infrastructure/persistence/supabase_repos.py:158-166`, then `:176-177`:
+**Example 3 — implementation from one base, interface from another.** Each Supabase repository inherits shared plumbing (the client, running a query off the event loop, translating failures) and, separately, its port. `app/infrastructure/persistence/supabase_repos.py:165-173`, then `:176-177`:
 
 ```python
 class _SupabaseRepository:
@@ -307,7 +307,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
         """Return ``[local, claude, *extra_cloud, gemini]``, each wrapped for its location.
 ```
 
-**Example 3 — new action kinds and triggers are registered, not coded in.** `ActionFactory.register` maps a kind to a builder (`app/services/anticipation/service.py:90-92`); the container registers each trigger with `AnticipationService.register_trigger` (`app/container.py:188-196`):
+**Example 3 — new action kinds and triggers are registered, not coded in.** `ActionFactory.register` maps a kind to a builder (`app/services/anticipation/service.py:90-92`); the container registers each trigger with `AnticipationService.register_trigger` (`app/container.py:208-216`):
 
 ```python
     def register(self, kind: str, build: Callable[[dict], ProactiveAction]) -> None:
@@ -325,7 +325,7 @@ class SupabaseTaskRepository(_SupabaseRepository, TaskRepository):
 
 **Here:** any implementation of a port can stand in for any other without the caller noticing: the in-memory and Supabase repositories, the two energy estimators, the real and the null event bus.
 
-**Example 1 — one contract suite, two families.** Every repository test runs twice, once per family. `tests/test_repository_contracts.py:77-81`:
+**Example 1 — one contract suite, two families.** Every repository test runs twice, once per family. `tests/test_repository_contracts.py:83-87`:
 
 ```python
 @pytest.fixture(params=["in_memory", "supabase_fake"])
@@ -335,7 +335,7 @@ def repos(request, memory_store, fake_client) -> Repositories:
     return RepositoryFactory.supabase(fake_client)
 ```
 
-**Example 2 — the null event bus.** `NullEventBus` honours `publish` by doing nothing, so code built without a container (tests, scripts, the lazy default chain in `app/core/model_router.py:169`) runs unchanged. `app/domain/events.py:112-116`:
+**Example 2 — the null event bus.** `NullEventBus` honours `publish` by doing nothing, so code built without a container (tests, scripts, the lazy default chain in `app/core/model_router.py:169`) runs unchanged. `app/domain/events.py:115-119`:
 
 ```python
 class NullEventBus(EventBus):
@@ -369,7 +369,7 @@ class NullEventBus(EventBus):
     energy: EnergyEstimator  # the learned focus profile the solver leans on
 ```
 
-**Example 2 — one-method ports.** `Sweep`, `TextEmbedder` and `EnergyEstimator` each have one abstract method; `UsageRepository` has two, `GoalRepository` three (`app/domain/ports.py:257-323`, `581-678`). `app/domain/ports.py:601-608`:
+**Example 2 — one-method ports.** `Sweep`, `TextEmbedder` and `EnergyEstimator` each have one abstract method; `UsageRepository` has two, `GoalRepository` three (`app/domain/ports.py:262-328`, `662-759`). `app/domain/ports.py:682-689`:
 
 ```python
 class Sweep(ABC):
@@ -399,7 +399,7 @@ class Sweep(ABC):
 
 **Would break:** `tests/test_injection.py::test_planning_nodes__read_planning_services_from_state__none_means_no_slots_no_focus_no_scan`, `tests/test_planning_replan.py::test_planning_state_out__habits_could_not_be_read__the_reply_leads_with_it`, and the interface-completeness check in `tests/test_design_conformance.py` (every abstract method of a port is drawn, and a port has no concrete methods).
 
-**Where we fall short:** the turn state is not segregated. `JarvisState` is one 44-key `TypedDict` that every top-level node receives (`app/orchestrator/state.py:31-118`), and the whole `AppContainer` rides in it under `container` (`app/services/chat_turn/context.py:63`), so any node can reach any service: inside a turn the container works like a service locator. Only the planning module projects its state; research and knowledge receive the full dict. Two ports are also wider than their clients need: `TaskRepository` mixes reads with the status writes (the spec's `TaskReader` / `TaskWriter` split was not made, `app/domain/ports.py:59-123`), and `MemoryRepository` has eight methods (`ports.py:400-501`).
+**Where we fall short:** the turn state is not segregated. `JarvisState` is one 44-key `TypedDict` that every top-level node receives (`app/orchestrator/state.py:31-118`), and the whole `AppContainer` rides in it under `container` (`app/services/chat_turn/context.py:63`), so any node can reach any service: inside a turn the container works like a service locator. Only the planning module projects its state; research and knowledge receive the full dict. Two ports are also wider than their clients need: `TaskRepository` mixes reads with the status writes (the spec's `TaskReader` / `TaskWriter` split was not made, `app/domain/ports.py:64-128`), and `MemoryRepository` has eight methods (`ports.py:405-506`).
 
 ---
 
@@ -407,7 +407,7 @@ class Sweep(ABC):
 
 **Here:** high-level policy (services, triggers, the planner) depends on ports in the domain; concrete infrastructure depends on the same ports; and exactly one place, the composition root, connects the two.
 
-**Example 1 — one place picks the repository family.** `app/container.py:124-128`:
+**Example 1 — one place picks the repository family.** `app/container.py:131-139`:
 
 ```python
         if supabase_client is not None:
@@ -431,7 +431,7 @@ class Sweep(ABC):
     ) -> None:
 ```
 
-**Example 3 — the anticipation layer depends on a planning abstraction.** `MorningBriefTrigger` needs a re-plan, so it takes the `DraftPlanner` port (`app/domain/ports.py:618-640`); the implementation that drives the LangGraph planning sub-graph lives in the modules layer (`PlanningGraphReplanner`, `app/modules/planning_replan.py:34`) and is injected by the container (`app/container.py:177`, `189-192`). `app/services/anticipation/triggers.py:99-108`:
+**Example 3 — the anticipation layer depends on a planning abstraction.** `MorningBriefTrigger` needs a re-plan, so it takes the `DraftPlanner` port (`app/domain/ports.py:699-721`); the implementation that drives the LangGraph planning sub-graph lives in the modules layer (`PlanningGraphReplanner`, `app/modules/planning_replan.py:34`) and is injected by the container (`app/container.py:197`, `209-212`). `app/services/anticipation/triggers.py:99-108`:
 
 ```python
     def __init__(
@@ -450,23 +450,23 @@ class Sweep(ABC):
 
 **Where we fall short:**
 
-- **Eight raw-table leftovers.** Eight files still call Supabase tables directly instead of through a port: `services/chat_history.py`, `api/v1/endpoints/sessions.py`, `api/v1/endpoints/documents.py`, `api/v1/endpoints/ingestion.py`, `services/extraction/orchestrator.py`, `services/extraction/task_material_linker.py` (no repositories yet for sessions, messages, documents, materials and pending calendar rows: Plan 3 Task 6 was dropped), plus `services/analytical/workspace_builder.py` and `services/user_preferences.py`. They are pinned by an allow-list that can only shrink (`tests/test_layering.py:451-466`, `505-524`). Because of them, `ChatTurnService` still takes a raw `db_client` for the chat history (`app/services/chat_turn/service.py:243-252`).
+- **Six raw-table leftovers.** Six files still call Supabase tables directly instead of through a port: `services/chat_history.py`, `api/v1/endpoints/sessions.py`, `api/v1/endpoints/ingestion.py`, `services/extraction/orchestrator.py` (no repositories yet for sessions, messages and pending calendar rows: Plan 3 Task 6 was dropped), plus `services/analytical/workspace_builder.py` and `services/user_preferences.py`. They are pinned by an allow-list that can only shrink (`tests/test_layering.py:451-462`, `514-531`); documents and their task links left it when they gained `DocumentRepository`. Because of them, `ChatTurnService` still takes a raw `db_client` for the chat history (`app/services/chat_turn/service.py:243-252`).
 - **One import of infrastructure from core.** `app/core/model_router.py` imports the chain, decorators and factory to install and read the process-wide chain (the one entry on `_INFRASTRUCTURE_IMPORTS_ALLOWED`, `tests/test_layering.py:146-151`).
-- **Process-wide singletons are still looked up.** The container is no longer looked up anywhere (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`), but three collaborators still are: the hook pipeline through `get_hooks()` (`app/core/module_framework.py:120`, `app/orchestrator/module_wrapper.py:21`, `app/services/analytical/workspace_builder.py:51`), the installed LLM chain through `get_chain()` (`app/core/model_router.py:160-171`), and the module registry (`app/modules/__init__.py:9`, read by `build_jarvis_graph`). Each is built once per process and is replaceable in tests (`set_chain`, `reset_chain`), but a caller cannot be handed a different one through its constructor. These are in-process guards and wiring that predate the restructure; moving them into the container is the next step.
+- **Process-wide singletons are still looked up.** The container is no longer looked up anywhere (`tests/test_injection.py::test_runtime_registry__gone_and_imported_nowhere`), but three collaborators still are: the hook pipeline through `get_hooks()` (`app/core/module_framework.py:120`, `app/orchestrator/module_wrapper.py:21`, `app/services/analytical/workspace_builder.py:52`), the installed LLM chain through `get_chain()` (`app/core/model_router.py:160-171`), and the module registry (`app/modules/__init__.py:9`, read by `build_jarvis_graph`). Each is built once per process and is replaceable in tests (`set_chain`, `reset_chain`), but a caller cannot be handed a different one through its constructor. These are in-process guards and wiring that predate the restructure; moving them into the container is the next step.
 
 ---
 
 ## 10. The ten largest source files
 
-Line counts at `c956a8f` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tail`); `planning_graph.py`, `graph.py`, `memory_service.py` and `workspace_builder.py` grew after `e76bff9` (1,008, 810, 627 and 531 lines there). The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
+Line counts at `c956a8f` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tail`); `planning_graph.py`, `graph.py`, `memory_service.py` and `workspace_builder.py` grew after `e76bff9` (1,008, 810, 627 and 531 lines there). `supabase_repos.py`, `in_memory.py` and `ports.py` are counted after the documents repositories were added. The code style rule asks to consider a split past about 200–300 lines (`.claude/rules/code-style.md`).
 
 | # | File | Lines | What it holds | What would be split next |
 |---|---|---|---|---|
-| 1 | `app/infrastructure/persistence/supabase_repos.py` | 1,027 | All eleven Supabase repositories and their shared base | One module per repository in a `persistence/supabase/` package, `_SupabaseRepository` in `base.py`; `RepositoryFactory` imports change, nothing else |
+| 1 | `app/infrastructure/persistence/supabase_repos.py` | 1,120 | All twelve Supabase repositories and their shared base | One module per repository in a `persistence/supabase/` package, `_SupabaseRepository` in `base.py`; `RepositoryFactory` imports change, nothing else |
 | 2 | `app/modules/planning_graph.py` | 1,015 | Every planning step (validate, constraints, habit translation, slot expansion, decomposition, fusion, solve, draft, infeasible ladder) and the module definition | A `modules/planning/` package: constraint steps, decomposition, solving and the horizon ladder, drafting, and the definition with `planning_state_in/out` (the dropped Plan 3 Task 9) |
-| 3 | `app/infrastructure/persistence/in_memory.py` | 880 | The in-memory store and all eleven in-memory repositories | Mirror the Supabase split, one module per repository |
+| 3 | `app/infrastructure/persistence/in_memory.py` | 1,010 | The in-memory store, all twelve in-memory repositories and the in-memory file store | Mirror the Supabase split, one module per repository |
 | 4 | `app/orchestrator/graph.py` | 846 | `build_jarvis_graph` plus the bodies of the top-level nodes (context, extraction, classification, draft actions, rule storage) | Keep only the wiring; move node bodies to `orchestrator/nodes/` (draft actions, understanding, rules) |
-| 5 | `app/domain/ports.py` | 737 | Eleven repository ports plus the LLM, retry, embedding, energy, planner and sweep ports | `ports/repositories.py`, `ports/llm.py`, `ports/learning.py`, re-exported from `ports/__init__.py` so imports stay valid |
+| 5 | `app/domain/ports.py` | 818 | Twelve repository ports, the document file store, plus the LLM, retry, embedding, energy, planner and sweep ports | `ports/repositories.py`, `ports/llm.py`, `ports/learning.py`, re-exported from `ports/__init__.py` so imports stay valid |
 | 6 | `app/services/memory/patterns.py` | 724 | The four detectors, `PatternService`, its view models and `PatternObserver` | `patterns/detectors.py` (the strategies), `patterns/service.py`, `patterns/observer.py` |
 | 7 | `app/domain/entities.py` | 701 | Every entity, enum and transition table | Entities by aggregate (planning, memory, anticipation, conversation, usage) and the transition tables in one `lifecycles.py` |
 | 8 | `app/services/memory/memory_service.py` | 639 | Memory lifecycle (remember, confirm, dismiss, forget, edit, fade) and recall | A `MemoryRecall` class for `recall` and `drop_suppressed`; the lifecycle stays in `MemoryService` |
@@ -487,7 +487,7 @@ Line counts at `c956a8f` (`git ls-files 'app/*.py' | xargs wc -l | sort -n | tai
 | OCP | Detectors, providers, triggers, actions added by registration | Modules still need edits to the routing table and graph |
 | LSP | One contract suite over two repository families | The chain widens `LLMProvider` with `skip_local` |
 | ISP | `PlanningServices`; one-method ports | 44-key turn state carrying the whole container |
-| DIP | One composition root; `test_layering.py` | 8 raw-table leftovers; three process-wide lookups |
+| DIP | One composition root; `test_layering.py` | 6 raw-table leftovers; three process-wide lookups |
 
 ---
 

@@ -1,6 +1,6 @@
 # 07 — API design
 
-Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 48 operations on 42 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `e76bff9` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
+Jarvis's backend is a FastAPI application. Every route sits under `/api/v1`, except `/` and `/health`. The running server documents 49 operations on 43 paths in `GET /openapi.json`, none deprecated. All user interaction goes through one entry point, `POST /api/v1/chat/stream`. It is a server-sent-events (SSE) stream: frames show the turn's progress, learning frames say what Jarvis remembered and noticed, and one typed `complete` frame closes the turn. The REST resources around it cover the other actions: accepting a proposed plan (a draft), recording what happened to a task, seeing and correcting what Jarvis remembers, letting Jarvis make the first move with consent (anticipation), and managing documents and conversations. Every failed request returns one error envelope, `{"error": {"code", "message", "details", "request_id"}}`, over HTTP and inside the stream. Every JSON route declares a typed response model, and the OpenAPI document gives the envelope as the 422, 4XX and 5XX response of every operation. This document is written from the code at commit `e76bff9` (now part of `main`) and checked against the live `/openapi.json`. Where the two disagree it says so. §11 lists where the design spec and the code differ.
 
 Owner: ______
 
@@ -25,7 +25,7 @@ Owner: ______
 
 ## 1. Layering
 
-A request passes through four layers, and each layer depends only on the one below it. `tests/test_layering.py` enforces the import direction: nothing below the API imports the API (`test_layering__nothing_below_the_api__imports_the_api`), and raw table calls are allowed only in eight listed files (`_RAW_TABLE_CALLS_ALLOWED`, `tests/test_layering.py:451-466`).
+A request passes through four layers, and each layer depends only on the one below it. `tests/test_layering.py` enforces the import direction: nothing below the API imports the API (`test_layering__nothing_below_the_api__imports_the_api`), and raw table calls are allowed only in six listed files (`_RAW_TABLE_CALLS_ALLOWED`, `tests/test_layering.py:451-462`).
 
 ```mermaid
 flowchart TB
@@ -51,7 +51,7 @@ flowchart TB
         MEM["InMemory repositories"]
     end
     DB[("Supabase Postgres via PostgREST, RPC accept_draft and match_memories")]
-    LEG["Raw-table leftovers: sessions, documents, pending calendar, chat history, workspace cache"]
+    LEG["Raw-table leftovers: sessions, pending calendar, chat history, workspace cache"]
 
     FE --> MW
     MW --> RT
@@ -81,16 +81,15 @@ flowchart TB
 | **Services** | Domain rules and transactions. Examples: `DraftService.accept` (atomic accept), `TaskService` (status compare-and-set plus one event), `MemoryService` (lifecycle), `AnticipationService` (triggers, consent, suggestions), `UserModelService` (the You page), `ChatTurnService` (one chat turn). | `app/services/` |
 | **Ports → adapters** | ABC repositories, each with a Supabase and an InMemory implementation under one contract suite. Every method takes `user_id` first. | `app/domain/ports.py`, `app/infrastructure/persistence/` |
 
-**Routes that follow the layering fully:** `memories`, `you`, `anticipation`, `drafts`, `tasks` (complete, skip, list) and `habits` (trackers and rules).
+**Routes that follow the layering fully:** `memories`, `you`, `anticipation`, `drafts`, `tasks` (complete, skip, list), `habits` (trackers and rules) and `documents` (list, file, delete through `DocumentService`; the chunks read goes to ChromaDB, not a table).
 
-**Routes that still reach the database directly.** These files are on the raw-table allow-list (`tests/test_layering.py:451-466`), each with its reason; Task 6 of the restructure (repositories for sessions, documents and the pending calendar) was dropped:
+**Routes that still reach the database directly.** These files are on the raw-table allow-list (`tests/test_layering.py:451-462`), each with its reason; Task 6 of the restructure (repositories for sessions and the pending calendar) was dropped:
 - `sessions` (`chat_sessions`);
-- `documents` (`ingested_documents`, `task_materials`);
-- `ingestion` pending-calendar routes (`pending_calendar_updates`), and `/ingestion/process` through `services/extraction/orchestrator.py` and `task_material_linker.py`;
-- the workspace routes, through `workspace_builder.py` (`task_workspaces` cache, `user_tasks` columns the `Task` entity does not carry, `task_materials`) and `user_preferences.py`;
+- `ingestion` pending-calendar routes (`pending_calendar_updates`), and `/ingestion/process` through `services/extraction/orchestrator.py` (its pending calendar row; a kept document goes through `DocumentService`);
+- the workspace routes, through `workspace_builder.py` (`task_workspaces` cache, `user_tasks` columns the `Task` entity does not carry, its own `task_materials` read for the task's chunks) and `user_preferences.py`;
 - the chat stream's session and message writes (`app/services/chat_history.py`).
 
-The documents and pending-calendar handlers make synchronous supabase-py calls inside `async def` (`documents.py:70-78`, `ingestion.py:208-218`), so each round trip blocks the event loop.
+The pending-calendar handlers make synchronous supabase-py calls inside `async def` (`ingestion.py:208-218`), and the document chunks read calls ChromaDB the same way (`documents.py:137-142`), so each round trip blocks the event loop. The other documents routes go through `DocumentService`, whose repositories and file store run their calls on worker threads.
 
 ---
 
@@ -133,8 +132,8 @@ The places where this vocabulary is not yet followed are listed in §8.
 
 | Route | Bound | Order |
 |---|---|---|
-| `GET /tasks/` | 500 (`TASK_LIST_LIMIT`, `app/domain/ports.py:48`) | newest `created_at` first |
-| `GET /habits/tracker/due` | 500 trackers read (`TRACKER_LIST_LIMIT`, `ports.py:50`) | newest first |
+| `GET /tasks/` | 500 (`TASK_LIST_LIMIT`, `app/domain/ports.py:51`) | newest `created_at` first |
+| `GET /habits/tracker/due` | 500 trackers read (`TRACKER_LIST_LIMIT`, `ports.py:53`) | newest first |
 | `GET /habits/constraints` | the rules in effect (`list_active`), read newest first so the cap drops the oldest | newest first |
 | `GET /memories/` | none beyond the 1000-row cap | oldest first |
 | `GET /anticipation/suggestions` | 100 (`_LIST_LIMIT`, `app/services/anticipation/service.py:70`) | newest first |
@@ -169,7 +168,7 @@ The places where this vocabulary is not yet followed are listed in §8.
 | `RunTriggerRequest.trigger` | 1–64 chars, a registered name | `app/api/v1/endpoints/anticipation.py:109` |
 | `ScheduleRequest` deep-work and task-duration caps | ranges as in the model | `app/api/v1/endpoints/schedule.py:23-65` |
 
-**Not bounded:** `ChatStreamRequest.user_id`, `conversation_id` and `file_name`; `IngestionRequest.payload`; `DraftRejectRequest.reason`; `UpdateSessionRequest.title`; and the ids in paths, which are plain strings. A non-UUID id matches nothing in the repositories, which pre-check the form with `is_uuid` (for drafts, `supabase_repos.py:338`).
+**Not bounded:** `ChatStreamRequest.user_id`, `conversation_id` and `file_name`; `IngestionRequest.payload`; `DraftRejectRequest.reason`; `UpdateSessionRequest.title`; and the ids in paths, which are plain strings. A non-UUID id matches nothing in the repositories, which pre-check the form with `is_uuid` (for drafts, `supabase_repos.py:345`).
 
 ### 2.5 Idempotency and concurrency
 
@@ -299,7 +298,7 @@ Every error response has one shape, whatever raised it: a `JarvisError`, request
            "details": null, "request_id": "…"}}
 ```
 
-The `//` comments are labels only; the bodies are plain JSON. The messages are the literal strings in `app/services/memory/memory_service.py:581-583` (`_get`), `app/services/draft_service.py:59` (`PLAN_CHANGED`, with the latest draft added at `app/api/v1/endpoints/drafts.py:114-119`), `app/infrastructure/persistence/_mapping.py:145-153` (`task_id_clash`), `supabase_repos.py:431-435` (`accept_atomic`) and `app/api/deps.py:31-37` (`require_supabase`).
+The `//` comments are labels only; the bodies are plain JSON. The messages are the literal strings in `app/services/memory/memory_service.py:581-583` (`_get`), `app/services/draft_service.py:59` (`PLAN_CHANGED`, with the latest draft added at `app/api/v1/endpoints/drafts.py:114-119`), `app/infrastructure/persistence/_mapping.py:147-155` (`task_id_clash`), `supabase_repos.py:438-442` (`accept_atomic`) and `app/api/deps.py:31-37` (`require_supabase`).
 
 Every body a client receives on an error is this envelope; `tests/test_api_contract.py::test_endpoints__no_ad_hoc_error_bodies` checks that no route builds an error body of its own.
 
@@ -353,7 +352,7 @@ Field tables are taken from the Pydantic models and agree with `/openapi.json` `
 | `tasks_written` | integer \| null |
 | `draft_id` | string \| null |
 
-### 4.3 The You page models (`app/api/v1/endpoints/you.py:27, 49`, `app/services/user_model_service.py:75, 106, 128`, `app/domain/entities.py:550, 563`)
+### 4.3 The You page models (`app/api/v1/endpoints/you.py:27, 49`, `app/services/user_model_service.py:75, 106, 128`, `app/domain/entities.py:594, 607`)
 
 `YouResponse` is `{profile: YouProfile, patterns: PatternShown[], rules: RuleShown[], memories: MemoryOut[], focus: FocusProfile, receipt: PrivacyReceipt, streak_days: integer ≥ 0}`. `streak_days` is the number of consecutive days, on the user's clock, with at least one task completed, read from the outcome history. A streak is not broken until the local day ends: with nothing done yet today it counts back from yesterday (`you.py:70-77`).
 
@@ -432,7 +431,7 @@ The edit responses: `DraftRejectResponse {status: "rejected", draft_id}` (`draft
 
 ## 5. Endpoint catalogue
 
-Generated from the live `/openapi.json` (48 operations) and the Pydantic models. The "Use case" lines name the user goal each route serves. UC1–UC8 are the use cases of `01-requirements.md`; routes that serve no numbered use case say what they support. "CU" means the route resolves the user through `CurrentUser`. Every operation also documents `ErrorResponse` for 422, 4XX and 5XX; the Errors column lists what each route actually raises.
+Generated from the live `/openapi.json` (49 operations) and the Pydantic models. The "Use case" lines name the user goal each route serves. UC1–UC8 are the use cases of `01-requirements.md`; routes that serve no numbered use case say what they support. "CU" means the route resolves the user through `CurrentUser`. Every operation also documents `ErrorResponse` for 422, 4XX and 5XX; the Errors column lists what each route actually raises.
 
 ### 5.1 Chat (the entry point)
 
@@ -483,7 +482,7 @@ Every task route first requires the database (`require_supabase`, `tasks.py:116,
 | `POST /tasks/{task_id}/complete` | Record **done**, from `pending`, `missed` or `skipped`. One `completed` event carries the quality and actual duration in its metadata. | `TaskCompleteRequest {user_id, quality: 0–5 = 3, actual_duration_minutes? ≥1}` | `TaskResponse` (`status: "completed"`) | 404 `not_found`; 409 `stale_version`; 503 `persistence_unavailable` |
 | `POST /tasks/{task_id}/skip` | **Set aside** a pending task. One `skipped` event carries the reason. The message suggests today's buffer or tomorrow morning; nothing is re-placed. | `TaskSkipRequest {user_id, reason? ≤500}` | `TaskResponse` (`status: "skipped"`, or the current status with "already done / set aside, so nothing changed") | 404; 409; 503 |
 | `GET /tasks/?user_id=&status=` | The user's tasks, newest first, at most 500; `status` filters to one `TaskStatus` | — | `TaskListResponse {tasks: Task[], count}` | 422 (unknown status); 503 |
-| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h. Links, and practice links when the task has no document chunks, come only from Gemini's web search; when it fails, `notices` says "Web results are unavailable right now, so no links are shown", the workspace is not cached, and the search is not tried again for 5 minutes. Its database reads still block the event loop (a raw-table leftover) | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[]}` (`app/schemas/workspace.py:53`) | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-60`) |
+| `GET /tasks/{task_id}/workspace?user_id=&prompt=&refresh=false` | The proactive workspace (RAG chunks, links, practice, WOOP card); cached 24 h. Links, and practice links when the task has no document chunks, come only from Gemini's web search; when it fails, `notices` says "Web results are unavailable right now, so no links are shown", the workspace is not cached, and the search is not tried again for 5 minutes. Its database reads still block the event loop (a raw-table leftover) | — | `TaskWorkspace {task_id, task_title, primary_objective, surfaced_assets: StudyAsset[], woop_card: WoopCard \| null, notices: string[], linked_documents: LinkedDocument[]}` (`app/schemas/workspace.py:55`). `linked_documents` (`{source_id, file_name: string \| null, has_file: boolean}`, `app/schemas/documents.py`) are the user's documents linked to the task, read through `DocumentService.linked_documents` on every request after the cache (never cached), `[]` when there are none or they cannot be read | 422 `validation_error` (empty `user_id`); 500 `internal_error` "Could not build the task workspace."; a `JarvisError` passes through with its own status (`app/api/v1/endpoints/workspace.py:39-62`) |
 | `DELETE /tasks/{task_id}/workspace?user_id=` | Drop the cached workspace | — | `WorkspaceInvalidated {status: "invalidated"}` (`workspace.py:19`) | — (a failed delete is swallowed) |
 
 **Use case:** UC4 (complete or skip a task). The workspace routes support preparing for a task (no numbered use case).
@@ -542,18 +541,21 @@ Every route first requires the database (`require_supabase`) and goes through th
 
 | Method + path | Purpose | Request | Response | Errors |
 |---|---|---|---|---|
-| `GET /documents/?user_id=` | Ingested documents, newest first, each with `linked_task_ids` | — | `DocumentListResponse {documents: DocumentOut[]}` (`app/api/v1/endpoints/documents.py:23, 43`; extra row columns pass through) | 503 `persistence_unavailable` |
-| `DELETE /documents/{source_id}?user_id=` | Delete the user's ChromaDB chunks, links and record | — | `DocumentDeleteResponse {status: "deleted", source_id}` | 404 `not_found` "Document not found."; 503 |
+| `GET /documents/?user_id=` | Ingested documents, newest first, each with `has_file` (its file is kept and opens) and `linked_tasks` (the tasks it is linked to that the user still has, with titles); `linked_task_ids` repeats their ids for older clients. One read each of the records, the links and the tasks, and one listing of the user's stored files; if the links, tasks or file store cannot answer, the documents are still listed, without them | — | `DocumentListResponse {documents: DocumentOut[]}`, `DocumentOut {source_id, id, user_id, file_name, media_type, document_topics, chunk_count, created_at, has_file: boolean, linked_tasks: {task_id, title}[], linked_task_ids: string[]}` (`app/schemas/documents.py`) | 503 `persistence_unavailable` (no database, or the records cannot be read) |
+| `GET /documents/{source_id}/file?user_id=` | The uploaded file itself, as raw bytes with the content type it was uploaded as, `Content-Disposition: inline; filename="…"` (the uploaded name with any folder part, quotes, semicolons and control characters removed; RFC 6266 `filename*` added for a non-ASCII name), `X-Content-Type-Options: nosniff`, `Cache-Control: private, no-store` | — | the file's bytes (not JSON; with the chat stream, the one untyped route, `tests/test_api_contract.py`) | 404 `not_found` "Document not found." (not the caller's) or "This document's file was not kept, so it cannot be opened." (pasted text, or an upload whose file could not be stored); 503 `persistence_unavailable` (no database, or the file store cannot be reached) |
+| `DELETE /documents/{source_id}?user_id=` | Delete the user's ChromaDB chunks, task links, record and stored file; the linked tasks' cached workspaces are dropped | — | `DocumentDeleteResponse {status: "deleted", source_id}` | 404 `not_found` "Document not found."; 503 |
 | `GET /documents/{source_id}/chunks?user_id=` | The user's text chunks for a document | — | `DocumentChunksResponse {source_id, chunks: string[], count}` | 503 `persistence_unavailable` |
 | `POST /ingestion/ingest` | Classify text or a file (no user, nothing stored) | `IngestionRequest {payload = "", file_base64? (≤ 10 MB), media_type?, file_name? (≤ 255)}` (`app/api/v1/endpoints/ingestion.py:51`) | `IntentClassification {intent: IntentType, confidence: 0–1, summary}` (`app/schemas/context.py:34`) | 422 `validation_error` (no input, bad base64, missing `media_type`, oversized file); 503 `document_read_timeout` (the file took more than 120 s to read); 503 `llm_unavailable` "Could not classify the payload. Try again shortly." |
-| `POST /ingestion/process` | Full extraction pipeline: classify, then route to calendar, knowledge, behavioural or action extraction. Rules, tasks and goals go through the container's repositories, only when there is a database. A kept document's row stores `file_name`, so the document list shows the file's own name. | `ProcessIngestionRequest {payload, file_base64?, media_type?, file_name? (≤ 255), user_id?}` (`ingestion.py:155`) | `IngestionPipelineResult {intent, classification_summary, calendar_result?, pending_calendar_id?, knowledge_result?, behavioral_result?, action_proposal?}` (`app/schemas/context.py:234`) | 422 `validation_error`; 503 `document_read_timeout`; other errors from the pipeline propagate |
+| `POST /ingestion/process` | Full extraction pipeline: classify, then route to calendar, knowledge, behavioural or action extraction. Rules, tasks, goals and documents go through the container, only when there is a database. A kept document's row stores `file_name`, so the document list shows the file's own name; an uploaded file is kept too, and the document is linked to the user's pending tasks it fits (`knowledge_result.linked_task_ids`). | `ProcessIngestionRequest {payload, file_base64?, media_type?, file_name? (≤ 255), user_id?}` (`ingestion.py:155`) | `IngestionPipelineResult {intent, classification_summary, calendar_result?, pending_calendar_id?, knowledge_result?, behavioral_result?, action_proposal?}` (`app/schemas/context.py:234`) | 422 `validation_error`; 503 `document_read_timeout`; other errors from the pipeline propagate |
 | `GET /ingestion/pending-calendar?user_id=` (CU) | Timetable extractions awaiting approval | — | `PendingCalendarListResponse {pending: PendingCalendarOut[]}` (`ingestion.py:71, 87`) | 503 |
 | `POST /ingestion/pending-calendar/{pending_id}/approve?user_id=` (CU) | Approve one; returns the slots for scheduling | — | `PendingCalendarApproved {status: "approved", daily_context: TimeSlot[]}` | 404 `not_found` (also when already processed); 503 |
 | `POST /ingestion/pending-calendar/{pending_id}/reject?user_id=` (CU) | Reject one | — | `PendingCalendarRejected {status: "rejected"}` | 404; 503 |
 
 **Use case:** supports ingestion of documents and timetables (no numbered use case).
 
-**What is kept of an upload.** Its text chunks (in ChromaDB) and one `ingested_documents` row: name, media type, topics, chunk count. The file itself is not kept: the pipeline tries an S3 upload, which fails quietly because `boto3` is not installed, and nothing reads `s3_key` back. So no route returns the original file, and the Documents page shows the name, topics, chunk count and linked tasks, with no viewer. Reading a file runs on a worker thread, one document at a time, for at most 120 s (`read_document`, `app/utils/docling_helper.py`).
+**What is kept of an upload.** Its text chunks (in ChromaDB), one `ingested_documents` row (name, media type, topics, chunk count), and the file itself, in the private Supabase Storage bucket `jarvis-documents` at `{user_id}/{source_id}` with its content type (`DocumentFileStore`; the bucket is created on first use, limited to 10 MB, the largest upload ingestion accepts). The key is derived from the row, so no column records it (`s3_key` is unused). Keeping the file is best effort: if the store fails, the document is kept without it (`has_file: false`) and the failure is logged. Reading a file runs on a worker thread, one document at a time, for at most 120 s (`read_document`, `app/utils/docling_helper.py`).
+
+**Linking documents and tasks.** A document is linked to a task when one of its topics, or the subject in its file name ("DBMS unit 3 notes.pdf" gives "DBMS"), is within cosine similarity 0.52 of the task's title (`DOCUMENT_LINK_SIMILARITY`, measured on the local sentence model). Both directions: a new document is linked to the user's pending tasks when it is kept, and the tasks an accepted plan writes are linked to the user's documents right after the accept commits (`DocumentLinkListener` on `DraftAccepted`; a failure there is logged and never fails the accept). A change to a task's links drops its cached workspace.
 
 ### 5.9 Sessions — conversations
 
@@ -769,7 +771,7 @@ These are stated plainly so a reviewer does not have to find them.
 - Every route's own 404 is `not_found`; Starlette's 404 for an unmatched path, and its 405 for an undeclared method, are `http_error`.
 - `GET /sessions/` and `GET /sessions/{id}/messages` answer 503 `persistence_unavailable` like every other list when the database is down or its query fails, never `[]` (`app/services/chat_history.py:254-255, 271-275, 341-342, 359-361`).
 - `PUT /sessions/{id}` and `DELETE /sessions/{id}` answer success for an unknown id.
-- `DELETE /tasks/{id}/workspace` always answers `invalidated`; a failed delete is swallowed (`app/services/analytical/workspace_builder.py:490-504`).
+- `DELETE /tasks/{id}/workspace` always answers `invalidated`; a failed delete is swallowed (`app/services/analytical/workspace_builder.py:491-505`).
 - OpenAPI's shared 422 description names `schedule_infeasible` on every operation, though only the accept and `/schedule/generate-schedule` raise it (`error_handlers.py:34-41`).
 
 **Semantics.**
@@ -788,7 +790,7 @@ These are stated plainly so a reviewer does not have to find them.
 
 ## 9. OpenAPI vs code
 
-Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone. Re-checked at `c956a8f` the same way: still 48 operations on 42 paths and 102 component schemas (`file_name` is a new field of an existing request, not a new path).
+Checked against `GET http://localhost:8000/openapi.json` on the running server at `e76bff9`: 48 operations, 42 paths, 102 component schemas, no operation deprecated. Re-checked at `3208648` against the app built in-process (`app.openapi()` and `app.routes`): the same 48 operations on 42 paths and 102 component schemas, none deprecated; the hidden `/chat/v2/stream` alias, never in the schema, is gone. Re-checked at `c956a8f` the same way: still 48 operations on 42 paths and 102 component schemas (`file_name` is a new field of an existing request, not a new path). Re-checked in-process after the documents work: 49 operations on 43 paths (the new `GET /documents/{source_id}/file`) and 104 component schemas (`LinkedTask`, `LinkedDocument`).
 
 What agrees:
 - Every operation declares a typed 2xx response model (`tests/test_api_contract.py::test_openapi__every_json_route__declares_a_typed_response_model`, `::test_openapi__schema__every_operation_has_a_typed_2xx_but_the_stream`).
@@ -827,7 +829,7 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 | §10: "`Literal`, `max_length`, `UUID` and date types on every request model" | The chat and ingestion requests and the draft edit are bounded (§2.4), but path and body ids are plain strings, repositories check the UUID form themselves, and some text fields have no `max_length` (§2.4, "Not bounded"). |
 | §10: `ConsentRequiredError` → "202 / SSE `consent_request`" | There is no such error (it was never raised and was deleted). The `consent_request` frame comes from a hook answering ASK; a suggestion that needs consent is stored PENDING with `consent_behavior: "ask"`. |
 | §10: "List endpoints no longer return `[]` on a DB failure; they return 503" | True everywhere except `GET /sessions/` and a failed query on `GET /sessions/{id}/messages`. |
-| §12 (phase 2b): "remaining repositories (sessions, memories, documents, pending-calendar)" | Sessions, documents and the pending calendar still use raw table calls (Task 6 of the restructure was dropped; §1). |
+| §12 (phase 2b): "remaining repositories (sessions, memories, documents, pending-calendar)" | Documents have one now (`DocumentRepository`, and `DocumentFileStore` for the files). Sessions and the pending calendar still use raw table calls (Task 6 of the restructure was dropped; §1). |
 | §11 (via `08-database-schema.md`): "point the health check at `user_profiles`" | `/health` probes `user_tasks` (`app/db/supabase_py.py:116`). |
 
 ---
@@ -837,7 +839,7 @@ The spec is `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-des
 From `Jarvis-Engine/` on branch `main`, with the backend running on port 8000 for the live steps:
 
 ```bash
-# Routes, parameters and response models: compare against §5 (expect 48 operations).
+# Routes, parameters and response models: compare against §5 (expect 49 operations).
 curl -s http://localhost:8000/openapi.json | python3 -m json.tool | less
 curl -s http://localhost:8000/openapi.json | python3 -c \
   'import json,sys; d=json.load(sys.stdin); print(sum(len(v) for v in d["paths"].values()), "operations")'

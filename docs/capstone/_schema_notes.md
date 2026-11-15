@@ -80,13 +80,13 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 | `user_memories` | `Memory` | `SupabaseMemoryRepository` |
 | `chat_sessions` | `ConversationSession` | `chat_history` and the sessions endpoints (sessions, titles, pins, archive, activity); `SupabaseConversationRepository.set_summary` (the summary columns only) |
 | `chat_messages` | `ChatMessage` | `chat_history` (read by `SupabaseConversationRepository`) |
+| `ingested_documents` | `IngestedDocument` | `SupabaseDocumentRepository`, reached through `DocumentService` (the ingestion pipeline keeps a document; the documents routes list and delete it) |
+| `task_materials` | `TaskMaterialLink` | `SupabaseDocumentRepository.link`, called by `DocumentLinker` (both directions); `workspace_builder` still reads it directly for a task's chunks |
 
 `Pattern` is computed and never stored. The other user tables have no domain entity, and the code that reaches them is on the raw-table allow-list in `tests/test_layering.py` (`_RAW_TABLE_CALLS_ALLOWED`):
 
 | Table | Read or written by |
 |---|---|
-| `task_materials` | `task_material_linker`, the documents endpoint, `workspace_builder` |
-| `ingested_documents` | ingestion orchestrator, the documents endpoint |
 | `pending_calendar_updates` | calendar extraction (insert), the pending-calendar endpoints |
 | `user_preferences` | the learning-style read (nothing writes it) |
 | `task_workspaces` | workspace cache (`workspace_builder`) |
@@ -185,11 +185,11 @@ These are the tables the domain layer persists. Entities live in `app/domain/ent
 
 No code wrote `in_progress`, `cancelled` or `rolled_forward`, so those three statuses are not allowed. At `e76bff9` every status write goes through `TaskRepository` (`update_status`, `bring_back`) or `accept_draft()`, with `TaskStatus` values only. Plan 3 deleted `PATCH /tasks/{id}` and its `TaskUpdateRequest`, the last place that described `rolled_forward`, so no route can send a free-form status.
 
-**`duration_minutes` / `difficulty_weight` NOT NULL.** The one insert path, `accept_draft()`, takes rows that `build_task_rows` builds from validated `TaskChunk`s, which always carry both values. (The v1 `_persist_fused_tasks` path did the same; plan 3 deleted it.) The `Task` entity also requires both, and `accepted_task_rows` (`app/infrastructure/persistence/_mapping.py:205`) rejects a row without them before the RPC is sent.
+**`duration_minutes` / `difficulty_weight` NOT NULL.** The one insert path, `accept_draft()`, takes rows that `build_task_rows` builds from validated `TaskChunk`s, which always carry both values. (The v1 `_persist_fused_tasks` path did the same; plan 3 deleted it.) The `Task` entity also requires both, and `accepted_task_rows` (`app/infrastructure/persistence/_mapping.py:207`) rejects a row without them before the RPC is sent.
 
 **`draft_schedules.horizon_start` stays TEXT and becomes nullable.** The app writes an ISO string, and `build_task_rows` parses that same string back. A `timestamptz` column would hand back a reformatted string and would read a naive value as UTC.
 
-**`ingested_documents.s3_key text` is new.** The ingestion pipeline writes it whenever the S3 upload succeeds, but no migration created it.
+**`ingested_documents.s3_key text` is new, and unused.** It was meant for an S3 upload that never ran (`boto3` was never installed), and no migration created it. The uploaded file is now kept in Supabase Storage (bucket `jarvis-documents`) at a key derived from the row itself, `{user_id}/{source_id}`, so nothing writes or reads `s3_key`; the column stays (no migration drops it) and is always null.
 
 **`task_completion_signals` keeps its `quality` column.** Since plan 3 nothing writes the table at all; it is kept, not dropped.
 
@@ -290,7 +290,7 @@ No code wrote `in_progress`, `cancelled` or `rolled_forward`, so those three sta
 |---|---|---|
 | `ensure_user_profile()` | `BEFORE INSERT` on the 18 tables that reference `user_profiles` | `insert into user_profiles(user_id) … on conflict do nothing`. The first row a user writes anywhere creates their profile, so the FKs hold without every legacy insert path creating a profile first. A NULL `user_id` (allowed only on `llm_usage_events`) is skipped. |
 | `ensure_goal()` | `BEFORE INSERT` on `user_tasks`, `draft_schedules`, `user_plan_updates` | When `goal_id` is set, inserts `(user_id, goal_id, title = goal_id)` into `goals`, `on conflict do nothing`. `goals` has its own `ensure_user_profile` trigger, so the firing order on one table does not matter. The brief named the first two tables; `user_plan_updates` also carries a `goal_id` (read from `user_tasks`) and gets the same FK, so it gets the same trigger. |
-| `ensure_ingested_document()` | `BEFORE INSERT` on `task_materials` | The ingestion orchestrator links a document to tasks *before* it upserts the `ingested_documents` row. Without this trigger, `task_materials_document_fkey` would reject every link, and the linker swallows errors, so linking would fail silently. The trigger inserts the `(user_id, source_id)` row; the pipeline's later upsert on `(user_id, source_id)` fills in file name, topics, chunk count and `s3_key`. |
+| `ensure_ingested_document()` | `BEFORE INSERT` on `task_materials` | Written when the ingestion orchestrator linked a document to tasks *before* it upserted the `ingested_documents` row; without it, `task_materials_document_fkey` would have rejected every link. `DocumentService` now stores the record first and links after, so the trigger finds the row already there; it stays as a guard for any link written first. |
 | `set_updated_at()` | `BEFORE UPDATE` on the tables that already had `updated_at`: `user_profiles`, `user_preferences`, `user_memories`, `habit_trackers` (and `chat_sessions` until plan 2) | Keeps `updated_at` current. |
 | `set_chat_session_updated_at()` | `BEFORE UPDATE` on `chat_sessions` (plan 2, `20261115000003`) | As `set_updated_at()`, except that an update changing only the summary columns keeps `updated_at`: a summary is not activity. Renaming, pinning or archiving a session still bumps `updated_at`, and the session list is ordered by it. |
 
