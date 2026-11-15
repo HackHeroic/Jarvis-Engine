@@ -459,7 +459,8 @@ async def _store_rule(state: JarvisState, habit: str) -> dict:
     """Store one stated habit as a rule: ``{"status": "stored", "id": ...}`` or not stored.
 
     Through the ``ConstraintRepository`` of the composition root in the turn's state
-    (the rule's id is known at once, for linking it to the memory of stating it).
+    (the rule's id is known at once, for linking it to the memory of stating it); its
+    check-ins start through the root's ``RuleCheckIns``.
     Without a container (tests, scripts) nothing is stored, and the turn says so.
     """
     from app.services.extraction import behavioral_store
@@ -470,7 +471,7 @@ async def _store_rule(state: JarvisState, habit: str) -> dict:
         logger.debug("store_constraint: no container in the turn's state, so no rule is stored")
         return {"status": "skipped"}
     return await behavioral_store.store_behavioral_constraint(
-        container.repos.constraints, habit, user_id=user_id
+        container.repos.constraints, habit, user_id=user_id, check_ins=container.rule_check_ins
     )
 
 

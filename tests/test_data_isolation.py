@@ -16,6 +16,9 @@ _UNSET = object()
 _SLOT = {"name": "OS lecture", "start_min": 60, "end_min": 120, "availability": "blocked"}
 # habit_trackers.id is a uuid: an id of another form could never name a tracker.
 _ALICES_TRACKER = "7d0c0f3e-5b1a-4c2e-9f00-00000000a11c"
+# Each user's rule; a tracker follows one (habit_trackers.constraint_id).
+_ALICES_RULE = "7d0c0f3e-5b1a-4c2e-9f00-0000000a11ce"
+_BOBS_RULE = "7d0c0f3e-5b1a-4c2e-9f00-000000000b0b"
 
 
 def _seed() -> dict[str, list[dict]]:
@@ -24,9 +27,15 @@ def _seed() -> dict[str, list[dict]]:
             {"id": "pc-alice", "user_id": "alice", "status": "pending", "extracted_slots": [_SLOT]},
             {"id": "pc-bob", "user_id": "bob", "status": "pending", "extracted_slots": []},
         ],
+        "behavioral_constraints": [
+            {"id": _ALICES_RULE, "user_id": "alice", "raw_text": "No work after 10 PM",
+             "constraint_type": "habit", "created_at": "2026-11-01T10:00:00+00:00"},
+            {"id": _BOBS_RULE, "user_id": "bob", "raw_text": "Keep 1 to 2 PM free",
+             "constraint_type": "habit", "created_at": "2026-11-01T10:00:00+00:00"},
+        ],
         "habit_trackers": [
-            {"id": _ALICES_TRACKER, "user_id": "alice", "repetitions": 0, "ef": 2.5,
-             "next_interval_days": 1},
+            {"id": _ALICES_TRACKER, "user_id": "alice", "constraint_id": _ALICES_RULE,
+             "repetitions": 0, "ef": 2.5, "next_interval_days": 1},
         ],
     }
 
@@ -202,11 +211,18 @@ def test_habits_lists__db_unavailable__503_not_an_empty_list(
     assert "hunter2" not in resp.text
 
 
-def test_tracker_due__as_alice__only_alices_trackers(client):
+def test_tracker_due__as_alice__only_alices_rules_and_trackers(client, app_state):
+    _, supabase = app_state
+
     resp = client.get("/api/v1/habits/tracker/due", params={"user_id": "alice"})
 
     assert resp.status_code == 200
-    assert [t["id"] for t in resp.json()["due_trackers"]] == [_ALICES_TRACKER]
+    body = resp.json()
+    assert [t["id"] for t in body["due_trackers"]] == [_ALICES_TRACKER]
+    assert [t["constraint_id"] for t in body["due_trackers"]] == [_ALICES_RULE]
+    assert body["upcoming_trackers"] == []
+    # Reading Alice's check-ins starts no tracker for Bob's rule, under either user.
+    assert [r["constraint_id"] for r in supabase.rows["habit_trackers"]] == [_ALICES_RULE]
 
 
 # ── task workspace ──────────────────────────────────────────

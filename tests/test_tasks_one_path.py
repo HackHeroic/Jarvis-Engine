@@ -291,6 +291,7 @@ _ONE_PATH_FILES = (
     "services/analytical/missed_deadlines.py",
     "services/analytical/mastery_tracker.py",
     "services/analytical/sm2_engine.py",
+    "services/analytical/rule_check_ins.py",
     "services/extraction/behavioral_store.py",
 )
 

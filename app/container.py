@@ -39,6 +39,7 @@ from app.services.anticipation.triggers import (
     MorningBriefTrigger,
     PatternRuleTrigger,
 )
+from app.services.analytical.rule_check_ins import RuleCheckIns
 from app.services.analytical.workspace_builder import invalidate_workspaces
 from app.services.documents.linker import DocumentLinker, DocumentLinkListener
 from app.services.documents.service import DocumentService
@@ -102,6 +103,7 @@ class AppContainer:
     user_model_service: UserModelService
     conversation_memory: ConversationMemoryService
     stated_rules: StatedRules
+    rule_check_ins: RuleCheckIns
     documents: DocumentService
     document_linker: DocumentLinker
     settings: Settings
@@ -169,6 +171,9 @@ class AppContainer:
         draft_service = DraftService(
             repos.drafts, events, task_events=repos.task_events, tasks=repos.tasks
         )
+        # Jarvis checks in on every rule it learned, spaced out (SM-2) while it holds:
+        # each way a rule is stored starts its check-ins, and deleting one ends them.
+        rule_check_ins = RuleCheckIns(repos.habit_trackers, repos.constraints, repos.profiles)
         # Documents and tasks find each other by meaning, both ways: a new document is
         # linked to the pending tasks it fits when it is kept, and an accepted plan's tasks
         # to the documents they fit once the accept has committed (DraftAccepted). A
@@ -200,6 +205,7 @@ class AppContainer:
             constraints=repos.constraints,
             memory=memory_service,
             planner=planner,
+            check_ins=rule_check_ins,
         )
         anticipation = AnticipationService(
             {}, actions, consent, repos.suggestions, repos.profiles, repos.constraints,
@@ -254,7 +260,8 @@ class AppContainer:
             ),
             conversation_memory=conversation_memory,
             # A stated rule and the memory of stating it: letting go of one lets go of both.
-            stated_rules=StatedRules(repos.constraints, memory_service),
+            stated_rules=StatedRules(repos.constraints, memory_service, check_ins=rule_check_ins),
+            rule_check_ins=rule_check_ins,
             # The user's documents across their record, links and file.
             documents=DocumentService(
                 repos.documents, repos.document_files, repos.tasks,

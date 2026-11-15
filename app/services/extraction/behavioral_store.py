@@ -1,11 +1,13 @@
 """Behavioral pipeline: store the user's rules (behavioural constraints) in Strategy Hub (L7).
 
-Rules are written and read through the ``ConstraintRepository`` port. Deleting a rule
-is ``StatedRules.delete_rule`` (``DELETE /habits/constraints/{id}``), which also lets
-go of the memory of stating it.
+Rules are written and read through the ``ConstraintRepository`` port. A stored rule's
+check-ins start at once (``RuleCheckIns.start``). Deleting a rule is
+``StatedRules.delete_rule`` (``DELETE /habits/constraints/{id}``), which also lets go of
+the memory of stating it and ends its check-ins.
 """
 
 import logging
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +15,7 @@ from app.domain import errors
 from app.domain.entities import BehavioralConstraint, MemorySource
 from app.domain.ports import ConstraintRepository
 from app.services.analytical.habit_translator import invalidate_habit_cache
+from app.services.analytical.rule_check_ins import RuleCheckIns
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +29,15 @@ async def store_behavioral_constraint(
     *,
     user_id: str,
     constraint_type: str = "habit",
+    check_ins: RuleCheckIns | None = None,
+    learned_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Store a rule the user stated (e.g. "no study before 11am") for every later plan.
+
+    ``check_ins`` starts Jarvis's check-ins on it ("still how you work?"), the first due
+    tomorrow; best effort, so the rule is stored even when that fails. None (tests,
+    scripts): the next read of the check-ins starts them. ``learned_at`` is when it was
+    said; None: when it is stored (the demo seed passes its own clock).
 
     Returns ``{"status": "stored", "id": ...}`` (the id at once, so the rule can be
     linked to the memory of stating it), or ``{"status": "error", "error": ...}`` with a
@@ -42,6 +52,7 @@ async def store_behavioral_constraint(
         recurrence="daily",
         structured_semantics={},
         source=MemorySource.SAID,
+        created_at=learned_at,
     )
     try:
         stored = await constraints.add(user_id, rule)
@@ -49,6 +60,8 @@ async def store_behavioral_constraint(
         logger.warning("Could not store behavioral constraint (%s)", exc.code)
         return {"status": "error", "error": "Could not save this preference."}
     invalidate_habit_cache()
+    if check_ins is not None:
+        await check_ins.start(user_id, stored)
     return {"status": "stored", "id": stored.id}
 
 

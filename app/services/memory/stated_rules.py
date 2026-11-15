@@ -12,7 +12,8 @@ Planning plans from the rule alone and skips the memory a rule covers
 memory deletes every rule linked to it (it says them all), and deleting a rule deletes
 the copies of it said again in the same words and forgets its memory, unless a
 differently worded rule still rests on that memory. Deleting one rule never removes
-another. Each move is user-scoped and safe to repeat.
+another. Each move is user-scoped and safe to repeat. A rule's check-ins
+(``RuleCheckIns``) end just before the rule is deleted, by whichever move.
 """
 
 import logging
@@ -22,6 +23,7 @@ from collections.abc import Iterable
 from app.domain import errors
 from app.domain.entities import BehavioralConstraint, Memory
 from app.domain.ports import ConstraintRepository
+from app.services.analytical.rule_check_ins import RuleCheckIns
 from app.services.memory.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -62,9 +64,18 @@ def covered_memory_ids(rules: Iterable[BehavioralConstraint | dict]) -> frozense
 class StatedRules:
     """Keeps a stated rule and the memory of stating it together."""
 
-    def __init__(self, rules: ConstraintRepository, memory: MemoryService) -> None:
+    def __init__(
+        self,
+        rules: ConstraintRepository,
+        memory: MemoryService,
+        *,
+        check_ins: RuleCheckIns | None = None,
+    ) -> None:
+        """``check_ins`` ends a deleted rule's check-ins; None (tests, scripts): there
+        are none to end, and a read of the check-ins never lists a deleted rule anyway."""
         self._rules = rules
         self._memory = memory
+        self._check_ins = check_ins
 
     async def link(self, user_id: str, rule_id: str, memory_id: str) -> bool:
         """Link the user's rule to the memory of stating it; False when there is no such
@@ -93,7 +104,7 @@ class StatedRules:
             r for r in await self._rules.list_active(user_id) if rule_memory_id(r) == memory_id
         ]
         for rule in linked:
-            await self._rules.delete(user_id, rule.id)
+            await self._delete(user_id, rule.id)
         return [rule.id for rule in linked]
 
     async def dismiss_memory(self, user_id: str, memory_id: str) -> tuple[Memory, list[str]]:
@@ -123,16 +134,23 @@ class StatedRules:
         rule = next((r for r in rules if r.id == rule_id), None)
         memory_id = rule_memory_id(rule)
         if rule is None or memory_id is None:
-            return await self._rules.delete(user_id, rule_id)
+            return await self._delete(user_id, rule_id)
         words = _normalised(rule.raw_text)
         linked = [r for r in rules if rule_memory_id(r) == memory_id]
         copies = [r for r in linked if r.id != rule_id and _normalised(r.raw_text) == words]
         if all(_normalised(r.raw_text) == words for r in linked):
             await self._let_go_of(user_id, memory_id, learned=_adopted(rule))
-        deleted = await self._rules.delete(user_id, rule_id)
+        deleted = await self._delete(user_id, rule_id)
         for copy in copies:
-            await self._rules.delete(user_id, copy.id)
+            await self._delete(user_id, copy.id)
         return deleted
+
+    async def _delete(self, user_id: str, rule_id: str) -> bool:
+        """Delete one of the user's rules, its check-ins first (the database's key would
+        only clear their link to it). Returns whether the rule was there."""
+        if self._check_ins is not None:
+            await self._check_ins.stop(user_id, rule_id)
+        return await self._rules.delete(user_id, rule_id)
 
     async def _let_go_of(self, user_id: str, memory_id: str, *, learned: bool) -> None:
         """Forget the memory of saying a rule; dismiss a learned pattern a rule came from.

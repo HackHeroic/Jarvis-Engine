@@ -1,7 +1,7 @@
-"""Habits endpoints: SM-2 trackers and the user's rules (behavioural constraints).
+"""Habits endpoints: Jarvis's check-ins on the user's rules, and the rules themselves.
 
-Routing and parsing only. Trackers go through ``sm2_engine`` over the container's
-``HabitTrackerRepository``, rules through its ``ConstraintRepository`` and
+Routing and parsing only. Check-ins (an SM-2 tracker per rule) go through the
+container's ``RuleCheckIns``, rules through its ``ConstraintRepository`` and
 ``StatedRules``. Every route first requires the database (``require_supabase``):
 without it the container runs on in-memory repositories, where the page would read
 as a brand-new user. An outage is a 503 in the one error envelope, never an empty list.
@@ -15,32 +15,18 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentUser, get_container, require_supabase
 from app.domain import errors
-from app.domain.entities import BehavioralConstraint, HabitTracker
+from app.domain.entities import BehavioralConstraint
+from app.schemas.habits import CheckInReviewed, RuleCheckInList
 from app.services.analytical.habit_translator import invalidate_habit_cache
-from app.services.analytical.sm2_engine import get_due_trackers, record_completion
-from app.services.planning.local_time import user_zone
 
 router = APIRouter()
 
 
 class TrackerCompleteRequest(BaseModel):
-    """Request body for marking a habit tracker as complete with SM-2 quality."""
+    """The user's answer to a check-in on one of their rules."""
 
-    quality: int = Field(ge=0, le=5, description="SM-2 quality: 0=blackout, 5=perfect recall")
-
-
-class TrackerCompleteResponse(BaseModel):
-    """When the habit is next due, after this review."""
-
-    next_review_date: datetime = Field(description="When the next review is due (UTC).")
-    next_interval_days: int = Field(ge=0, description="Days from now until that review.")
-
-
-class DueTrackersResponse(BaseModel):
-    """The user's trackers due for review."""
-
-    due_trackers: list[HabitTracker] = Field(
-        description="Trackers due today or earlier on the user's clock, newest first."
+    quality: int = Field(
+        ge=0, le=5, description="Still how the user works? 0 = not any more, 5 = exactly."
     )
 
 
@@ -79,11 +65,12 @@ class ConstraintDeleteResponse(BaseModel):
 
 @router.post(
     "/tracker/{tracker_id}/complete",
-    response_model=TrackerCompleteResponse,
-    summary="Record habit completion with SM-2 quality",
+    response_model=CheckInReviewed,
+    summary="Answer a check-in on one of the user's rules (SM-2 quality 0-5)",
     description=(
-        "User grades the review 0-5. Returns next_review_date and next_interval_days. "
-        "Another user's tracker or an unknown id: 404."
+        "Records the answer and spaces the next check-in: 1 day, then 6, then longer while "
+        "the rule holds; a rating under 3 brings it back tomorrow. Another user's tracker "
+        "or an unknown id: 404."
     ),
 )
 async def complete_tracker(
@@ -91,33 +78,31 @@ async def complete_tracker(
     body: TrackerCompleteRequest,
     http_request: Request,
     user: CurrentUser,
-) -> TrackerCompleteResponse:
-    """Record a review and update the SM-2 state of one of the caller's trackers."""
+) -> CheckInReviewed:
+    """Record a check-in on one of the caller's rules and say when it comes back."""
     require_supabase(http_request)
-    trackers = get_container(http_request).repos.habit_trackers
-    result = await record_completion(trackers, user, tracker_id, body.quality)
-    return TrackerCompleteResponse(**result)
+    check_ins = get_container(http_request).rule_check_ins
+    return await check_ins.review(user, tracker_id, body.quality)
 
 
 @router.get(
     "/tracker/due",
-    response_model=DueTrackersResponse,
-    summary="List habit trackers due for review",
+    response_model=RuleCheckInList,
+    summary="List the check-ins on the user's rules: due now, and not due yet",
     description=(
-        "Returns trackers where last_done_at + next_interval_days <= today, both as dates "
-        "in the user's timezone."
+        "Every rule in effect, each with one tracker (started here for a rule that has "
+        "none, counting from when it was learned, so its first check-in is due a day "
+        "after). Due: last check-in (or learning the rule) plus its interval is today or "
+        "earlier, both as dates in the user's timezone. A deleted rule is never listed."
     ),
 )
-async def list_due_trackers(http_request: Request, user: CurrentUser) -> DueTrackersResponse:
-    """List SM-2 trackers due for review today or earlier; 503 when the database is down.
+async def list_due_trackers(http_request: Request, user: CurrentUser) -> RuleCheckInList:
+    """The caller's check-ins, due and not yet due; 503 when the database is down.
 
     "Today" is the user's: the zone comes from their profile.
     """
     require_supabase(http_request)
-    container = get_container(http_request)
-    profile = await container.repos.profiles.get_or_create(user)
-    due = await get_due_trackers(container.repos.habit_trackers, user, user_zone(profile))
-    return DueTrackersResponse(due_trackers=due)
+    return await get_container(http_request).rule_check_ins.list_for_user(user)
 
 
 @router.get(
@@ -144,9 +129,9 @@ async def list_behavioral_constraints(
     response_model=ConstraintDeleteResponse,
     summary="Delete a behavioral constraint",
     description=(
-        "Removes a saved rule; future schedules stop applying it. A rule stated in chat "
-        "takes the memory of stating it with it (forgotten for good). Another user's rule "
-        "or an unknown id: 404."
+        "Removes a saved rule and its check-ins; future schedules stop applying it. A rule "
+        "stated in chat takes the memory of stating it with it (forgotten for good). "
+        "Another user's rule or an unknown id: 404."
     ),
 )
 async def delete_behavioral_constraint(

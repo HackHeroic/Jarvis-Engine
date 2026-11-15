@@ -6,11 +6,12 @@ user's clock. India is UTC+5:30, so 00:00-05:30 IST is still the previous UTC da
 """
 
 from datetime import date, datetime, time, timedelta, timezone
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.domain.entities import TaskEvent, TaskEventType
+from app.domain.entities import HabitTracker, TaskEvent, TaskEventType
 from app.domain.errors import PersistenceError
 from app.domain.ports import TaskEventRepository
 import app.core.config as config
@@ -22,7 +23,7 @@ from app.services.analytical.mastery_tracker import (
     reschedule_count_of,
     streak_as_of,
 )
-from app.services.analytical.sm2_engine import get_due_trackers
+from app.services.analytical.sm2_engine import next_due_on
 from tests.fakes import BagOfWordsEmbedder, FakeDBClient, FakeSupabase
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -220,46 +221,45 @@ async def test_success_ratio__history_unreadable__logged_and_neutral(caplog):
     assert "Success ratio" in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_due_trackers__ist_morning__uses_local_date():
-    supabase = FakeSupabase({"habit_trackers": [
-        # Done 10:00 IST Sun 15 Nov, every day: due Mon 16 Nov on the user's clock.
-        {"id": "daytime", "user_id": "alice", "next_interval_days": 1,
-         "last_done_at": "2026-11-15T04:30:00+00:00"},
-        # Done 01:30 IST Mon 16 Nov (still the 15th in UTC): not due again until the 17th.
-        {"id": "small_hours", "user_id": "alice", "next_interval_days": 1,
-         "last_done_at": "2026-11-15T20:00:00+00:00"},
-        {"id": "bobs", "user_id": "bob", "next_interval_days": 1,
-         "last_done_at": "2026-11-15T04:30:00+00:00"},
-    ]})
+def test_next_due_on__ist_small_hours__counts_the_local_day():
+    # Done 10:00 IST Sun 15 Nov, every day: due Mon 16 Nov on the user's clock.
+    daytime = HabitTracker(
+        id=str(uuid4()), user_id="alice", next_interval_days=1, quality_last=4,
+        last_done_at=datetime(2026, 11, 15, 4, 30, tzinfo=timezone.utc),
+    )
+    # Done 01:30 IST Mon 16 Nov (still the 15th in UTC): not due again until the 17th.
+    small_hours = daytime.model_copy(
+        update={"last_done_at": datetime(2026, 11, 15, 20, 0, tzinfo=timezone.utc)}
+    )
     # 03:00 IST on Mon 16 Nov is 21:30 UTC on Sun 15 Nov.
     morning = datetime(2026, 11, 16, 3, 0, tzinfo=IST)
+    today_ist, today_utc = morning.date(), morning.astimezone(timezone.utc).date()
 
-    trackers = _container(supabase).repos.habit_trackers
+    on_ist = [next_due_on(t, IST, today=today_ist) for t in (daytime, small_hours)]
+    on_utc = [next_due_on(t, ZoneInfo("UTC"), today=today_utc) for t in (daytime, small_hours)]
 
-    due = await get_due_trackers(trackers, "alice", IST, as_of_date=morning)
-    on_utc = await get_due_trackers(trackers, "alice", ZoneInfo("UTC"), as_of_date=morning)
-
-    assert [t["id"] for t in due] == ["daytime"]
-    assert on_utc == []  # on UTC dates it is still the 15th: nothing would be due yet
+    assert on_ist == [date(2026, 11, 16), date(2026, 11, 17)]  # only daytime is due today
+    assert all(day > today_utc for day in on_utc)  # on UTC dates it is still the 15th
 
 
 @pytest.mark.asyncio
-async def test_due_trackers_api__zone_from_the_profile(monkeypatch):
+async def test_rule_check_ins_api__zone_from_the_profile(monkeypatch):
+    """The due day is a date on the profile's clock: a rule learned at 21:00 in New York
+    (already the 16th in India) is first checked on the 16th there, not the 17th."""
     import httpx
 
+    from app.domain.entities import BehavioralConstraint
     from app.main import app
 
     supabase = FakeSupabase()
     container = _container(supabase)
     await container.repos.profiles.update("alice", timezone="America/New_York")
-    seen: dict = {}
+    rule = await container.repos.constraints.add("alice", BehavioralConstraint(
+        id=str(uuid4()), user_id="alice", raw_text="No work after 10 PM",
+        constraint_type="habit",
+        created_at=datetime(2026, 11, 16, 2, 0, tzinfo=timezone.utc),  # 21:00 NY, 15 Nov
+    ))
 
-    async def fake_due(trackers, user_id, zone, *, as_of_date=None):
-        seen.update(trackers=trackers, user_id=user_id, zone=zone)
-        return []
-
-    monkeypatch.setattr("app.api.v1.endpoints.habits.get_due_trackers", fake_due)
     monkeypatch.setattr(app.state, "container", container, raising=False)
     monkeypatch.setattr(app.state, "db_client", FakeDBClient(supabase), raising=False)
     async with httpx.AsyncClient(
@@ -268,8 +268,7 @@ async def test_due_trackers_api__zone_from_the_profile(monkeypatch):
         resp = await api.get("/api/v1/habits/tracker/due", params={"user_id": "alice"})
 
     assert resp.status_code == 200
-    assert seen == {
-        "trackers": container.repos.habit_trackers,
-        "user_id": "alice",
-        "zone": ZoneInfo("America/New_York"),
-    }
+    body = resp.json()
+    assert body["timezone"] == "America/New_York"
+    (check_in,) = body["due_trackers"] + body["upcoming_trackers"]
+    assert (check_in["constraint_id"], check_in["next_due_on"]) == (rule.id, "2026-11-16")

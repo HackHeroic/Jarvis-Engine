@@ -199,6 +199,7 @@ async def process_full_pipeline(
         tasks=repos.tasks if repos is not None else None,
         goals=repos.goals if repos is not None else None,
         documents=container.documents if repos is not None else None,
+        check_ins=container.rule_check_ins if repos is not None else None,
     )
 
 

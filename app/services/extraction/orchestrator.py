@@ -16,6 +16,7 @@ from app.schemas.context import (
     IntentType,
     PendingCalendarUpdate,
 )
+from app.services.analytical.rule_check_ins import RuleCheckIns
 from app.services.extraction.action_item_handler import propose_action_item
 from app.services.extraction.behavioral_store import get_behavioral_context_for_calendar, store_behavioral_constraint
 from app.services.extraction.calendar_extractor import extract_calendar_slots
@@ -113,6 +114,7 @@ async def process_ingestion(
     tasks: Optional[TaskRepository] = None,
     goals: Optional[GoalRepository] = None,
     documents: Optional[DocumentService] = None,
+    check_ins: Optional[RuleCheckIns] = None,
 ) -> IngestionPipelineResult:
     """Run the full autonomous extraction pipeline.
 
@@ -133,6 +135,8 @@ async def process_ingestion(
         documents: The container's DocumentService: a document read for knowledge is
             kept through it (its record, the uploaded file itself, and its links to the
             user's pending tasks). None: not kept, and linked to nothing.
+        check_ins: The container's RuleCheckIns: a stated preference stored as a rule
+            gets its check-ins. None: they start when the Habits page is next read.
 
     Returns:
         IngestionPipelineResult with intent and pipeline-specific results.
@@ -296,7 +300,8 @@ async def process_ingestion(
     elif classification.intent == IntentType.BEHAVIORAL_CONSTRAINT:
         if constraints is not None and user_id:
             br = await store_behavioral_constraint(
-                constraints, text, user_id=user_id, constraint_type="preference"
+                constraints, text, user_id=user_id, constraint_type="preference",
+                check_ins=check_ins,
             )
         else:
             br = {"status": "skipped", "reason": "No database to keep it in."}

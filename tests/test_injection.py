@@ -638,6 +638,7 @@ _CONTAINER_BUILT_SERVICES = (
     "app/services/anticipation/triggers.py",
     "app/services/documents/service.py",
     "app/services/documents/linker.py",
+    "app/services/analytical/rule_check_ins.py",
 )
 
 

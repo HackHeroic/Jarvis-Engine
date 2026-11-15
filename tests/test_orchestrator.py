@@ -1377,8 +1377,9 @@ async def test_store_constraint__persists_each_habit_and_confirms(monkeypatch):
     container = build_test_container()
     stored = []
 
-    async def fake_store(constraints, habit, *, user_id, constraint_type="habit"):
+    async def fake_store(constraints, habit, *, user_id, constraint_type="habit", check_ins):
         assert constraints is container.repos.constraints
+        assert check_ins is container.rule_check_ins  # its check-ins start with it
         stored.append((habit, constraint_type, user_id))
         return {"status": "stored", "id": f"c-{len(stored)}"}
 

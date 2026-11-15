@@ -16,6 +16,7 @@ from app.domain.anticipation import ActionResult, ActionRisk, ProactiveAction
 from app.domain.entities import HOURS_PER_DAY, BehavioralConstraint, DraftStatus
 from app.domain.ports import ConstraintRepository, DraftPlanner
 from app.schemas.context import SemanticTimeSlot
+from app.services.analytical.rule_check_ins import RuleCheckIns
 from app.services.anticipation.service import ActionFactory
 from app.services.draft_service import DraftService
 from app.services.memory.memory_service import MemoryService
@@ -125,6 +126,7 @@ class AdoptRuleAction(ProactiveAction):
         constraints: ConstraintRepository,
         memory: MemoryService,
         planner: DraftPlanner,
+        check_ins: RuleCheckIns | None = None,
     ) -> None:
         if not 0 <= hour < HOURS_PER_DAY:
             raise errors.ValidationError("An hour runs from 0 to 23.", details={"hour": hour})
@@ -136,6 +138,7 @@ class AdoptRuleAction(ProactiveAction):
         self._constraints = constraints
         self._memory = memory
         self._planner = planner
+        self._check_ins = check_ins  # None (tests): the next read of the list starts them
 
     def describe(self) -> str:
         return f"Keep {clock_hour(self._hour)} clear"
@@ -177,7 +180,9 @@ class AdoptRuleAction(ProactiveAction):
                 details={"memory_id": self._memory_id, "status": status},
             ) from exc
         if not await self._rule_stored(user_id):
-            await self._constraints.add(user_id, self._rule(user_id))
+            rule = await self._constraints.add(user_id, self._rule(user_id))
+            if self._check_ins is not None:  # Jarvis will check in on it, as on a stated rule
+                await self._check_ins.start(user_id, rule)
         h12 = clock_hour(self._hour)
         saved = f"Saved. Every plan from now on keeps {h12} clear"
         try:
@@ -293,8 +298,12 @@ def build_action_factory(
     constraints: ConstraintRepository,
     memory: MemoryService,
     planner: DraftPlanner,
+    check_ins: RuleCheckIns | None = None,
 ) -> ActionFactory:
-    """An ``ActionFactory`` that rebuilds every action the triggers propose."""
+    """An ``ActionFactory`` that rebuilds every action the triggers propose.
+
+    ``check_ins`` starts the check-ins on a rule an accepted suggestion adopts.
+    """
     factory = ActionFactory()
     factory.register(
         ApplyDraftAction.kind,
@@ -311,6 +320,7 @@ def build_action_factory(
             constraints=constraints,
             memory=memory,
             planner=planner,
+            check_ins=check_ins,
         ),
     )
     factory.register(
