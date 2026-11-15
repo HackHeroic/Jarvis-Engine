@@ -164,7 +164,7 @@ Retired in the restructure: the v1 chat routes (`POST /chat/`, the v1 `/chat/str
 
 ## 7. Tests
 
-**2340 passed, 2 xfailed, 2 deselected**, about 91 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `670e2d5`. 94 test files.
+**2361 passed, 2 xfailed, 2 deselected**, about 91 s, fully offline: `.venv/bin/python -m pytest tests/ -q` on a clean export of `670e2d5`. 94 test files.
 
 - **The 2 xfails are `strict=True`** and pin open design questions: TMT priority collapses for deadlines more than ~16 h away, and a task the model leaves without an if-then plan gets none (`tests/behaviour/test_psychology.py:119, 249`). When one is fixed its test fails; remove the marker.
 - **The 2 deselected are `slow`** (`pyproject.toml:65-68`): the solver run to its time cap (`tests/behaviour/test_psychology.py:193`) and the forget filter on the real embedder (`tests/test_conversation_memory.py:1006`). Run them with `pytest -m slow`.

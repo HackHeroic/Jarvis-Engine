@@ -73,7 +73,7 @@ Then start the frontend (`npm install && npm run dev` in jarvis-frontend) and op
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q        # offline: never touches the network (2340 passed, 2 xfailed, 2 deselected at dab11aa)
+.venv/bin/python -m pytest tests/ -q        # offline: never touches the network (2361 passed, 2 xfailed, 2 deselected at fe74172)
 .venv/bin/python scripts/live_e2e.py        # 18 live checks against real Supabase and Claude (backend must be running)
 ```
 

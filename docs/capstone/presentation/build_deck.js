@@ -1277,8 +1277,8 @@ async function s20() {
   const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Proof" });
   head(s, "21  ·  PROOF", "Checked, not claimed");
   const stats = [
-    ["2,340", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
-    ["457", "frontend tests pass", "23 vitest files", C.accent2, HEX.gold],
+    ["2,361", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
+    ["460", "frontend tests pass", "23 vitest files", C.accent2, HEX.gold],
     ["18", "live end-to-end steps", "real Supabase and Claude; all passed on the final code", C.accent3, HEX.dusk],
     ["15", "class diagrams verified", "against the code, by a test", C.accent6, HEX.sageLight],
   ];
@@ -1307,8 +1307,8 @@ async function s20() {
     text(s, [mono(g, { fontSize: 12 }), { text: "   " + d, options: { fontSize: 13, color: C.text2 } }], { x: x + 0.2, y, w: CW / 2 - 0.5, h: 0.54, valign: "middle" });
   });
   s.addNotes(
-    "The offline suite at backend commit bb670f0: 2,340 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 91 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
-      "The frontend has 457 vitest tests in 23 files at frontend commit 164b01a. " +
+    "The offline suite at backend commit fe74172: 2,361 passed, 2 strict xfails that pin known design gaps, and 2 slow tests deselected; it takes about 91 seconds and tests/conftest.py blocks every non-localhost connection (PROJECT_STATUS section 7). " +
+      "The frontend has 460 vitest tests in 23 files at frontend commit c97eb60. " +
       "scripts/live_e2e.py drives the running backend against real Supabase and Claude in 18 steps as a throwaway user and deletes its rows; it was re-run on 670e2d5 and every step passed with no traceback in the server log, and its cached-prompt step read 1,398 tokens. Run it again on demo day. " +
       "The guards that keep the design honest are the layering test, the design-conformance test over the class diagrams, the SSE golden files and the repository contract suite."
   );

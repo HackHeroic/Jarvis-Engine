@@ -345,7 +345,7 @@ Each task maps to a role (`MODEL_ROUTING`, `model_router.py:180-199`); the role 
 
 | Role | Tasks | Local model | Claude effort |
 |---|---|---|---|
-| `PRIMARY` | `socratic_chunker`, `habit_translation`, `document_understanding`, `research_summarization`, `practice_generation`, `workspace_outline`, `calendar_parsing` | The detected heavy Gemma (`GEMMA_PRIMARY_MODEL`) | medium, `max_tokens` 8000 |
+| `PRIMARY` | `socratic_chunker`, `habit_translation`, `document_understanding`, `research_summarization`, `practice_generation`, `workspace_outline`, `workspace_composition`, `calendar_parsing` | The detected heavy Gemma (`GEMMA_PRIMARY_MODEL`) | medium, `max_tokens` 8000 |
 | `FAST` | `intent_classification`, `brain_dump_extraction`, `memory_extraction`, `voice_of_jarvis`, `voice_of_jarvis_synthesis`, `goal_validation`, `task_edit_parsing`, `action_item_extraction`, `session_summary` | The detected small Gemma (`GEMMA_FAST_MODEL`) | low, `max_tokens` 2048 structured / 4096 text |
 | `CLOUD` | `web_search`, `real_time_research` | never local | medium |
 
