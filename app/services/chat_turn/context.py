@@ -47,6 +47,7 @@ def initial_state(
         "user_id": request.user_id,
         "user_model": user_model,
         "user_message": request.user_prompt,
+        "tutor_mode": request.tutor_mode,
         "file_base64": request.file_base64,
         "file_media_type": request.media_type,
         "file_name": request.file_name,

@@ -103,6 +103,7 @@ async def reply_frames(
                 "user_model": final_state.get("user_model"),
                 "memory_context": initial_state.get("memory_context", ""),
                 "conversation_history": initial_state.get("conversation_history", []),
+                "tutor_mode": request.tutor_mode,
             })
             for frame in text.said(out.get("response_message") or _STANDING_BY,
                                    out.get("thinking_process")):

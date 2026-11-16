@@ -83,6 +83,10 @@ class ChatStreamRequest(BaseModel):
             "for this turn."
         ),
     )
+    tutor_mode: bool = Field(
+        default=False,
+        description="Answer learning questions as an active tutor, grounded in the user's documents when available.",
+    )
 
     _file_within_the_limit = field_validator("file_base64")(within_upload_limit)
 

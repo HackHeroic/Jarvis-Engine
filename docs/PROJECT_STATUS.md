@@ -1,6 +1,6 @@
 # Jarvis Engine — Project Status
 
-**Last updated:** 2026-11-15
+**Last updated:** 2026-11-16
 **Branch:** `main` (the capstone work is merged) · **Checked against:** `d3e9132` (end of capstone plan 3, "finish the restructure"); the fixes up to `cc8d170` are folded in where they change a claim. `path:line` references are at `d3e9132`.
 **Scope:** what the code does today. Every claim below names the file it was checked in. Where something is a stub or not built, it says so. This is the one current architecture document; the capstone documents (§10) expand each part.
 
@@ -128,6 +128,7 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 | You page | Patterns, rules, memories in use, focus profile, privacy receipt (30 days), `streak_days`, settings (autonomy mode, wake time, timezone) | `app/services/user_model_service.py:166`, `app/api/v1/endpoints/you.py` |
 | LLM chain | Local Gemma (auto-detected PRIMARY + FAST) → Claude → Gemini; regex PII redaction before any cloud send; retries with backoff; timeouts; every call metered into `llm_usage_events`; one PRIMARY local call at a time | `app/infrastructure/llm/`, `app/core/model_router.py:204-211` |
 | Documents | Docling → ChromaDB ingestion, user-scoped document search, timetable extraction with approval. Docling runs on a worker thread, one document at a time, at most 120 s (503 `document_read_timeout`, `read_document` in `app/utils/docling_helper.py`). `POST /ingestion/process` keeps the upload's `file_name`. The uploaded file itself is kept in a private Supabase Storage bucket (`jarvis-documents`, at `{user_id}/{source_id}`, best effort) and opens from `GET /documents/{source_id}/file`; the list says `has_file` and names linked tasks with titles. Documents and tasks are linked topic by topic (cosine ≥ 0.52 between a topic, or the file name's subject, and a task title): a new document to the user's pending tasks, and an accepted plan's tasks to the user's documents (`DocumentLinkListener` on `DraftAccepted`, after the commit). A task's workspace lists its `linked_documents`. A short text message that mentions the user's notes is answered from the stored documents; only pasted material of 400+ characters is ingested (`PASTED_MATERIAL_MIN_CHARS`, `app/orchestrator/graph.py`) | `app/services/extraction/`, `app/services/documents/{service,linker}.py`, `app/api/v1/endpoints/documents.py`, `ingestion.py` |
+| Student tutor | Chat's persistent Tutor toggle selects a teaching prompt for conversational learning questions: short explanations, hints before solutions, one understanding check at a time, and course-document grounding when retrieved material is available. It does not change planning requests. | `app/schemas/chat_stream.py` (`tutor_mode`), `app/modules/conversation.py` (`JARVIS_TUTOR_PROMPT`), `jarvis-frontend/app/(app)/chat/page.tsx` |
 | Also | Workspace builder (RAG + web links + practice; after a failed web search it waits 5 minutes before searching again, `WEB_SEARCH_COOLDOWN_S`), mastery coach, checkpoint retention (newest 20 per thread, daily) | `app/services/analytical/`, `app/modules/coach.py`, `app/orchestrator/checkpoint.py:271` |
 
 ---
@@ -136,6 +137,7 @@ Deleted in the restructure: `control_policy.py` (v1 and `execute_agentic_flow`),
 
 - **Triggers:** PreTaskPrep and DeadlineRisk. Only the morning brief and the pattern rule exist (`app/container.py:208-217`). The brief preps no workspace.
 - **Ask-back:** no `clarify_gate` and no `clarify_request` frame.
+- **Tutor progress tracking:** Tutor mode adapts to answers in the conversation, but does not yet record per-topic understanding or schedule spaced review.
 - **Research cognition:** `summarize` returns "Found N results…" with no model call, and `link_to_tasks` returns nothing (`app/modules/research_graph.py:69-75`). The knowledge module's `extract_calendar`, `link_to_tasks`, `propose_actions` and `file_operations` are thin.
 - **Hooks:** 7 handlers are registered, but only `PreCloudLLM` and `PreModuleExecution` have call sites, and aggregation is first DENY or ASK (`app/orchestrator/hooks.py:39-55, 132-138`).
 - **From the restructure (dropped tasks):** the `CognitiveModule` registry with derived routing (routing is still `INTENT_TO_MODULE`), and repositories for chat sessions and messages and pending-calendar rows.
