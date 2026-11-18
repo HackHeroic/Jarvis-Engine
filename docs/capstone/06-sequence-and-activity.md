@@ -337,7 +337,7 @@ sequenceDiagram
     API-->>FE: 200 status skipped, anti-guilt message
     par PEARL in the background
         PO->>PS: observe(user), one look per user at a time
-        PS->>TER: outcome events of the last 30 days
+        PS->>TER: outcome events of the last 28 days
         PS->>PS: each detector reads the latest outcome per slot, local hours
         PS->>MR: create or strengthen the behavioral_pattern memory, inferred
         PS->>PS: hold the PatternChange for the next turn
