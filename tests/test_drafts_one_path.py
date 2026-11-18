@@ -41,7 +41,7 @@ DSA_TOPICS = ["Graph traversal", "Shortest paths", "DP on sequences", "Tree recu
 @pytest.fixture(autouse=True)
 def _monday_morning(clock):
     """Plans start at 08:00 on Monday on the user's clock; accepts happen before then."""
-    clock.freeze(MONDAY_8AM, scheduling)
+    clock.freeze(MONDAY_8AM, scheduling, services_lead=timedelta(minutes=1))
 
 
 def _script_dsa_plan(llm) -> None:

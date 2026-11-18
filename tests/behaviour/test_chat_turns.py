@@ -7,7 +7,7 @@ notice: the reply, whether a draft is waiting, what landed in their task list,
 and how many model calls the turn cost.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -30,7 +30,7 @@ def _monday_morning(clock):
 
     (Was 07:30 UTC, when the horizon was UTC's 08:00; the day is the user's now.)
     """
-    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), scheduling)
+    clock.freeze(datetime(2026, 11, 16, 8, 0, tzinfo=IST), scheduling, services_lead=timedelta(minutes=1))
 
 
 def _script_dsa_plan(llm) -> None:

@@ -257,7 +257,9 @@ async def test_return_after_idle__newest_8_verbatim_summary_in_the_note_prefix_a
         session = turn.conversation_id
     # The user goes quiet; the session-summary sweep finds the conversation idle.
     memory = jarvis.state.container.conversation_memory
-    idle = frozen.now + timedelta(minutes=config.SESSION_IDLE_MINUTES + 1)
+    # Saved messages carry the real time (chat_history stamps them), so "idle" is counted
+    # from it: the frozen Monday is in the past once that date has gone by.
+    idle = datetime.now(timezone.utc) + timedelta(minutes=config.SESSION_IDLE_MINUTES + 1)
     assert await memory.summarize_idle("alice", idle) == 1
     for n in (8, 9):  # the user comes back to the same conversation
         await jarvis.say(f"Topic {n} of my graph revision", session=session)

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from storage3.exceptions import StorageApiError
 
+from app.domain.clock import utc_now
 from app.domain.entities import LLMLocation
 from app.domain.errors import LLMUnavailableError
 from app.domain.ports import LLMProvider, LLMRequest, TextEmbedder
@@ -237,7 +238,7 @@ class _Query:
             if held is None:
                 held = {
                     "id": str(uuid.uuid4()),
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": utc_now().isoformat(),
                     **_COLUMN_DEFAULTS.get(self._table, {}),
                 }
                 self._rows.append(held)
@@ -259,7 +260,7 @@ class _Query:
                 # Deep copies: a real client serialises the payload, so a caller
                 # mutating its dict afterwards cannot reach the stored row.
                 stored = {
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": utc_now().isoformat(),
                     **_COLUMN_DEFAULTS.get(self._table, {}),
                     **copy.deepcopy(row),
                 }
@@ -574,7 +575,7 @@ class FakeSupabase:
             )
             if draft is None:
                 raise Exception("DRAFT_NOT_FOUND")
-            now = datetime.now(timezone.utc)
+            now = utc_now()
             expires_at = draft.get("expires_at")
             if draft.get("status") not in ("pending", "modified") or (
                 expires_at is not None and _comparable(expires_at) < now

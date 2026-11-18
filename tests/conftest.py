@@ -306,7 +306,14 @@ class Clock:
         self._monkeypatch = monkeypatch
         self.now: datetime | None = None
 
-    def freeze(self, when: datetime, *modules: Any) -> None:
+    def freeze(
+        self, when: datetime, *modules: Any, services_lead: timedelta = timedelta(0)
+    ) -> None:
+        """Fix "now" at ``when`` in ``modules`` and for every service's default clock.
+
+        ``services_lead`` puts the services' clock that much earlier, for a test whose
+        plan starts at ``when`` and is accepted before its first slot begins.
+        """
         self.now = when
         clock = self
 
@@ -318,8 +325,25 @@ class Clock:
                     return current.astimezone(tz)
                 return current.astimezone(timezone.utc).replace(tzinfo=None)
 
+        # ``utc_now`` is every service's default clock (DraftService refuses a plan whose
+        # slots have all begun), so a frozen "now" holds there too: a test that plans on a
+        # fixed date keeps passing after that date has gone by.
+        import app.domain.clock as domain_clock
+
+        class _Services(datetime):
+            @classmethod
+            def now(cls, tz=None):  # noqa: D401 - mirrors datetime.now
+                current = clock.now - services_lead
+                if tz is not None:
+                    return current.astimezone(tz)
+                return current.astimezone(timezone.utc).replace(tzinfo=None)
+
         for module in modules:
-            self._monkeypatch.setattr(module, "datetime", _Frozen)
+            self._monkeypatch.setattr(
+                module, "datetime", _Services if module is domain_clock else _Frozen
+            )
+        if domain_clock not in modules:
+            self._monkeypatch.setattr(domain_clock, "datetime", _Services)
 
     def advance(self, **delta: float) -> None:
         self.now = self.now + timedelta(**delta)
