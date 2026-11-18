@@ -6,6 +6,156 @@ This document lists every design pattern that is actually present in the Jarvis 
 
 ---
 
+## 0. Start here: every pattern in plain words
+
+Read this section first. It explains each pattern the way you would say it out loud. Sections 2 to 12 below are the reference: line numbers, code excerpts, tests. Open them only when someone asks for proof.
+
+**What a design pattern is.** A named, well-known solution to a problem that keeps coming back in software. Naming it lets a reader understand a piece of code in one word. A pattern is only worth using when the problem is real; each one below starts with the problem we actually had.
+
+**How to answer any pattern question.** Four sentences, always in this order:
+
+1. The problem we had.
+2. The pattern, in one line.
+3. Where it is in our code (name the class).
+4. Why we did not do the simpler thing.
+
+**The six to present** are marked ★. The other five are for questions.
+
+### ★ Repository (detail in §2)
+
+- **In one line:** a class that hides the database behind plain methods like `get`, `add`, `list_pending`.
+- **Think of it as:** a librarian. You ask for a book by name. You never walk into the storage room, and you do not care if the books are on shelves or in boxes.
+- **Our problem:** before the capstone, endpoints wrote database queries directly. Some forgot to filter by `user_id`, so one user could read another user's data. Tests also needed a real database.
+- **In Jarvis:** `TaskRepository`, `DraftRepository`, `MemoryRepository` and eight more are abstract classes in `app/domain/ports.py`. Each has **two** real versions: a Supabase one (`supabase_repos.py`) and an in-memory one (`in_memory.py`). Services only see the abstract class.
+- **Why not query the database in the service?** Then every service would know Supabase, tests could not run offline, and the `user_id` filter would be easy to forget. Now every repository method takes `user_id` first.
+- **Proof it works:** the same tests run against both versions (`tests/test_repository_contracts.py`). If the two behaved differently, a test would fail.
+
+### ★ Strategy (detail in §3)
+
+- **In one line:** several interchangeable ways of doing one job, behind one interface, so you can swap them without touching the caller.
+- **Think of it as:** Google Maps. Car, bus or walking: the app asks "give me a route" the same way each time. Only the route-finder changes.
+- **Our problem:** many things in Jarvis have more than one way to be done, and more will come: which AI model answers, how we look for habits in the user's history.
+- **In Jarvis, two examples to remember:**
+  - `LLMProvider`: three versions (local model, Claude, Gemini). The code that asks a question never knows which one answers.
+  - `PatternDetector`: four versions (skips at a certain hour, best hour, deadline crunch, repeated skip). PEARL runs whichever detectors it is given.
+- **Why not `if model == "claude": ... elif model == "gemini": ...`?** Every new model would mean editing that function. With Strategy we added Claude by writing one new class and changing nothing else.
+
+### ★ Decorator (detail in §4)
+
+- **In one line:** wrap an object in another object with the same interface, to add one extra behaviour around it.
+- **Think of it as:** a phone with a case, then a screen protector. Still a phone, still used the same way; each layer adds one thing.
+- **Our problem:** every call to a cloud AI model needs four extra things: hide personal data (redact), try again on a network error (retry), stop if it takes too long (timeout), and record the cost (meter). The local model needs only two of them.
+- **In Jarvis:** four wrapper classes in `app/infrastructure/llm/decorators.py`: `RedactingProvider`, `RetryingProvider`, `TimeoutProvider`, `MeteredProvider`. Each one *is* an `LLMProvider` and holds another `LLMProvider` inside it. A cloud model is wrapped like this:
+
+  ```
+  Redacting( Retrying( Metered( Timeout( Claude ))))
+  ```
+
+  Read it from the outside in: personal data is removed once, then each retry gets its own timeout.
+- **Why not put all four inside the Claude class?** We would copy the same code into Gemini and the local model. **Why not subclasses** like `RetryingRedactedClaude`? Four behaviours times three models is far too many classes.
+
+### ★ Chain of Responsibility (detail in §5)
+
+- **In one line:** pass a request along a line of handlers; the first one that can deal with it does, otherwise it goes to the next.
+- **Think of it as:** a customer-care call. The first agent handles it if they can; if not, it goes to the next level, then the manager.
+- **Our problem:** two decisions have this "try in order" shape.
+- **In Jarvis, two chains:**
+  - **Which model answers** (`FallbackChainProvider`, `app/infrastructure/llm/chain.py`): try the local model; if it fails, try Claude; if that fails, try Gemini.
+  - **May Jarvis act on its own?** (`ConsentPolicy`, `app/domain/anticipation.py`): four rules checked in order. Did the user dismiss this before? Is it read-only? Did the user already state a rule about it? Otherwise, what does the user's autonomy setting say? The first rule with an opinion decides.
+- **Why not one big `if/else`?** Each new rule would edit that function. Here a new rule is a new class added to the list.
+- **Do not confuse with Decorator.** A decorator *always* calls the thing it wraps and adds something. A chain *stops* at the first handler that succeeds.
+
+### ★ State, written as transition tables (detail in §6)
+
+- **In one line:** an object may only move between states along allowed paths; any other move is refused.
+- **Think of it as:** an online order. Placed → shipped → delivered. You cannot cancel a delivered order, and you cannot deliver it twice.
+- **Our problem:** a draft plan was accepted twice and every task was duplicated. A forgotten memory could come back.
+- **In Jarvis:** a small table per lifecycle in `app/domain/entities.py`. For a draft: `pending` or `modified` may become modified, accepted, rejected, expired or superseded. An `accepted` draft may become **nothing**. `DraftSchedule.transition()` checks the table and raises a 409 error on an illegal move. The same idea covers suggestions, memories and tasks.
+- **Why a table and not one class per state** (the textbook form)? Our states have no behaviour of their own. The only question is "is this move allowed?", and a table answers that in five lines.
+- **Bonus to mention:** the same table tells the database which states a write may start from, which is how a double click is stopped.
+
+### ★ Observer (detail in §7)
+
+- **In one line:** when something happens, announce it; whoever is interested reacts. The announcer does not know who is listening.
+- **Think of it as:** a YouTube channel. The creator uploads once. Subscribers get notified. The creator does not message each one.
+- **Our problem:** when the user clicks Complete on a task, PEARL should look at the history for new patterns. The click should not wait for that, and should not fail if it fails. The same is true in other places: a finished model call should be recorded for the cost receipt, and a new pattern should lead to a rule proposal.
+- **In Jarvis:** `EventBus` in `app/domain/events.py`. Who announces and who listens:
+  - `TaskService` publishes `TaskCompleted`, `TaskSkipped`, `TaskMissed` → `PatternObserver` runs PEARL in the background.
+  - PEARL publishes `PatternDetected` → `AnticipationListener` proposes a rule.
+  - Every model call publishes `LLMCallCompleted` → `UsageLedger` records its cost.
+  - An accepted plan publishes `DraftAccepted` → `DocumentLinkListener` links documents to the new tasks.
+
+  If a listener crashes, the error is logged and the original action still succeeds.
+- **Why not let `TaskService` call PEARL directly?** Then finishing a task would depend on the learning code, would be slower, and would break whenever learning broke.
+
+### Template Method (detail in §8)
+
+- **In one line:** a base class fixes the order of steps; subclasses fill in the steps but cannot change the order.
+- **Think of it as:** a recipe card with blanks. Everyone follows "prepare, cook, serve" in that order; only the dish differs.
+- **In Jarvis:** `Trigger.run` in `app/domain/anticipation.py`. Every proactive action goes: is it due? → already done today? → gather facts → build the suggestion → **ask consent** → store. `MorningBriefTrigger` and `PatternRuleTrigger` fill in the steps.
+- **Why:** so no trigger can ever skip the consent step.
+
+### Factory and the composition root (detail in §9)
+
+- **In one line:** one place decides which concrete classes get created; everyone else just receives them.
+- **Think of it as:** a restaurant kitchen. You order a meal; you do not choose which stove or which cook.
+- **In Jarvis:** `AppContainer.build` in `app/container.py` runs once at startup. It picks Supabase or in-memory repositories, builds the model chain, and hands every service what it needs. `RepositoryFactory` builds a whole matching set of repositories at once (that part is called an **Abstract Factory**).
+- **Why:** services never import the database or a model library, so they stay easy to test and to change.
+
+### Facade (detail in §10)
+
+- **In one line:** one simple method in front of several complicated subsystems.
+- **Think of it as:** a hotel reception desk. One desk; behind it are housekeeping, the kitchen and billing.
+- **In Jarvis:** `UserModelService.snapshot()` gives the You page everything in one call: profile, patterns, rules, memories, focus profile, privacy receipt. Six subsystems behind one method.
+
+### Adapter (detail in §11)
+
+- **In one line:** a class that makes someone else's library fit the interface we want.
+- **Think of it as:** a travel plug adapter. The socket does not change, your charger does not change; the adapter sits between them.
+- **In Jarvis:** `ClaudeProvider` makes Anthropic's library look like our `LLMProvider`. `SupabaseTaskRepository` makes Supabase look like our `TaskRepository`. Each also turns the library's errors into our own error types.
+- **Adapter or Strategy?** The same class can be both. `ClaudeProvider` is an *adapter* because it translates a library, and a *strategy* because it is one of three interchangeable providers.
+
+### Command (detail in §12)
+
+- **In one line:** turn "something to do" into an object, so it can be stored now and run later.
+- **Think of it as:** a restaurant order slip. Written now, cooked later, and it says exactly what to make.
+- **In Jarvis:** `ProactiveAction` (`ApplyDraftAction`, `AdoptRuleAction`, `ShareInsightAction`). When Jarvis suggests "put today's plan in place", the action is saved as data with the suggestion. When the user clicks Accept, even hours later, it is rebuilt and run exactly once.
+
+### How three patterns work together on one model call
+
+This is the best single example to give, because it shows patterns solving one real problem together.
+
+```mermaid
+flowchart LR
+    A["Any code that needs a model"] --> B["route_llm_call"]
+    B --> C["FallbackChainProvider - Chain of Responsibility: try in order"]
+    C --> D1["Local model - Strategy 1"]
+    C --> D2["Redact, Retry, Meter, Timeout - Decorators - around Claude - Strategy 2"]
+    C --> D3["Redact, Retry, Meter, Timeout - Decorators - around Gemini - Strategy 3"]
+```
+
+- **Strategy:** three models that can replace each other.
+- **Decorator:** the safety layers wrapped around each cloud model.
+- **Chain of Responsibility:** if one fails, the next one is tried.
+
+### Quick check: which pattern is it?
+
+| If the code… | It is |
+|---|---|
+| hides the database behind `get` / `add` methods | Repository |
+| has several classes doing the same job in different ways | Strategy |
+| wraps an object to add one behaviour, same interface | Decorator |
+| tries handlers in order until one decides | Chain of Responsibility |
+| refuses illegal status changes | State |
+| publishes an event that others react to | Observer |
+| fixes the order of steps in a base class | Template Method |
+| is the one place that creates objects | Factory / composition root |
+| gives one simple call over many subsystems | Facade |
+| makes an outside library fit our interface | Adapter |
+| stores an action as data to run later | Command |
+
+---
+
 ## 1. Patterns at a glance
 
 | # | Pattern | Main location | Status | Pinned by |
