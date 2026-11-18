@@ -1001,8 +1001,8 @@ async function s15() {
     box(s, bx, y, 3.2, 0.4, { r: 0.08, name: r });
     text(s, [mono(r, { fontSize: 13, color: C.accent2 })], { x: bx + 0.2, y, w: 2.8, h: 0.4, valign: "middle" });
   });
-  text(s, "48", { x: bx, y: 5.0, w: 1.3, h: 0.75, fontSize: 44, bold: true, color: C.accent1 });
-  text(s, "operations on 42 paths, all typed", { x: bx + 1.25, y: 5.12, w: 2.1, h: 0.6, fontSize: 13, color: C.text2 });
+  text(s, "49", { x: bx, y: 5.0, w: 1.3, h: 0.75, fontSize: 44, bold: true, color: C.accent1 });
+  text(s, "operations on 43 paths, all typed", { x: bx + 1.25, y: 5.12, w: 2.1, h: 0.6, fontSize: 13, color: C.text2 });
 
   // column C: envelope
   const cx = 8.75;
@@ -1031,7 +1031,7 @@ async function s15() {
   text(s, "Exception text never reaches a client.", { x: cx, y: 5.5, w: 3.85, h: 0.3, fontSize: 13, color: C.text2 });
   s.addNotes(
     "07-api-design.md. Chat has exactly one way in, POST /api/v1/chat/stream, which streams ten typed frame types, each a Pydantic model in app/schemas/chat_stream.py written by SseEncoder; tests/test_sse_golden.py pins the bytes of eleven recorded turns. " +
-      "Everything else is REST resources: 48 operations on 42 paths, every JSON route with a typed response model. " +
+      "Everything else is REST resources: 49 operations on 43 paths, every JSON route with a typed response model. " +
       "Every error, REST or inside the stream, is the same envelope with a stable code and a request id, rendered by app/api/error_handlers.py; exception text never reaches a client. " +
       "Malformed input is 422, state conflicts are 409, a dependency that is down is 503, and no route answers 400, 501 or 502 any more."
   );
@@ -1074,7 +1074,7 @@ async function s16() {
   });
   text(s, "A second accept writes nothing: 409.", { x: 7.65, y: 6.08, w: 4.7, h: 0.36, fontSize: 16, bold: true, color: C.accent1 });
   s.addNotes(
-    "08-database-schema.md: 19 tables built by the 19 migrations in supabase/migrations. user_profiles is the root; each of the other 18 tables has a user_id foreign key, and every table has row-level security with an owner policy. " +
+    "08-database-schema.md: 19 tables built by the 20 migrations in supabase/migrations. user_profiles is the root; each of the other 18 tables has a user_id foreign key, and every table has row-level security with an owner policy. " +
       "task_events is append-only: the status column on user_tasks is only the current state, and PEARL, the focus profile and the streak read only the events (ADR-11). user_memories carries a 384-dimension pgvector embedding. " +
       "accept_draft() is one plpgsql transaction: it locks the user's profile row first and then the draft, checks the draft is still open, replaces the pending tasks, marks the draft accepted and supersedes the user's other open drafts. " +
       "Locking the profile row first is what stops two concurrent accepts from deadlocking (08, section 6.1)."
