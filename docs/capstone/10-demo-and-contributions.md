@@ -203,12 +203,24 @@ Two views of the same team. **4.1** says who presents which part of the evaluati
 
 | Owner | Presents | Documents | Slides |
 |---|---|---|---|
-| **Murali** | The introduction and the Meera story; requirements; architecture; sequence and activity (the chat turn and planning: S1, S2, A1, A2) | guide §1–3; `01`; `02`; `06` | 1–6 |
+| **Murali** | The introduction and the Meera story; requirements; architecture; sequence and activity (the chat turn and planning: S1, S2, A1, A2); **planning, the CP-SAT solver and PEARL** | guide §1–3; `01`; `02`; `06`; the table below | 1–6, 13 |
 | **Amathziah** | Sequence and activity (anticipation, memory and learning: S3–S8, A3); the class diagrams; the database diagrams (ER diagram and the state machines) | `06`; `03`; `08` (diagrams) | 6, 7, 11, 12, 15 |
 | **Ravi** | API design; the database schema (tables, keys, constraints, `accept_draft`); errors, edge cases and concurrency | `07`; `08`; `09` | 14, 15, 16 |
 | **Pugal** | OOP; SOLID; design patterns | `04`; `05` | 8, 9, 10 |
 
-The team named the first four rows' main topics. Three were not named and are placed here with the nearest topic, for the team to change: the class diagrams (with Amathziah's diagrams), OOP (with SOLID, the same document) and error handling (with the API). Slides 13 and 17 to 24 (the solver, models, working software, proof, decisions) are shared: whoever built the part speaks to it.
+The team named the first four rows' main topics. Three were not named and are placed here with the nearest topic, for the team to change: the class diagrams (with Amathziah's diagrams), OOP (with SOLID, the same document) and error handling (with the API). Slides 17 to 23 (models, working software, proof, decisions, limits) are shared: whoever built the part speaks to it. The deck has no team slide; this section is the record.
+
+**Planning, CP-SAT and PEARL (Murali): where each is written up.**
+
+| Topic | Read | Code |
+|---|---|---|
+| Planning: a brain dump becomes a draft | guide §3 step 6; `01` §4.1 and UC1; `06` S1 and A2 (the planning sub-graph) | `app/modules/planning_graph.py` |
+| The CP-SAT solver: hard and soft blocks, TMT priority, the energy term, the horizon ladder | guide D20; `01` FR-4 and NFR-1; `09` §3.3; viva answers in §3.2 of this document; slide 13 | `app/core/or_tools/solver.py`, `app/services/planning/scheduling.py` |
+| The user's clock: 08:00 day start, 22:00 cutoff | guide D21 | `app/services/planning/local_time.py` |
+| A rule taught in chat, then a re-plan | `01` §4.3 and UC3; `06` S3 | `app/services/memory/stated_rules.py` |
+| PEARL: the four pattern detectors and their thresholds | guide D16; `01` FR-25 and UC7; `03` §8.2; `05` §3 (Strategy); `06` S4 and S7 | `app/services/memory/patterns.py` |
+| The focus profile, and how it reaches the solver | guide D20 (the energy term); `01` FR-30 and FR-31; `03` §8.2 | `app/services/energy.py` |
+| Rule check-ins (spaced repetition) | guide D33 | `app/services/analytical/rule_check_ins.py` |
 
 **Design patterns.** Doc `05` documents eleven. Pugal owns the section and presents these six, the ones that carry the most weight in the code; each teammate answers for the pattern their own topic touches:
 

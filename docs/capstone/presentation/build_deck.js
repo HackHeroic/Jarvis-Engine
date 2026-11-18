@@ -1368,37 +1368,6 @@ async function s22() {
   );
 }
 
-async function s23() {
-  const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Close" });
-  head(s, "24  ·  TEAM JARVIS", "Who presents what");
-  const members = [
-    ["Introduction and the Meera story", "Requirements and architecture", "Sequence and activity"],
-    ["Sequence and activity", "Class diagrams", "Database diagrams"],
-    ["API design", "Database schema", "Errors and concurrency"],
-    ["OOP", "SOLID", "Design patterns"],
-  ];
-  const owners = ["Murali", "Amathziah", "Ravi", "Pugal"];
-  const gap = 0.3;
-  const w = (CW - gap * 3) / 4;
-  for (let i = 0; i < 4; i++) {
-    const x = MX + i * (w + gap);
-    box(s, x, 2.0, w, 4.3, { name: `Member ${i + 1}` });
-    await orb(s, "User", x + 0.62, 2.6, 0.68, { solid: true, accent: i % 2 ? HEX.gold : HEX.terra, scheme: i % 2 ? C.accent2 : C.accent1 });
-    text(s, owners[i], { x: x + 1.1, y: 2.47, w: w - 1.2, h: 0.32, fontSize: 16, bold: true, color: C.text2 });
-    text(s, "Presents", { x: x + 0.3, y: 3.15, w: w - 0.5, h: 0.4, fontSize: 18, bold: true, objectName: `Presents ${owners[i]}` });
-    text(
-      s,
-      members[i].map((m, j) => ({ text: m, options: { bullet: { indent: 14 }, breakLine: j < 2 } })),
-      { x: x + 0.3, y: 3.8, w: w - 0.5, h: 2.3, fontSize: 15, color: C.text2, paraSpaceAfter: 10 }
-    );
-  }
-  text(s, "Each member presents the topics listed here; see doc 10 §4.1.", { x: MX, y: 6.45, w: 9, h: 0.28, fontSize: 12, color: C.text2 });
-  s.addNotes(
-    "Each member presents a part of the evaluation: Murali the introduction, the Meera story, requirements, architecture and sequence and activity; Amathziah sequence and activity and the class and database diagrams; Ravi API design, the database schema and error handling; Pugal OOP, SOLID and design patterns. " +
-      "The split is recorded in doc 10 section 4.1 and in the owner lines on the capstone documents; section 4.2 maps the thirteen subsystems to who knows the code."
-  );
-}
-
 async function s24() {
   const s = pres.addSlide({ masterName: "JARVIS_TITLE", sectionTitle: "Close" });
   s.addText("LIVE DEMO  ·  TEN MINUTES", { placeholder: "eyebrow", charSpacing: 4, bullet: false });
@@ -1459,7 +1428,7 @@ async function main() {
     ["Design", [s05, s06, s07, s08, s09, s10, s11, s12, s13, s14]],
     ["Implementation", [s15, s16, s17, s18]],
     ["Proof", [s19, s19b, s19c, s20, s21]],
-    ["Close", [s22, s23, s24]],
+    ["Close", [s22, s24]],
   ];
   for (const [title, fns] of sections) {
     pres.addSection({ title });
