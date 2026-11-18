@@ -2,7 +2,7 @@
 
 This document is the team's playbook for the evaluation. Jarvis is a personal intelligence for one person: it keeps their work ready before they need it, learns from what actually happened (an append-only outcome history becomes patterns and a focus profile that change the solver's math), remembers what they say and forgets on request for good, and makes the first move each morning only with consent. Section 1 is the demo-day setup, with exact commands, the environment it needs and what to do when the cloud model or the network fails. Section 2 is a ten-minute demo script, minute by minute, with the exact text to type, what appears on screen (quoted from the seeded `demo` user as read from the running backend on 2026-11-14), the point to make and the rubric criterion it shows, plus a three-minute cut. Section 3 is a bank of viva questions with honest answers and the file to open. Section 4 maps every subsystem to its files and documents, with what its owner must be able to explain and the assigned owners. Section 5 lists the limits we state openly. File references are `path:line` at commit `d3e9132`, now part of `main` (frontend `4fa06ef`).
 
-**Who presents what: Murali (introduction, the Meera story, requirements, architecture, sequence and activity); Amathziah (sequence and activity, class and database diagrams); Ravi (API design, database schema, error handling); Pugal (OOP, SOLID, design patterns). Detail in §4.**
+**Who presents what: Murali (introduction, the Meera story, requirements, architecture, the chat turn; anticipation, memory, CP-SAT and PEARL); Amathziah (sequence and activity, class and database diagrams); Ravi (API design, database schema, error handling); Pugal (OOP, SOLID, design patterns). Each person has a plate in `team/`. Detail in §4.**
 
 ---
 
@@ -201,14 +201,18 @@ Two views of the same team. **4.1** says who presents which part of the evaluati
 
 ### 4.1 Who presents what
 
-| Owner | Presents | Documents | Slides |
-|---|---|---|---|
-| **Murali** | The introduction and the Meera story; requirements; architecture; sequence and activity (the chat turn and planning: S1, S2, A1, A2); **planning, the CP-SAT solver and PEARL** | guide §1–3; `01`; `02`; `06`; the table below | 1–6, 13 |
-| **Amathziah** | Sequence and activity (anticipation, memory and learning: S3–S8, A3); the class diagrams; the database diagrams (ER diagram and the state machines) | `06`; `03`; `08` (diagrams) | 6, 7, 11, 12, 15 |
-| **Ravi** | API design; the database schema (tables, keys, constraints, `accept_draft`); errors, edge cases and concurrency | `07`; `08`; `09` | 14, 15, 16 |
-| **Pugal** | OOP; SOLID; design patterns | `04`; `05` | 8, 9, 10 |
+| Owner | Presents | Documents | Slides | Own design patterns | Plate |
+|---|---|---|---|---|---|
+| **Murali** | The introduction and the Meera story; requirements; architecture; the chat turn; **anticipation, memory management, the CP-SAT solver and PEARL** | guide §1–4; `01`; `02`; `06` S1; the table below | 1–6, 11, 12, 13 | Strategy, State | `team/murali/` |
+| **Amathziah** | Sequence and activity diagrams; the class diagrams; the database diagrams (ER diagram and the state machines) | `06`; `03`; `08` (diagrams) | 6, 7, 15 | Observer, Template Method | `team/amathziah/` |
+| **Ravi** | API design; the database schema (tables, keys, constraints, `accept_draft`); errors, edge cases and concurrency | `07`; `08`; `09` | 14, 15, 16 | Repository, Adapter | `team/ravi/` |
+| **Pugal** | OOP; SOLID; the design patterns overview | `04`; `05` | 8, 9, 10 | Singleton, Factory | `team/pugal/` |
 
-The team named the first four rows' main topics. Three were not named and are placed here with the nearest topic, for the team to change: the class diagrams (with Amathziah's diagrams), OOP (with SOLID, the same document) and error handling (with the API). Slides 17 to 23 (models, working software, proof, decisions, limits) are shared: whoever built the part speaks to it. The deck has no team slide; this section is the record.
+Each person presents their own two patterns in depth; Pugal gives the overview of all of them on slide 10. Decorator, Chain of Responsibility, Facade and Command are not assigned: anyone answers them from `05` §0. "Singleton" here means one instance built once at the composition root (`AppContainer`, `get_hooks()`, `get_chain()`), not a class with `getInstance()`; `05` §13 says why.
+
+`team/where-everything-is.md` is the one-page map of the code for every OOP pillar, SOLID principle and pattern, and says which pattern supports which SOLID principle.
+
+Slides 17 to 23 (models, working software, proof, decisions, limits) are shared: whoever built the part speaks to it. The deck has no team slide; the team's names are on the title slide and this section is the record.
 
 **Planning, CP-SAT and PEARL (Murali): where each is written up.**
 
@@ -221,19 +225,6 @@ The team named the first four rows' main topics. Three were not named and are pl
 | PEARL: the four pattern detectors and their thresholds | guide D16; `01` FR-25 and UC7; `03` §8.2; `05` §3 (Strategy); `06` S4 and S7 | `app/services/memory/patterns.py` |
 | The focus profile, and how it reaches the solver | guide D20 (the energy term); `01` FR-30 and FR-31; `03` §8.2 | `app/services/energy.py` |
 | Rule check-ins (spaced repetition) | guide D33 | `app/services/analytical/rule_check_ins.py` |
-
-**Design patterns.** Doc `05` documents eleven. Pugal owns the section and presents these six, the ones that carry the most weight in the code; each teammate answers for the pattern their own topic touches:
-
-| Pattern | Where | Also answers for it |
-|---|---|---|
-| Repository (with its factory) | 11 ports, two families | Ravi (the database) |
-| Strategy | `LLMProvider`, `PatternDetector` | Murali (architecture) |
-| Decorator | redact → retry → meter → timeout | Pugal |
-| Chain of Responsibility | provider fallback, `ConsentPolicy` | Pugal |
-| State (transition tables) | drafts, suggestions, memories | Amathziah (the state machines) |
-| Observer | `EventBus` | Amathziah (the sequences that publish events) |
-
-The other five (Template Method, Factory and the composition root, Facade, Adapter, Command-like `ProactiveAction`) are in doc `05` §8–12 for questions.
 
 ### 4.2 Who knows which code
 

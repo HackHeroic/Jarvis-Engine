@@ -19,7 +19,7 @@ Read this section first. It explains each pattern the way you would say it out l
 3. Where it is in our code (name the class).
 4. Why we did not do the simpler thing.
 
-**The six to present** are marked ★. The other five are for questions.
+**Who presents which pattern:** Murali has Strategy and State; Amathziah has Observer and Template Method; Ravi has Repository and Adapter; Pugal has Singleton and Factory and gives the overview. The ones marked ★ carry the most weight in the code.
 
 ### ★ Repository (detail in §2)
 
@@ -102,6 +102,14 @@ Read this section first. It explains each pattern the way you would say it out l
 - **In Jarvis:** `AppContainer.build` in `app/container.py` runs once at startup. It picks Supabase or in-memory repositories, builds the model chain, and hands every service what it needs. `RepositoryFactory` builds a whole matching set of repositories at once (that part is called an **Abstract Factory**).
 - **Why:** services never import the database or a model library, so they stay easy to test and to change.
 
+### Singleton (see §9 and §13)
+
+- **In one line:** exactly one instance of something exists for the whole program.
+- **Think of it as:** the principal of a school. There is one, and everyone goes to the same one.
+- **In Jarvis:** one `AppContainer` is built once at startup (`AppContainer.build`, called from `app/main.py`) and kept on `app.state`. Two more single instances: the hook pipeline (`get_hooks()` in `app/orchestrator/hooks.py`) and the installed model chain (`get_chain()` in `app/core/model_router.py`).
+- **What is different from the textbook:** we do not write a class with a private constructor and `getInstance()`. The container is created in one place and *passed* to whoever needs it. A class that guards its own single instance is a hidden global: hard to test and hard to replace. Ours is single because only one place builds it.
+- **Admit:** `get_hooks()` and `get_chain()` are still looked up globally. That is listed as a shortfall of dependency inversion.
+
 ### Facade (detail in §10)
 
 - **In one line:** one simple method in front of several complicated subsystems.
@@ -150,6 +158,7 @@ flowchart LR
 | publishes an event that others react to | Observer |
 | fixes the order of steps in a base class | Template Method |
 | is the one place that creates objects | Factory / composition root |
+| exists exactly once for the whole program | Singleton |
 | gives one simple call over many subsystems | Facade |
 | makes an outside library fit our interface | Adapter |
 | stores an action as data to run later | Command |

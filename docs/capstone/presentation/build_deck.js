@@ -346,7 +346,8 @@ async function s01() {
   s.addText("CAPSTONE  ·  SYSTEM DESIGN & SOFTWARE ENGINEERING", { placeholder: "eyebrow", charSpacing: 1.5, bullet: false });
   s.addText("Jarvis", { placeholder: "title", glow: { size: 14, opacity: 0.3, color: HEX.terra }, bullet: false });
   s.addText("A personal intelligence that has your work ready before you ask.", { placeholder: "subtitle", bullet: false });
-  text(s, "Team Jarvis", { x: MX, y: 5.55, w: 5, h: 0.4, fontSize: 18, bold: true });
+  text(s, "Team Jarvis", { x: MX, y: 5.2, w: 5, h: 0.4, fontSize: 18, bold: true });
+  text(s, "Murali Madhav C  ·  Amathziah J  ·  Ravi Yadav  ·  Pugazhendhi J", { x: MX, y: 5.58, w: 9, h: 0.32, fontSize: 14, color: C.text1 });
   text(s, "Low-level design evaluation  ·  November 2026", { x: MX, y: 5.95, w: 6, h: 0.3, fontSize: 13, color: C.text2 });
   s.addNotes(
     "Good morning. We are Team Jarvis, and this is our capstone for System Design and Software Engineering. " +
