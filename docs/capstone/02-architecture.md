@@ -2,7 +2,7 @@
 
 This document is the high-level design of the Jarvis backend at commit `d3e9132`, now part of `main`. Jarvis is a personal intelligence: it learns from what actually happened (task outcomes, not self-reports), remembers and forgets on request, and makes the first move with the user's consent. It is one FastAPI process built as layers with ports and adapters: routers call application services; services depend on domain ports (abstract base classes); infrastructure implements the ports; a single composition root (`AppContainer`) picks every concrete class. A LangGraph graph runs each chat turn, OR-Tools CP-SAT solves schedules, Supabase Postgres with pgvector stores the data, and language models are reached local-first (LM Studio) with a Claude cloud tier behind a PII gate. The sections below give the layers and the dependency rule exactly as `tests/test_layering.py` enforces it, a component diagram, the runtime view of a chat turn and of the background scheduler, the deployment view, the language-model routing design, and the key decisions with the alternatives that were rejected.
 
-**Owner: Pugal**
+**Owner: Murali**
 
 ---
 

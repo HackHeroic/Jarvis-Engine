@@ -1277,8 +1277,8 @@ async function s20() {
   const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Proof" });
   head(s, "21  ·  PROOF", "Checked, not claimed");
   const stats = [
-    ["2,361", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
-    ["460", "frontend tests pass", "23 vitest files", C.accent2, HEX.gold],
+    ["2,366", "backend tests pass, fully offline", "plus 2 strict xfails that pin known gaps", C.accent1, HEX.terra],
+    ["471", "frontend tests pass", "25 vitest files", C.accent2, HEX.gold],
     ["18", "live end-to-end steps", "real Supabase and Claude; all passed on the final code", C.accent3, HEX.dusk],
     ["15", "class diagrams verified", "against the code, by a test", C.accent6, HEX.sageLight],
   ];
@@ -1370,14 +1370,14 @@ async function s22() {
 
 async function s23() {
   const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Close" });
-  head(s, "24  ·  TEAM JARVIS", "Four owners, thirteen subsystems");
+  head(s, "24  ·  TEAM JARVIS", "Who presents what");
   const members = [
-    ["Domain and ports", "Persistence and schema", "API and errors"],
-    ["LLM tier", "Chat turn and orchestration", "Memory"],
-    ["Planning and solver", "Tasks and outcome history", "PEARL and focus profile"],
-    ["Anticipation and consent", "Frontend", "Tests, live check and seed"],
+    ["Introduction and the Meera story", "Requirements and architecture", "Sequence and activity"],
+    ["Sequence and activity", "Class diagrams", "Database diagrams"],
+    ["API design", "Database schema", "Errors and concurrency"],
+    ["OOP", "SOLID", "Design patterns"],
   ];
-  const owners = ["Pugal", "Amathziah", "Murali", "Ravi"];
+  const owners = ["Murali", "Amathziah", "Ravi", "Pugal"];
   const gap = 0.3;
   const w = (CW - gap * 3) / 4;
   for (let i = 0; i < 4; i++) {
@@ -1385,17 +1385,17 @@ async function s23() {
     box(s, x, 2.0, w, 4.3, { name: `Member ${i + 1}` });
     await orb(s, "User", x + 0.62, 2.6, 0.68, { solid: true, accent: i % 2 ? HEX.gold : HEX.terra, scheme: i % 2 ? C.accent2 : C.accent1 });
     text(s, owners[i], { x: x + 1.1, y: 2.47, w: w - 1.2, h: 0.32, fontSize: 16, bold: true, color: C.text2 });
-    text(s, "Owner", { x: x + 0.3, y: 3.15, w: w - 0.5, h: 0.4, fontSize: 18, bold: true, objectName: `Owner ${owners[i]}` });
+    text(s, "Presents", { x: x + 0.3, y: 3.15, w: w - 0.5, h: 0.4, fontSize: 18, bold: true, objectName: `Presents ${owners[i]}` });
     text(
       s,
       members[i].map((m, j) => ({ text: m, options: { bullet: { indent: 14 }, breakLine: j < 2 } })),
       { x: x + 0.3, y: 3.8, w: w - 0.5, h: 2.3, fontSize: 15, color: C.text2, paraSpaceAfter: 10 }
     );
   }
-  text(s, "Each owner presents the areas listed here; see doc 10 §4.", { x: MX, y: 6.45, w: 9, h: 0.28, fontSize: 12, color: C.text2 });
+  text(s, "Each member presents the topics listed here; see doc 10 §4.1.", { x: MX, y: 6.45, w: 9, h: 0.28, fontSize: 12, color: C.text2 });
   s.addNotes(
-    "Each member explains their own part, so the contribution map in 10-demo-and-contributions.md section 4 assigns thirteen subsystems with their key files and what the owner must be able to explain. " +
-      "The four-way ownership split shown here is recorded in doc 10 §4 and in the owner lines on the capstone documents. Docs are shared: each owner keeps their own sections current."
+    "Each member presents a part of the evaluation: Murali the introduction, the Meera story, requirements, architecture and sequence and activity; Amathziah sequence and activity and the class and database diagrams; Ravi API design, the database schema and error handling; Pugal OOP, SOLID and design patterns. " +
+      "The split is recorded in doc 10 section 4.1 and in the owner lines on the capstone documents; section 4.2 maps the thirteen subsystems to who knows the code."
   );
 }
 

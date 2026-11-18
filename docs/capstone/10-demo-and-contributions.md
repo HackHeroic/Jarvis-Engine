@@ -2,7 +2,7 @@
 
 This document is the team's playbook for the evaluation. Jarvis is a personal intelligence for one person: it keeps their work ready before they need it, learns from what actually happened (an append-only outcome history becomes patterns and a focus profile that change the solver's math), remembers what they say and forgets on request for good, and makes the first move each morning only with consent. Section 1 is the demo-day setup, with exact commands, the environment it needs and what to do when the cloud model or the network fails. Section 2 is a ten-minute demo script, minute by minute, with the exact text to type, what appears on screen (quoted from the seeded `demo` user as read from the running backend on 2026-11-14), the point to make and the rubric criterion it shows, plus a three-minute cut. Section 3 is a bank of viva questions with honest answers and the file to open. Section 4 maps every subsystem to its files and documents, with what its owner must be able to explain and the assigned owners. Section 5 lists the limits we state openly. File references are `path:line` at commit `d3e9132`, now part of `main` (frontend `4fa06ef`).
 
-**Team owners: Pugal (domain, persistence, API); Amathziah (LLM, chat, memory); Murali (planning, tasks, PEARL); Ravi (anticipation, frontend, tests, seed).**
+**Who presents what: Murali (introduction, the Meera story, requirements, architecture, sequence and activity); Amathziah (sequence and activity, class and database diagrams); Ravi (API design, database schema, error handling); Pugal (OOP, SOLID, design patterns). Detail in §4.**
 
 ---
 
@@ -197,7 +197,35 @@ Answers are short on purpose; open the file named to go deeper.
 
 ## 4. Contribution map
 
-Four team members share thirteen subsystems. These owner assignments are for team contributions and presentation preparation.
+Two views of the same team. **4.1** says who presents which part of the evaluation. **4.2** says who knows which part of the code.
+
+### 4.1 Who presents what
+
+| Owner | Presents | Documents | Slides |
+|---|---|---|---|
+| **Murali** | The introduction and the Meera story; requirements; architecture; sequence and activity (the chat turn and planning: S1, S2, A1, A2) | guide §1–3; `01`; `02`; `06` | 1–6 |
+| **Amathziah** | Sequence and activity (anticipation, memory and learning: S3–S8, A3); the class diagrams; the database diagrams (ER diagram and the state machines) | `06`; `03`; `08` (diagrams) | 6, 7, 11, 12, 15 |
+| **Ravi** | API design; the database schema (tables, keys, constraints, `accept_draft`); errors, edge cases and concurrency | `07`; `08`; `09` | 14, 15, 16 |
+| **Pugal** | OOP; SOLID; design patterns | `04`; `05` | 8, 9, 10 |
+
+The team named the first four rows' main topics. Three were not named and are placed here with the nearest topic, for the team to change: the class diagrams (with Amathziah's diagrams), OOP (with SOLID, the same document) and error handling (with the API). Slides 13 and 17 to 24 (the solver, models, working software, proof, decisions) are shared: whoever built the part speaks to it.
+
+**Design patterns.** Doc `05` documents eleven. Pugal owns the section and presents these six, the ones that carry the most weight in the code; each teammate answers for the pattern their own topic touches:
+
+| Pattern | Where | Also answers for it |
+|---|---|---|
+| Repository (with its factory) | 11 ports, two families | Ravi (the database) |
+| Strategy | `LLMProvider`, `PatternDetector` | Murali (architecture) |
+| Decorator | redact → retry → meter → timeout | Pugal |
+| Chain of Responsibility | provider fallback, `ConsentPolicy` | Pugal |
+| State (transition tables) | drafts, suggestions, memories | Amathziah (the state machines) |
+| Observer | `EventBus` | Amathziah (the sequences that publish events) |
+
+The other five (Template Method, Factory and the composition root, Facade, Adapter, Command-like `ProactiveAction`) are in doc `05` §8–12 for questions.
+
+### 4.2 Who knows which code
+
+Four team members share thirteen subsystems.
 
 | Subsystem | Key files | Covered in | The owner must be able to explain | Owner |
 |---|---|---|---|---|
@@ -215,7 +243,7 @@ Four team members share thirteen subsystems. These owner assignments are for tea
 | **Tests, live checks and seed** | `tests/conftest.py`, `tests/fakes.py`, `tests/behaviour/`, `tests/golden/`, `tests/test_layering.py`, `tests/test_design_conformance.py`, `scripts/live_e2e.py`, `scripts/seed_demo_user.py` | 10; every "How to verify" | • The offline suite: socket guard, fakes, scripted model, real CP-SAT, strict xfails. • The seed: live services under a simulated clock, exit codes, why the backend must be stopped. • The live script's steps and its cleanup of the throwaway user. | Ravi |
 | **Docs** | `docs/capstone/*`, `docs/PROJECT_STATUS.md`, `docs/superpowers/specs/2026-11-14-capstone-lld-and-anticipation-design.md` | all | • Traceability: requirement → code → test. • How the diagrams are checked against the code. • The known limits and where the spec was amended. | All four |
 
-Assigned split: Pugal owns Domain, Persistence, API and errors; Amathziah owns the LLM tier, Chat turn and Memory; Murali owns Planning, Tasks and PEARL; Ravi owns Anticipation, Frontend, Tests and seed. Docs are shared: each owner keeps their sections current.
+Code areas: Pugal has Domain, Persistence, API and errors; Amathziah has the LLM tier, Chat turn and Memory; Murali has Planning, Tasks and PEARL; Ravi has Anticipation, Frontend, Tests and seed. Docs are shared: each owner keeps their sections current.
 
 ---
 

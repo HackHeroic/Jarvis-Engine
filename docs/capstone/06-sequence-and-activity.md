@@ -2,7 +2,7 @@
 
 This document shows, message by message, how Jarvis behaves at run time: how a brain dump becomes a proposed plan, how a plan is accepted atomically (including two clicks at once and an accept that comes after some of its times have passed), how a rule the user teaches changes the next plan, how a Complete or a Skip becomes a learning moment, how a forgotten fact stays forgotten, how the morning brief makes the first move under consent, how a noticed pattern becomes a rule, and what every language-model call goes through on its way to a provider. Each sequence diagram is followed by a numbered walk-through: the numbers match the arrows (Mermaid `autonumber`), and each row names the code (`path:line`) and the offline test or live-check step that exercises it. The activity diagrams then show the orchestrator's turn graph, the planning sub-graph and the trigger lifecycle, and the state machines show the legal status moves for drafts, tasks, suggestions and memories, drawn from the transition tables in the code. Jarvis is a personal intelligence that keeps the user's work ready before they ask; the diagrams show the parts that make that true. All references are to commit `d3e9132`, now part of `main`. Where the spec and the code differ, these diagrams follow the code.
 
-**Owners: Amathziah, Murali**
+**Owners: Murali, Amathziah**
 
 ---
 

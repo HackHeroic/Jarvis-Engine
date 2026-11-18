@@ -2,7 +2,7 @@
 
 This document is the low-level design of the Jarvis backend drawn as UML class diagrams, at commit `d3e9132`, now part of `main`. There is one overview diagram and fourteen subsystem diagrams: the domain (planning entities, learning entities, events, errors), persistence (the ports and the two repository families), the language-model chain, the chat turn and the orchestrator, anticipation (triggers and consent), and memory and learning. Every class named in a diagram is a real class at the module given in the class index (section 9), and `tests/test_design_conformance.py` parses every diagram in this file and checks it against the code: each class imports, each `<<interface>>` is an `abc.ABC` with abstract methods, each inheritance or realization arrow is a real `issubclass`, each listed method exists with the listed parameter names, each enumeration lists exactly its members, and each whole/part or association arrow names a real attribute. A diagram that lies fails the build.
 
-**Owner: Pugal**
+**Owner: Amathziah**
 
 ---
 

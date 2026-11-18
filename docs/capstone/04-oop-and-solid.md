@@ -2,7 +2,7 @@
 
 This document shows where the four pillars of object-oriented programming (encapsulation, abstraction, inheritance, polymorphism) and the five SOLID principles are applied in the Jarvis backend, at commit `d3e9132`, now part of `main`. For each one it gives what it means in this code base in one sentence, two or three concrete examples with `file:line` and a short excerpt copied from the code, the test that would fail if the principle were broken, and one honest place where the code falls short and why. The class-level picture is in `03-class-diagrams.md`, and the patterns these principles produce (Strategy, Decorator, Chain of Responsibility, Template Method and others) are in `05-design-patterns.md`. The last section lists the ten largest source files and what would be split next.
 
-**Owner: Amathziah**
+**Owner: Pugal**
 
 ---
 
