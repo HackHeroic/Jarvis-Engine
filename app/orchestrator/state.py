@@ -45,6 +45,7 @@ class JarvisState(TypedDict):
     # Current turn
     user_message: str
     tutor_mode: Optional[bool]
+    voice_mode: Optional[bool]
     file_base64: Optional[str]
     file_media_type: Optional[str]
     file_name: Optional[str]

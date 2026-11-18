@@ -87,6 +87,10 @@ class ChatStreamRequest(BaseModel):
         default=False,
         description="Answer learning questions as an active tutor, grounded in the user's documents when available.",
     )
+    voice_mode: bool = Field(
+        default=False,
+        description="The message was spoken and the reply is read aloud: short, plain sentences with no markdown.",
+    )
 
     _file_within_the_limit = field_validator("file_base64")(within_upload_limit)
 

@@ -85,6 +85,24 @@ ACTIVE TUTOR MODE:
 - Keep the tone warm, direct and respectful. Drop the butler role and do not call the learner 'sir'.
 """
 
+JARVIS_VOICE_RULES = """
+
+SPOKEN REPLY (this turn was spoken to you, and your reply is read aloud):
+- Write for the ear. One to three short sentences, unless you are teaching or the user asked for detail.
+- No markdown, lists, headings, emoji, code or symbols. Say dates, times, numbers and formulas the way a person says them: "tomorrow at five", "x squared plus two x".
+- Lead with the answer or the action. No filler openers.
+- Ask at most one short question, and only when it moves things forward.
+- When the answer comes from the user's documents, name the document in words. When it does not, say so before answering from general knowledge.
+- Never claim an action you did not take, and never invent a task, a deadline or a source. If you cannot do something yet, say so plainly and offer the nearest thing you can do.
+"""
+
+
+def chat_system_prompt(*, tutor_mode: bool = False, voice_mode: bool = False) -> str:
+    """The system prompt for a conversational reply: one of four fixed strings, so the
+    provider's prompt cache still reads each back."""
+    prompt = JARVIS_TUTOR_PROMPT if tutor_mode else JARVIS_CHAT_PROMPT
+    return prompt + JARVIS_VOICE_RULES if voice_mode else prompt
+
 
 async def _stream_chat_reply(
     user_message: str,
@@ -166,7 +184,9 @@ async def run_general_chat(state: dict) -> dict:
         history = with_context_note(state.get("conversation_history"), note)
 
         progress_queue = state.get("progress_queue")
-        system_prompt = JARVIS_TUTOR_PROMPT if state.get("tutor_mode") else JARVIS_CHAT_PROMPT
+        system_prompt = chat_system_prompt(
+            tutor_mode=bool(state.get("tutor_mode")), voice_mode=bool(state.get("voice_mode"))
+        )
         if progress_queue is not None:
             # Live SSE turn: stream the reply token-by-token through the bridge
             # instead of making the endpoint re-emit it as one blob.
