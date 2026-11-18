@@ -212,7 +212,7 @@ Each person presents their own two patterns in depth; Pugal gives the overview o
 
 `team/where-everything-is.md` is the one-page map of the code for every OOP pillar, SOLID principle and pattern, and says which pattern supports which SOLID principle.
 
-Slides 17 to 23 (models, working software, proof, decisions, limits) are shared: whoever built the part speaks to it. The deck has no team slide; the team's names are on the title slide and this section is the record.
+Slides 17 to 22 (models, working software, proof, decisions) are shared: whoever built the part speaks to it. The deck has no team slide; the team's names are on the title slide and this section is the record.
 
 **Planning, CP-SAT and PEARL (Murali): where each is written up.**
 

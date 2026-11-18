@@ -9,7 +9,7 @@ One folder per person. Each folder has a `README.md`: what you present, what to 
 | **Ravi** | API design, database schema, errors and concurrency | 14, 15, 16 | Repository, Adapter | [ravi/](ravi/README.md) |
 | **Pugal** | OOP, SOLID, design patterns overview | 8, 9, 10 | Singleton, Factory | [pugal/](pugal/README.md) |
 
-Slides 17 to 23 (models, working software, proof, decisions, limits) are shared: whoever built the part speaks to it. Decorator, Chain of Responsibility, Facade and Command are nobody's "own" pattern; anyone can answer them from `05-design-patterns.md` section 0.
+Slides 17 to 22 (models, working software, proof, decisions) are shared: whoever built the part speaks to it. Decorator, Chain of Responsibility, Facade and Command are nobody's "own" pattern; anyone can answer them from `05-design-patterns.md` section 0.
 
 **For everyone:** [where-everything-is.md](where-everything-is.md) is the one-page map of the code: every OOP pillar, every SOLID principle and every design pattern, with the file to open, and which pattern supports which SOLID principle.
 

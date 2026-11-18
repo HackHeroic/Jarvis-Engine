@@ -1341,34 +1341,6 @@ async function s21() {
   );
 }
 
-async function s22() {
-  const s = pres.addSlide({ masterName: "JARVIS_CONTENT", sectionTitle: "Close" });
-  head(s, "23  ·  HONEST LIMITS", "What is not built, said out loud");
-  const w = (CW - 0.3) / 2;
-  const cols = [
-    ["NOT BUILT", C.accent1, "X", HEX.terra, ["Ask-back clarifying questions", "PreTaskPrep and DeadlineRisk triggers", "Research summariser", "CognitiveModule registry", "Real authentication"]],
-    ["KNOWN LIMITS", C.accent2, "TriangleAlert", HEX.gold, ["Locks are per process: one worker", "PII gate is regex only", "6 legacy table calls, allow-listed", "Version check has a small window", "Document links are by meaning: fuzzy"]],
-  ];
-  for (let c = 0; c < 2; c++) {
-    const [title, col, ic, hex, items] = cols[c];
-    const x = MX + c * (w + 0.3);
-    box(s, x, 2.0, w, 4.25, { name: title });
-    eyebrowText(s, title, x + 0.35, 2.25, 4, col);
-    for (let i = 0; i < items.length; i++) {
-      const y = 2.75 + i * 0.68;
-      await icon(s, ic, x + 0.35, y - 0.005, 0.3, hex);
-      text(s, items[i], { x: x + 0.85, y, w: w - 1.1, h: 0.42, fontSize: 16 });
-    }
-  }
-  text(s, "All listed in doc 10 §5 and PROJECT_STATUS §4 and §10.", { x: MX, y: 6.55, w: 8, h: 0.28, fontSize: 12, color: C.text2 });
-  s.addNotes(
-    "We state these openly (10-demo-and-contributions.md section 5, PROJECT_STATUS sections 4 and 10). Not built: ask-back, the PreTaskPrep and DeadlineRisk triggers, a research summariser (it returns a result count), the CognitiveModule registry, and real authentication; the caller is a user_id query parameter behind the CurrentUser seam a JWT would replace. " +
-      "Known limits: the turn, model and anticipation locks are per process, which is correct for the one process Jarvis runs as; anything that could corrupt data is guarded in Postgres instead. " +
-      "The PII gate is regex only, six legacy call sites still make raw table calls on a tested allow-list, and the draft version check has a small window before accept_draft runs. " +
-      "Found while clicking through the app and since fixed: the Habits page was empty (each learned rule now gets a spaced check-in), an uploaded file was not kept (it is now stored privately and opens in the viewer), and workspace links needed Gemini (they now come from Claude's web search). Still a limit: documents are linked to tasks by meaning, so a link can be missed or a near-miss made."
-  );
-}
-
 async function s24() {
   const s = pres.addSlide({ masterName: "JARVIS_TITLE", sectionTitle: "Close" });
   s.addText("LIVE DEMO  ·  TEN MINUTES", { placeholder: "eyebrow", charSpacing: 4, bullet: false });
@@ -1429,7 +1401,7 @@ async function main() {
     ["Design", [s05, s06, s07, s08, s09, s10, s11, s12, s13, s14]],
     ["Implementation", [s15, s16, s17, s18]],
     ["Proof", [s19, s19b, s19c, s20, s21]],
-    ["Close", [s22, s24]],
+    ["Close", [s24]],
   ];
   for (const [title, fns] of sections) {
     pres.addSection({ title });
